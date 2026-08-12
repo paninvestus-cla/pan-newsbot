@@ -161,7 +161,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.134"
+BOT_VERSION = "v3.9.135"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -4617,29 +4617,134 @@ def _play_alert_sound(event_key: str) -> None:
 
 
 # ── 取引ロック状態管理 ────────────────────────────────────────────────────────
-# 取引ロックエラーが検出されたら True にセットし、
-# リスク監視ループで60秒ごとに赤い警告を繰り返し表示する。
+# 取引ロックエラーが検出されたら True にセットし、解除確認まで状況表示する。
 _trade_locked: bool = False
+_trade_lock_at: Optional[datetime.datetime] = None    # ロックで発注が失敗した時刻
 _trade_lock_last_warned: Optional[datetime.datetime] = None
-_TRADE_LOCK_WARN_INTERVAL_SEC = 60   # 警告の繰り返し間隔
+# ★ v3.9.135: フル警告を出す最短間隔。定期的な鳴らし直しは廃止したので、
+#   これは「発注が連続してブロックされたときに鳴らしすぎない」ためだけに使う。
+_TRADE_LOCK_WARN_INTERVAL_SEC = 1800   # 30分
+# ロック中と記録している間、解除されたかを確かめる間隔（注文は出さない）。
+# moomoo の上限は 10回/30秒。10分おきなら十分に余裕がある。
+_TRADE_LOCK_PROBE_SEC = 600
+_TRADE_LOCK_PROBE_TIMEOUT_SEC = 15
+_trade_lock_last_probe: Optional[datetime.datetime] = None
 
-def _warn_trade_locked() -> None:
-    """取引ロック検出時に赤いボックスで警告を表示する。 ターミナルには ANSI 赤色、ファイルログには色なし。"""
+
+def _clear_trade_lock(where: str = "") -> None:
+    """発注が通った＝ロックは解けている。フラグを下ろす。
+
+    ★ v3.9.135: 従来は新規ロングの成功時にしか下ろしておらず、ショートや決済が
+    通っても警告が消えなかった。発注が成功する経路すべてから呼ぶ。
+    """
+    global _trade_locked, _trade_lock_at, _trade_lock_last_warned, _trade_lock_last_probe
+    if _trade_locked:
+        _trade_locked = False
+        _trade_lock_at = None
+        _trade_lock_last_warned = None
+        _trade_lock_last_probe = None
+        log.info(f"[取引ロック] ✅ 発注が通りました（{where}）→ ロックは解除されています")
+
+
+def _probe_trade_unlocked(trd_env) -> Optional[bool]:
+    """取引ロックが解けているかを、注文を出さずに確かめる。
+
+    戻り値: True=解除済み / False=ロック中 / None=判定できず
+
+    ★ v3.9.135: moomoo にはロック状態を照会する API が無い（公式ドキュメント
+    "No query API exists." / SDK の Trd_UnlockTrade 応答は空）。
+    ロック解除が要るのは「発注」と「注文の変更・取消」だけで、建玉照会などは
+    ロック中でも通るため、照会系では判定できない。
+
+    そこで **存在しない注文IDの取消** を投げる。注文は一切出さない。
+      ・ロック中        → unlock を促すエラーが返る（取消の手前で弾かれる）
+      ・解除済み        → 「このorderIDは存在しません」が返る（ロック検査は通過）
+    実機（実口座・解除済み）で後者を確認済み。
+    """
+    if trd_env != TrdEnv.REAL:
+        return True          # デモは解除不要
+    try:
+        with _trade_ctx() as ctx:
+            ret, data = ctx.modify_order(
+                ModifyOrderOp.CANCEL, "0", 0, 0,
+                trd_env=trd_env, acc_id=REAL_ACC_ID,
+            )
+        if ret == RET_OK:
+            # order_id="0" の取消成功は想定外。解除済みとは推定できても、何が
+            # 取消対象になったか確認できないため、状態を消さず異常として残す。
+            log.error("[取引ロック] 存在しない注文IDの取消が成功しました（判定保留）")
+            return None
+        _err = str(data).lower()
+        if "unlock" in _err:
+            return False
+        # 未知エラー（通信、口座、権限、頻度制限等）を解除済みと誤認しない。
+        # 実口座で確認済みの応答と、その英語表記だけを解除済みの根拠にする。
+        _not_found_markers = (
+            "このorderidは存在しません",
+            "orderid does not exist",
+            "order id does not exist",
+            "orderid not found",
+            "order id not found",
+        )
+        if any(_marker in _err for _marker in _not_found_markers):
+            return True
+        log.debug(f"[取引ロック] 状態確認が未知の応答（判定保留）: {_mask_secrets(data)}")
+        return None
+    except Exception as _e:
+        log.debug(f"[取引ロック] 状態の確認に失敗（判定保留）: {_mask_secrets(_e)}")
+        return None
+
+
+def _lock_status_suffix() -> str:
+    """[状況] 行に足す取引ロックの状態。ロックで失敗していなければ空文字。
+
+    ★ v3.9.135: 鳴らし続ける代わりに、ここで静かに状態を出す。
+    """
+    if not _trade_locked or _trade_lock_at is None:
+        return ""
+    return f"  ⚠️ {_trade_lock_at:%m/%d %H:%M} の発注が取引ロックで失敗（OpenDで解除してください）"
+
+
+def _warn_trade_locked(repeat: bool = False) -> None:
+    """取引ロックで発注が失敗したことを知らせる。
+
+    ★ v3.9.135: 文面を実態に合わせた。
+      ・この Bot は OpenD とだけ通信する。moomoo アプリ側の操作では解除されない
+        ため、アプリの案内は誤解のもとだった（利用者指摘）。
+      ・Bot はロック状態を直接問い合わせられないため、安全な取消プローブまたは
+        次の発注成功で解除を確認する。
+    """
+    _at = _trade_lock_at.strftime("%H:%M") if _trade_lock_at else "直近"
+    if repeat:
+        log.warning(
+            f"  ⛔ [取引ロック] {_at} の発注がロックで失敗しました。"
+            f"OpenD で解除済みであれば、次のシグナルで発注されます"
+            f"（Bot からは解除できたかを確認できません）"
+        )
+        return
+    # ★ v3.9.135: 同じロックで発注が連続ブロックされたときに鳴らし続けない
+    global _trade_lock_last_warned
+    _now_w = datetime.datetime.now()
+    if (_trade_lock_last_warned is not None and
+            (_now_w - _trade_lock_last_warned).total_seconds() < _TRADE_LOCK_WARN_INTERVAL_SEC):
+        log.warning(f"  ⛔ [取引ロック] 発注がブロックされました（{_now_w:%H:%M}）")
+        return
+    _trade_lock_last_warned = _now_w
     _play_alert_sound("trade_locked")  # ★ v3.9.19: アラート音
     lines = [
         "╔══════════════════════════════════════════════════════════╗",
-        "║  ⛔  取引ロックが検出されました（発注がブロックされています） ║",
+        "║  ⛔  取引ロックのため発注できませんでした                 ║",
         "║                                                          ║",
-        "║  以下のいずれかを確認・操作してください:                  ║",
+        "║  OpenD ウィンドウ → 設定 → トレードロック解除            ║",
+        "║  → 取引パスワードを入力して解除してください               ║",
         "║                                                          ║",
-        "║  【OpenD の場合】                                         ║",
-        "║    OpenD ウィンドウ → 設定 → トレードロック解除           ║",
-        "║    → 取引パスワードを入力して解除                         ║",
+        "║  ※ この Bot は OpenD とだけ通信します。                  ║",
+        "║     moomoo アプリ側で操作しても解除されません。           ║",
         "║                                                          ║",
-        "║  【moomoo アプリの場合】                                  ║",
-        "║    右上アイコン → セキュリティ → 取引パスワード入力        ║",
-        "║                                                          ║",
-        "║  解除後は再起動不要。次のシグナルで自動的に発注します。    ║",
+        "║  解除後の再起動は不要です。                               ║",
+        "║  この警告は繰り返しません。                               ║",
+        "║  解除されたかを10分おきに確認し、解除を確認したら          ║",
+        "║  自動でこの表示は消えます。                               ║",
         "╚══════════════════════════════════════════════════════════╝",
     ]
     # ターミナル: 赤太字で表示
@@ -11447,7 +11552,7 @@ def place_buy(
     confidence に応じた動的注文金額と BUDGET_USD ベースの上限管理を適用する。
     qty を指定した場合はその株数で発注（ショートクリーンアップ用）。
     """
-    global _trade_locked, _trade_lock_last_warned  # 取引ロック状態管理
+    global _trade_locked, _trade_lock_at, _trade_lock_last_warned, _trade_lock_last_probe  # 取引ロック状態管理
     tag     = f"【{symbol}】"
     mode    = "【デモ】" if trd_env == TrdEnv.SIMULATE else "【実注文】"
     session, _ = get_session_info()
@@ -11834,7 +11939,9 @@ def place_buy(
             # 取引ロックエラーを検出 → 赤い警告を表示
             if "unlock" in str(data).lower():
                 _trade_locked = True
+                _trade_lock_at = datetime.datetime.now()   # ★ v3.9.135: 失敗時刻を残す
                 _trade_lock_last_warned = None  # 即時表示させる
+                _trade_lock_last_probe = None
                 _warn_trade_locked()
             return False
         order_id = str(data["order_id"][0])
@@ -11849,9 +11956,7 @@ def place_buy(
     try:
         _register_pending_order(order_id, symbol, trd_env)
         # 発注成功 → 取引ロックフラグをクリア
-        if _trade_locked:
-            _trade_locked = False
-            log.info("[ロック解除] ✅ 発注成功 → 取引ロック解消を確認")
+        _clear_trade_lock("新規ロング")
         # 約定確認を非同期で実行（5秒後）
         _threadsafe_future(
             _check_order_filled(order_id, symbol, qty, limit_price, trd_env, mode)
@@ -11932,7 +12037,7 @@ def place_short(
     victims: Optional[List[str]]       = None,  # ★ v2.95: AI victims (GAS送信用)
 ) -> bool:
     """空売り（新規SELL）注文を moomoo に発行する。 信用口座でベア局面時に SPY/QQQ を空売りする。 決済は place_cover（買い戻し）で行う。"""
-    global _trade_locked, _trade_lock_last_warned  # 取引ロック状態管理
+    global _trade_locked, _trade_lock_at, _trade_lock_last_warned, _trade_lock_last_probe  # 取引ロック状態管理
     tag  = f"【{symbol}】"
     mode = "【デモ】" if trd_env == TrdEnv.SIMULATE else "【実注文】"
     session, _ = get_session_info()
@@ -12289,13 +12394,16 @@ def place_short(
             elif "unlock" in err_str:
                 # 取引ロックエラー → 赤い警告を表示
                 _trade_locked = True
+                _trade_lock_at = datetime.datetime.now()   # ★ v3.9.135: 失敗時刻を残す
                 _trade_lock_last_warned = None
+                _trade_lock_last_probe = None
                 _warn_trade_locked()
             else:
                 log.error(f"{tag} [ORDER] SHORT 失敗: {data}")
             return False
         order_id = str(data["order_id"][0])
         log.info(f"{tag} [ORDER] SHORT orderId={order_id}  qty={qty}  price={limit_price}")
+        _clear_trade_lock("新規ショート")   # ★ v3.9.135: 発注が通った＝ロックは解けている
     except Exception as e:
         log.error(f"{tag} [ORDER] SHORT API例外: {e}", exc_info=True)
         return False
@@ -13614,6 +13722,7 @@ def _close_one_position_id(
                 f"qty={qty} price={'MKT' if use_market else f'${limit_price:.2f}'} "
                 f"trd_side={trd_side} orderId={order_id}"
             )
+            _clear_trade_lock("決済")   # ★ v3.9.135: 発注が通った＝ロックは解けている
             return ret, order_id
         else:
             # ★ v3.9.63: 「Not enough positions」= 建玉は既に決済済み (二重決済レース等)。
@@ -16743,14 +16852,29 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
         if _status_counter >= _status_interval:
             _status_counter = 0
 
-            # 取引ロック中なら赤い警告を繰り返し表示
+            # ★ v3.9.135: 取引ロックの定期的な鳴らし直しは廃止した。
+            #   発注が1日出ない日もあり、その間ずっと鳴り続けていた（利用者指摘）。
+            #   代わりに、ロック中と記録している間だけ10分おきに状態を確かめ、
+            #   解けていれば静かに消す。確認は注文を出さない方法で行う。
             if _trade_locked:
-                global _trade_lock_last_warned
-                now_warn = datetime.datetime.now()
-                if (_trade_lock_last_warned is None or
-                        (now_warn - _trade_lock_last_warned).total_seconds() >= _TRADE_LOCK_WARN_INTERVAL_SEC):
-                    _trade_lock_last_warned = now_warn
-                    _warn_trade_locked()
+                global _trade_lock_last_probe
+                _now_p = datetime.datetime.now()
+                if (_trade_lock_last_probe is None or
+                        (_now_p - _trade_lock_last_probe).total_seconds() >= _TRADE_LOCK_PROBE_SEC):
+                    _trade_lock_last_probe = _now_p
+                    try:
+                        _unlocked = await asyncio.wait_for(
+                            asyncio.to_thread(_probe_trade_unlocked, trd_env),
+                            timeout=_TRADE_LOCK_PROBE_TIMEOUT_SEC,
+                        )
+                    except asyncio.TimeoutError:
+                        # SDK/OpenD が固まっても、損切り等のリスク監視は継続する。
+                        log.warning("[取引ロック] 状態確認がタイムアウト（判定保留）")
+                        _unlocked = None
+                    if _unlocked is True:
+                        _clear_trade_lock("解除を確認")
+                    elif _unlocked is False:
+                        log.debug("[取引ロック] まだ解除されていません")
             _has_any_pos = any(
                 state.get(s).position_qty != 0 or _tracked_position_cost.get(s, 0) > 0
                 for s in exec_syms
@@ -16771,7 +16895,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 price_str = "  ".join(_prices) if _prices else "価格取得失敗"
                 log.info(
                     f"[状況] ポジションなし  セッション:{session_now.upper()}"
-                    f"  {price_str}" + _ext_status_suffix()
+                    f"  {price_str}" + _ext_status_suffix() + _lock_status_suffix()
                 )
             elif _startup_position_unknown and not _has_any_pos:
                 # long_mv>0 で検出済みだが position_list_query では確認できていない状態
