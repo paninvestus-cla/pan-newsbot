@@ -1,0 +1,19264 @@
+"""
+moomoo_trade_v1.py
+==================
+セクター連動型アルゴトレード（moomoo証券 実口座対応版）
++ Discord Webhook通知 + 外部ニュースAPI + 資金管理
+
+【moomoo API の構成】
+  OpenQuoteContext  : リアルタイム株価の取得（bid/ask/last）
+  OpenSecTradeContext: 米国株注文・ポジション照会・口座情報取得（FUTUJP）
+  銘柄コード形式    : "US.SPY" / "US.QQQ" など "US." プレフィックス必須
+
+【取引戦略】
+  ブル（score=1）  : SPY / QQQ を現物買い（BUY）
+  ベア（score=-1） : SPY / QQQ を空売り（SELL新規）、決済は買い戻し（BUY）
+  信用口座（MARGIN）を使用。レバレッジETFは使用しない。
+
+【時間外取引】
+  moomoo API では注文時に TimeInForce と ExtendedTime フラグで制御する。
+  通常時間  : TimeInForce.DAY
+  時間外    : TimeInForce.DAY + outside_rth=True（プリ・アフター）
+  20:00以降 : TimeInForce.GTT（Good Till Time）相当として OVT を模倣
+
+【継承機能（v17_discord から）】
+  - Claude Haiku によるニュース判定
+  - confidence 連動の動的ロットサイズ（$5,000〜$50,000）
+  - Discord Webhook 通知（売買実行時のみ）
+  - Finnhub 外部ニュース取得（20秒間隔）
+  - 重複排除フィルタ（articleId + 先頭35文字）
+  - 損切り（MAX_LOSS_PCT）/ トレイリングストップ（TRAIL_TRIGGER_PCT 発動）
+  - 除外キーワードフィルタ（スポーツ・エンタメ等）
+  - NYSE セッション管理（週末停止）
+
+【週末前強制全決済】
+  金曜 15:45 ET に全ポジションを強制決済し、市場クローズ後の
+  ニュース取得・発注も停止する。
+  理由: 週末持越し金利（土日3日分）・地政学リスクの回避。
+  月曜プリマーケット開始時に自動的にトレード再開。
+
+.env 設定項目:
+  ANTHROPIC_API_KEY=sk-ant-...
+  DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+  FINNHUB_API_KEY=...          # 任意
+  ALPACA_API_KEY_ID=...        # 任意（Alpaca News WebSocket）
+  ALPACA_API_SECRET_KEY=...    # 任意（Alpaca News WebSocket）
+  MOOMOO_HOST=127.0.0.1        # OpenD が動作しているホスト（デフォルト: 127.0.0.1）
+  MOOMOO_PORT=11111             # OpenD のポート番号（デフォルト: 11111）
+  MOOMOO_RSA_KEY=              # RSA秘密鍵ファイルのパス（認証が必要な場合のみ）
+  MOOMOO_ACC_ID=               # 【実口座必須】特定口座・信用口座のacc_id (Wizardの自動取得、または --live 起動時に自動設定)
+  BUDGET_USD=50000              # 【重要】1回の最大発注上限額（ユーザーごとに設定）
+
+使い方:
+  python moomoo_trade_v1.py                # デモ口座（シミュレーション）
+  python moomoo_trade_v1.py --live         # 実口座（要注意）
+
+前提:
+  pip install moomoo-api anthropic requests python-dotenv
+  OpenD（moomoo デスクトップアプリ内の API ゲートウェイ）を起動しておくこと
+"""
+
+
+import asyncio
+import argparse
+import logging
+import math
+import os
+import re
+import shutil
+import signal
+import sys
+import json
+import datetime
+import threading
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from logging.handlers import TimedRotatingFileHandler
+from types import SimpleNamespace
+from typing import Optional, Union, List, Dict, Tuple, Any
+from zoneinfo import ZoneInfo
+
+import requests
+import anthropic
+from dotenv import load_dotenv
+
+# ── moomoo API ───────────────────────────────────────────────────────────────
+# moomoo-api 10.x: OpenUSTradeContext は OpenSecTradeContext に統合 (旧 9.x 互換のため任意import)。
+# 本Botは OpenSecTradeContext(SecurityFirm.FUTUJP) のみ使用 → OpenUSTradeContext なくても動作。
+try:
+    import moomoo as ft
+    from moomoo import (
+        OpenQuoteContext,
+        OpenSecTradeContext,
+        TrdEnv,
+        TrdSide,
+        TrdMarket,
+        OrderType,
+        TimeInForce,
+        ModifyOrderOp,
+        SecurityFirm,
+        Currency,
+        RET_OK,
+        KLType,
+        SubType,
+        Market,
+    )
+    # SubAccType: JP_TOKUTEI指定に必要（moomoo証券サポート回答 2026-04-21）
+    # 旧バージョンに存在しない場合はNoneとして互換性を維持
+    try:
+        from moomoo import SubAccType  # type: ignore
+    except ImportError:
+        SubAccType = None  # type: ignore
+    # AssetCategory: position_list_query の JP特定口座US株建玉取得に必要
+    try:
+        from moomoo import AssetCategory  # type: ignore
+    except ImportError:
+        AssetCategory = None  # type: ignore
+    # moomoo 10.x では削除済み。存在すれば import、なければ None。
+    try:
+        from moomoo import OpenUSTradeContext  # type: ignore
+    except ImportError:
+        OpenUSTradeContext = None  # type: ignore
+except ImportError:
+    # 旧パッケージ名 futu へのフォールバック
+    try:
+        import futu as ft
+        from futu import (
+            OpenQuoteContext,
+            TrdEnv,
+            TrdSide,
+            OrderType,
+            TimeInForce,
+            ModifyOrderOp,
+            RET_OK,
+            KLType,
+            SubType,
+            Market,
+        )
+        # futu 旧版で存在しない可能性がある記号は個別に import
+        try:
+            from futu import OpenUSTradeContext  # type: ignore
+        except ImportError:
+            OpenUSTradeContext = None  # type: ignore
+        try:
+            from futu import OpenSecTradeContext, TrdMarket, SecurityFirm, Currency  # type: ignore
+        except ImportError:
+            OpenSecTradeContext = None  # type: ignore
+            TrdMarket = None  # type: ignore
+            SecurityFirm = None  # type: ignore
+            Currency = None  # type: ignore
+    except ImportError:
+        print(
+            "[ERROR] moomoo-api がインストールされていません。\n"
+            "  pip install moomoo-api\n"
+            "を実行してください。"
+        )
+        sys.exit(1)
+
+load_dotenv()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ボットバージョン  ★ 現在の版はここ ★
+#  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
+# ══════════════════════════════════════════════════════════════════════════════
+BOT_VERSION = "v3.9.134"
+
+# ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
+#   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
+#   既定は安全側の "DEMO"（--live を付けない限りデモ）。
+_RUN_TRADE_ENV: str = "DEMO"
+
+
+# ── NYSE 取引カレンダー (本ファイル下部に定義) ─────────────────────────────────
+# 年1回メンテ要 (次回 2027 年末に 2028 年分追加 / 出典: NYSE 公式)。
+_EARLY_CLOSE_PRECLOSE_MINUTES = 15  # 早期クローズ何分前に強制決済発火するか
+
+
+def _gas_post(url: str, payload: str, timeout: int = 60) -> dict:
+    """GAS exec URL への POST (urllib 実装)。302 リダイレクト時の POST body 保持に対応。"""
+    import urllib.request as _ureq
+    import urllib.error  as _uerr
+    import json          as _json
+
+    data    = payload.encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    current_url = url
+
+    for _attempt in range(10):
+        req  = _ureq.Request(current_url, data=data, headers=headers, method="POST")
+        try:
+            # リダイレクトを自動処理させない → 独自ハンドラで302をキャッチ
+            opener = _ureq.build_opener(_ureq.HTTPSHandler())
+            opener.addheaders = []          # デフォルトヘッダーを除去
+            # redirect を無効にするために HTTPRedirectHandler を除外
+            no_redirect_opener = _ureq.build_opener()
+            # HTTPRedirectHandler を取り除く
+            no_redirect_opener.handlers = [
+                h for h in no_redirect_opener.handlers
+                if not isinstance(h, _ureq.HTTPRedirectHandler)
+            ]
+            with no_redirect_opener.open(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8")
+                # ★ v3.9.80: GAS が空 / 非JSON(HTMLエラーページ等)を返すケースを明示化。
+                #   過負荷・権限/デプロイ不備時に発生し、従来は「Expecting value: line 1
+                #   column 1 (char 0)」という不透明な JSONDecodeError になっていた。
+                #   分かりやすい例外にして分類(_classify_gas_error)→再送キューへ退避させる。
+                #   応答は不達でも GAS 側で書込済の可能性があるため、再送時は retry フラグで
+                #   trade_id / observation_id 重複排除され二重登録しない (v3.9.78 / GAS v9.4)。
+                _b = (body or "").strip()
+                if not _b:
+                    raise RuntimeError("GAS 応答が空 (empty response)")
+                try:
+                    return _json.loads(_b)
+                except ValueError:
+                    raise RuntimeError(f"GAS 非JSON応答 (non-JSON response len={len(_b)}): {_b[:80]!r}")
+
+        except _uerr.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                location = e.headers.get("Location", "").strip()
+                if not location:
+                    raise RuntimeError(f"GAS POST: Locationヘッダーが空 (status={e.code})")
+                current_url = location
+                continue  # リダイレクト先へ同じPOSTボディで再送
+            raise  # 4xx/5xx はそのまま上位へ
+
+    raise RuntimeError(f"GAS POST: リダイレクト上限（10回）到達 最終URL={current_url}")
+
+
+# ── ★ v3.9.75: GAS送信の堅牢化（分類ログ + インラインリトライ + 永続再送キュー）──
+# 認定サポーター報告（記録系で read timeout 多発）への対応。すべて best-effort で、
+# 送信は別スレッド/別タスク実行のため売買ロジック（asyncio本体）には一切影響しない。
+#   ・失敗を分類（DATA_COLLECT_TIMEOUT / OBSERVATION_TIMEOUT / ...）してログ文言を明確化。
+#   ・インライン 0/5/15 秒の3回再送 → 全失敗ならローカル JSONL キューへ退避。
+#   ・gas_retry_loop が定期再送。再送時は retry フラグを立て、GAS 側が
+#     trade_id / observation_id で重複排除（read timeout の二重登録を防ぐ）。
+_GAS_QUEUE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "gas_retry_queue.jsonl"
+)
+_GAS_QUEUE_LOCK = threading.Lock()
+_GAS_QUEUE_MAX = 3000             # 退避上限（超過は重要度の低い順に破棄）
+_GAS_RETRY_MAX_ATTEMPTS = 48      # ★ v3.9.82: 24→48（過負荷日でも翌セッションまで粘る）
+# ★ v3.9.88: 種別ごとの再送上限。重要度: トレード/サマリ(成績) > 観察(シャドー) > 観察PnL更新。
+#   トレードは実質破棄しない(高上限で粘る)。observation_pnl は最低優先で最初に諦める。
+#   退避超過(_GAS_QUEUE_MAX)・諦め破棄の両方でこの優先度を使う。
+_GAS_RETRY_MAX_BY_KIND = {
+    "trade":           480,   # 重要・少数。実質破棄しない（翌日以降も粘る）
+    "summary":         240,
+    "observation":     48,    # シャドー（中）
+    "observation_pnl": 24,    # +60分更新（最低優先・最初に諦める）
+}
+# 退避超過時に「先に捨てる」優先度（数字が大きいほど先に破棄）。
+_GAS_DROP_PRIORITY = {"trade": 0, "summary": 1, "observation": 2, "observation_pnl": 3}
+_GAS_RETRY_BACKOFF = [5, 15]      # インライン再送の待機（秒）
+
+# ── ★ v3.9.82 (A群): 160人スケール対策（Bot側のみ・GAS変更なし）─────────────
+# ① 送信ジッター: 各送信前に小ランダム遅延を入れ、市場イベントで全受講生が同時刻に
+#    GASへ殺到する相関バーストを散らす（GAS同時実行30枠の超過＝timeout/空応答を低減）。
+# ② 送信側オートバックオフ: 連続失敗が続いたら一定時間「直接送信を見送りキューへ退避」
+#    に切り替え、過負荷GASへの追い打ちを止める。回復は再送ループ(プローブ)が検知。
+_GAS_SEND_JITTER_SEC = 5.0            # ★ v3.9.97: 2.0→5.0（相関バーストを更に分散）送信前ジッター上限（秒）
+# ★ v3.9.126: 一斉決済（デモ日次 15:45 ET 等）は全台が同一秒に決済→送信するため、通常の
+#   5秒ジッターでは GAS の書き込みロックが逼迫する（2026-07-23 に GAS 側で行の上書き欠落が
+#   発生）。GAS v9.20 で欠落自体は fail-closed + 再送で防いだが、競合そのものを減らすため
+#   一斉決済由来の送信だけジッターを広げる。日次レポートは翌朝生成のため遅延の実害はない。
+_GAS_SEND_JITTER_SEC_BULK = 30.0      # 一斉決済トレードの送信前ジッター上限（秒）
+_BULK_CLOSE_REASON_HINTS = ("デモ日次決済", "週末前強制決済", "移行前全決済")
+_GAS_FAIL_COOLDOWN_THRESHOLD = 5      # 連続失敗この回数でクールダウン突入
+_GAS_FAIL_COOLDOWN_SEC = 180          # 初回クールダウン秒（以後・過負荷継続で指数的に延長）
+_GAS_FAIL_COOLDOWN_MAX_SEC = 1800     # ★ v3.9.95: クールダウンの上限（30分）
+# ★ v3.9.96: クールダウン中でも「直送を試みる」最重要種別。トレード記録/成績サマリは
+#   最優先で必ず送信機会を与える（低頻度・最重要）。観察/観察PnL（高頻度・低優先）だけを
+#   クールダウンで退避させ、過負荷の主因を絞る。トレードが先・エラー(観察)は後、を担保。
+_GAS_COOLDOWN_EXEMPT_KINDS = {"trade", "summary"}
+_gas_send_health = {"consecutive_fail": 0, "cooldown_until": 0.0, "last_cd_log": 0.0}
+
+
+def _gas_in_cooldown() -> bool:
+    import time as _t
+    return _t.time() < _gas_send_health.get("cooldown_until", 0.0)
+
+
+def _gas_mark_success() -> None:
+    _gas_send_health["consecutive_fail"] = 0
+    _gas_send_health["cooldown_until"] = 0.0
+
+
+def _gas_mark_failure() -> None:
+    import time as _t
+    _gas_send_health["consecutive_fail"] = int(_gas_send_health.get("consecutive_fail", 0)) + 1
+    cf = _gas_send_health["consecutive_fail"]
+    if cf >= _GAS_FAIL_COOLDOWN_THRESHOLD:
+        # ★ v3.9.95: 過負荷が長引くほどクールダウンを指数的に延長（180s→…→上限1800s）。
+        #   共有GASへの無駄な追い打ち（連投・HTML応答の量産）を抑える。回復は再送ループが検知。
+        _extra = min(cf - _GAS_FAIL_COOLDOWN_THRESHOLD, 4)   # 0,1,2,3,4
+        _cd = min(_GAS_FAIL_COOLDOWN_SEC * (2 ** _extra), _GAS_FAIL_COOLDOWN_MAX_SEC)
+        _gas_send_health["cooldown_until"] = _t.time() + _cd
+
+
+def _classify_gas_error(exc, kind: str) -> str:
+    """送信失敗を [DATA_COLLECT_TIMEOUT] 等に分類（注文系timeoutと区別するため）。"""
+    msg = str(exc).lower()
+    if "timed out" in msg or "timeout" in msg:
+        base = "TIMEOUT"
+    elif ("non-json" in msg or "empty response" in msg or "expecting value" in msg
+          or "応答が空" in msg or "非json" in msg):
+        base = "EMPTYRESP"   # ★ v3.9.80: GAS が空/非JSON(HTMLエラーページ等)を返した
+    elif "urlopen" in msg or "connection" in msg or "refused" in msg or "reset" in msg:
+        base = "CONN"
+    else:
+        base = "ERR"
+    tag = {
+        "trade":           "DATA_COLLECT",
+        "summary":         "DATA_COLLECT",
+        "observation":     "OBSERVATION",
+        "observation_pnl": "OBSERVATION",
+    }.get(kind, "GAS")
+    return f"{tag}_{base}"
+
+
+def _gas_enqueue(url: str, payload_str: str, kind: str, key: str) -> None:
+    """送信失敗ペイロードをローカル JSONL に退避（gas_retry_loop が後で再送）。"""
+    import time as _t
+    try:
+        rec = {
+            "url": url, "payload": payload_str, "kind": kind, "key": key or "",
+            "attempts": 0, "next_at": _t.time() + 30, "enq_at": _t.time(),
+        }
+        with _GAS_QUEUE_LOCK:
+            lines = []
+            if os.path.exists(_GAS_QUEUE_PATH):
+                with open(_GAS_QUEUE_PATH, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            # 同一 key の既存退避は置き換え（重複退避を防ぐ）
+            # ★ v3.9.120: 生テキストの部分一致 → JSON パース比較へ（エスケープを含む
+            #   キーや空白差で一致漏れし重複が残る問題の修正・外部AIレビュー指摘）。
+            if key:
+                def _same_key(_ln: str) -> bool:
+                    try:
+                        return json.loads(_ln).get("key", "") == key
+                    except Exception:
+                        return False
+                lines = [ln for ln in lines if not _same_key(ln)]
+            lines.append(json.dumps(rec, ensure_ascii=False) + "\n")
+            if len(lines) > _GAS_QUEUE_MAX:
+                # ★ v3.9.88: 単純な最古破棄でなく重要度順に保持。
+                #   トレード/サマリを最優先で残し、observation_pnl から先に捨てる
+                #   （同優先度内では新しいものを残す）。原ファイル順は維持。
+                def _drop_prio(_ln):
+                    try:
+                        return _GAS_DROP_PRIORITY.get(json.loads(_ln).get("kind", ""), 2)
+                    except Exception:
+                        return 2
+                _order = sorted(range(len(lines)), key=lambda i: (_drop_prio(lines[i]), -i))
+                _keep = set(_order[:_GAS_QUEUE_MAX])
+                lines = [lines[i] for i in range(len(lines)) if i in _keep]
+            with open(_GAS_QUEUE_PATH, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+    except Exception as _e:
+        log.debug(f"[GAS再送] 退避失敗(黙殺): {_mask_secrets(_e)}")
+
+
+def _gas_send_with_retry(url: str, payload_str: str, kind: str,
+                         key: str = "", timeout: int = 15,
+                         jitter_max: Optional[float] = None) -> bool:
+    """インライン 0/5/15 秒で最大3回送信。全失敗ならキューへ退避。戻り値 ok bool。
+    呼び出し側は別スレッド/別タスクのため、ここでの待機は売買本体を止めない。"""
+    import time as _t
+    import random as _rnd
+    # ★ v3.9.82 (A群②): クールダウン中は直接送信せずキューへ退避（過負荷GASへの追い打ち停止）。
+    #   回復は gas_retry_loop（プローブ）が検知し、成功でクールダウン解除。
+    # ★ v3.9.96: ただし最重要種別（trade/summary）はクールダウン中でも直送を試みる。
+    #   過負荷で退避させるのは高頻度・低優先の観察/観察PnLに限定し、トレード記録を最優先する。
+    if _gas_in_cooldown() and kind not in _GAS_COOLDOWN_EXEMPT_KINDS:
+        _gas_enqueue(url, payload_str, kind, key)
+        _now = _t.time()
+        if _now - _gas_send_health.get("last_cd_log", 0.0) >= 60:
+            _gas_send_health["last_cd_log"] = _now
+            log.warning(
+                f"[GAS_COOLDOWN] GAS送信を一時休止中（連続失敗 {_gas_send_health.get('consecutive_fail',0)}回）"
+                f" → {kind} はキューへ退避し回復後に自動再送（売買影響なし）"
+            )
+        return False
+    # ★ v3.9.82 (A群①): 送信前ジッターで相関バーストを散らす
+    # ★ v3.9.126: 一斉決済由来は jitter_max=_GAS_SEND_JITTER_SEC_BULK で更に広く散らす
+    try:
+        _jmax = _GAS_SEND_JITTER_SEC if jitter_max is None else float(jitter_max)
+        _t.sleep(_rnd.uniform(0, max(0.0, _jmax)))
+    except Exception:
+        pass
+    last_exc = None
+    _retry_payload = None  # ★ v3.9.78: 2回目以降は retry フラグ付きを送る
+    for _i, wait in enumerate([0] + _GAS_RETRY_BACKOFF):
+        if wait:
+            _t.sleep(wait)
+        # ★ v3.9.78: インライン再送（2回目以降）は retry=true を付与する。
+        #   初回送信がGASに書き込み成功したのに応答だけ timeout で消失した場合、
+        #   同一 payload をフラグ無しで再送すると GAS が二重登録してしまう
+        #   (6/8-6/9 のトレード重複122件の根本原因)。retry=true を立てることで
+        #   GAS 側の trade_id / observation_id 重複排除を確実に発火させる。
+        if _i == 0:
+            _send_payload = payload_str
+        else:
+            if _retry_payload is None:
+                try:
+                    _pj = json.loads(payload_str)
+                    _pj["retry"] = True
+                    if isinstance(_pj.get("data"), dict):
+                        _pj["data"]["retry"] = True
+                    _retry_payload = json.dumps(_pj, ensure_ascii=False)
+                except Exception:
+                    _retry_payload = payload_str
+            _send_payload = _retry_payload
+        try:
+            result = _gas_post(url, _send_payload, timeout=timeout)
+            if isinstance(result, dict) and result.get("ok"):
+                _gas_mark_success()   # ★ v3.9.82: 成功で健全性リセット（クールダウン解除）
+                return True
+            last_exc = RuntimeError(f"ng_response: {result}")
+        except Exception as e:
+            last_exc = e
+    _gas_mark_failure()   # ★ v3.9.82: 連続失敗カウント→閾値超でクールダウン突入
+    cls = _classify_gas_error(last_exc, kind)
+    _gas_enqueue(url, payload_str, kind, key)
+    log.warning(
+        f"[{cls}] {kind} 記録送信のみ失敗（売買影響なし・再送キューへ退避）: "
+        f"{_mask_secrets(last_exc)}"
+    )
+    return False
+
+
+def _gas_queue_drain_once() -> None:
+    """退避キューを1巡再送（同期・asyncio.to_thread から呼ばれる前提）。
+
+    ★ v3.9.120: 上書き競合の修正（外部AIレビュー指摘）。
+    旧実装は「ロック内で読む → ロック外で送信 → ロック内で古いスナップショットを
+    全上書き」だったため、送信中に別スレッドが _gas_enqueue した新規レコードが
+    書き戻しで消失し得た。読み取り時にファイルを空にし（新規 enqueue はその後の
+    空ファイルへ安全に追記される）、送信後は「追記」で残件を戻す方式に変更。
+    途中で予期しない例外が出ても finally で未処理分ごと必ず書き戻す。"""
+    import time as _t
+    if not os.path.exists(_GAS_QUEUE_PATH):
+        return
+    with _GAS_QUEUE_LOCK:
+        try:
+            with open(_GAS_QUEUE_PATH, "r", encoding="utf-8") as f:
+                lines = [ln for ln in f.readlines() if ln.strip()]
+            # 読んだ分をファイルから除去（以後の enqueue と衝突しない）
+            with open(_GAS_QUEUE_PATH, "w", encoding="utf-8") as f:
+                pass
+        except Exception:
+            return
+    now = _t.time()
+    kept: list = []
+    sent = 0; dropped = 0
+    for ln in lines:
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        if rec.get("next_at", 0) > now:
+            kept.append(ln if ln.endswith("\n") else ln + "\n")
+            continue
+        payload = rec.get("payload", "")
+        # 再送は GAS 側 dedup のため retry フラグを付与（二重登録防止）。
+        # トップレベルにも立てる（observation_batch 等 data を持たない型に対応）。
+        try:
+            pj = json.loads(payload)
+            pj["retry"] = True
+            if isinstance(pj.get("data"), dict):
+                pj["data"]["retry"] = True
+            payload = json.dumps(pj, ensure_ascii=False)
+        except Exception:
+            pass
+        ok = False
+        try:
+            r = _gas_post(rec.get("url", ""), payload, timeout=20)
+            ok = isinstance(r, dict) and r.get("ok")
+        except Exception:
+            ok = False
+        if ok:
+            sent += 1
+            _gas_mark_success()   # ★ v3.9.82: プローブ成功でクールダウン解除（送信再開）
+            continue
+        rec["attempts"] = int(rec.get("attempts", 0)) + 1
+        # ★ v3.9.88: 種別別の上限で破棄（トレードは高上限＝実質破棄しない／observation_pnlは最初に諦める）
+        _max_att = _GAS_RETRY_MAX_BY_KIND.get(rec.get("kind", ""), _GAS_RETRY_MAX_ATTEMPTS)
+        if rec["attempts"] >= _max_att:
+            dropped += 1
+            continue
+        # ★ v3.9.82: 指数バックオフ＋ジッター（160台の再送が同時バーストしないよう散らす）
+        import random as _rnd2
+        _base = min(3600, 60 * (2 ** min(rec["attempts"], 6)))
+        rec["next_at"] = now + _base + _rnd2.uniform(0, min(60, _base * 0.25))
+        kept.append(json.dumps(rec, ensure_ascii=False) + "\n")
+    with _GAS_QUEUE_LOCK:
+        try:
+            # ★ v3.9.120: 全上書き("w")ではなく追記("a")。読み取り時にファイルは空化済みで、
+            #   送信中に enqueue された新規レコードはその空ファイルに追記されているため、
+            #   ここで上書きすると消えてしまう。残件（kept）は後ろに足す。
+            with open(_GAS_QUEUE_PATH, "a", encoding="utf-8") as f:
+                f.writelines(kept)
+        except Exception as _e:
+            log.debug(f"[GAS再送] キュー書き戻し失敗(黙殺): {_mask_secrets(_e)}")
+    if sent or dropped:
+        log.info(f"[GAS再送] 再送成功 {sent}件 / 諦め破棄 {dropped}件 / 残 {len(kept)}件")
+
+
+async def gas_retry_loop() -> None:
+    """ローカル退避した未送信 GAS ペイロードを定期再送（best-effort・120秒間隔）。"""
+    if not _is_data_collect_enabled():
+        return
+    log.debug("[GAS再送] ループ開始 (120秒間隔)")
+    # ★ v3.9.81 (P1-3): 起動直後に1回即ドレイン（翌朝の再起動で未送信分を素早く回収）
+    try:
+        await asyncio.to_thread(_gas_queue_drain_once)
+    except Exception as _e0:
+        log.debug(f"[GAS再送] 起動時ドレイン例外(黙殺): {_mask_secrets(_e0)}")
+    while True:
+        try:
+            await asyncio.sleep(120)
+            await asyncio.to_thread(_gas_queue_drain_once)
+        except asyncio.CancelledError:
+            break
+        except Exception as _e:
+            log.debug(f"[GAS再送] ループ例外(黙殺): {_mask_secrets(_e)}")
+
+
+# ── ★ v3.9.7: 観察ログ機能 (認定サポーター集計用・受講生は無感) ───────────────────
+# AI が score=±1 を返したのに発注に至らなかった「near-miss ケース」を GAS の
+# 「観察ログ」シートに自動収集する。受講生 .env に DATA_COLLECT=true + STUDENT_NAME
+# が設定されていれば自動有効化 (既存トレード送信と同じガード)。
+# 設計原則:
+#   ① 受講生に可視化される変化はゼロ (バナー/Discord/ログ全て DEBUG レベル)
+#   ② Bot 動作を一切阻害しない (送信は daemon thread・失敗時黙殺)
+#   ③ Phase 2 (PnL 自動計算) は 60min 後に moomoo K 線で価格取得して更新
+import uuid as _uuid_mod
+
+# Phase 2: pending observation tracker
+#   {obs_id: {"decision_time_local": dt, "decision_time_et": dt, "symbol": str,
+#             "price_at_decision": float, "side_sign": int, "side": str}}
+_PENDING_OBSERVATIONS: Dict[str, Dict[str, Any]] = {}
+_PENDING_OBSERVATIONS_MAX: int = 5000   # メモリ上限 (FIFO で最古を捨てる)
+_OBSERVATION_PNL_DELAY_SEC: int = 3600  # +60min 後に PnL を取得
+
+# ── ★ v3.9.81 (P1-1): pending観察のディスク永続化 ─────────────────────────────
+# _PENDING_OBSERVATIONS はメモリのみで、ボット停止/再起動で消えていた (+60分PnL・
+# Step0仮想exit が朝レポートに欠落)。ファイルにも保存し、起動時に読み戻して
+# 「+60分経過済み」分を履歴K線から算出→送信することで、停止/翌朝再起動でも回収する。
+_PENDING_OBS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "pending_observations.jsonl"
+)
+_PENDING_OBS_LOCK = threading.Lock()
+
+
+def _persist_pending_obs(obs_id: str, info: dict) -> None:
+    """pending観察を1行追記（再起動後の +60分PnL/Step0 回収用）。"""
+    try:
+        rec = {
+            "obs_id":            obs_id,
+            "decision_time_local": info["decision_time_local"].isoformat(),
+            "decision_time_et":    info["decision_time_et"].isoformat(),
+            "symbol":            info.get("symbol", ""),
+            "price_at_decision": info.get("price_at_decision", 0.0),
+            "side_sign":         info.get("side_sign", 1),
+            "side":              info.get("side", "BUY"),
+            "entry":             info.get("entry"),   # ★ v3.9.98: 統合送信用の観察エントリ
+        }
+        with _PENDING_OBS_LOCK:
+            with open(_PENDING_OBS_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as _e:
+        log.debug(f"[観察永続化] 追記失敗(黙殺): {_mask_secrets(_e)}")
+
+
+def _unpersist_pending_obs(obs_id: str) -> None:
+    """処理済み（PnL送信に回した）pending観察をファイルから除去。"""
+    try:
+        with _PENDING_OBS_LOCK:
+            if not os.path.exists(_PENDING_OBS_PATH):
+                return
+            with open(_PENDING_OBS_PATH, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            _needle = f'"obs_id": "{obs_id}"'
+            kept = [ln for ln in lines if _needle not in ln]
+            if len(kept) != len(lines):
+                with open(_PENDING_OBS_PATH, "w", encoding="utf-8") as f:
+                    f.writelines(kept)
+    except Exception as _e:
+        log.debug(f"[観察永続化] 除去失敗(黙殺): {_mask_secrets(_e)}")
+
+
+def _load_pending_observations() -> int:
+    """起動時にファイルから pending観察を読み戻す。戻り値=読み込み件数。"""
+    try:
+        if not os.path.exists(_PENDING_OBS_PATH):
+            return 0
+        with _PENDING_OBS_LOCK:
+            with open(_PENDING_OBS_PATH, "r", encoding="utf-8") as f:
+                lines = [ln for ln in f.readlines() if ln.strip()]
+        n = 0
+        for ln in lines[-_PENDING_OBSERVATIONS_MAX:]:
+            try:
+                rec = json.loads(ln)
+                oid = rec["obs_id"]
+                if oid in _PENDING_OBSERVATIONS:
+                    continue
+                _PENDING_OBSERVATIONS[oid] = {
+                    "decision_time_local": datetime.datetime.fromisoformat(rec["decision_time_local"]),
+                    "decision_time_et":    datetime.datetime.fromisoformat(rec["decision_time_et"]),
+                    "symbol":              rec.get("symbol", ""),
+                    "price_at_decision":   float(rec.get("price_at_decision", 0.0)),
+                    "side_sign":           int(rec.get("side_sign", 1)),
+                    "side":                rec.get("side", "BUY"),
+                    "entry":               rec.get("entry"),   # ★ v3.9.98: 復元時も統合送信用エントリを保持
+                }
+                n += 1
+            except Exception:
+                continue
+        if n:
+            log.info(f"[観察永続化] 起動時に pending観察 {n}件 を復元 → +60分到達分を順次送信")
+        return n
+    except Exception as _e:
+        log.debug(f"[観察永続化] 読込失敗(黙殺): {_mask_secrets(_e)}")
+        return 0
+
+
+def _new_observation_id() -> str:
+    """観察イベント用 ID (16桁の uuid 短縮版)。GAS 側で PnL update の照合キーになる。"""
+    return _uuid_mod.uuid4().hex[:16]
+
+
+def _is_data_collect_enabled() -> bool:
+    """DATA_COLLECT=true + STUDENT_NAME 設定済みかを判定 (既存トレード送信と同じガード)。"""
+    return (
+        os.environ.get("DATA_COLLECT", "").strip().lower() == "true"
+        and bool(os.environ.get("STUDENT_NAME", "").strip())
+    )
+
+
+def _gas_webhook_url() -> str:
+    """GAS Webhook URL を返す。env の WEBHOOK_URL があれば優先、なければデフォルト。"""
+    DEFAULT_URL = (
+        "https://script.google.com/macros/s/"
+        "AKfycbwaeZlTBJKKXeeewH4xN1T2dN3LoPZm3IcWHdRooOlMqGyTaKaBmIPB_I7t3-bDiLil"
+        "/exec"
+    )
+    return os.environ.get("WEBHOOK_URL", "").strip() or DEFAULT_URL
+
+
+# ── ★ v3.9.76: 観察ログ/PnL のバッチ送信（GAS POST 回数・同時接続を削減）──────
+# 1件ずつ送らず数件まとめて送る。フラッシュは「件数到達」or「30秒間隔ループ」。
+# 送信は observation_batch_flush_loop（単一タスク）に集約＝直列化され、同時接続も抑制。
+# 失敗時は既存の _gas_send_with_retry 経由でローカル再送キューへ退避。
+_OBS_BATCH_MAX     = 200  # ★ v3.9.95: 100→200（1ペイロードで全件送信・POST数を更に削減）
+_OBS_PNL_BATCH_MAX = 200  # ★ v3.9.95: 100→200
+_obs_entry_buffer: list = []
+_obs_pnl_buffer:   list = []
+_obs_buffer_lock = threading.Lock()
+
+# ── ★ v3.9.110: ニュース系“文脈”観察のサンプリング（GAS負荷削減）──────────────
+# 戦略改善の本体シャドー（下記STAGES）と実発注(outcome="ordered")は常に100%記録する。
+# ニュースの見送り文脈（conf_threshold / observation_headline / meta_question 等）は
+# 母数が大きく較正には全件不要のため、OBS_NEWS_SAMPLE_PCT% だけを確率的に記録する。
+# env `OBS_NEWS_SAMPLE_PCT`（0〜100・既定30）で調整可。100で従来どおり全件。
+def _parse_pct_env(key: str, default: float) -> float:
+    try:
+        return max(0.0, min(100.0, float(os.environ.get(key, "").strip())))
+    except (ValueError, TypeError):
+        return default
+OBS_NEWS_SAMPLE_PCT = _parse_pct_env("OBS_NEWS_SAMPLE_PCT", 30.0)
+# 常に全件記録する（サンプリング対象外の）シャドー段階。
+_OBS_FULL_STAGES = {
+    "momentum_shadow", "trend_filter_ab", "premarket_filter_ab", "forced_stop_ab",
+    "shadow_short_entry", "shadow_short_exit",
+    # peak_retrace_sim / timeout_extension は v3.9.116 で計測終了・撤去
+}
+
+# ── ★ v3.9.116: momentum_shadow の重複送信削減（日替わり当番制）─────────────
+# モメンタムのシャドー観察は「同じ市場シグナル×同じ結果」を全受講生（直近週99名）が
+# 重複送信しており、GAS負荷とシート肥大の主因になっていた（実測: 5週間で13,536行に
+# 対しユニークシグナルは4,952件）。市場結果は誰が送っても同一のため、日替わりの
+# 「当番」に選ばれた受講生だけが送信する方式に変更する。
+# - 当番の決定は hash(生徒名＋ET日付) による決定論（乱数シード非依存・再起動でも同一）。
+#   毎日メンバーが入れ替わるため、特定受講生のPC停止でデータが恒久欠落しない。
+# - 既定 20%（≒毎日20名前後が送信）。env `MOMENTUM_SHADOW_REPORTER_PCT` で調整可。
+#   100 で従来どおり全員送信（講師・認定サポーターは 100 を推奨＝自環境の全量を確保）。
+# - 対象は momentum_shadow の GAS 送信のみ。実発注トレード記録・端末/Discord の
+#   日次サマリ（自分のシャドー成績表示）・trend/premarket 等のA/B計測は全員従来どおり。
+MOMENTUM_SHADOW_REPORTER_PCT = _parse_pct_env("MOMENTUM_SHADOW_REPORTER_PCT", 20.0)
+
+
+def _momentum_shadow_is_reporter() -> bool:
+    """本日この環境が momentum_shadow 送信の「当番」かを決定論的に返す。"""
+    if MOMENTUM_SHADOW_REPORTER_PCT >= 100:
+        return True
+    if MOMENTUM_SHADOW_REPORTER_PCT <= 0:
+        return False
+    try:
+        import hashlib
+        name = os.environ.get("STUDENT_NAME", "").strip() or "anon"
+        day = datetime.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        h = int(hashlib.md5(f"{name}|{day}".encode("utf-8")).hexdigest()[:8], 16)
+        return (h % 100) < MOMENTUM_SHADOW_REPORTER_PCT
+    except Exception:
+        return True   # 判定に失敗したら安全側（送信する）
+
+
+def _flush_obs_entry_buffer() -> None:
+    """観察エントリの溜まり分を observation_batch として一括送信。"""
+    with _obs_buffer_lock:
+        if not _obs_entry_buffer:
+            return
+        items = _obs_entry_buffer[:]
+        _obs_entry_buffer.clear()
+    cfg_name = os.environ.get("STUDENT_NAME", "").strip()
+    payload = json.dumps({
+        "token": "algo2026secret", "student_name": cfg_name,
+        "type": "observation_batch", "items": items,
+    }, ensure_ascii=False)
+    if _gas_send_with_retry(_gas_webhook_url(), payload, kind="observation", key="", timeout=25):
+        log.debug(f"[観察バッチ] エントリ {len(items)}件 送信完了")
+
+
+def _flush_obs_pnl_buffer() -> None:
+    """観察PnL更新の溜まり分を observation_pnl_batch として一括送信。"""
+    with _obs_buffer_lock:
+        if not _obs_pnl_buffer:
+            return
+        items = _obs_pnl_buffer[:]
+        _obs_pnl_buffer.clear()
+    cfg_name = os.environ.get("STUDENT_NAME", "").strip()
+    payload = json.dumps({
+        "token": "algo2026secret", "student_name": cfg_name,
+        "type": "observation_pnl_batch", "items": items,
+    }, ensure_ascii=False)
+    if _gas_send_with_retry(_gas_webhook_url(), payload, kind="observation_pnl", key="", timeout=25):
+        log.debug(f"[観察バッチ] PnL {len(items)}件 送信完了")
+
+
+def _buffer_obs_entry(data: dict) -> None:
+    with _obs_buffer_lock:
+        _obs_entry_buffer.append(data)
+        _full = len(_obs_entry_buffer) >= _OBS_BATCH_MAX
+    if _full:
+        threading.Thread(target=_flush_obs_entry_buffer, daemon=True).start()
+
+
+def _buffer_obs_pnl(data: dict) -> None:
+    with _obs_buffer_lock:
+        _obs_pnl_buffer.append(data)
+        _full = len(_obs_pnl_buffer) >= _OBS_PNL_BATCH_MAX
+    if _full:
+        threading.Thread(target=_flush_obs_pnl_buffer, daemon=True).start()
+
+
+async def observation_batch_flush_loop() -> None:
+    """約45秒ごとに観察エントリ/PnL のバッファをフラッシュ（送信を直列化）。
+    ★ v3.9.82: 間隔を45秒へ拡大＋ジッターで、160台の一斉フラッシュ(相関バースト)を散らす。"""
+    if not _is_data_collect_enabled():
+        return
+    import random as _rnd
+    # 起動時のランダムオフセット（全受講生のフラッシュ時刻をばらす）
+    # ★ v3.9.88: 0〜30秒 → 0〜60秒（160台の相関バーストを更に分散）
+    try:
+        await asyncio.sleep(_rnd.uniform(0, 60))
+    except Exception:
+        pass
+    log.debug("[観察バッチ] フラッシュループ開始 (約150〜210秒間隔・ジッターあり)")
+    _loop_i = 0
+    while True:
+        try:
+            # ★ v3.9.95: 90〜120秒 → 150〜210秒（POST数を削減し共有GASの過負荷を緩和。
+            #   シャドーは緊急性が低くバッファ全件を一括送信するためデータ欠落はしない）
+            # ★ v3.9.97: 適応スロットル — GASが不調なら送信間隔を自動で延ばしPOSTを更に間引く。
+            # ★ v3.9.110: 平常間隔を 150〜210秒 → 300〜450秒へ拡大。1POSTあたりの束ね行数を
+            #   増やしPOST数を約半減（160台スケール時のGAS負荷を先回りで軽減）。シャドーは
+            #   緊急性が低くバッファ全件を一括送信するためデータ欠落は起きない。
+            #   平常=300〜450秒／不調の兆し=約1.8倍／混雑=約3倍(最大10分)。
+            _base_sec = 300 + _rnd.uniform(0, 150)
+            _cf = int(_gas_send_health.get("consecutive_fail", 0))
+            if _gas_in_cooldown() or _cf >= _GAS_FAIL_COOLDOWN_THRESHOLD:
+                _interval = min(_base_sec * 3.0, 600.0)   # 混雑中: 最大10分まで延長
+            elif _cf >= 2:
+                _interval = min(_base_sec * 1.8, 420.0)   # 不調の兆し: 1.8倍
+            else:
+                _interval = _base_sec                      # 平常
+            await asyncio.sleep(_interval)
+            _loop_i += 1
+            await asyncio.to_thread(_flush_obs_entry_buffer)
+            # ★ v3.9.95: observation_pnl（最低優先）は隔回フラッシュ＝POST数を半減。
+            #   バッファ全件を一括送信するため欠落はしない（次回ループでまとめて送る）。
+            if _loop_i % 2 == 0:
+                await asyncio.to_thread(_flush_obs_pnl_buffer)
+        except asyncio.CancelledError:
+            try:
+                _flush_obs_entry_buffer()
+                _flush_obs_pnl_buffer()
+            except Exception:
+                pass
+            break
+        except Exception as _e:
+            log.debug(f"[観察バッチ] ループ例外(黙殺): {_mask_secrets(_e)}")
+
+
+def _log_observation(
+    *,
+    symbol: str,
+    side: str,                             # "BUY" or "SELL_SHORT"
+    confidence: float,
+    score: int,                            # 1 or -1 (place_buy=1, place_short=-1)
+    category: str = "",
+    headlines: Optional[List[str]] = None,
+    beneficiaries: Optional[List[str]] = None,
+    victims: Optional[List[str]] = None,
+    outcome: str = "blocked",              # "ordered" / "blocked"
+    block_stage: str = "",                 # conf_threshold / smh_strict / macro_downtrend / ...
+    block_reason: str = "",                # 詳細メッセージ
+    price_at_decision: float = 0.0,
+    # ★ v3.9.83: 発注判断の文脈を観察ログへ追加（運営が後から「なぜ発注/見送りか」を検証）。
+    #   いずれも任意。None の項目はペイロードに含めず GAS 側で空欄になる。
+    live_allowed: Optional[bool] = None,   # この銘柄サイドが実発注対象か (実発注可否)
+    size_pct: Optional[float] = None,      # 実効投入サイズ%（budget 比）
+    eff_stop_loss_pct: Optional[float] = None,  # 実効損切り%（この判定で使われる損切り幅）
+    pct_5m: Optional[float] = None,        # モメンタム 5 分変化率%
+    pct_15m: Optional[float] = None,       # モメンタム 15 分変化率%
+    quote_sanity: Optional[int] = None,    # 1=健全 / 0=異常クォートで遮断 / None=未チェック
+) -> None:
+    """観察イベントを GAS に送信し Phase 2 用に pending 登録する。
+
+    DATA_COLLECT=true + STUDENT_NAME 設定済みの環境でのみ動作。
+    すべての処理は DEBUG ログのみ・例外は黙殺 (受講生からの問い合わせを増やさない)。
+    """
+    if not _is_data_collect_enabled():
+        return
+
+    # ★ v3.9.110: ニュース系“文脈”観察のサンプリング（本体シャドー・実発注は全記録）。
+    #   母数の大きい見送り文脈のみ OBS_NEWS_SAMPLE_PCT% に間引き、GAS POST数を削減。
+    if (outcome != "ordered"
+            and block_stage not in _OBS_FULL_STAGES
+            and OBS_NEWS_SAMPLE_PCT < 100):
+        try:
+            import random as _r_smp
+            if _r_smp.uniform(0, 100) >= OBS_NEWS_SAMPLE_PCT:
+                return
+        except Exception:
+            pass
+
+    # ★ v3.9.116: momentum_shadow は日替わり当番のみ GAS 送信（重複データ削減）。
+    #   非当番はここで打ち切り＝pending登録も+60分PnL計測も行わない（CPU/POSTゼロ）。
+    #   端末/Discord の日次サマリは呼び出し元で別途記録されるため全員表示される。
+    if (block_stage == "momentum_shadow"
+            and outcome != "ordered"
+            and not _momentum_shadow_is_reporter()):
+        log.debug(f"[観察ログ] momentum_shadow 非当番のため送信スキップ ({symbol})")
+        return
+
+    try:
+        # 価格未指定の場合は get_quote で取得を試みる (失敗時は 0 のまま)
+        if price_at_decision <= 0:
+            try:
+                _q = get_quote(symbol)
+                price_at_decision = float(_q.get("last", 0)) or float(_q.get("ask", 0)) or 0.0
+            except Exception:
+                price_at_decision = 0.0
+
+        obs_id = _new_observation_id()
+        now_local = datetime.datetime.now()
+        now_et = datetime.datetime.now(_ET).replace(tzinfo=None)
+        session, _ = get_session_info()
+        headline_first = (headlines[0] if headlines else "")[:200]
+
+        # ── Phase 2 用 pending 登録 (price > 0 のときのみ・PnL 計算可能なケース) ──
+        if price_at_decision > 0:
+            side_sign = 1 if side == "BUY" else -1
+            # メモリ上限管理 (FIFO)
+            if len(_PENDING_OBSERVATIONS) >= _PENDING_OBSERVATIONS_MAX:
+                try:
+                    oldest = min(
+                        _PENDING_OBSERVATIONS.keys(),
+                        key=lambda k: _PENDING_OBSERVATIONS[k].get("decision_time_local", now_local),
+                    )
+                    _PENDING_OBSERVATIONS.pop(oldest, None)
+                except Exception:
+                    pass
+            _PENDING_OBSERVATIONS[obs_id] = {
+                "decision_time_local": now_local,
+                "decision_time_et":    now_et,
+                "symbol":              symbol,
+                "price_at_decision":   price_at_decision,
+                "side_sign":           side_sign,
+                "side":                side,
+            }
+            # ★ v3.9.98: 永続化は payload_data(entry) を含めて下で実施（統合送信用）。
+
+        # ── Phase 1 ペイロード送信 (daemon thread・Bot 動作非阻害) ──
+        cfg_name = os.environ.get("STUDENT_NAME", "").strip()
+
+        # ★ v3.9.26: モメンタム関連の実プリセット値を併記 (レポート集計のバージョン跨ぎ一貫性)
+        # 観察ログには bot_version と LEVEL の番号だけでなく、当時の実効しきい値も保存。
+        # これでレポート側は「Lv 番号」ではなく「実効プロファイル」基準で連結集計できる。
+        _momentum_meta: Dict[str, Any] = {}
+        if block_stage == "momentum_shadow":
+            try:
+                _m_5m, _m_15m = _get_momentum_thresholds(symbol)
+            except Exception:
+                _m_5m, _m_15m = 0.0, 0.0
+            _momentum_meta = {
+                "momentum_level":          MOMENTUM_LEVEL,
+                "momentum_risk_level":     MOMENTUM_RISK_LEVEL,
+                "signal_threshold_5m":     round(_m_5m, 4),
+                "signal_threshold_15m":    round(_m_15m, 4),
+                "stop_loss_pct":           round(MOMENTUM_STOP_LOSS_PCT, 4),
+                "per_trade_loss_pct":      round(MOMENTUM_PER_TRADE_LOSS_PCT, 4),
+                "daily_loss_pct":          round(MOMENTUM_DAILY_LOSS_PCT, 4),
+                "volatility_guard_pct":    round(MOMENTUM_VOLATILITY_GUARD_PCT, 4),
+                "max_signal_pct":          round(MOMENTUM_MAX_SIGNAL_PCT, 4),
+                "size_multiplier":         round(MOMENTUM_SIZE_MULTIPLIER.get(symbol, 1.0), 4),
+                "order_size_pct":          round(MOMENTUM_ORDER_SIZE_PCT, 4),
+            }
+
+        payload_data = {
+            "observation_id":    obs_id,
+            "bot_version":       BOT_VERSION_TAGGED,   # ★ v3.9.116: select_v1有効時は "+select_v1" 付き
+            "decision_time":     now_et.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol":            symbol,
+            "side":              side,
+            "session":           session,
+            "ai_score":          score,
+            "ai_confidence":     round(confidence, 2),
+            "ai_category":       category,
+            "beneficiaries":     beneficiaries or [],
+            "victims":           victims or [],
+            "headline_first":    headline_first,
+            "outcome":           outcome,
+            "block_stage":       block_stage,
+            "block_reason":      (block_reason or "")[:300],
+            "price_at_decision": round(price_at_decision, 2),
+        }
+        if _momentum_meta:
+            payload_data.update(_momentum_meta)
+
+        # ★ v3.9.83: 発注判断の文脈列（任意・None は送らない）。
+        if live_allowed is not None:
+            payload_data["live_allowed"] = 1 if live_allowed else 0
+        if size_pct is not None:
+            payload_data["size_pct"] = round(float(size_pct), 3)
+        if eff_stop_loss_pct is not None:
+            payload_data["eff_stop_loss_pct"] = round(float(eff_stop_loss_pct), 3)
+        if pct_5m is not None:
+            payload_data["pct_5m"] = round(float(pct_5m), 3)
+        if pct_15m is not None:
+            payload_data["pct_15m"] = round(float(pct_15m), 3)
+        if quote_sanity is not None:
+            payload_data["quote_sanity"] = 1 if quote_sanity else 0
+
+        # ★ v3.9.98: シャドー(観察)は最低優先。POST半減のため「エントリ単独送信」をやめ、
+        #   pending(価格>0=+60分PnLが取れるケース)はエントリを即送らず保持し、+60分PnLが
+        #   出た時点で『エントリ＋PnL』を1回の追記(observation_batch)にまとめて送る。
+        #   GAS側の「行を探して更新」処理も不要になる。トレード記録(最優先)は対象外で不変。
+        #   価格不明(+60分PnLが出ない)観察のみ、従来どおり即時にエントリだけ送る。
+        if obs_id in _PENDING_OBSERVATIONS:
+            _PENDING_OBSERVATIONS[obs_id]["entry"] = payload_data
+            _persist_pending_obs(obs_id, _PENDING_OBSERVATIONS[obs_id])  # entry込みで1行保存
+            log.debug(f"[観察ログ] pending保持(統合送信予定) obs_id={obs_id} {symbol} stage={block_stage}")
+        else:
+            _buffer_obs_entry(payload_data)
+            log.debug(f"[観察ログ] バッファ追加(即時) obs_id={obs_id} {symbol} {outcome} stage={block_stage}")
+
+    except Exception as _e:
+        # 観察ログ機能のエラーは Bot 本体動作に一切影響させない
+        log.debug(f"[観察ログ] 内部エラー (黙殺): {_mask_secrets(_e)}")
+
+
+# ============================================================
+#  ★ v3.9.74/110: Step0 シャドー計測 — 仮想exit算出（実決済は不変・観測ログ専用）
+#  「もし～で決済していたら」の仮想 PnL(%) を 1分足リプレイで算出し、観測ログへ列追加する。
+#  発注・決済ロジックには一切影響しない。
+#  ★ v3.9.110: 下流(レポート/集計)で未使用の①MFE可変トレール・②RSI(5分)反転・
+#    高ボラ損切り狭/広(v3.9.32で実装済＝検証完了)・④金曜フラグ・基準PnL列を撤去し、
+#    継続計測する「③15分撤退」のみ残した。関連ヘルパー(_wilder_rsi/_vexit_trail_drop/
+#    _VEXIT_TRAIL_* /_VEXIT_RSI_PERIOD)も併せて削除。
+# ============================================================
+# ★ v3.9.116: MFE可変トレールの段階幅（含み益ピーク% → トレール幅%）。
+#   v3.9.110 で「下流未使用」として撤去したが、戦略プロファイル select_v1 の選定・
+#   継続検証の基幹指標（週次レポートのシャドー検証で使用）になったため復活させる。
+#   ピークが伸びるほど狭く追従＝利益を守る。ピーク0.30%未満はトレール未起動。
+_VEXIT_TRAIL_TIERS = ((1.00, 0.08), (0.50, 0.12), (0.30, 0.20))
+
+
+def _vexit_trail_drop(mfe_pct: float) -> Optional[float]:
+    """含み益ピーク%に応じたMFEトレール幅%を返す（未起動なら None）。"""
+    for _th, _drop in _VEXIT_TRAIL_TIERS:
+        if mfe_pct >= _th:
+            return _drop
+    return None
+
+
+def _compute_virtual_exits(entry_price: float, side_sign: int,
+                           decision_time_et: "datetime.datetime", bars: list) -> dict:
+    """仮想exit算出（観測ログ専用・実決済は不変）。bars=[{"ts":datetime(ET naive),"close":float}]。
+    ★ v3.9.110: シャドー軽量化（RSI反転/損切り狭・広/金曜フラグ/計測メモ等を撤去）。
+    ★ v3.9.116: 「③15分撤退」も計測終了（5週集計で最下位＝不採用と結論）。
+    ★ v3.9.116: 「①MFE可変トレール」を復活。戦略プロファイル select_v1 の根拠かつ
+      継続検証の基幹指標（週次レポートで全シグナル vs 選抜条件を比較）になったため、
+      mfe_trail_pnl_pct / mfe_trail_min を再び算出・送信する（GAS列は既存のまま）。
+      例外は投げない（黙殺）。"""
+    # ★ v3.9.116: 「③15分撤退」は計測終了（5週集計で勝率43%と全出口方式中最下位＝
+    #   採用しないと結論。select_v1 検証でも不使用）。列はGAS側に残るが今後は空欄。
+    out = {
+        "mfe_trail_pnl_pct": None,   # ① MFE可変トレール適用後 PnL%（★ v3.9.116 復活）
+        "mfe_trail_min":     None,   # ① 決済までの保有分（トレール未発火なら窓末=60分）
+    }
+    try:
+        if not entry_price or entry_price <= 0:
+            return out
+
+        def ret_pct(p: float) -> float:
+            # 方向別 PnL%（正=利益）。side_sign: LONG=+1 / SHORT=-1
+            return (p - entry_price) / entry_price * 100.0 * side_sign
+
+        fwd = sorted([b for b in bars if b["ts"] >= decision_time_et], key=lambda b: b["ts"])
+        if not fwd:
+            return out
+
+        # ── ① MFE可変トレール（含み益ピークから段階幅で追従・60分窓）★ v3.9.116 復活 ──
+        bars60 = [b for b in fwd if (b["ts"] - decision_time_et).total_seconds() <= 60 * 60]
+        if bars60:
+            _peak = -999.0
+            for b in bars60:
+                r = ret_pct(b["close"])
+                if r > _peak:
+                    _peak = r
+                _drop = _vexit_trail_drop(_peak)
+                if _drop is not None and r <= _peak - _drop:
+                    out["mfe_trail_pnl_pct"] = round(r, 4)
+                    out["mfe_trail_min"] = round(
+                        (b["ts"] - decision_time_et).total_seconds() / 60.0, 1)
+                    break
+            else:
+                # トレール未発火（未起動含む）→ 窓末で決済（≒60分保有）
+                out["mfe_trail_pnl_pct"] = round(ret_pct(bars60[-1]["close"]), 4)
+                out["mfe_trail_min"] = round(
+                    (bars60[-1]["ts"] - decision_time_et).total_seconds() / 60.0, 1)
+    except Exception:
+        pass
+    return out
+
+
+def _compute_and_send_observation_pnl(obs_id: str, info: dict) -> None:
+    """observation_id に対応する +5/+15/+60min の PnL/share を K 線から計算して GAS 更新。
+
+    本関数は asyncio.to_thread から呼ばれる前提 (moomoo K 線 API は同期)。
+    例外は全て DEBUG ログのみ・上位に伝搬しない。
+    """
+    try:
+        symbol            = info["symbol"]
+        price_at_decision = info["price_at_decision"]
+        side_sign         = info["side_sign"]
+        decision_time_et  = info["decision_time_et"]
+
+        # ── 取得範囲: decision -120min 〜 decision +65min ──
+        #   ★ v3.9.74: 仮想exitの RSI(5分) 算出に過去ウォームアップが必要なため、
+        #     開始を -5min → -120min に拡張（+5/15/60min の最寄り抽出には影響なし）。
+        start_et = (decision_time_et - datetime.timedelta(minutes=120)).strftime("%Y-%m-%d %H:%M:%S")
+        end_et   = (decision_time_et + datetime.timedelta(minutes=65)).strftime("%Y-%m-%d %H:%M:%S")
+
+        klines = None
+        try:
+            with _quote_ctx() as ctx:
+                ret, klines, _ = ctx.request_history_kline(
+                    code=f"US.{symbol}",
+                    start=start_et, end=end_et,
+                    ktype=KLType.K_1M,
+                    max_count=200,
+                    extended_time=True,
+                )
+                if ret != RET_OK or klines is None:
+                    log.debug(f"[観察PnL] {obs_id} {symbol} K線取得失敗 ret={ret}")
+                    return
+                if hasattr(klines, "empty") and klines.empty:
+                    log.debug(f"[観察PnL] {obs_id} {symbol} K線空 (休場の可能性)")
+                    return
+        except Exception as _e_kl:
+            log.debug(f"[観察PnL] {obs_id} K線取得例外: {_mask_secrets(_e_kl)}")
+            return
+
+        # ── 各 target 時刻の最寄り K 線 close を抽出 ──
+        targets = {
+            5:  decision_time_et + datetime.timedelta(minutes=5),
+            15: decision_time_et + datetime.timedelta(minutes=15),
+            60: decision_time_et + datetime.timedelta(minutes=60),
+        }
+        nearest: Dict[int, Optional[Dict[str, Any]]] = {5: None, 15: None, 60: None}
+        _bars: list = []   # ★ v3.9.74: 仮想exit算出用に全バーを収集
+        for _, row in klines.iterrows():
+            try:
+                ts_et = datetime.datetime.strptime(str(row["time_key"]), "%Y-%m-%d %H:%M:%S")
+                price = float(row["close"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if price <= 0:
+                continue
+            _bars.append({"ts": ts_et, "close": price})
+            for m, target in targets.items():
+                cur = nearest[m]
+                if cur is None or abs((ts_et - target).total_seconds()) < abs((cur["ts"] - target).total_seconds()):
+                    nearest[m] = {"ts": ts_et, "price": price}
+
+        # ── PnL/share 計算 (側に応じて符号調整) ──
+        # ★ v3.9.130: 最寄りバーに許容誤差(±3分)を導入。argmin は上限が無く、候補に
+        #   -120分側のウォームアップバーも含むため、データが +Nmin に届かない場合(セッション跨ぎ・
+        #   薄商い・休場境界)に「判定時刻より前のバー」が pnl として無警告で記録される恐れがあった。
+        #   これは make_weekly_report.py の hold60 経由で select_v1 の検証データに直結するため、
+        #   target から離れすぎた最寄りバーは欠測(None)として記録し、静かなデータ歪みを防ぐ。
+        _NEAREST_TOL_SEC = 180  # ±3分
+        pnl_results: Dict[str, Optional[float]] = {}
+        for m in (5, 15, 60):
+            snap = nearest[m]
+            if snap is None:
+                pnl_results[f"pnl_{m}min"] = None
+            elif abs((snap["ts"] - targets[m]).total_seconds()) > _NEAREST_TOL_SEC:
+                # 最寄りバーが target から ±3分超 → データ欠損とみなし欠測扱い
+                pnl_results[f"pnl_{m}min"] = None
+                log.debug(
+                    f"[観察PnL] {obs_id} {symbol} +{m}min 最寄りバーが許容外 "
+                    f"(Δ{abs((snap['ts'] - targets[m]).total_seconds()):.0f}秒) → 欠測(None)"
+                )
+            else:
+                # PnL/share = (price_T - price_decision) * side_sign
+                pnl_results[f"pnl_{m}min"] = round(
+                    (snap["price"] - price_at_decision) * side_sign, 4
+                )
+
+        # ── ★ v3.9.74/110: Step0 仮想exit算出（実決済は不変・観測ログ専用）──
+        #   v3.9.110で下流未使用の反実仮想列を撤去し、継続計測の「15分撤退」のみ算出。
+        _vexit = _compute_virtual_exits(
+            float(price_at_decision), int(side_sign), decision_time_et, _bars,
+        )
+
+        # ── GAS 送信 ──
+        # ★ v3.9.98: エントリ(保持済み)があれば「エントリ＋PnL」を1回の追記(observation_batch)で
+        #   まとめて送る＝POST半減＋GAS更新スキャン不要。エントリが無い旧pending(再起動前の
+        #   古い永続記録)のみ、従来の observation_pnl 更新にフォールバックする。
+        _entry = info.get("entry")
+        if _entry:
+            _merged = dict(_entry)
+            # ★ v3.9.110: 5分/15分PnLは下流未使用のため送信停止（60分のみ保持）
+            _merged["pnl_60min"] = pnl_results.get("pnl_60min")
+            _merged.update(_vexit)   # mfe_trail_*（★ v3.9.116: exit15_* は計測終了）
+            _buffer_obs_entry(_merged)   # 統合：エントリ＋PnLを1行追記
+            log.debug(
+                f"[観察統合] {obs_id} バッファ追加(エントリ+PnL) {symbol} "
+                f"60m={pnl_results.get('pnl_60min')}"
+            )
+        else:
+            _pnl_data = {
+                "observation_id": obs_id,
+                # ★ v3.9.110: 5分/15分PnLは下流未使用のため送信停止（60分のみ）
+                "pnl_60min":      pnl_results.get("pnl_60min"),
+            }
+            _pnl_data.update(_vexit)
+            _buffer_obs_pnl(_pnl_data)   # 旧pending(entryなし)のみ更新送信
+            log.debug(f"[観察PnL] {obs_id} バッファ追加(更新・旧式) {symbol} 60m={pnl_results.get('pnl_60min')}")
+
+    except Exception as _e:
+        log.debug(f"[観察PnL] {obs_id} 内部エラー (黙殺): {_mask_secrets(_e)}")
+
+
+async def observation_pnl_check_loop() -> None:
+    """60 秒間隔で _PENDING_OBSERVATIONS をスキャンし、+60min 経過した観察の PnL を計算 → GAS 更新。
+
+    DATA_COLLECT=true 以外の環境では即座に return してアイドル化する (リソース節約)。
+    """
+    if not _is_data_collect_enabled():
+        log.debug("[観察PnL] DATA_COLLECT 無効 → ループ非起動")
+        return
+
+    # ★ v3.9.81 (P1-1): 起動時に前回までの pending観察を復元（停止/再起動でも回収）
+    try:
+        _load_pending_observations()
+    except Exception as _e_lp:
+        log.debug(f"[観察PnL] 起動時復元失敗(黙殺): {_mask_secrets(_e_lp)}")
+
+    log.debug("[観察PnL] チェックループ開始 (60 秒間隔・+60min 後に PnL 算出)")
+    while True:
+        try:
+            await asyncio.sleep(60)
+            now_local = datetime.datetime.now()
+            ready_ids: List[str] = []
+            for obs_id, info in list(_PENDING_OBSERVATIONS.items()):
+                elapsed = (now_local - info.get("decision_time_local", now_local)).total_seconds()
+                if elapsed >= _OBSERVATION_PNL_DELAY_SEC:
+                    ready_ids.append(obs_id)
+
+            for obs_id in ready_ids:
+                info = _PENDING_OBSERVATIONS.pop(obs_id, None)
+                _unpersist_pending_obs(obs_id)   # ★ v3.9.81: 処理に回したら永続ファイルから除去
+                if info is None:
+                    continue
+                try:
+                    await asyncio.to_thread(_compute_and_send_observation_pnl, obs_id, info)
+                except Exception as _e_inner:
+                    log.debug(f"[観察PnL] {obs_id} 計算失敗 (黙殺): {_mask_secrets(_e_inner)}")
+
+        except asyncio.CancelledError:
+            log.debug("[観察PnL] ループキャンセル受信 → 終了")
+            raise
+        except Exception as _e:
+            log.debug(f"[観察PnL] ループ例外 (継続): {_mask_secrets(_e)}")
+            await asyncio.sleep(60)
+
+
+# ── ★ v3.9.28: シャドー SHORT ライフサイクル シミュレーション ────────────────
+# moomoo デモ口座は API 経由の空売り非対応のため、これまでは place_short() で
+# 即スキップしていた。その結果、デモ環境では LONG のみが集計対象となり SHORT
+# 戦略の検証ができなかった。
+#
+# 本機能は「実発注はしないが、SELL_SHORT 判定が出たら entry/exit を仮想記録し、
+# LONG と同じ決済ルール (MAX_LOSS_PCT / TRAIL / TIMEOUT) でシミュレートする」。
+# 結果は観察ログとして GAS に送信され、デモ環境でも SHORT 戦略の PnL を集計可能。
+#
+# 動作条件:
+#   - SHADOW_SHORT_ENABLED=true (デフォルト・全ユーザ ON)
+#   - trd_env == TrdEnv.SIMULATE (デモ口座のみ)
+#   - DATA_COLLECT の有無は不問 (v3.9.28 で独立化・全デモ環境で動作)
+#
+# 注: 既存の _log_observation() は DATA_COLLECT=true ゲートで動作。
+# 本機能は受講生全員に SHORT 検証データを提供する目的で独立 GAS 送信を採用。
+SHADOW_SHORT_ENABLED: bool = (
+    os.environ.get("SHADOW_SHORT_ENABLED", "true").strip().lower() == "true"
+)
+
+# ── ★ v3.9.65: デモ口座のネッティング空売り対応 ────────────────────────────────
+# moomoo デモは信用区分 (SELL_SHORT / BUY_BACK) を受け付けないが、ネッティング口座
+# としては「プレーン SELL で保有を超えて売る = ショート新規」「プレーン BUY で決済」が
+# できる (5/27 受講生ログで実証)。これを正式対応し、デモ生も勝ち筋のショート側を
+# 実発注検証できるようにする (信用口座に近い成績検証)。
+#   - DEMO_SHORT_ENABLED=true  : デモで SELL_SHORT シグナル時にプレーン SELL で建てる (既定)
+#   - DEMO_SHORT_ENABLED=false : スキップ → シャドー SHORT 記録のみ (従来動作に戻す場合)
+# ★ v3.9.68: 既定を false→true に変更。.env に記載が無ければデモでもショート実発注化。
+#   安全前提が出揃ったため既定 ON: デモ決済=BUY(v3.9.63)/二重決済防止(v3.9.64)/
+#   flat時のみ新規ショート(v3.9.65)/サーキットブレーカー配線(v3.9.67)。Wizard でも選択可。
+DEMO_SHORT_ENABLED: bool = (
+    os.environ.get("DEMO_SHORT_ENABLED", "true").strip().lower() == "true"
+)
+
+# ── ★ v3.9.69: 実口座のショート(空売り) ON/OFF ─────────────────────────────────
+# 受講生要望: 実口座では空売り規制がなく PnL 低下が懸念されるため、買い専用運用を
+# 選べるようにする。REAL_SHORT_ENABLED=false で実口座のショートを一括停止
+# (ニュース駆動・モメンタム両方。place_short の共通ゲートで遮断)。
+#   - REAL_SHORT_ENABLED=true  : 実口座でも空売りする (既定・従来動作)
+#   - REAL_SHORT_ENABLED=false : 実口座は買い専用。SHORT 判定はシャドー記録のみ
+# デモ口座の挙動は従来どおり DEMO_SHORT_ENABLED で制御 (本フラグは実口座専用)。
+REAL_SHORT_ENABLED: bool = (
+    os.environ.get("REAL_SHORT_ENABLED", "true").strip().lower() == "true"
+)
+
+# シャドー SHORT のオープンポジション状態 (key: observation_id)
+_SHADOW_SHORT_POSITIONS: Dict[str, Dict[str, Any]] = {}
+_SHADOW_SHORT_LOCK = threading.Lock()
+
+
+def _shadow_short_open(
+    *,
+    symbol: str,
+    confidence: float,
+    category: str = "",
+    news_source: str = "",
+    headlines: Optional[List[str]] = None,
+    beneficiaries: Optional[List[str]] = None,
+    victims: Optional[List[str]] = None,
+) -> None:
+    """シャドー SHORT のエントリー記録。
+    place_short() の TrdEnv.SIMULATE 分岐から呼び出される。
+    v3.9.28: DATA_COLLECT の有無に関わらず動作 (全デモ環境で SHORT 戦略検証可能)。
+    """
+    if not SHADOW_SHORT_ENABLED:
+        return
+    try:
+        # ── エントリー価格取得 ──
+        try:
+            _q = get_quote(symbol)
+            entry_price = float(_q.get("last", 0)) or float(_q.get("bid", 0)) or float(_q.get("ask", 0)) or 0.0
+        except Exception:
+            entry_price = 0.0
+        if entry_price <= 0:
+            log.debug(f"[シャドーSHORT] {symbol} エントリー価格取得失敗 → スキップ")
+            return
+
+        # ── 仮想株数 (LONG と同じ山型サイズ配分を流用) ──
+        order_usd = calc_order_size(confidence)
+        qty = max(1, int(order_usd / entry_price))
+
+        # ── 観察ログ記録 (entry) ──
+        obs_id = _new_observation_id()
+        with _SHADOW_SHORT_LOCK:
+            _SHADOW_SHORT_POSITIONS[obs_id] = {
+                "symbol":       symbol,
+                "entry_price":  entry_price,
+                "entry_time":   datetime.datetime.now(),
+                "qty":          qty,
+                "order_usd":    order_usd,
+                "confidence":   confidence,
+                "category":     category,
+                "news_source":  news_source,
+                "headlines":    headlines or [],
+                "beneficiaries": beneficiaries or [],
+                "victims":      victims or [],
+                # 決済ルール用の状態
+                "peak_price":      entry_price,  # SHORT の peak は安値
+                "trail_triggered": False,
+            }
+
+        log.info(
+            f"[シャドーSHORT-ENTRY] {symbol} entry=${entry_price:.2f} qty={qty}株 "
+            f"額=${order_usd:.0f} conf={confidence:.2f} (実発注なし・PnL 仮想計算)"
+        )
+
+        # GAS に entry 観察ログ送信 (block_stage="shadow_short_entry")
+        # observation_id を _SHADOW_SHORT_POSITIONS のキーと一致させるため、
+        # _log_observation 経由ではなく直接送信する
+        cfg_name = os.environ.get("STUDENT_NAME", "").strip()
+        now_et = datetime.datetime.now(_ET).replace(tzinfo=None)
+        session, _ = get_session_info()
+        payload = json.dumps({
+            "token":        "algo2026secret",
+            "student_name": cfg_name,
+            "type":         "observation",
+            "data": {
+                "observation_id":    obs_id,
+                "bot_version":       BOT_VERSION_TAGGED,   # ★ v3.9.116: select_v1有効時は "+select_v1" 付き
+                "decision_time":     now_et.strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol":            symbol,
+                "side":              "SELL_SHORT",
+                "session":           session,
+                "ai_score":          -1,
+                "ai_confidence":     round(confidence, 2),
+                "ai_category":       category,
+                "news_source":       news_source,
+                "beneficiaries":     beneficiaries or [],
+                "victims":           victims or [],
+                "headline_first":    (headlines[0] if headlines else "")[:200],
+                "outcome":           "shadow_open",
+                "block_stage":       "shadow_short_entry",
+                "block_reason":      f"shadow SHORT open at ${entry_price:.2f} x {qty}株",
+                "price_at_decision": round(entry_price, 2),
+                "shadow_short_qty":  qty,
+                "shadow_short_usd":  round(order_usd, 2),
+            }
+        }, ensure_ascii=False)
+
+        def _send_thread():
+            # ★ v3.9.75: 再送/退避つき送信（entry は append・retry時 observation_id で dedup）
+            _gas_send_with_retry(_gas_webhook_url(), payload,
+                                 kind="observation", key=obs_id, timeout=15)
+        threading.Thread(target=_send_thread, daemon=True).start()
+
+    except Exception as _e:
+        log.debug(f"[シャドーSHORT] open 内部エラー (黙殺): {_mask_secrets(_e)}")
+
+
+def _shadow_short_check_exit(pos: Dict[str, Any]) -> Optional[Tuple[str, float]]:
+    """シャドー SHORT の決済条件チェック。
+    決済すべきなら (exit_reason, exit_price) を返す。継続なら None。
+
+    LONG ルールの SHORT 対称版:
+      ・損切り: 価格が entry × (1 + MAX_LOSS_PCT) 以上に上昇
+      ・トレール作動: peak (安値) が entry × (1 - TRAIL_TRIGGER_PCT) 以下に到達
+      ・トレール決済: 価格が peak × (1 + TRAIL_DROP_PCT) 以上に戻り
+      ・タイムアウト: 経過時間 > TIMEOUT_EXIT_MINUTES (0 設定で無効)
+    """
+    try:
+        symbol = pos["symbol"]
+        entry  = pos["entry_price"]
+        # 現在価格取得
+        try:
+            _q = get_quote(symbol)
+            cur = float(_q.get("last", 0)) or float(_q.get("ask", 0)) or float(_q.get("bid", 0)) or 0.0
+        except Exception:
+            cur = 0.0
+        if cur <= 0:
+            return None  # 価格取れず → 継続
+
+        # ── 安値更新 (SHORT の peak は安値) ──
+        if cur < pos["peak_price"]:
+            pos["peak_price"] = cur
+
+        # ── ① 損切り: 価格上昇で SHORT 損 ──
+        # ★ v3.9.32: 高ボラ銘柄 (SMH 等) は損切り幅を拡大
+        _eff_loss = _effective_max_loss_pct(symbol, MAX_LOSS_PCT)
+        if cur >= entry * (1 + _eff_loss):
+            return ("強制損切り", cur)
+
+        # ── ② トレール作動チェック ──
+        if not pos["trail_triggered"]:
+            if pos["peak_price"] <= entry * (1 - TRAIL_TRIGGER_PCT):
+                pos["trail_triggered"] = True
+                log.info(
+                    f"[シャドーSHORT-TRAIL] {symbol} トレール作動 "
+                    f"peak=${pos['peak_price']:.2f} entry=${entry:.2f} "
+                    f"(-{TRAIL_TRIGGER_PCT*100:.1f}% 到達)"
+                )
+        # ── ③ トレール決済 (peak から TRAIL_DROP_PCT 戻り) ──
+        if pos["trail_triggered"]:
+            if cur >= pos["peak_price"] * (1 + TRAIL_DROP_PCT):
+                return ("トレール停止", cur)
+
+        # ── ④ タイムアウト ──
+        if TIMEOUT_EXIT_MINUTES > 0:
+            elapsed_min = (datetime.datetime.now() - pos["entry_time"]).total_seconds() / 60
+            if elapsed_min > TIMEOUT_EXIT_MINUTES:
+                return ("時間切れ", cur)
+
+        return None
+    except Exception as _e:
+        log.debug(f"[シャドーSHORT] check_exit 内部エラー: {_mask_secrets(_e)}")
+        return None
+
+
+def _shadow_short_close(obs_id: str, pos: Dict[str, Any], exit_reason: str, exit_price: float) -> None:
+    """シャドー SHORT クローズ + PnL 計算 + GAS 送信。"""
+    try:
+        symbol  = pos["symbol"]
+        entry   = pos["entry_price"]
+        qty     = pos["qty"]
+        # SHORT PnL = (entry - exit) × qty (上昇 → 負)
+        pnl_usd = (entry - exit_price) * qty
+        pnl_pct = (entry - exit_price) / entry * 100 if entry > 0 else 0.0
+        held_min = (datetime.datetime.now() - pos["entry_time"]).total_seconds() / 60
+
+        log.info(
+            f"[シャドーSHORT-EXIT] {symbol} {exit_reason} "
+            f"entry=${entry:.2f} exit=${exit_price:.2f} "
+            f"PnL={pnl_pct:+.2f}% (${pnl_usd:+.2f}) {held_min:.1f}分 "
+            f"(qty={qty}株・実発注なし)"
+        )
+
+        # GAS に exit 更新送信
+        cfg_name = os.environ.get("STUDENT_NAME", "").strip()
+        payload = json.dumps({
+            "token":        "algo2026secret",
+            "student_name": cfg_name,
+            "type":         "shadow_short_exit",
+            "data": {
+                "observation_id":    obs_id,
+                "bot_version":       BOT_VERSION_TAGGED,   # ★ v3.9.116: select_v1有効時は "+select_v1" 付き
+                "symbol":            symbol,
+                "entry_price":       round(entry, 2),
+                "exit_price":        round(exit_price, 2),
+                "qty":               qty,
+                "pnl_usd":           round(pnl_usd, 2),
+                "pnl_pct":           round(pnl_pct, 4),
+                "exit_reason":       exit_reason,
+                "holding_minutes":   round(held_min, 2),
+                "exit_time":         datetime.datetime.now(_ET).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        }, ensure_ascii=False)
+
+        def _send_thread():
+            # ★ v3.9.75: 再送/退避つき送信（exit は observation_id 照合の更新＝冪等）
+            _gas_send_with_retry(_gas_webhook_url(), payload,
+                                 kind="observation", key=obs_id, timeout=15)
+        threading.Thread(target=_send_thread, daemon=True).start()
+
+        # ★ v3.9.30: 当日サマリ用バッファに追記 (Discord/端末表示用)
+        try:
+            _record_today_shadow_short({
+                "symbol":      symbol,
+                "entry_price": entry,
+                "exit_price":  exit_price,
+                "qty":         qty,
+                "pnl_usd":     pnl_usd,
+                "pnl_pct":     pnl_pct,
+                "exit_reason": exit_reason,
+                "held_min":    held_min,
+            })
+        except Exception:
+            pass
+
+        # ポジション削除
+        with _SHADOW_SHORT_LOCK:
+            _SHADOW_SHORT_POSITIONS.pop(obs_id, None)
+    except Exception as _e:
+        log.debug(f"[シャドーSHORT] close 内部エラー (黙殺): {_mask_secrets(_e)}")
+
+
+async def shadow_short_exit_loop() -> None:
+    """シャドー SHORT のライフサイクル監視ループ。30 秒間隔で各オープンポジションの
+    決済条件をチェック。実発注は行わない (PnL 仮想計算のみ)。
+    v3.9.28: DATA_COLLECT の有無に関わらず動作 (全デモ環境で常時稼働)。"""
+    if not SHADOW_SHORT_ENABLED:
+        log.debug("[シャドーSHORT] SHADOW_SHORT_ENABLED=false → 非起動")
+        return
+    log.info(
+        f"[シャドーSHORT] 監視ループ開始 "
+        f"(損切り -{MAX_LOSS_PCT*100:.2f}% / トレール -{TRAIL_TRIGGER_PCT*100:.1f}% 作動・戻り +{TRAIL_DROP_PCT*100:.1f}% / "
+        f"タイムアウト {TIMEOUT_EXIT_MINUTES}分)"
+    )
+    while True:
+        try:
+            await asyncio.sleep(30)  # 30 秒間隔
+            await market_open_event.wait()
+
+            # スナップショットを取って反復 (close 中に dict が変更されても安全)
+            with _SHADOW_SHORT_LOCK:
+                snapshot = list(_SHADOW_SHORT_POSITIONS.items())
+
+            for obs_id, pos in snapshot:
+                exit_info = _shadow_short_check_exit(pos)
+                if exit_info is not None:
+                    reason, exit_price = exit_info
+                    _shadow_short_close(obs_id, pos, reason, exit_price)
+
+        except asyncio.CancelledError:
+            log.debug("[シャドーSHORT] ループキャンセル受信 → 終了")
+            raise
+        except Exception as _e:
+            log.debug(f"[シャドーSHORT] ループ例外 (継続): {_mask_secrets(_e)}")
+            await asyncio.sleep(60)
+
+
+# ── ★ v3.9.12: モメンタムシャドー観察ループ (Phase 0) ──────────────────────────
+async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
+    """強トレンド検知でモメンタムシグナルを観察 / 実発注する。
+
+    ★ v3.9.35: Phase 1 実発注に対応。
+      - MOMENTUM_LIVE_TRADING=false → シャドー観察のみ (実発注なし)
+      - MOMENTUM_LIVE_TRADING=true  → 観察 + live-eligible シグナルを実発注
+
+    起動条件:
+      - 実発注モード (MOMENTUM_LIVE_TRADING=true) なら DATA_COLLECT 不問で起動
+      - シャドーのみなら MOMENTUM_SHADOW_ENABLED=true + DATA_COLLECT=true で起動
+
+    シグナル条件 (絶対値):
+      |SPY/QQQ/SMH/IWM の 5min 騰落率| ≥ 銘柄別閾値
+      かつ |15min 騰落率| ≥ 銘柄別閾値
+      かつ 同方向シグナルが直近 MOMENTUM_COOLDOWN_MIN 分以内に出ていない
+
+    実発注対象 (live-eligible): MOMENTUM_ENABLED_SIDES に含まれるサイドのみ
+      (SMH / IWM はシャドー専用 — 観察記録のみで実発注しない)。
+    """
+    # 実発注モードなら DATA_COLLECT 不問で起動。シャドーのみなら従来条件。
+    if not MOMENTUM_SHADOW_ENABLED and not MOMENTUM_LIVE_TRADING:
+        log.debug("[モメンタム] SHADOW/LIVE とも無効 → 非起動")
+        return
+    if not MOMENTUM_LIVE_TRADING and not _is_data_collect_enabled():
+        log.debug("[モメンタム] シャドーのみ + DATA_COLLECT 無効 → 非起動")
+        return
+    if MOMENTUM_ORDER_SIZE_PCT <= 0:
+        log.debug("[モメンタム] MOMENTUM_ORDER_SIZE_PCT=0 → 機能無効")
+        return
+
+    # ★ v3.9.16/v3.9.25: Level + 銘柄別閾値 + リスク管理設定を表示
+    _level_name = _MOMENTUM_LEVEL_NAMES.get(MOMENTUM_LEVEL, "?")
+    _risk_name = _MOMENTUM_RISK_LEVEL_NAMES.get(MOMENTUM_RISK_LEVEL, "?")
+    _thresh_summary = ", ".join(
+        f"{_s}={_t5}%/{_t15}%"
+        for _s in MOMENTUM_SYMBOLS
+        for (_t5, _t15) in [_get_momentum_thresholds(_s)]
+    )
+    _mom_mode_label = "実発注モード (Phase 1)" if MOMENTUM_LIVE_TRADING else "シャドー観察モード (Phase 0)"
+    # ★ v3.9.116: 戦略プロファイルの適用状態を起動時に明示
+    if MOMENTUM_PROFILE_SELECT:
+        log.warning(
+            "[モメンタム] 🎛 戦略プロファイル: 選抜プロファイル v1 (select_v1) が有効です。"
+            " 実発注は SHORTのみ / SPY除外 / ET 9・10・12・13時台のみ に絞り、"
+            "建玉トレールは無効（固定損切り）になります。"
+            "シャドー観察は全銘柄・全サイド・全時間帯で継続します。"
+            " 従来どおりに戻すには Wizard STEP 13 [0] で「標準」を選んでください。"
+        )
+    elif _PROFILE_TAG == "+flatstop":
+        log.warning(
+            "[モメンタム] 🎛 戦略プロファイル: 標準＋固定損切り（検証中）。"
+            " 建玉トレールを無効化し、固定の損切り（既定0.5%・高ボラ倍率は従来どおり）で運用します。"
+            " シートの botバージョン列に \"+flatstop\" が付き、標準との比較集計に使われます。"
+            " 従来の建玉トレールに戻すには Wizard STEP 13 [6] で「建玉トレール（標準）」を選んでください。"
+        )
+    else:
+        log.info("[モメンタム] 🎛 戦略プロファイル: 標準（従来どおり・プロファイルによる絞り込みなし）")
+    # ★ v3.9.116: シャドー観察の当番制（重複送信削減）の状態を明示
+    if MOMENTUM_SHADOW_REPORTER_PCT < 100:
+        log.info(
+            f"[モメンタム] 📡 シャドー観察の送信当番: 本日は"
+            f"{'当番（送信する）' if _momentum_shadow_is_reporter() else '非当番（送信しない・日替わりで交代）'}"
+            f" (当番率 {MOMENTUM_SHADOW_REPORTER_PCT:.0f}%・端末/Discordの自分のシャドー成績表示は全員従来どおり)"
+        )
+    log.info(
+        f"[モメンタム] {_mom_mode_label} ループ開始 (間隔={MOMENTUM_CHECK_INTERVAL_SEC}秒, "
+        f"Level {MOMENTUM_LEVEL}({_level_name}), {_thresh_summary}, "
+        f"クールダウン={MOMENTUM_COOLDOWN_MIN}分, "
+        f"最大発注額={MOMENTUM_ORDER_SIZE_PCT}% of BUDGET)"
+    )
+    if MOMENTUM_LIVE_TRADING:
+        _demo_short_note = (
+            "デモはネッティング空売り有効 (DEMO_SHORT_ENABLED=true)" if DEMO_SHORT_ENABLED
+            else "デモ口座では SHORT は約定不可 (DEMO_SHORT_ENABLED=false) のため BUY サイドのみ実発注"
+        )
+        log.warning(
+            f"[モメンタム] ⚡ 実発注モード有効: live-eligible サイド {sorted(MOMENTUM_ENABLED_SIDES)} "
+            f"を実発注します (上記以外のサイド・銘柄はシャドー記録のみ。{_demo_short_note})"
+        )
+        # ★ v3.9.67: 実発注対象 vs リスク監視対象を起動時に明示 (認定サポーター指摘対応)
+        log.warning(
+            f"[モメンタム監視整合] 実発注対象銘柄={sorted(_momentum_live_symbols())} "
+            f"→ これらは risk_monitor/週末決済/パニック/sync の監視対象に取込済 (v3.9.61)。"
+            f" SHORT 決済サイド: 実口座=BUY_BACK / デモ=BUY (v3.9.63)。"
+        )
+    log.info(
+        f"[モメンタムリスク管理] RiskLevel {MOMENTUM_RISK_LEVEL}({_risk_name}): "
+        f"1回損失 ≤ {MOMENTUM_PER_TRADE_LOSS_PCT:.2f}% / "
+        f"1日損失 ≤ {MOMENTUM_DAILY_LOSS_PCT:.2f}% / "
+        f"急変動ガード ±{MOMENTUM_VOLATILITY_GUARD_PCT:.2f}%"
+    )
+    # ★ v3.9.67: サーキットブレーカー (日次/週次損失上限) の設定値と現在状態を明示。
+    _cb_daily_preset = _BUDGET_USD * (MOMENTUM_DAILY_LOSS_PCT / 100.0)
+    _cb_daily_budget = (_BUDGET_USD * (MOMENTUM_DAILY_LOSS_BUDGET_PCT / 100.0)
+                        if MOMENTUM_DAILY_LOSS_BUDGET_PCT > 0 else 0.0)
+    _cb_weekly = (_BUDGET_USD * (MOMENTUM_WEEKLY_LOSS_BUDGET_PCT / 100.0)
+                  if MOMENTUM_WEEKLY_LOSS_BUDGET_PCT > 0 else 0.0)
+    log.warning(
+        f"[モメンタム サーキットブレーカー] "
+        f"日次停止: RiskLevel -{MOMENTUM_DAILY_LOSS_PCT:.2f}% (-${_cb_daily_preset:,.0f}) "
+        f"または BUDGET比 -{MOMENTUM_DAILY_LOSS_BUDGET_PCT:.1f}% (-${_cb_daily_budget:,.0f}) / "
+        f"週次停止: BUDGET比 -{MOMENTUM_WEEKLY_LOSS_BUDGET_PCT:.1f}% (-${_cb_weekly:,.0f}) / "
+        f"現在状態: 日次={'停止中' if _momentum_daily_stopped else '稼働'} "
+        f"週次={'停止中' if _momentum_weekly_stopped else '稼働'} "
+        f"(確定損益は決済時に自動反映・04:00 ET リセット)"
+    )
+    log.info(
+        f"[モメンタム個別設定] "
+        f"有効サイド {sorted(MOMENTUM_ENABLED_SIDES)} / "
+        f"サイズ係数 {MOMENTUM_SIZE_MULTIPLIER} / "
+        f"損切り -{MOMENTUM_STOP_LOSS_PCT:.2f}% / "
+        f"強シグナル上限 ±{MOMENTUM_MAX_SIGNAL_PCT:.2f}%"
+        + ("（無効）" if MOMENTUM_MAX_SIGNAL_PCT <= 0 else "")
+        + (f" (DRAM ±{MOMENTUM_DRAM_MAX_SIGNAL_PCT:.2f}%)" if "DRAM" in MOMENTUM_SYMBOLS else "")  # ★ v3.9.62
+        + (f" (SMH ±{MOMENTUM_SMH_MAX_SIGNAL_PCT:.2f}%)" if "SMH" in MOMENTUM_SYMBOLS else "")  # ★ v3.9.72
+        + f" / タイムアウト "
+        + ("無効（トレール/損切りで管理）" if MOMENTUM_TIMEOUT_MIN <= 0 else f"{MOMENTUM_TIMEOUT_MIN}分")
+        + f" / セッション切替CD "
+        + ("無効" if MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC <= 0 else f"{MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC}秒")
+        + f" / L/S転換 "
+        + ("ON(従来=反対シグナルで強制転換)" if MOMENTUM_REVERSE_EXIT
+           else "OFF(転換抑制=反対シグナルは見送り・既定 v3.9.89)")  # ★ v3.9.89
+        + (f" / LONG下限 5m≥{MOMENTUM_LONG_MIN_SIGNAL_PCT:.2f}%(弱LONG実発注抑制・v3.9.94)"  # ★ v3.9.94
+           if MOMENTUM_LONG_MIN_SIGNAL_PCT > 0 else " / LONG下限 無効")
+    )
+
+    while True:
+        try:
+            await asyncio.sleep(MOMENTUM_CHECK_INTERVAL_SEC)
+            # market_open_event が clear されている間は待機 (週末/OVERNIGHT/disabled セッション)
+            await market_open_event.wait()
+
+            now = datetime.datetime.now()
+            cooldown_sec = MOMENTUM_COOLDOWN_MIN * 60
+
+            # ★ v3.9.41: 時間帯フィルタは廃案 (3 日中 2 日で逆効果が実証された
+            #   ため撤去)。寄り付き 9-10 時台が黄金時間帯になる日が多く、
+            #   固定時間帯フィルタは害となるケースが大半 (5/22 検証で
+            #   フィルタ後 WR 0.0% に壊滅)。代わりに既存の急変動ガード
+            #   (SPY 5m |Δ| ≥ MOMENTUM_VOLATILITY_GUARD_PCT) で制御する。
+
+            # ★ v3.9.25: デイストップロス済みなら新規発注しない (シャドーでも記録停止)
+            if _momentum_is_daily_stopped():
+                continue
+
+            # ★ v3.9.58: セッション切替直後のクールダウン
+            # OVN/WEEKEND/休日から稼働セッションへ遷移した直後は値動きが
+            # 急変動しがちだが、その方向性は持続しないケースが多い (寄り高 V 字等)。
+            # MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC 秒間 (デフォルト 300 = 5 分) は
+            # モメンタムシグナル発火を見送り、相場が落ち着いてから発火する。
+            # 0 設定で無効化。
+            if (
+                MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC > 0
+                and _last_session_change_at is not None
+            ):
+                _sess_elapsed = (now - _last_session_change_at).total_seconds()
+                if _sess_elapsed < MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC:
+                    _remain = int(MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC - _sess_elapsed)
+                    # 1 分ごとに 1 回だけログ出力 (連発防止)
+                    if not hasattr(momentum_shadow_loop, "_cooldown_logged_at") or \
+                       (now - getattr(momentum_shadow_loop, "_cooldown_logged_at", now - datetime.timedelta(seconds=60))).total_seconds() >= 60:
+                        log.info(
+                            f"[モメンタム] ⏳ セッション切替クールダウン中: "
+                            f"残り {_remain}秒 (持続性確認のため発火見送り)"
+                        )
+                        setattr(momentum_shadow_loop, "_cooldown_logged_at", now)
+                    continue
+
+            # ★ v3.9.25: 急変動ガード (SPY 5m チェック)
+            if _momentum_check_volatility_guard("SPY"):
+                continue
+
+            for symbol in MOMENTUM_SYMBOLS:
+                if symbol not in _INDEX_PRICE_HISTORY:
+                    continue
+                pct_5  = get_index_pct_change(symbol, 5)
+                pct_15 = get_index_pct_change(symbol, 15)
+                if pct_5 is None or pct_15 is None:
+                    continue
+
+                # ★ v3.9.16: 銘柄別の閾値を取得 (MOMENTUM_LEVEL プリセット or 個別 override)
+                thresh_5m, thresh_15m = _get_momentum_thresholds(symbol)
+
+                # 強上昇 / 強下落の判定 (両方の閾値を同時に満たす)
+                if pct_5 >= thresh_5m and pct_15 >= thresh_15m:
+                    direction, side, score = "LONG", "BUY", 1
+                elif pct_5 <= -thresh_5m and pct_15 <= -thresh_15m:
+                    direction, side, score = "SHORT", "SELL_SHORT", -1
+                else:
+                    continue
+
+                # ★ v3.9.25/v3.9.32: 銘柄サイドが Phase 1 実発注の対象かを判定。
+                # v3.9.25 は非対象サイドを continue でスキップしていたが、
+                # v3.9.32 で「シャドー観察は全銘柄・全サイド記録、実発注対象は
+                # MOMENTUM_ENABLED_SIDES のみ」に変更。SMH は ENABLED_SIDES に
+                # 含めないことで「シャドー専用 (観察のみ・実発注なし)」となる。
+                _live_eligible = _momentum_side_allowed(symbol, side)
+
+                # クールダウン (同方向シグナル)
+                cooldown_key = f"{symbol}_{direction}"
+                last_sig = _last_momentum_signal.get(cooldown_key)
+                if last_sig is not None and (now - last_sig).total_seconds() < cooldown_sec:
+                    continue
+                _last_momentum_signal[cooldown_key] = now
+
+                # 現在価格 (失敗時は 0)
+                price = 0.0
+                try:
+                    _q = get_quote(symbol)
+                    price = float(_q.get("last", 0)) or float(_q.get("ask", 0)) or 0.0
+                except Exception:
+                    pass
+
+                # ★ v3.9.25: 銘柄別サイズ係数 + 連敗縮小を適用
+                # ★ v3.9.31: シグナル強度別サイズ配分 (山型) を追加
+                #   弱 50% / 中 75% / 中強 100% / 強 0%(発注なし)
+                #   0.8%+ の強シグナルは累計マイナスのため発注対象外。ただし
+                #   シャドーではデータ収集のため引き続き観察ログに記録する。
+                size_multiplier = MOMENTUM_SIZE_MULTIPLIER.get(symbol, 1.0)
+                consec_multiplier = _momentum_get_size_multiplier()
+                strength_multiplier, strength_label = _momentum_strength_multiplier(pct_15, symbol)
+                # ★ v3.9.66 (施策C): サイド別係数で勝ち筋(SHORT)に資金を寄せる。
+                _side_multiplier = MOMENTUM_SHORT_SIZE_MULT if side == "SELL_SHORT" else MOMENTUM_BUY_SIZE_MULT
+                effective_size_pct = (
+                    MOMENTUM_ORDER_SIZE_PCT * size_multiplier
+                    * consec_multiplier * strength_multiplier * _side_multiplier
+                )
+                # ★ v3.9.123 (PAN方針決定 7/21): モメンタムは損切り幅のみボラ別に拡大し、
+                #   発注サイズは縮小しない（÷倍率は適用しない）。
+                #   理由: ボラティリティが高い銘柄ほど手数料（アドバンス往復最低約$4.4）に
+                #   勝ちやすく、SMH SHORT は全期間で最主力のエッジ。サイズを1/3にすると
+                #   手数料ハードルが 0.073%→0.218% に跳ね上がり、利確0.22%の設計と両立しない。
+                #   1トレードの想定損失は銘柄で異なるが、日次/週次サーキットブレーカー
+                #   （MOMENTUM_DAILY/WEEKLY_LOSS_BUDGET_PCT）で総量を管理する。
+                #   （v3.9.122 で一時導入したサイズ÷倍率は同方針により撤回。
+                #    ニュース系・qty自動計算経路の÷は従来どおり place 側で維持。）
+
+                # 想定発注額 + 想定株数 (集計時の総 PnL 換算用)
+                hypothetical_order_usd = _BUDGET_USD * (effective_size_pct / 100.0)
+                hypothetical_qty = round(hypothetical_order_usd / price, 2) if price > 0 else 0
+
+                # ★ v3.9.32: Phase 1 実発注の対象判定タグ
+                _elig_tag = "live可" if _live_eligible else "シャドー専用"
+                reason = (
+                    f"{symbol} 5m {pct_5:+.2f}% / 15m {pct_15:+.2f}%  "
+                    f"強度={strength_label}  "
+                    f"[{_elig_tag}]  "
+                    f"budget_pct={effective_size_pct:.1f}%  "
+                    f"(base={MOMENTUM_ORDER_SIZE_PCT}% × sym={size_multiplier:.2f} "
+                    f"× consec={consec_multiplier:.2f} × 強度={strength_multiplier:.2f})  "
+                    f"想定発注=${hypothetical_order_usd:.0f}  "
+                    f"想定株数={hypothetical_qty}株"
+                )
+
+                # ★ v3.9.94/114: LONG は 5分モメンタムが選択レンジ [下限, 上限) の内側のみ実発注。
+                #   弱LONG(下限未満)は損失の主因、強すぎるLONG(上限以上)は反転しやすく低調のため除外。
+                #   SHORTは対象外＝従来どおり。シャドー観察は下で全件記録（見送り分もデータに残る）。
+                _long_range_ok = (
+                    side != "BUY"
+                    or (
+                        (MOMENTUM_LONG_MIN_SIGNAL_PCT <= 0 or pct_5 >= MOMENTUM_LONG_MIN_SIGNAL_PCT)
+                        and (MOMENTUM_LONG_MAX_SIGNAL_PCT <= 0 or pct_5 < MOMENTUM_LONG_MAX_SIGNAL_PCT)
+                    )
+                )
+                # ★ v3.9.114: LONGが選択レンジ内なら、山型(15分基準)の「強(発注なし)=0」を解除して
+                #   強帯も実発注する（Wizardの上限緩和選択の意図を反映）。弱/中の縮小配分は維持。
+                #   ショート・レンジ外は従来の山型のまま。
+                if side == "BUY" and _long_range_ok and strength_multiplier <= 0:
+                    strength_multiplier, strength_label = 1.00, "強(LONG許可)"
+                    effective_size_pct = (
+                        MOMENTUM_ORDER_SIZE_PCT * size_multiplier
+                        * consec_multiplier * strength_multiplier * _side_multiplier
+                    )
+
+                # ★ v3.9.35: Phase 1 実発注を行うかの判定
+                _will_live_order = (
+                    MOMENTUM_LIVE_TRADING and _live_eligible
+                    and strength_multiplier > 0
+                    and effective_size_pct > 0 and price > 0
+                    and _long_range_ok
+                )
+                # ★ v3.9.103: 当日トレンド・フィルター（逆張り抑制）。
+                #   上昇日(SPY+)のショート / 下落日(SPY-)のロング を against-trend と判定。
+                #   既定は計測のみ（売買不変・観察ログに trend_filter_ab を残す）。
+                #   MOMENTUM_TREND_FILTER_ENABLED=true で against-trend の実発注を実ブロック。
+                _trend_pct = _market_trend_pct()
+                _against_trend = False
+                if _trend_pct is not None and MOMENTUM_TREND_FILTER_PCT > 0:
+                    if score < 0 and _trend_pct >= MOMENTUM_TREND_FILTER_PCT:
+                        _against_trend = True   # 上昇日のショート
+                    elif score > 0 and _trend_pct <= -MOMENTUM_TREND_FILTER_PCT:
+                        _against_trend = True   # 下落日のロング
+                _trend_blocked = False
+                if _against_trend and _will_live_order and MOMENTUM_TREND_FILTER_ENABLED:
+                    _will_live_order = False
+                    _trend_blocked = True
+
+                # ★ v3.9.104: プレマーケット新規エントリー抑制（既定は計測のみ）。
+                #   premarket が恒常的な出血源のため、premarket 中の新規実発注を対象にする。
+                #   既定 MOMENTUM_PREMARKET_FILTER_ENABLED=false ＝売買不変（計測のみ）。
+                _is_premarket = (get_session_info()[0] == SESSION_PREMARKET)
+                _premarket_blocked = False
+                if _is_premarket and _will_live_order and MOMENTUM_PREMARKET_FILTER_ENABLED:
+                    _will_live_order = False
+                    _premarket_blocked = True
+
+                # ★ v3.9.121: MOMENTUM_MAX_OPEN_POSITIONS（既定1）を実装。
+                #   従来は定義のみで未参照の死に設定だった（利用者H指摘②の調査で発覚）。
+                #   モメンタム由来の建玉数が上限以上なら新規実発注を見送る（シャドー記録は全件継続）。
+                _max_open_blocked = False
+                if _will_live_order and MOMENTUM_MAX_OPEN_POSITIONS > 0:
+                    try:
+                        _open_mom = sum(
+                            1 for _s2 in MOMENTUM_SYMBOLS
+                            if state.get(_s2).position_qty != 0
+                            and state.get(_s2).entry_ai_category == "MOMENTUM"
+                        )
+                        if _open_mom >= MOMENTUM_MAX_OPEN_POSITIONS:
+                            _will_live_order = False
+                            _max_open_blocked = True
+                    except Exception:
+                        pass
+
+                # ★ v3.9.116: 戦略プロファイル select_v1（Wizard STEP 13 [0]・既定OFF）。
+                #   実発注だけを絞り、シャドー観察は全件継続（trend/premarketフィルタと同型）。
+                _profile_block_reason = None
+                if _will_live_order and MOMENTUM_PROFILE_SELECT:
+                    _now_et_hour = datetime.datetime.now(_ET).hour
+                    if side == "BUY":
+                        _profile_block_reason = "LONGは実発注対象外（SHORTのみ）"
+                    elif symbol in _SELECT_V1_EXCLUDED_SYMBOLS:
+                        _profile_block_reason = f"{symbol}は実発注対象外銘柄"
+                    elif _now_et_hour not in _SELECT_V1_ENTRY_HOURS_ET:
+                        _profile_block_reason = (
+                            f"時間帯対象外（ET {_now_et_hour}時台・対象は9/10/12/13時台）"
+                        )
+                    if _profile_block_reason:
+                        _will_live_order = False
+
+                if _will_live_order:
+                    _order_note = "⚡ 実発注 (Phase 1)"
+                elif _trend_blocked:
+                    _order_note = (
+                        f"実発注なし・当日トレンド逆行"
+                        f"（{'上昇日ショート' if score < 0 else '下落日ロング'} / "
+                        f"SPY{MOMENTUM_TREND_LOOKBACK_MIN}m {_trend_pct:+.2f}%）→ ブロック"
+                    )
+                elif _premarket_blocked:
+                    _order_note = "実発注なし・プレマーケット抑制 → ブロック"
+                elif _max_open_blocked:
+                    _order_note = (
+                        f"実発注なし・同時保有上限 "
+                        f"(MOMENTUM_MAX_OPEN_POSITIONS={MOMENTUM_MAX_OPEN_POSITIONS}) → シャドーのみ"
+                    )
+                elif _profile_block_reason:
+                    _order_note = f"実発注なし・選抜プロファイル: {_profile_block_reason} → シャドーのみ"
+                elif not _live_eligible:
+                    _order_note = "実発注なし・シャドー専用銘柄 (Phase 1 でも発注対象外)"
+                elif not _long_range_ok:
+                    # ★ v3.9.121: v3.9.114 の改名(_long_min_ok→_long_range_ok)取りこぼしを修正。
+                    #   旧名参照で NameError → ループ全体 except に捕捉され、その周回の後続銘柄の
+                    #   走査・シャドー記録・実発注が丸ごとスキップされていた（実ログで20回確認・利用者H指摘①）。
+                    _order_note = (
+                        f"実発注なし・LONGレンジ外 "
+                        f"(5m {pct_5:+.2f}% / レンジ {MOMENTUM_LONG_MIN_SIGNAL_PCT:.2f}〜"
+                        f"{MOMENTUM_LONG_MAX_SIGNAL_PCT:.2f}%) → シャドーのみ"
+                    )
+                elif strength_multiplier <= 0:
+                    _order_note = "実発注なし・強シグナルのためデータ収集のみ (発注対象外)"
+                elif MOMENTUM_LIVE_TRADING:
+                    _order_note = "実発注なし・実発注モードだが価格取得失敗等で見送り"
+                else:
+                    _order_note = "実発注なし・観察ログのみ (シャドーモード)"
+                log.info(
+                    f"[モメンタム] 🎯 {direction} シグナル検出: {reason}  "
+                    f"({_order_note}・次回 {MOMENTUM_COOLDOWN_MIN}分後まで同方向ロック)"
+                )
+
+                # 観察ログに記録 (既存の _log_observation を流用)
+                # block_stage="momentum_shadow" で集計時に識別可能
+                _log_observation(
+                    symbol=symbol,
+                    side=side,
+                    confidence=0.70,  # シャドー固定値 (集計時のフィルタ用)
+                    score=score,
+                    category="MOMENTUM",
+                    headlines=[f"[MOMENTUM SHADOW] {reason}"],
+                    outcome="blocked",
+                    block_stage="momentum_shadow",
+                    block_reason=reason[:300],
+                    price_at_decision=price,
+                    # ★ v3.9.83: 発注判断の文脈（運営が「なぜ発注/見送りか」を後から検証）
+                    live_allowed=_live_eligible,
+                    size_pct=effective_size_pct,
+                    eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
+                    pct_5m=pct_5,
+                    pct_15m=pct_15,
+                )
+
+                # ★ v3.9.103: 当日トレンド逆行（against-trend）の計測ログ。
+                #   既存の +5/+15/+60分 仮想exitパイプラインに相乗りし、「上昇日ショート/
+                #   下落日ロングを抑制したら成績がどう変わるか」を後追い計測する（売買は不変）。
+                if _against_trend:
+                    try:
+                        _log_observation(
+                            symbol=symbol,
+                            side=side,
+                            confidence=0.70,
+                            score=score,
+                            category="MOMENTUM",
+                            headlines=[
+                                f"[TREND FILTER] SPY{MOMENTUM_TREND_LOOKBACK_MIN}m "
+                                f"{_trend_pct:+.2f}% vs {'SHORT' if score < 0 else 'LONG'}"
+                            ],
+                            outcome="blocked",
+                            block_stage="trend_filter_ab",
+                            block_reason=(
+                                f"against_trend side={'SHORT' if score < 0 else 'LONG'} "
+                                f"trend={_trend_pct:+.2f}% thr={MOMENTUM_TREND_FILTER_PCT:.2f}% "
+                                f"enforced={MOMENTUM_TREND_FILTER_ENABLED} "
+                                f"would_live={_will_live_order or _trend_blocked}"
+                            )[:300],
+                            price_at_decision=price,
+                            live_allowed=_live_eligible,
+                            size_pct=effective_size_pct,
+                            eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
+                            pct_5m=pct_5,
+                            pct_15m=pct_15,
+                        )
+                    except Exception:
+                        pass
+
+                # ★ v3.9.104: プレマーケット新規エントリー抑制の計測ログ。
+                #   「premarket の実発注を抑制したら成績がどう変わるか」を、既存の
+                #   +5/+15/+60分 仮想exitパイプラインで後追い計測する（既定は売買不変）。
+                #   実発注対象（would-be-live）だった premarket 建てのみ記録。
+                if _is_premarket and (_will_live_order or _premarket_blocked):
+                    try:
+                        _log_observation(
+                            symbol=symbol,
+                            side=side,
+                            confidence=0.70,
+                            score=score,
+                            category="MOMENTUM",
+                            headlines=[
+                                f"[PREMARKET FILTER] premarket {'SHORT' if score < 0 else 'LONG'} "
+                                f"5m {pct_5:+.2f}%"
+                            ],
+                            outcome="blocked",
+                            block_stage="premarket_filter_ab",
+                            block_reason=(
+                                f"premarket_entry side={'SHORT' if score < 0 else 'LONG'} "
+                                f"enforced={MOMENTUM_PREMARKET_FILTER_ENABLED} "
+                                f"would_live={_will_live_order or _premarket_blocked}"
+                            )[:300],
+                            price_at_decision=price,
+                            live_allowed=_live_eligible,
+                            size_pct=effective_size_pct,
+                            eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
+                            pct_5m=pct_5,
+                            pct_15m=pct_15,
+                        )
+                    except Exception:
+                        pass
+
+                # ★ v3.9.30: 当日サマリ用バッファに追記 (Discord/端末表示用)
+                # ★ v3.9.31: シグナル強度ラベルと係数も記録
+                try:
+                    _record_today_shadow_momentum({
+                        "symbol":         symbol,
+                        "direction":      direction,        # LONG / SHORT
+                        "side":           side,             # BUY / SELL_SHORT
+                        "pct_5":          pct_5,
+                        "pct_15":         pct_15,
+                        "price":          price,
+                        "size_pct":       effective_size_pct,
+                        "strength_label": strength_label,
+                        "strength_mult":  strength_multiplier,
+                        "live_eligible":  _live_eligible,    # ★ v3.9.32
+                    })
+                except Exception:
+                    pass
+
+                # ── ★ v3.9.35: Phase 1 実発注 ────────────────────────────────
+                # MOMENTUM_LIVE_TRADING=true かつ live-eligible サイドのみ。
+                # place_buy / place_short を再利用するため、発注後のポジションは
+                # risk_monitor_loop が損切り/トレール/時間切れで自動管理する。
+                # qty を明示指定して calc_order_size を回避し、モメンタム算出の
+                # サイズ (BUDGET × MAX_PCT × 強度係数) で発注する。
+                # ★ v3.9.65: デモ口座での SHORT は place_short 内で分岐:
+                #   DEMO_SHORT_ENABLED=true  → プレーン SELL で実発注ショート (ネッティング)
+                #   DEMO_SHORT_ENABLED=false → シャドー SHORT に自動転送 (記録のみ)。
+                # ★ v3.9.63: 寄り高値掴みガード — 直近高値圏での BUY 追随は実発注見送り
+                # (シャドー観察ログは上で記録済み)。
+                if _will_live_order and _momentum_high_chase_block(symbol, side, price):
+                    log.info(
+                        f"[モメンタム実発注] {symbol} {side} 見送り (高値掴みガード): "
+                        f"現値 ${price:.2f} が直近{MOMENTUM_HIGH_CHASE_LOOKBACK_MIN}分高値の "
+                        f"{MOMENTUM_HIGH_CHASE_GUARD_PCT:.2f}%以内 → シャドー記録のみ"
+                    )
+                    _will_live_order = False
+                if _will_live_order:
+                    _mom_qty = max(1, int(hypothetical_order_usd / price))
+                    log.warning(
+                        f"[モメンタム実発注] {symbol} {side} {_mom_qty}株 "
+                        f"(想定 ${hypothetical_order_usd:,.0f}) → 発注実行"
+                    )
+                    try:
+                        _place_fn = place_buy if side == "BUY" else place_short
+                        # ★ v3.9.121: ニュース系(process_headlines/process_stock_news)と同じ
+                        #   銘柄単位ロックで発注を直列化（利用者H指摘②-1）。同一銘柄への
+                        #   ニュース発注とモメンタム発注が同時に走る race を防ぐ。
+                        #   place_buy/place_short/place_close_all は sync のためデッドロックは増えない。
+                        async with _get_sym_lock(symbol):
+                            _mom_ok = await asyncio.to_thread(
+                                _place_fn, symbol, trd_env,
+                                confidence=0.70,
+                                trigger=symbol,
+                                reason=f"[モメンタム] {reason}",
+                                qty=_mom_qty,
+                                category="MOMENTUM",
+                                news_source="MOMENTUM",
+                                headlines=[f"[MOMENTUM] {reason}"],
+                            )
+                        if _mom_ok:
+                            # ★ v3.9.111: エントリー時モメンタム5分/15分%を建玉状態に記録
+                            #   （決済時に _send_trade_result がトレード行へ相乗り記録・解析用）
+                            try:
+                                _ts_mom = state.get(symbol)
+                                _ts_mom.entry_pct_5m  = pct_5
+                                _ts_mom.entry_pct_15m = pct_15
+                            except Exception:
+                                pass
+                            log.info(f"[モメンタム実発注] {symbol} {side} 発注成功")
+                        else:
+                            log.info(
+                                f"[モメンタム実発注] {symbol} {side} 発注見送り "
+                                f"(place 側ガードによりスキップ)"
+                            )
+                    except Exception as _e_mom:
+                        log.warning(
+                            f"[モメンタム実発注] {symbol} {side} エラー (継続): "
+                            f"{_mask_secrets(_e_mom)}"
+                        )
+
+        except asyncio.CancelledError:
+            log.debug("[モメンタムシャドー] ループキャンセル受信 → 終了")
+            raise
+        except Exception as _e:
+            log.debug(f"[モメンタムシャドー] ループ例外 (継続): {_mask_secrets(_e)}")
+            await asyncio.sleep(60)
+
+
+# ── ★ v3.9.91: 決済理由 → 構造化コード(exit_code) ───────────────────────────────
+#   自由文字列の決済理由は表記揺れでレポート分類が取りこぼし「その他」に落ちる
+#   （6/22: 報告書「その他」-$3,062 の実体は建玉トレールだった）。決済時に一意な
+#   コードを付与し、レポート/集計を常に正確にする。人間用の文章は exit_reason に残す。
+def _exit_code_from_reason(reason: str) -> str:
+    """決済理由(自由文字列) を構造化コードへ正規化する。判定は決定論的・順序依存。"""
+    s = str(reason or "")
+    if "建玉トレール" in s:                                   return "ENTRY_TRAIL"
+    if "トレイリングストップ" in s:                           return "TRAIL"
+    if "強制損切り" in s or ("損切り" in s and "トレール" not in s): return "FORCED_STOP"
+    if "時間切れ" in s or "タイムアウト" in s:                 return "TIMEOUT"
+    if ("ロング前ショート" in s or "ショート前ロング" in s
+            or "転換" in s or ("シグナルのため" in s and "決済" in s)): return "LS_REVERSE"
+    if "パニック" in s:                                        return "PANIC"
+    if "デモ日次" in s:                                        return "DEMO_DAILY"
+    if "移行前全決済" in s or "週末" in s or "金曜" in s or "セッション" in s: return "SESSION_CLOSE"
+    if "利確" in s or "利益確定" in s or "リトレース" in s:     return "TAKE_PROFIT"
+    if s.strip() == "":                                        return "UNKNOWN"
+    return "OTHER"
+
+
+# ── トレード結果リアルタイム送信 ─────────────────────────────────────────────────
+def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
+                       qty: int, realized_pnl: float, hold_min: float,
+                       session: str, ai_score: int, ai_conf: float,
+                       ai_category: str, news_source: str, exit_reason: str,
+                       # ── ★ v2.95: GAS連携用の追加フィールド（kwargs） ──────
+                       headlines: Optional[List[str]] = None,
+                       beneficiaries: Optional[List[str]] = None,
+                       victims: Optional[List[str]] = None,
+                       price_trend: float = 0.0,
+                       peak_pnl: float = 0.0,
+                       # ── ★ v3.1.0: ショート取引識別フィールド ───────────
+                       # 後方互換のためデフォルトは "LONG"。引数を渡さない既存
+                       # コードからの呼出は従来通りロング扱いになる。
+                       trade_type: str = "LONG",
+                       # ── ★ v3.9.133: 決済時点でスナップショットした「実際に適用された
+                       #   損切り%」（%単位）。本関数は別スレッドで走るため、ここで受け取らずに
+                       #   state から読むと、同一銘柄の次の建玉や sync のクリアで値が
+                       #   入れ替わりうる（Codexレビュー指摘）。None のときのみ state を参照する。
+                       enforced_stop_pct: Optional[float] = None) -> None:
+    """1トレード完結時にGAS Webhookへ即時送信する。 / DATA_COLLECT=true かつ STUDENT_NAME 設定済みの場合のみ動作。 / センシティブ情報（APIキー・口座番号）は一切送信しない。"""
+    import json as _json, datetime as _dt
+    # ★ v3.8.6: 当日トレード集計バッファに追記 (DATA_COLLECT 設定や送信成否に依存せず、
+    # ローカルでサマリを表示するため必ず記録)。
+    try:
+        _record_today_trade({
+            'symbol':      symbol,
+            'pnl':         realized_pnl,
+            'qty':         qty,
+            'entry_price': entry_price,
+            'exit_price':  exit_price,
+            'hold_min':    hold_min,
+            'session':     session,
+            'ai_category': ai_category,
+            'exit_reason': exit_reason,
+            'trade_type':  trade_type,
+        })
+    except Exception:
+        pass  # サマリ記録の失敗は GAS 送信を阻害しない
+
+    # ── ★ v3.9.67: モメンタム・サーキットブレーカーへ確定損益を反映 ──────────
+    # 認定サポーター指摘 (6/3): momentum_record_trade_result() が定義のみで未配線
+    # だったため、日次/週次の損失上限が機能していなかった。決済確定の共通経路である
+    # 本関数 (LONG/SHORT・即時/リトライの全 4 経路から呼ばれる) で、ai_category が
+    # MOMENTUM の確定損益を日次/週次 PnL に積み上げる。DATA_COLLECT のゲートより前で
+    # 実行するため、データ収集の有無に関わらず必ず反映される。
+    if ai_category == "MOMENTUM":
+        try:
+            with _momentum_pnl_lock:
+                momentum_record_trade_result(realized_pnl, _BUDGET_USD)
+        except Exception as _e_mrtr:
+            log.warning(f"[モメンタム] サーキットブレーカー反映エラー (継続): {_mask_secrets(_e_mrtr)}")
+
+    cfg_collect = os.environ.get("DATA_COLLECT", "").strip().lower()
+    cfg_name    = os.environ.get("STUDENT_NAME", "").strip()
+    if cfg_collect != "true" or not cfg_name:
+        return
+    DEFAULT_URL = (
+        "https://script.google.com/macros/s/"
+        "AKfycbwaeZlTBJKKXeeewH4xN1T2dN3LoPZm3IcWHdRooOlMqGyTaKaBmIPB_I7t3-bDiLil"
+        "/exec"
+    )
+    cfg_url = os.environ.get("WEBHOOK_URL", "").strip() or DEFAULT_URL
+    # ★ v2.86: 固定オフセット(-4h)は EDT 専用。EST 期間（11月〜3月）は -5h で
+    # 1時間ズレるため、DST を自動考慮する ZoneInfo に変更。
+    now_et = _dt.datetime.now(ZoneInfo("America/New_York"))
+    _exit_ts = now_et.strftime("%Y-%m-%d %H:%M:%S")
+    # ★ v3.9.75: 決定論的 trade_id（再送時の GAS 側重複排除キー）。
+    import hashlib as _hl
+    _tid_src = (f"{cfg_name}|{symbol}|{_exit_ts}|{qty}|"
+                f"{round(entry_price, 2)}|{round(exit_price, 2)}|{trade_type}")
+    trade_id = _hl.md5(_tid_src.encode("utf-8")).hexdigest()[:16]
+
+    # ── ★ v3.9.111: 出口チューニング解析用の派生列（利用者B要望B案・すべて決済時に計算＝GAS負荷増なし）──
+    _abs_qty = abs(qty) if qty else 0
+    _entry_notional = entry_price * _abs_qty
+    def _pct_of_notional(v):
+        return round(v / _entry_notional * 100.0, 4) if _entry_notional > 0 else ""
+    _realized_pct = _pct_of_notional(realized_pnl)   # 確定損益%（建玉額比・予算非依存）
+    _peak_pct     = _pct_of_notional(peak_pnl)       # 最大含み益%
+    # ピークからの戻り幅%（含み益を出したのに削った分。ピーク≤確定なら0）
+    if isinstance(_peak_pct, (int, float)) and isinstance(_realized_pct, (int, float)):
+        _dd_from_peak = round(max(0.0, _peak_pct - _realized_pct), 4)
+    else:
+        _dd_from_peak = ""
+    _exit_code_val   = _exit_code_from_reason(exit_reason)
+    _trail_triggered = 1 if _exit_code_val in ("TRAIL", "ENTRY_TRAIL") else 0
+    _is_mom = (ai_category == "MOMENTUM")
+    # ★ v3.9.133: 損切り%は「設定の素の値」と「実際に適用された値」を分けて記録する。
+    #   旧実装は常に高ボラ倍率を掛けて出力していたが、モメンタム建玉は監視ループ側で
+    #   倍率をスキップする仕様（v3.9.93）のため、記録=1.50% / 実際=0.50%（SMH）のように
+    #   系統的にズレていた。この列を根拠にした損切り幅のチューニングは無効になるため、
+    #   実際に適用された値（監視ループが建玉に保存）を優先して出力する。
+    #   _base_stop_pct     … 設定の素の値（倍率なし）
+    #   _eff_stop          … 実際に適用された値。監視ループ未評価時のみ設計値で補完する。
+    try:
+        _base_stop = MOMENTUM_STOP_LOSS_PCT if _is_mom else (MAX_LOSS_PCT * 100.0)
+        _base_stop_pct = round(_base_stop, 4)
+    except Exception:
+        _base_stop = 0.0; _base_stop_pct = ""
+    _eff_stop = ""
+    try:
+        # ①決済時に渡されたスナップショットを最優先（本関数は別スレッドで走るため、
+        #   state から読むと同一銘柄の次の建玉や sync のクリアで値が入れ替わりうる）
+        _ts_stop = enforced_stop_pct
+        if _ts_stop is None:
+            _ts_stop = getattr(state.get(symbol), "enforced_stop_pct", None)  # ②現在値
+        if _ts_stop is not None:
+            _eff_stop = round(float(_ts_stop), 4)          # ← 実際に適用された値
+        else:
+            # ③監視ループが一度も評価していない建玉（即時決済等）。設計上の適用値で補完。
+            #   risk_monitor_loop の優先順位（決算 > モメンタム > 通常）と倍率の有無を合わせる。
+            _is_earn_rec = (symbol in EARNINGS_PRE_TICKERS or symbol in EARNINGS_AFTER_TICKERS)
+            if _is_earn_rec and EARNINGS_MAX_LOSS_PCT > 0:
+                _eff_stop = round(EARNINGS_MAX_LOSS_PCT * 100.0 * _symbol_loss_mult(symbol), 4)
+            elif _is_mom:
+                _eff_stop = round(_base_stop, 4)            # モメンタムは倍率を掛けない実装
+            else:
+                _eff_stop = round(_base_stop * _symbol_loss_mult(symbol), 4)
+    except Exception:
+        _eff_stop = ""
+    # トレール幅%（設定値）。※モメンタムのENTRY_TRAILはretrace方式のため参考値。
+    try:
+        _trail_width = round(float(os.environ.get("TRAIL_DROP_PCT", "0.15")), 4)
+    except (ValueError, TypeError):
+        _trail_width = ""
+    # 往復手数料の概算（1株あたり見積り・既定Advance相当。env FEE_PER_SHARE_RT で調整）。
+    try:
+        _fee_est = round(_abs_qty * float(os.environ.get("FEE_PER_SHARE_RT", "0.011")), 4)
+    except (ValueError, TypeError):
+        _fee_est = ""
+    # エントリー時モメンタム5分/15分%（TickerState から・モメンタム実発注時のみ設定）。
+    _e5m = ""; _e15m = ""
+    try:
+        _ts_read = state.get(symbol)
+        if getattr(_ts_read, "entry_pct_5m", None) is not None:
+            _e5m = round(float(_ts_read.entry_pct_5m), 3)
+        if getattr(_ts_read, "entry_pct_15m", None) is not None:
+            _e15m = round(float(_ts_read.entry_pct_15m), 3)
+    except Exception:
+        pass
+
+    payload = _json.dumps({
+        "token":        "algo2026secret",
+        "student_name": cfg_name,
+        "type":         "trade",
+        "data": {
+            "trade_id":     trade_id,
+            "timestamp":    _exit_ts,
+            "date":         now_et.strftime("%Y-%m-%d"),
+            "symbol":       symbol,
+            "entry_price":  round(entry_price, 2),
+            "exit_price":   round(exit_price, 2),
+            "qty":          qty,
+            "realized_pnl": round(realized_pnl, 2),
+            "hold_min":     hold_min,
+            "session":      session,
+            "ai_score":     ai_score,
+            "ai_conf":      round(ai_conf, 2),
+            "ai_category":  ai_category,
+            "news_source":  news_source,
+            "exit_reason":  exit_reason,
+            "exit_code":    _exit_code_from_reason(exit_reason),  # ★ v3.9.91: 構造化決済コード
+            "trade_env":    _RUN_TRADE_ENV,                       # ★ v3.9.99: REAL / DEMO（実取引/デモ判別）
+            "momentum_level": MOMENTUM_LEVEL,                     # ★ v3.9.109: L1-5（設定別レポート用）
+            # ── ★ v3.9.111: 出口チューニング解析用（利用者B要望B案・決済時計算・GAS負荷増なし）──
+            "realized_pnl_pct":        _realized_pct,      # 確定損益%（建玉額比・予算非依存）
+            "peak_pnl_pct":            _peak_pct,          # 最大含み益%
+            "drawdown_from_peak_pct":  _dd_from_peak,      # ピークからの戻り幅%
+            "trail_triggered":         _trail_triggered,   # トレール決済=1（TRAIL/ENTRY_TRAIL）
+            "trail_width_pct":         _trail_width,       # トレール幅%（設定値・参考）
+            # ★ v3.9.133: 実際に適用された損切り%（監視ループが確定した値）。
+            #   TRAIL(利確トレール)決済は損切り閾値を使わないため参考値。
+            "stop_loss_pct_effective": _eff_stop,
+            "base_stop_pct":           _base_stop_pct,     # ★ v3.9.133: 設定の素の値（倍率なし）
+            # ★ v3.9.133: 上の損切り%がこの決済で実際に発動したか（1=発動 / 0=非発動）。
+            #   FORCED_STOP と ENTRY_TRAIL は損切り閾値で決済、TRAIL は利確トレールで決済。
+            "stop_pct_applied":        1 if _exit_code_val in ("FORCED_STOP", "ENTRY_TRAIL") else 0,
+            "fee_estimate":            _fee_est,           # 往復手数料 概算$
+            "momentum_5m_pct":         _e5m,               # エントリー時モメンタム5分%
+            "momentum_15m_pct":        _e15m,              # エントリー時モメンタム15分%
+            # ── ★ v2.95: GAS連携用の追加フィールド ──────────────────────
+            "headlines":    (headlines or [])[:3],
+            "beneficiaries": beneficiaries or [],
+            "victims":      victims or [],
+            "price_trend":  round(price_trend, 3),
+            "peak_pnl":     round(peak_pnl, 2),
+            # ── ★ v3.1.0: ショート取引識別フィールド ─────────────────
+            # "LONG" または "SHORT"。GAS 側はこの値を「取引方向」列に記録する。
+            "trade_type":   trade_type,
+            "settings":     _get_settings_snapshot(),
+        }
+    }, ensure_ascii=False)
+    # ★ v3.9.75: インライン再送→失敗時はローカルキューへ退避（記録欠落を防止）。
+    # ★ v3.9.126: デモ日次/週末前/移行前の一斉決済は全台が同一秒に送信するため、
+    #   ジッターを広げて GAS の書き込みロック逼迫（＝再送・退避の多発）を避ける。
+    _is_bulk = any(h in str(exit_reason or "") for h in _BULK_CLOSE_REASON_HINTS)
+    _jit = _GAS_SEND_JITTER_SEC_BULK if _is_bulk else None
+    if _gas_send_with_retry(cfg_url, payload, kind="trade", key=trade_id,
+                            timeout=60, jitter_max=_jit):
+        log.info(f"[データ収集] ✅ トレード送信完了  {symbol}  pnl={realized_pnl:+.2f}"
+                 + ("  [選抜プロファイルv1]" if MOMENTUM_PROFILE_SELECT else ""))   # ★ v3.9.116
+
+    # ── ★ v3.9.116: 決済時シミュレーション2種を計測終了・撤去 ─────────────────
+    # ①peakリトレース微利確sim(v3.9.17/peak_retrace_sim・週470行) は「含み益をどう守るか」
+    #   の問いごと仮想MFEトレール(mfe_trail_pnl_pct・v3.9.116復活)が上位互換で計測するため統合。
+    # ②TIMEOUT延長sim(v3.9.16/timeout_extension・週372行) は「延長したらどうなったか」が
+    #   momentum_shadow の pnl_60min ＋ v3.9.111 出口チューニング列(peak/drawdown)で
+    #   同じ問いに答えられるため終了。いずれも下流(日次/週次レポート・分析)未使用を確認済み。
+    #   → GAS送信 週約840行削減。復活させる場合は CHANGELOG v3.9.16/17 を参照。
+
+
+def _get_settings_snapshot() -> str:
+    """ルール改善分析用に設定値を文字列化（センシティブ情報は含まない）"""
+    import json as _json
+    snap = {
+        # ★ v3.9.116: select_v1 有効時は "+select_v1" 付き。GAS はこの値をシートの
+        #   「botバージョン」列へ書くため、決済記録からプロファイル選択が判別できる。
+        "bot_version":   BOT_VERSION_TAGGED,
+        "strategy_profile": MOMENTUM_STRATEGY_PROFILE,   # ★ v3.9.116（将来のGAS列追加用）
+        "budget_usd":    int(os.environ.get("BUDGET_USD", "50000") or 50000),
+        "max_loss_pct":  os.environ.get("MAX_LOSS_PCT", "0.5"),
+        "trail_trigger": os.environ.get("TRAIL_TRIGGER_PCT", "0.30"),
+        "trail_drop":    os.environ.get("TRAIL_DROP_PCT", "0.15"),
+        "confidence":    os.environ.get("STRONG_BUY_CONFIDENCE", "0.75"),
+        "panic_conf":    os.environ.get("PANIC_CONFIDENCE", ""),
+        "timeout_min":   os.environ.get("TIMEOUT_EXIT_MINUTES", "10"),
+        "tickers":       os.environ.get("TRIGGER_TICKERS", "SPY,QQQ"),
+        # v3.9.20: pyramid_* キーは撤去 (山型サイズ配分に置き換え)
+        "limit_buf":     os.environ.get("LIMIT_BUFFER_PCT", "0.010"),
+        "stock_tickers": os.environ.get("STOCK_TICKERS", ""),
+        "news_sources":  ",".join(
+            s for s, k in [
+                ("Alpaca",       os.environ.get("ALPACA_API_KEY_ID", "")),
+                ("Finnhub",      os.environ.get("FINNHUB_API_KEY", "")),
+                ("RSS",          "always"),
+            ] if k
+        ),
+    }
+    return _json.dumps(snap, ensure_ascii=False, separators=(",", ":"))
+
+# ── セットアップウィザード完了チェック ─────────────────────────────────────────
+# setup_wizard.py を実行して WIZARD_COMPLETED=true が .env にない場合は起動停止
+_WIZARD_COMPLETED = os.environ.get("WIZARD_COMPLETED", "").strip().lower()
+if _WIZARD_COMPLETED != "true":
+    print(
+        "\n"
+        "  ╔══════════════════════════════════════════════════════════╗\n"
+        "  ║  ⚠️  セットアップウィザードが未実行です                      ║\n"
+        "  ║                                                          ║\n"
+        "  ║  売買Botを起動する前に setup_wizard.py を実行してください。  ║\n"
+        "  ║                                                          ║\n"
+        "  ║  Mac:     python3 setup_wizard.py                       ║\n"
+        "  ║  Windows: python  setup_wizard.py                       ║\n"
+        "  ╚══════════════════════════════════════════════════════════╝\n"
+    )
+    sys.exit(1)
+
+# ── 設定 ──────────────────────────────────────────────────────────────────────
+# ── moomoo OpenD 接続設定 ────────────────────────────────────────────────────
+MOOMOO_HOST    = os.environ.get("MOOMOO_HOST", "127.0.0.1")
+MOOMOO_PORT    = int(os.environ.get("MOOMOO_PORT", "11111"))
+MOOMOO_RSA_KEY = os.environ.get("MOOMOO_RSA_KEY", "")   # RSA秘密鍵ファイルパス（任意）
+# ★ v3.9.129: OpenD 無応答対策。moomoo SDK の同期照会は「接続READY待ち」を
+#   _sync_query_connect_timeout=None（＝無限）で待つため、OpenD がクラッシュせず
+#   固まると position_list_query 等が永久に返らない（利用者Aの実口座で120分沈黙）。
+#   ctx 生成直後に set_sync_query_connect_timeout() でこの待ちを有限化する。
+#   応答自体は SDK 内部の 12 秒 query_timeout / 33 秒 conn_alive で頭打ちされる。
+MOOMOO_CONNECT_TIMEOUT_SEC = int(os.environ.get("MOOMOO_CONNECT_TIMEOUT_SEC", "20"))
+# MOOMOO_TRADE_PASSWORD: moomoo GUI版ではAPIからのロック解除が無効化されたため未使用
+# 取引ロックが発生した場合は moomoo アプリで手動アンロックが必要です
+MOOMOO_TRADE_PASSWORD = ""  # 未使用（GUI版APIロック解除無効化のため）
+
+# ── 実口座acc_id(MOOMOO_ACC_ID) ──────────────────────────────────
+# 各ユーザーの「特定口座・信用口座」のacc_idを.envから読み込む。
+# 実口座モード(--live)では必須。未設定ならmain()起動時に停止。
+# 口座IDの調べ方: setup_wizard.py の自動取得、または --live 起動時に自動取得して .env へ書込
+_REAL_ACC_ID_RAW = os.environ.get("MOOMOO_ACC_ID", "").strip()
+try:
+    REAL_ACC_ID: int = int(_REAL_ACC_ID_RAW) if _REAL_ACC_ID_RAW else 0
+except ValueError:
+    print(f"[ERROR] MOOMOO_ACC_ID の値が無効です（数値である必要があります）: {_REAL_ACC_ID_RAW!r}")
+    sys.exit(1)
+
+# ── トリガー銘柄（ニュース監視専用）────────────────────────────────────────────
+# setup_wizard.py の STEP4 で設定した銘柄を読み込む
+_trigger_raw = os.environ.get("TRIGGER_TICKERS", "").strip()
+TRIGGER_TICKERS = [t.strip() for t in _trigger_raw.split(",") if t.strip()] if _trigger_raw else ["SPY", "QQQ"]
+
+# ── トリガー → 実行銘柄マッピング（TRIGGER_TICKERS から動的生成）─────────────
+# ブル（score=1）→ 現物買い / ベア（score=-1）→ 空売り（新規SELL）
+EXECUTION_MAP: Dict[str, List[str]] = {t: [t] for t in TRIGGER_TICKERS}
+
+# ── カテゴリ別発注銘柄マッピング ─────────────────────────────────────────────
+# MACRO → 先頭銘柄（通常SPY）
+# TECH  → 2番目以降（通常QQQ）
+# SEMI  → TRIGGER_TICKERSにSMHが含まれていればSMH、なければTECHと同じ（v2.85）
+_macro_sym = TRIGGER_TICKERS[0] if TRIGGER_TICKERS else "SPY"
+_tech_sym  = TRIGGER_TICKERS[1] if len(TRIGGER_TICKERS) > 1 else TRIGGER_TICKERS[0]
+_semi_sym  = "SMH" if "SMH" in TRIGGER_TICKERS else _tech_sym
+LEVERAGED_MAP: Dict[str, Dict[str, str]] = {
+    "MACRO":       {"bull": _macro_sym, "bear": _macro_sym},
+    "TECH":        {"bull": _tech_sym,  "bear": _tech_sym},
+    # ★ v2.94: SEMI_STRONG (強い半導体ニュース) のみ SMH 発注対象。
+    # 旧 "SEMI" エントリーは process_signal 側で発注前に return するため
+    # 実質使われないが、AI 旧モデル等が "SEMI" を返した場合のフォールバック用
+    # に残しておく（process_signal の SEMI スキップが先に発動する）。
+    "SEMI_STRONG": {"bull": _semi_sym,  "bear": _semi_sym},
+    "SEMI":        {"bull": _semi_sym,  "bear": _semi_sym},
+}
+
+# ── 個別株監視銘柄（任意）────────────────────────────────────────────────
+# STOCK_TICKERS=TSLA,NVDA,AAPL のように.envに設定すると
+# その銘柄固有のニュースをFinnhub company-news APIで取得して直接売買する。
+# 未設定の場合は個別株ループを起動しない（既存動作に影響ゼロ）。
+# ショートを使う場合はFinnhub APIキーが必要（貸株在庫確認に使用）。
+_stock_raw = os.environ.get("STOCK_TICKERS", "").strip()
+STOCK_TICKERS: List[str] = [
+    t.strip().upper() for t in _stock_raw.split(",") if t.strip()
+] if _stock_raw else []
+
+# ── 決算監視銘柄 ─────────────────────────────────────────────────────────────
+# EARNINGS_PRE=AAPL,MSFT    … プレマーケット 06:00〜08:00 ET に監視
+# EARNINGS_AFTER=AMZN,NVDA  … アフター     16:00〜16:30 ET に監視
+_earn_pre_raw   = os.environ.get("EARNINGS_PRE",   "").strip()
+_earn_after_raw = os.environ.get("EARNINGS_AFTER", "").strip()
+EARNINGS_PRE_TICKERS:   List[str] = [t.strip().upper() for t in _earn_pre_raw.split(",")   if t.strip()] if _earn_pre_raw   else []
+EARNINGS_AFTER_TICKERS: List[str] = [t.strip().upper() for t in _earn_after_raw.split(",") if t.strip()] if _earn_after_raw else []
+EARNINGS_POLL_SEC:   int   = int(os.environ.get("EARNINGS_POLL_SEC",   "2"))
+EARNINGS_CONFIDENCE: float = float(os.environ.get("EARNINGS_CONFIDENCE", "0.80"))
+_all_earnings = list(dict.fromkeys(EARNINGS_PRE_TICKERS + EARNINGS_AFTER_TICKERS))
+
+# ── 決算後モメンタム戦略パラメータ (v2.50 / アイデアB) ──────────────────────
+# WAIT_SEC: 検知後の方向確認待機秒数 (0=待機なし旧動作) / MIN_PCT: 最小変動率 %
+_earn_wait_raw = os.environ.get("EARNINGS_MOMENTUM_WAIT_SEC", "").strip()
+EARNINGS_MOMENTUM_WAIT_SEC: int = int(_earn_wait_raw) if _earn_wait_raw.isdigit() else 30
+_earn_min_raw = os.environ.get("EARNINGS_MOMENTUM_MIN_PCT", "").strip()
+try:
+    EARNINGS_MOMENTUM_MIN_PCT: float = float(_earn_min_raw) if _earn_min_raw else 2.0
+except ValueError:
+    EARNINGS_MOMENTUM_MIN_PCT = 2.0
+
+# ── ★ v3.9.73: PCT 入力単位の統一「1 = 1%」(後方互換あり) ───────────────────
+# 旧来、%系 env に2系統が混在していた:
+#   A群「1=1%」 : MAX_LOSS_PCT=0.30(=0.30%) / STOCK_MAX_PCT=10 / MOMENTUM_* など
+#   B群「0.01=1%」: TRAIL_*/LIMIT_BUFFER_*/EARNINGS_MAX_LOSS_PCT/EARNINGS_TRAIL_*
+# 受講生の混乱を避けるため B群を A群「1=1%(パーセント数値)」へ統一する。
+# 既存 .env を壊さないよう、値の大きさで旧小数を自動判別して後方互換で読む:
+#   値 >= 0.05  → 新方式(パーセント数値)。/100 して内部 fraction 化 (例 0.30→0.003)
+#   0 < 値 < 0.05 → 旧方式(小数)。そのまま fraction として使用 (例 0.003→0.003) + 警告
+#   空 → 既定 fraction / 0以下 → 0.0
+# しきい値 0.05: B群の現実的パーセント値(トレール≥0.1, バッファ≥0.3, 決算≥0.5)と
+#   旧小数(0.003〜0.05)を明確に分離。0.05%未満は非現実的なため衝突しない。
+_pct_unit_legacy_warnings: list = []  # (key, 旧小数値, 新表記候補) を起動時にまとめて警告
+
+def _pct_frac(key: str, default_frac: float, lo_frac: float = 0.0, hi_frac: float = 1.0) -> float:
+    """%系 env を fraction で返す。入力は「1=1%」を正とし、旧小数は後方互換で受ける。"""
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default_frac
+    try:
+        v = float(raw)
+    except ValueError:
+        return default_frac
+    if v <= 0:
+        return 0.0
+    if v >= 0.05:
+        frac = v / 100.0            # 新方式: パーセント数値 (0.30 = 0.30%)
+    else:
+        frac = v                    # 旧方式: 小数 (0.003 = 0.30%) → そのまま fraction
+        _pct_unit_legacy_warnings.append((key, v, round(v * 100, 4)))
+    return max(lo_frac, min(hi_frac, frac))
+
+
+def _emit_pct_unit_warnings() -> None:
+    """★ v3.9.73: 旧小数表記を検出した PCT 項目を起動時に1回まとめて警告。"""
+    if not _pct_unit_legacy_warnings:
+        return
+    log.warning(
+        "[PCT単位] 旧表記(小数)の項目を検出しました。新表記は『1=1%』です "
+        "(例: 0.003→0.30 と記載)。Wizard 再実行で自動統一されます。当面は旧表記でも動作します。"
+    )
+    for _k, _old, _new in _pct_unit_legacy_warnings:
+        log.warning(f"[PCT単位]   {_k}={_old} (旧小数) → 新表記は {_new}")
+
+
+# ── 決算銘柄専用トレール・タイムアウト (v2.50 / アイデアC) ─────────────────
+# 決算後は値動きが大きいためトレール幅広・タイムアウト無効が標準。
+# TRAIL_TRIGGER_PCT 3% (通常1%) / TRAIL_DROP_PCT 1.5% (通常0.5%) / TIMEOUT 0=無効
+# ★ v3.9.73: 入力は「1=1%」に統一 (旧小数も後方互換で受ける・_pct_frac)。
+EARNINGS_TRAIL_TRIGGER_PCT: float = _pct_frac("EARNINGS_TRAIL_TRIGGER_PCT", 0.03, 0.0, 0.5)
+EARNINGS_TRAIL_DROP_PCT: float = _pct_frac("EARNINGS_TRAIL_DROP_PCT", 0.015, 0.0, 0.5)
+_etout_raw = os.environ.get("EARNINGS_TIMEOUT_EXIT_MINUTES", "").strip()
+try:
+    EARNINGS_TIMEOUT_EXIT_MINUTES: int = int(_etout_raw) if _etout_raw else 0
+    if EARNINGS_TIMEOUT_EXIT_MINUTES < 0:
+        EARNINGS_TIMEOUT_EXIT_MINUTES = 0
+except ValueError:
+    EARNINGS_TIMEOUT_EXIT_MINUTES = 0
+
+# EARNINGS_MAX_LOSS_PCT: 決算銘柄専用の強制損切りライン（未設定/0 時はMAX_LOSS_PCTを流用）
+# ★ v3.9.73: 入力は「1=1%」に統一 (例 EARNINGS_MAX_LOSS_PCT=3 → -3%。旧 0.03 も後方互換)。
+EARNINGS_MAX_LOSS_PCT: float = _pct_frac("EARNINGS_MAX_LOSS_PCT", 0.0, 0.0, 0.5)
+# 0または未設定 = 通常のMAX_LOSS_PCTを流用
+
+# ── ★ v3.9.12: モメンタムシャドー観察モード (Phase 0) ──────────────────────
+# ニュースに頼らず「強いトレンド検出だけで発注する」戦略の Phase 0 評価機能。
+# 実発注は行わず、観察ログに「もし発注していたらどうなったか」を記録するだけ。
+# 5/12 PAN ログ分析で、preEntry +0.1〜+0.3% トレンド帯のエントリーが勝率 93%
+# だったことから、ニュース不要のトレンドフォロー戦略の有効性を 2 週間検証する。
+# DATA_COLLECT=true 環境でのみ動作 (受講生環境は完全に無感)。
+#
+# 設定の意味:
+#   MOMENTUM_SHADOW_ENABLED:    機能 ON/OFF (Phase 0 は true で観察のみ)
+#   MOMENTUM_LIVE_TRADING:      実発注 ON/OFF (Phase 1 で使用・現状 false 固定)
+#   MOMENTUM_TREND_5M_PCT:      5分騰落率の絶対値しきい値 (デフォルト 0.20%)
+#   MOMENTUM_TREND_15M_PCT:     15分騰落率の絶対値しきい値 (デフォルト 0.40%)
+#   MOMENTUM_CHECK_INTERVAL_SEC:チェック間隔 (デフォルト 300 秒 = 5 分)
+#   MOMENTUM_COOLDOWN_MIN:      同方向シグナルのクールダウン (デフォルト 30 分)
+#   MOMENTUM_ORDER_SIZE_PCT:    BUDGET_USD の何%を 1 件あたりに使うか (デフォルト 20)
+#                               観察ログには想定発注額として記録される。
+#                               0 設定で機能完全無効化。
+MOMENTUM_SHADOW_ENABLED: bool = (
+    os.environ.get("MOMENTUM_SHADOW_ENABLED", "true").strip().lower() == "true"
+)
+# ★ v3.9.68: 既定を false→true に変更。.env に記載が無ければモメンタム実発注 ON。
+#   (Wizard [2] 動作モードでも選択可。シャドー観察のみに戻す場合は false を明示)
+MOMENTUM_LIVE_TRADING: bool = (
+    os.environ.get("MOMENTUM_LIVE_TRADING", "true").strip().lower() == "true"
+)
+
+def _parse_momentum_float(key: str, default: float, min_val: float = 0.0, max_val: float = 5.0) -> float:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+        return max(min_val, min(max_val, v))
+    except ValueError:
+        return default
+
+def _parse_momentum_int(key: str, default: int, min_val: int = 0, max_val: int = 86400) -> int:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+        return max(min_val, min(max_val, v))
+    except ValueError:
+        return default
+
+MOMENTUM_TREND_5M_PCT:        float = _parse_momentum_float("MOMENTUM_TREND_5M_PCT",  0.20, 0.05, 2.0)
+MOMENTUM_TREND_15M_PCT:       float = _parse_momentum_float("MOMENTUM_TREND_15M_PCT", 0.40, 0.10, 3.0)
+MOMENTUM_CHECK_INTERVAL_SEC:  int   = _parse_momentum_int("MOMENTUM_CHECK_INTERVAL_SEC", 300, 60, 1800)
+MOMENTUM_COOLDOWN_MIN:        int   = _parse_momentum_int("MOMENTUM_COOLDOWN_MIN", 30, 5, 240)
+MOMENTUM_ORDER_SIZE_PCT:      float = _parse_momentum_float("MOMENTUM_ORDER_SIZE_PCT", 70.0, 0.0, 100.0)
+MOMENTUM_MAX_OPEN_POSITIONS:  int   = _parse_momentum_int("MOMENTUM_MAX_OPEN_POSITIONS", 1, 0, 10)
+
+# ── ★ v3.9.16: 銘柄別キャリブレーション (5 段階レベル) ───────────────────────
+# ★ v3.9.26: プリセット値を上方スライド (案B: 旧Lv1 → 新Lv3 にピン留め)
+#   5/15-5/19 シャドー観察データで「旧 Lv1 が累計最良 (+1.19% / 勝率61.5%) /
+#   旧 Lv5 のみ累計マイナス (-0.36% / 勝率41.2%)」と判明。旧プリセットでは
+#   推奨値の Lv3 が中庸過ぎ、Lv5 はノイズ過多だった。
+#   ユーザ .env の MOMENTUM_LEVEL 値は変更せず、プリセットの中身だけスライド:
+#     新 Lv3 = 旧 Lv1 (実績最良)  / 新 Lv4 = 旧 Lv2  / 新 Lv5 = 旧 Lv3
+#     新 Lv1 = 旧 Lv1 ×1.5 (より保守)  / 新 Lv2 = 旧 Lv1 ×1.25
+#   既存ユーザの .env は無変更でOK、推奨 Lv3 がデータ最良値に一致する。
+#
+# MOMENTUM_LEVEL: 1 (超厳格) 〜 5 (最緩和) の 5 段階。閾値の 6 値のみ制御。
+# 想定発火頻度: L1 ≈ 0-1件/日 〜 L5 ≈ 5-8件/日 (3 銘柄合算)
+#
+# CD と ORDER_SIZE_PCT は MOMENTUM_LEVEL と独立に設定可能 (MOMENTUM_COOLDOWN_MIN /
+# MOMENTUM_ORDER_SIZE_PCT を別途設定する)。
+#
+# 上級者向け: 個別 env (MOMENTUM_{QQQ,SPY,SMH}_{5M,15M}_PCT) を設定すると
+# LEVEL プリセットを上書きできる。
+MOMENTUM_LEVEL: int = _parse_momentum_int("MOMENTUM_LEVEL", 3, 1, 5)
+
+# Level → 銘柄別 (5min, 15min) 閾値プリセット (絶対値)
+# ★ v3.9.26: 上方スライド (新Lv3 = 旧Lv1 ピン留め)
+# ★ v3.9.33: IWM (Russell 2000 小型株 ETF) を追加。シャドー専用 (MOMENTUM_ENABLED_SIDES
+#   には含めない) のため実発注対象外。閾値は QQQ をやや上回る推定値で開始し、
+#   1-2 週間のシャドー観察データで再キャリブレーション予定。
+# ★ v3.9.62: DRAM (Roundhill Memory ETF・2026-04-02 上場) を追加。シャドー専用。
+#   DRAM はボラが非常に大きい (≈ SPY の約3倍) ため、閾値は SPY プリセット × 3.0 で
+#   開始する (Lv3 標準 = SPY 0.10/0.22 → DRAM 0.30/0.66)。新規上場で実績が浅いため、
+#   IWM 同様 1-2 週間のシャドー観察データで再キャリブレーション予定。
+_MOMENTUM_LEVEL_PRESETS: Dict[int, Dict[str, tuple]] = {
+    1: {"QQQ": (0.22, 0.45), "SPY": (0.15, 0.33), "SMH": (0.33, 0.67), "IWM": (0.24, 0.48), "DRAM": (0.45, 0.99)},  # 超厳格
+    2: {"QQQ": (0.18, 0.36), "SPY": (0.13, 0.28), "SMH": (0.27, 0.55), "IWM": (0.20, 0.40), "DRAM": (0.39, 0.84)},  # 厳格
+    3: {"QQQ": (0.15, 0.30), "SPY": (0.10, 0.22), "SMH": (0.22, 0.45), "IWM": (0.16, 0.33), "DRAM": (0.30, 0.66)},  # 標準 ⭐推奨
+    4: {"QQQ": (0.12, 0.24), "SPY": (0.08, 0.18), "SMH": (0.18, 0.36), "IWM": (0.13, 0.26), "DRAM": (0.24, 0.54)},  # 緩和
+    5: {"QQQ": (0.10, 0.20), "SPY": (0.07, 0.15), "SMH": (0.15, 0.30), "IWM": (0.11, 0.22), "DRAM": (0.21, 0.45)},  # 最緩和
+}
+_MOMENTUM_LEVEL_NAMES: Dict[int, str] = {
+    1: "超厳格", 2: "厳格", 3: "標準", 4: "緩和", 5: "最緩和",
+}
+
+# ★ v3.9.26: プリセット履歴 (レポート集計のバージョン跨ぎ一貫性のため)
+# 観察ログには bot_version と LEVEL の実効値 (signal_threshold) が記録されるので、
+# レポート側は「実効プロファイル」基準で連結集計できる。
+# 例: v3.9.25 Lv1 と v3.9.26 Lv3 はどちらも QQQ=(0.15, 0.30) → 同じプロファイル。
+_MOMENTUM_LEVEL_PRESETS_HISTORY: Dict[str, Dict[int, Dict[str, tuple]]] = {
+    "v3.9.16-v3.9.25": {
+        1: {"QQQ": (0.15, 0.30), "SPY": (0.10, 0.22), "SMH": (0.22, 0.45)},
+        2: {"QQQ": (0.12, 0.24), "SPY": (0.08, 0.18), "SMH": (0.18, 0.36)},
+        3: {"QQQ": (0.10, 0.20), "SPY": (0.07, 0.15), "SMH": (0.15, 0.30)},
+        4: {"QQQ": (0.08, 0.16), "SPY": (0.06, 0.12), "SMH": (0.12, 0.24)},
+        5: {"QQQ": (0.06, 0.12), "SPY": (0.04, 0.09), "SMH": (0.09, 0.18)},
+    },
+    "v3.9.26+": dict(_MOMENTUM_LEVEL_PRESETS),  # 現行プリセットのスナップショット
+    # 注: IWM は v3.9.33・DRAM は v3.9.62 で追加。それ以前の各銘柄データは存在しない
+    #     ため、上記スナップショットに含まれていても集計上の問題はない。
+}
+
+# ── ★ v3.9.25: MOMENTUM_RISK_LEVEL (1-5) リスク管理一括設定 ─────────────────
+# ★ v3.9.26: RISK_LEVEL も同方針で上方スライド (新Lv3 = 旧Lv1 ピン留め)
+#   理由: LEVEL のスライドと整合させ「LEVEL=3,3 推奨」を v3.9.25 と一致させる。
+#   ユーザ .env の MOMENTUM_RISK_LEVEL 値は変更せず、プリセットの中身だけ更新。
+#
+# Level → (1回損失%, 1日損失%, 投入額%, 急変動ガード%)
+_MOMENTUM_RISK_LEVEL_PRESETS: Dict[int, Dict[str, float]] = {
+    1: {"per_trade_pct": 0.10, "daily_pct": 0.25, "order_pct":  5.0, "vola_pct": 0.50},  # 超慎重 (新)
+    2: {"per_trade_pct": 0.15, "daily_pct": 0.40, "order_pct":  7.0, "vola_pct": 0.60},  # 慎重 (新)
+    3: {"per_trade_pct": 0.20, "daily_pct": 0.50, "order_pct": 10.0, "vola_pct": 0.70},  # 標準 ⭐推奨 (= 旧 Lv1)
+    4: {"per_trade_pct": 0.25, "daily_pct": 0.75, "order_pct": 12.0, "vola_pct": 0.85},  # 積極 (= 旧 Lv2)
+    5: {"per_trade_pct": 0.30, "daily_pct": 1.00, "order_pct": 15.0, "vola_pct": 1.00},  # 高リスク (= 旧 Lv3)
+}
+_MOMENTUM_RISK_LEVEL_NAMES: Dict[int, str] = {
+    1: "超慎重", 2: "慎重", 3: "標準", 4: "積極", 5: "高リスク",
+}
+
+# ★ v3.9.26: RISK_LEVEL プリセット履歴 (レポート集計のバージョン跨ぎ一貫性)
+_MOMENTUM_RISK_LEVEL_PRESETS_HISTORY: Dict[str, Dict[int, Dict[str, float]]] = {
+    "v3.9.25": {
+        1: {"per_trade_pct": 0.20, "daily_pct": 0.50, "order_pct": 10.0, "vola_pct": 0.70},
+        2: {"per_trade_pct": 0.25, "daily_pct": 0.75, "order_pct": 12.0, "vola_pct": 0.85},
+        3: {"per_trade_pct": 0.30, "daily_pct": 1.00, "order_pct": 15.0, "vola_pct": 1.00},
+        4: {"per_trade_pct": 0.35, "daily_pct": 1.25, "order_pct": 20.0, "vola_pct": 1.25},
+        5: {"per_trade_pct": 0.40, "daily_pct": 1.50, "order_pct": 25.0, "vola_pct": 1.50},
+    },
+    "v3.9.26+": dict(_MOMENTUM_RISK_LEVEL_PRESETS),
+}
+
+MOMENTUM_RISK_LEVEL: int = _parse_momentum_int("MOMENTUM_RISK_LEVEL", 3, 1, 5)
+_risk_preset = _MOMENTUM_RISK_LEVEL_PRESETS.get(MOMENTUM_RISK_LEVEL,
+                                                 _MOMENTUM_RISK_LEVEL_PRESETS[3])
+MOMENTUM_PER_TRADE_LOSS_PCT:  float = _risk_preset["per_trade_pct"]   # 1 トレード許容損失
+MOMENTUM_DAILY_LOSS_PCT:      float = _risk_preset["daily_pct"]       # 1 日累計 損失上限
+MOMENTUM_RISK_ORDER_SIZE_PCT: float = _risk_preset["order_pct"]       # 投入額 (RISK_LEVEL から)
+MOMENTUM_VOLATILITY_GUARD_PCT: float = _risk_preset["vola_pct"]       # 急変動ガード 閾値
+
+# ── ★ v3.9.34: MOMENTUM_MAX_PCT (Wizard v1.8 で設定する 1 回の最大発注比率) ──
+# 発注額の決定方法を「最大発注比率 (MAX_PCT) を山型配分」に変更。
+#   最終発注額 = BUDGET × MOMENTUM_MAX_PCT × シグナル強度係数 (50/75/100/0%)
+# 優先順位:
+#   ① MOMENTUM_MAX_PCT (Wizard v1.8 で設定・新方式) が最優先
+#   ② 旧 MOMENTUM_ORDER_SIZE_PCT が .env にあれば後方互換で使用
+#   ③ どちらもなければ RISK_LEVEL プリセットの order_pct にフォールバック
+# 受講生の多くは BUDGET $10,000 前後で、旧 RISK_LEVEL の 10-25% では
+# 1 回 $1,000-$2,500 となり手数料負けしやすかった。MAX_PCT 既定 80% で
+# 中シグナル時 $6,000 を確保し、手数料を吸収できる水準にする。
+_momentum_max_pct_raw = os.environ.get("MOMENTUM_MAX_PCT", "").strip()
+_legacy_size_pct_raw = os.environ.get("MOMENTUM_ORDER_SIZE_PCT", "").strip()
+if _momentum_max_pct_raw:
+    # ① 新方式: Wizard v1.8 の MOMENTUM_MAX_PCT
+    try:
+        MOMENTUM_ORDER_SIZE_PCT = max(0.0, min(100.0, float(_momentum_max_pct_raw)))
+    except ValueError:
+        MOMENTUM_ORDER_SIZE_PCT = 80.0
+elif _legacy_size_pct_raw:
+    # ② 後方互換: 旧 MOMENTUM_ORDER_SIZE_PCT は _parse_momentum_float で読込済
+    pass
+else:
+    # ③ フォールバック: RISK_LEVEL プリセットの order_pct
+    MOMENTUM_ORDER_SIZE_PCT = MOMENTUM_RISK_ORDER_SIZE_PCT
+
+# ── ★ v3.9.25: 個別 .env 設定 (上級者向け・5 項目) ────────────────────────
+# Wizard では聞かない。デフォルト動作で大半の受講生は問題なし。
+
+# 1) 銘柄サイド有効化 (デフォルト: 7 日間シャドーで累計プラスの組合せのみ)
+# ★ v3.9.61: IWM:SELL_SHORT を実発注対象から除外しシャドー専用に戻す。
+#   v3.9.54 で IWM:SELL_SHORT を実発注対象に追加していたが、IWM は TRIGGER_TICKERS
+#   にも EXECUTION_MAP にも含まれないため、risk_monitor_loop / 週末決済 /
+#   パニックセル / sync_positions のいずれの監視系統からも漏れていた
+#   (5/29 23:25 IWM SHORT 27株が約定後・週末決済でも検出されず放置された実例)。
+#   実発注は「TRIGGER_TICKERS に含まれ監視対象である」SPY/QQQ のみに限定する。
+#   IWM は MOMENTUM_SYMBOLS でシャドー観察を継続。
+#   (※ v3.9.61 では併せて「実発注銘柄は必ず監視対象に含める」システム的修正と
+#      起動時のズレ検証警告を追加。万一 env で監視外銘柄を実発注対象にしても
+#      自動的に監視対象へ取り込まれる。)
+# ★ v3.9.63: SMH:BUY を実発注対象に追加 (構造問題の是正)。
+#   背景: 全受講生がデモ口座で、デモは API 空売り不可 (place_short が shadow 転送)。
+#   そのため SPY/QQQ:SELL_SHORT を有効化しても実際に約定する実発注は QQQ:BUY のみに
+#   なり、QQQ:BUY は観察で最悪サイド (6/1: WR22.8%/-1.72%, Phase 1 実発注 WR14.3%)。
+#   一方デモで約定可能かつ観察で好調な SMH-BUY (6/1: +3.30%/WR80.2%) はシャドー止まり
+#   だった。SMH は TRIGGER_TICKERS(標準 SPY,QQQ,SMH) に含まれ監視対象のため、
+#   v3.9.61 原則「実発注銘柄=必ず監視対象」に適合し orphan の懸念なし。
+#   QQQ:BUY は実発注継続だが要観察 (上昇トレンド日は機能・往来/下落日は不振)。
+#   env MOMENTUM_ENABLED_SIDES で上書き可 (QQQ:BUY を外す等は受講生/講師判断)。
+# ★ v3.9.66: 勝ち筋の SHORT 側を実発注対象に追加 (ブレークスルー施策A)。
+#   観察データで SHORT が一貫して BUY を圧倒 (6/2: SHORT +2.25%/WR87% vs BUY +0.55%/WR50%)。
+#   SMH-SHORT +3.34%, QQQ-SHORT +2.97%(WR100%), IWM-SHORT +1.56%(WR100%),
+#   DRAM-SHORT +0.73%(WR98%)。v3.9.65 のデモ・ネッティング空売り (DEMO_SHORT_ENABLED=true)
+#   と組み合わせることで、デモ生も勝ち筋ショートを実発注化できる。
+#   監視整合性: SMH は TRIGGER_TICKERS、IWM は _momentum_live_symbols() 経由で
+#   risk_monitor/週末決済/パニック/sync に自動取込済 (v3.9.61 原則) のため orphan 懸念なし。
+# ★ v3.9.70: DRAM:SELL_SHORT を既定から除外 (実績浅く、自動実発注化が想定外だったため)。
+#   DRAM は MOMENTUM_SYMBOLS でシャドー観察を継続 (実発注はしない)。
+#   実発注対象サイドは Wizard で明示選択し MOMENTUM_ENABLED_SIDES に書き出す方針へ。
+#   .env に MOMENTUM_ENABLED_SIDES があればそれが最優先 (= Wizard 設定が取引対象)。
+# ★ v3.9.79: 既定の実発注サイドから IWM を除外（IWM/DRAM はシャドー観察のみ・実発注成績不振のため）。
+#   IWM/DRAM を実発注にしたい場合のみ env MOMENTUM_ENABLED_SIDES で明示指定する。
+_DEFAULT_ENABLED_SIDES = (
+    "SPY:SELL_SHORT,QQQ:SELL_SHORT,QQQ:BUY,SMH:BUY,SMH:SELL_SHORT"
+)
+_enabled_sides_raw = os.environ.get("MOMENTUM_ENABLED_SIDES", _DEFAULT_ENABLED_SIDES).strip()
+MOMENTUM_ENABLED_SIDES: set = set()
+for _pair in _enabled_sides_raw.split(","):
+    _pair = _pair.strip().upper()
+    if ":" in _pair:
+        MOMENTUM_ENABLED_SIDES.add(_pair)
+
+
+def _momentum_live_symbols() -> set:
+    """★ v3.9.61: MOMENTUM_LIVE_TRADING=true 時に実発注されうる銘柄の集合を返す。
+
+    MOMENTUM_ENABLED_SIDES (例: {'QQQ:BUY', 'SPY:SELL_SHORT'}) から銘柄部分のみを
+    抽出する。risk_monitor_loop / 週末決済 / パニックセル / sync_positions の
+    監視対象に必ず含めることで、「実発注したが監視されない」ポジションの発生を
+    構造的に防ぐ (5/29 IWM orphan 事象の再発防止)。
+    MOMENTUM_LIVE_TRADING=false (シャドーのみ) のときは空集合を返す。
+    """
+    if not MOMENTUM_LIVE_TRADING:
+        return set()
+    return {
+        _s.split(":")[0].strip().upper()
+        for _s in MOMENTUM_ENABLED_SIDES
+        if ":" in _s
+    }
+
+# 2) ★ v3.9.45: 銘柄別サイズ係数は廃止 (全銘柄 1.0 に統一)
+# 旧 v3.9.32-v3.9.44: SPY=1.0 / QQQ=0.5 / SMH=0.0 / IWM=0.85
+# 旧設計の理由:
+#   - QQQ=0.5 は変動が大きいためサイズ縮小 (リスク調整)
+#   - SMH=0.0 / IWM=0.85 はシャドー専用銘柄 (発注対象外)
+# 廃止の理由:
+#   - QQQ=0.5 で発注額が半分になり手数料負けの主因になっていた
+#     (BUDGET $10,000・MAX_PCT 80% で QQQ は $4,000 → 手数料込で利幅縮小)
+#   - SMH=0.0 はシャドー観察ログの想定発注額を $0 にしてしまい、データ集計の
+#     精度を損なっていた (実発注の可否は MOMENTUM_ENABLED_SIDES で独立に制御)
+#   - 「銘柄別リスク調整」は MAX_LOSS_PCT × _HIGHVOL_SYMBOLS の自動調整で
+#     既にカバーされている (二重制御の重複)
+# 全銘柄 1.0 に統一することで:
+#   - 手数料負けを解消 (発注額がベース予算 × MAX_PCT × 強度係数で素直に決まる)
+#   - シャドー観察データの想定発注額が現実的な値になり、PnL 推定が正確に
+#   - 実発注対象は MOMENTUM_ENABLED_SIDES で引き続き制御 (SMH/IWM は除外維持)
+# 環境変数 MOMENTUM_SIZE_MULTIPLIER_<銘柄> で上書き可能 (上級者向け)。
+MOMENTUM_SIZE_MULTIPLIER: Dict[str, float] = {
+    "SPY":  _parse_momentum_float("MOMENTUM_SIZE_MULTIPLIER_SPY", 1.00, 0.0, 2.0),
+    "QQQ":  _parse_momentum_float("MOMENTUM_SIZE_MULTIPLIER_QQQ", 1.00, 0.0, 2.0),
+    "SMH":  _parse_momentum_float("MOMENTUM_SIZE_MULTIPLIER_SMH", 1.00, 0.0, 2.0),
+    "IWM":  _parse_momentum_float("MOMENTUM_SIZE_MULTIPLIER_IWM", 1.00, 0.0, 2.0),
+    "DRAM": _parse_momentum_float("MOMENTUM_SIZE_MULTIPLIER_DRAM", 1.00, 0.0, 2.0),  # ★ v3.9.62
+}
+
+# 3-4) ★ v3.9.41: 発注時間帯フィルタは廃案
+# v3.9.25 で「RTH 11:00-15:30 ET 限定発火」フィルタを導入したが、
+# 8 日間のシャドー検証 (5/15-22) で 3 日中 2 日で逆効果が実証された:
+#   - 5/20 大幅劣化: フィルタ前 +1.55% / WR 78.6% → フィルタ後 -0.17% / WR 60%
+#   - 5/22 完全壊滅: フィルタ前 +0.745% / WR 66.1% → フィルタ後 -1.16% / WR 0%
+# 寄り付き 9-10 時台 (ET) が黄金時間帯になる日が多く、ここを固定除外する
+# のは害となるケースが大半。代わりに既存の急変動ガード (SPY 5m |Δ| ≥
+# MOMENTUM_VOLATILITY_GUARD_PCT) で「相場状態」ベースの制御に統一する。
+# .env の MOMENTUM_RTH_START_ET / MOMENTUM_RTH_END_ET は無視される。
+
+# 5) 個別損切りライン (デフォルト 0.50%)
+MOMENTUM_STOP_LOSS_PCT: float = _parse_momentum_float("MOMENTUM_STOP_LOSS_PCT", 0.50, 0.10, 5.0)
+
+# ★ v3.9.94: LONG(BUY) の最小シグナル閾値 (5分騰落率の下限・デフォルト 0.15%)。
+#   実データ分析(LONG 1,699件): エントリー前変動 <0.10% の弱シグナルLONGが損失の
+#   ほぼ全て(その帯だけ約 -$5,275)。0.10%以上に絞るとLONGは -$4,599 → +$676 と
+#   プラス転換し、勝率も 0.52→0.58→0.64 と単調改善。安全マージンを取り 0.15% を
+#   LONG専用の下限に設定(371件・WR53%・+$627)。SHORTは現状維持(SHORTが利益源のため)。
+#   ※ LONG の実発注のみ抑制し、シャドー観察(momentum_shadow)は全件継続記録する。
+#   0 で無効(従来どおり)。
+MOMENTUM_LONG_MIN_SIGNAL_PCT: float = _parse_momentum_float(
+    "MOMENTUM_LONG_MIN_SIGNAL_PCT", 0.70, 0.0, 5.0)   # ★ v3.9.114: 0.15→0.70（弱LONG除外）
+# ★ v3.9.114: ロング実発注の5分モメンタム上限（0=無制限）。過去観察で1.5%超は反転しやすく
+#   低調だったため、Wizardの「強帯も許可」選択でここを1.50へ緩和して強帯を捕捉する。
+#   0.80(既定・現行上限相当) / 1.00(中程度以上) / 1.50(強帯も許可)。ショートは対象外。
+MOMENTUM_LONG_MAX_SIGNAL_PCT: float = _parse_momentum_float(
+    "MOMENTUM_LONG_MAX_SIGNAL_PCT", 0.80, 0.0, 5.0)
+
+# ★ v3.9.93 (案a): 高ボラ銘柄の損切り幅拡大は「実取引では変えず、全員のシャドーで検証」
+#   する方針。現状の不整合（高ボラ銘柄は発注時に size÷倍率済みなのに、モメンタム損切りは
+#   0.50%固定で倍率未適用＝SMHは小サイズ+狭損切りで自分のノイズ0.52%に負けwhipsaw）を、
+#   観察ログの仮想列「狭い損切り(現行) vs 広い損切り(×倍率)」(_compute_virtual_exits)で
+#   計測する。実発注のロジックは一切変更しない。
+
+# 6) ★ v3.9.26: 強シグナル上限ガード
+# 5/19 シャドーで「強シグナル 0.8%+ が 2 日連続マイナス」と判明 (ノイズ域)。
+# |5min 騰落率| ≥ MOMENTUM_MAX_SIGNAL_PCT のシグナルはノイズ扱いでスキップ。
+# 0 設定で無効化 (上限なし)。
+MOMENTUM_MAX_SIGNAL_PCT: float = _parse_momentum_float("MOMENTUM_MAX_SIGNAL_PCT", 0.80, 0.0, 5.0)
+
+# ★ v3.9.62: 銘柄別の強シグナル上限オーバーライド。
+# 既定の 0.80% は SPY/QQQ スケールの観察データ由来。DRAM はボラが約3倍のため、
+# 同じ 0.80% だと通常のトレンドが頻繁に「ノイズ(発注なし)」扱いで弾かれる。
+# DRAM 専用に ≈3倍 (= 既定 0.80% × 3 = 2.40%) を適用する。env で上書き可能。
+# ※ DRAM はシャドー専用のため、この上限は観察ログ上の「想定発注/見送り」判定にのみ影響する。
+MOMENTUM_DRAM_MAX_SIGNAL_PCT: float = _parse_momentum_float(
+    "MOMENTUM_DRAM_MAX_SIGNAL_PCT", round(MOMENTUM_MAX_SIGNAL_PCT * 3.0, 2), 0.0, 10.0
+)
+# ★ v3.9.72: SMH の強シグナル上限を 0.80%→1.20% に引き上げ (env 上書き可)。
+# SMH は 15分変動率の中央値 0.52% と高ボラで、共通 0.80% 上限だと信号の約17%が
+# 「強(発注なし)」に弾かれ発注機会を不必要に削っていた。検証 (観察60分) では新たに
+# 解禁される 0.80-1.20% 帯が SHORT +0.36%/WR75%・LONG +0.13%/WR70% と明確にプラス。
+# 一方 1.20%超は SHORT 平均マイナス (大負けの尾) のため 1.20% で線引きする。
+MOMENTUM_SMH_MAX_SIGNAL_PCT: float = _parse_momentum_float(
+    "MOMENTUM_SMH_MAX_SIGNAL_PCT", 1.20, 0.0, 10.0
+)
+_MOMENTUM_MAX_SIGNAL_OVERRIDE: Dict[str, float] = {
+    "DRAM": MOMENTUM_DRAM_MAX_SIGNAL_PCT,
+    "SMH":  MOMENTUM_SMH_MAX_SIGNAL_PCT,
+}
+
+# 7) ★ v3.9.63: 寄り高値掴みガード (BUY 実発注のみ)。
+# 6/1 実発注は全件 QQQ-BUY で WR14.3%、エントリー $744-745 の高値掴みほどマイナス大
+# (QQQ が寄り $737→$745 へ上昇後に伸び悩み、時間切れ決済が小幅マイナス連発)。
+# 直近 MOMENTUM_HIGH_CHASE_LOOKBACK_MIN 分の高値に対し現値が GUARD_PCT% 以内なら
+# 「天井圏での追随買い」とみなし BUY 実発注を見送る (シャドー観察ログは継続記録)。
+# SHORT には適用しない (下落の勢いに乗る側なので高値掴み問題と無関係)。
+# 0 設定で無効化。デフォルトは保守的 (0.05% = ほぼ高値到達時のみ抑止) で開始し、
+# シャドーデータで調整する。
+MOMENTUM_HIGH_CHASE_GUARD_PCT: float = _parse_momentum_float(
+    "MOMENTUM_HIGH_CHASE_GUARD_PCT", 0.05, 0.0, 2.0)
+MOMENTUM_HIGH_CHASE_LOOKBACK_MIN: int = _parse_momentum_int(
+    "MOMENTUM_HIGH_CHASE_LOOKBACK_MIN", 30, 5, 240)
+
+# 8) ★ v3.9.66 (施策C): サイド別サイズ配分 — 勝ち筋に資金を寄せる。
+# 観察データで SHORT が BUY を一貫して圧倒 (6/2: SHORT WR87% vs BUY WR50%)。
+# BUY のサイズに係数を掛けて縮小し、相対的に SHORT へ資金を集中させる。
+# 1.0 で無効 (BUY も SHORT と同サイズ)。既定 0.6 (BUY を 60% に圧縮)。
+MOMENTUM_BUY_SIZE_MULT: float = _parse_momentum_float("MOMENTUM_BUY_SIZE_MULT", 0.60, 0.0, 1.0)
+MOMENTUM_SHORT_SIZE_MULT: float = _parse_momentum_float("MOMENTUM_SHORT_SIZE_MULT", 1.00, 0.0, 2.0)
+
+
+def _momentum_high_chase_block(symbol: str, side: str, price: float) -> bool:
+    """★ v3.9.63: BUY 実発注が「直近高値の追随買い (高値掴み)」かを判定。
+
+    True を返すと実発注を見送る (シャドー観察は別途継続)。
+    - SHORT / ガード無効 (PCT<=0) / 価格不正 のときは常に False。
+    - 直近 LOOKBACK_MIN 分の高値 hi に対し price >= hi*(1 - GUARD_PCT/100) なら True。
+    """
+    if side != "BUY" or MOMENTUM_HIGH_CHASE_GUARD_PCT <= 0 or price <= 0:
+        return False
+    hist = _INDEX_PRICE_HISTORY.get(symbol)
+    if not hist:
+        return False
+    cutoff = datetime.datetime.now() - datetime.timedelta(minutes=MOMENTUM_HIGH_CHASE_LOOKBACK_MIN)
+    highs = [p for (t, p) in hist if t >= cutoff and p > 0]
+    if len(highs) < 3:   # データ不足時はガードしない (誤抑止回避)
+        return False
+    hi = max(highs)
+    if hi <= 0:
+        return False
+    threshold = hi * (1 - MOMENTUM_HIGH_CHASE_GUARD_PCT / 100.0)
+    return price >= threshold
+
+
+def _momentum_max_signal_for(symbol: str) -> float:
+    """★ v3.9.62: 銘柄別の強シグナル上限 (絶対値%) を返す。未登録銘柄は共通値。"""
+    return _MOMENTUM_MAX_SIGNAL_OVERRIDE.get(symbol, MOMENTUM_MAX_SIGNAL_PCT)
+
+# ── コード固定値 (env なし・全員共通) ──────────────────────────────────────
+_MOMENTUM_CONSEC_LOSS_LIMIT      = 3      # 連敗カウント基準
+_MOMENTUM_CONSEC_LOSS_SIZE_RATIO = 0.5    # 連敗時サイズ縮小率 (50%)
+_MOMENTUM_CONSEC_LOSS_RESET_MIN  = 60     # 連敗リセット時間 (60 分)
+_MOMENTUM_VOLA_COOLDOWN_MIN      = 10     # 急変動ガード クールダウン (10 分)
+_MOMENTUM_TRAIL_MIN_PEAK_USD     = 1.50   # peak トレール 発動最低 PnL
+_MOMENTUM_TRAIL_RETRACE_PCT      = 0.35   # peak から 35% 戻し
+_MOMENTUM_DAILY_RESET_HOUR_ET    = 4      # デイストップ リセット 04:00 ET
+
+# ── ★ v3.9.25: モメンタム実行時の状態管理 ────────────────────────────────
+# デイストップロス: 1 日累計 PnL を追跡 → -X% で当日停止
+_momentum_daily_pnl: float = 0.0
+_momentum_daily_reset_date: Optional["datetime.date"] = None
+_momentum_daily_stopped: bool = False
+# ★ v3.9.67: momentum_record_trade_result は決済確定スレッド (_send_trade_result) から
+# 呼ばれるため、日次/週次 PnL 累計の競合を防ぐロック。
+_momentum_pnl_lock = threading.Lock()
+
+# 急変動ガード: 直近の発動時刻を保持
+_momentum_volatility_guard_until: Optional["datetime.datetime"] = None
+
+# 連敗時サイズ縮小: 連敗カウント + リセット時刻
+_momentum_consecutive_losses: int = 0
+_momentum_last_win_time: Optional["datetime.datetime"] = None
+
+# ★ v3.9.55: BUDGET 比 % ベースのサーキットブレーカー (5/27 Phase 1 初日 -$504 への対応)
+# 既存の MOMENTUM_DAILY_LOSS_PCT は RISK_LEVEL プリセット由来 (L3=0.50%) で
+# 絶対額があまりに小さく、Phase 1 の壊滅損失を防げなかった。
+# 受講生の BUDGET (例 $10,000) に対する % で「日 3% (= $300) / 週 5% (= $500)」を
+# トップレベルのハードストップとして導入。% ベースなので異なる BUDGET でも比例調整。
+# 週次は月曜 ET 04:00 でリセット (取引日基準と一致)。
+_momentum_weekly_pnl: float = 0.0
+_momentum_weekly_reset_date: Optional["datetime.date"] = None   # 週の月曜日
+_momentum_weekly_stopped: bool = False
+
+# ── ★ v3.9.58: セッション切替後のモメンタムクールダウン ──────────────────
+# OVN/WEEKEND/休日 → PREMARKET 等の切替直後は急変動しがちだが持続しない
+# (寄り高 V 字等) ケースが多いため、モメンタムシグナル発火を一定時間見送る。
+# 0 設定で無効化。デフォルト 300 秒 = 5 分。
+_mom_sess_cd_raw = os.environ.get("MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC", "").strip()
+try:
+    MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC: int = int(_mom_sess_cd_raw) if _mom_sess_cd_raw else 300
+    if MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC < 0:
+        MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC = 0
+except ValueError:
+    MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC = 300
+
+# ── トップレベル安全網: BUDGET 比 % で停止 (RISK_LEVEL とは独立) ────────────
+# .env で値を上書き可能。0 設定で無効化。
+_mom_daily_budget_pct_raw  = os.environ.get("MOMENTUM_DAILY_LOSS_BUDGET_PCT", "").strip()
+_mom_weekly_budget_pct_raw = os.environ.get("MOMENTUM_WEEKLY_LOSS_BUDGET_PCT", "").strip()
+try:
+    MOMENTUM_DAILY_LOSS_BUDGET_PCT: float = float(_mom_daily_budget_pct_raw) if _mom_daily_budget_pct_raw else 3.0
+    if MOMENTUM_DAILY_LOSS_BUDGET_PCT < 0:
+        MOMENTUM_DAILY_LOSS_BUDGET_PCT = 0.0
+except ValueError:
+    MOMENTUM_DAILY_LOSS_BUDGET_PCT = 3.0
+try:
+    MOMENTUM_WEEKLY_LOSS_BUDGET_PCT: float = float(_mom_weekly_budget_pct_raw) if _mom_weekly_budget_pct_raw else 5.0
+    if MOMENTUM_WEEKLY_LOSS_BUDGET_PCT < 0:
+        MOMENTUM_WEEKLY_LOSS_BUDGET_PCT = 0.0
+except ValueError:
+    MOMENTUM_WEEKLY_LOSS_BUDGET_PCT = 5.0
+
+
+def _momentum_reset_daily_if_needed() -> None:
+    """ET 基準で日付が変わったらデイストップ状態をリセット。
+    ★ v3.9.54: 週次サーキットブレーカー (月曜 04:00 ET リセット) も同時に処理。
+    """
+    global _momentum_daily_pnl, _momentum_daily_reset_date, _momentum_daily_stopped
+    global _momentum_weekly_pnl, _momentum_weekly_reset_date, _momentum_weekly_stopped
+    now_et = datetime.datetime.now(_ET)
+    # 04:00 ET 起点の「取引日」を計算
+    if now_et.hour < _MOMENTUM_DAILY_RESET_HOUR_ET:
+        trade_date = (now_et - datetime.timedelta(days=1)).date()
+    else:
+        trade_date = now_et.date()
+    if _momentum_daily_reset_date != trade_date:
+        _momentum_daily_reset_date = trade_date
+        _momentum_daily_pnl = 0.0
+        _momentum_daily_stopped = False
+    # 週次リセット (月曜 04:00 ET = 週の開始)
+    # trade_date の週の月曜日を計算 (weekday(): 月=0, 日=6)
+    week_start = trade_date - datetime.timedelta(days=trade_date.weekday())
+    if _momentum_weekly_reset_date != week_start:
+        _momentum_weekly_reset_date = week_start
+        _momentum_weekly_pnl = 0.0
+        _momentum_weekly_stopped = False
+
+
+def _momentum_check_volatility_guard(symbol: str) -> bool:
+    """急変動ガード判定。True なら新規発注禁止 (沈静化待ち中)"""
+    global _momentum_volatility_guard_until
+    now = datetime.datetime.now()
+    # クールダウン中?
+    if _momentum_volatility_guard_until is not None and now < _momentum_volatility_guard_until:
+        return True
+    # SPY の 5m 変動率をチェック (基準銘柄として)
+    spy_5m = get_index_pct_change("SPY", 5)
+    if spy_5m is None:
+        return False
+    if abs(spy_5m) >= MOMENTUM_VOLATILITY_GUARD_PCT:
+        _momentum_volatility_guard_until = now + datetime.timedelta(minutes=_MOMENTUM_VOLA_COOLDOWN_MIN)
+        log.warning(
+            f"[モメンタム] 🌪 急変動ガード発動: SPY 5m {spy_5m:+.2f}% "
+            f"(閾値 ±{MOMENTUM_VOLATILITY_GUARD_PCT:.2f}%) → 新規発注を {_MOMENTUM_VOLA_COOLDOWN_MIN}分停止"
+        )
+        return True
+    return False
+
+
+def _momentum_get_size_multiplier() -> float:
+    """連敗時のサイズ縮小率を含むサイズ係数を返す"""
+    global _momentum_consecutive_losses, _momentum_last_win_time
+    # 60 分以内に勝ちが無ければ連敗カウント維持
+    now = datetime.datetime.now()
+    if _momentum_last_win_time is not None:
+        elapsed = (now - _momentum_last_win_time).total_seconds() / 60
+        if elapsed > _MOMENTUM_CONSEC_LOSS_RESET_MIN:
+            # 勝ちから一定時間経過 → 連敗カウンタ自然リセット (新たな勝ちが来るまで現状維持)
+            pass
+    if _momentum_consecutive_losses >= _MOMENTUM_CONSEC_LOSS_LIMIT:
+        return _MOMENTUM_CONSEC_LOSS_SIZE_RATIO
+    return 1.0
+
+
+def _momentum_strength_multiplier(pct_15: float, symbol: Optional[str] = None) -> tuple:
+    """★ v3.9.31: シグナル強度 (15m 騰落率の絶対値) でサイズ係数を山型に算出。
+
+    5/15-5/21 シャドー観察 5,358 件の強度別 5 日累計成績:
+      <0.3% (弱)        累計 +0.04%  → 投入 50%
+      0.3〜0.5% (中)    累計 +0.11%  → 投入 75%
+      0.5〜0.8% (中強)  累計 +0.21%  → 投入 100% ⭐スイートスポット
+      0.8%以上 (強)     累計 -0.41%  → 投入 0% (発注しない・シャドー記録のみ)
+
+    「最も強い」ではなく「最も効率的な 0.5〜0.8% 帯」に集中投下する山型設計。
+    0.8%+ 強シグナルは累計マイナスのため発注対象外 (MOMENTUM_MAX_SIGNAL_PCT で制御)。
+
+    ★ v3.9.62: 強シグナル上限は銘柄別 (_momentum_max_signal_for)。DRAM はボラ約3倍の
+       ため上限も ≈3倍 (既定 2.40%) を適用し、通常のトレンドが過剰に弾かれるのを防ぐ。
+
+    戻り値: (係数, ラベル) のタプル。
+    """
+    s = abs(pct_15)
+    # 強シグナル上限 (既定 0.80% / DRAM 2.40%) 以上 → 発注しない
+    _max_signal = _momentum_max_signal_for(symbol) if symbol else MOMENTUM_MAX_SIGNAL_PCT
+    if _max_signal > 0 and s >= _max_signal:
+        return (0.0, "強(発注なし)")
+    if s < 0.30:
+        return (0.50, "弱")
+    elif s < 0.50:
+        return (0.75, "中")
+    else:
+        return (1.00, "中強★")
+
+
+def momentum_record_trade_result(pnl: float, budget: float) -> None:
+    """モメンタム取引結果を集計に反映 (Phase 1 で呼出予定)。
+
+    - デイ累計 PnL を更新 → 1 日損失上限到達で当日停止
+    - 週次累計 PnL を更新 → 1 週間損失上限到達で月曜まで停止 (v3.9.54)
+    - 連敗カウンタを更新 → サイズ縮小判定
+
+    停止判定は 2 段階:
+      ① RISK_LEVEL プリセット由来の MOMENTUM_DAILY_LOSS_PCT (細かめの当日停止)
+      ② BUDGET 比 % のトップレベル安全網 (MOMENTUM_DAILY/WEEKLY_LOSS_BUDGET_PCT)
+    いずれか先に発火した方で停止。
+    """
+    global _momentum_daily_pnl, _momentum_daily_stopped
+    global _momentum_weekly_pnl, _momentum_weekly_stopped
+    global _momentum_consecutive_losses, _momentum_last_win_time
+    _momentum_reset_daily_if_needed()
+    _momentum_daily_pnl += pnl
+    _momentum_weekly_pnl += pnl
+    # 1 日損失上限チェック (RISK_LEVEL プリセット + トップレベル % のいずれかで発火)
+    daily_limit_preset = -budget * (MOMENTUM_DAILY_LOSS_PCT / 100.0)
+    daily_limit_budget = (
+        -budget * (MOMENTUM_DAILY_LOSS_BUDGET_PCT / 100.0)
+        if MOMENTUM_DAILY_LOSS_BUDGET_PCT > 0 else None
+    )
+    if not _momentum_daily_stopped:
+        if _momentum_daily_pnl <= daily_limit_preset:
+            _momentum_daily_stopped = True
+            log.warning(
+                f"[モメンタム] 🛑 1日損失上限 (RiskLevel) 到達: 累計 ${_momentum_daily_pnl:+.2f} "
+                f"≤ -${abs(daily_limit_preset):.2f} ({MOMENTUM_DAILY_LOSS_PCT:.2f}% of BUDGET) "
+                f"→ 当日の新規発注を停止 (04:00 ET 翌朝リセット)"
+            )
+        elif daily_limit_budget is not None and _momentum_daily_pnl <= daily_limit_budget:
+            _momentum_daily_stopped = True
+            log.warning(
+                f"[モメンタム] 🛑 1日損失上限 (BUDGET比) 到達: 累計 ${_momentum_daily_pnl:+.2f} "
+                f"≤ -${abs(daily_limit_budget):.2f} "
+                f"({MOMENTUM_DAILY_LOSS_BUDGET_PCT:.1f}% of BUDGET ${budget:,.0f}) "
+                f"→ 当日の新規発注を停止 (04:00 ET 翌朝リセット)"
+            )
+    # ★ v3.9.55: 1 週間損失上限チェック (BUDGET 比 %)
+    if not _momentum_weekly_stopped and MOMENTUM_WEEKLY_LOSS_BUDGET_PCT > 0:
+        weekly_limit = -budget * (MOMENTUM_WEEKLY_LOSS_BUDGET_PCT / 100.0)
+        if _momentum_weekly_pnl <= weekly_limit:
+            _momentum_weekly_stopped = True
+            log.warning(
+                f"[モメンタム] 🛑 1週間損失上限 (BUDGET比) 到達: 週累計 ${_momentum_weekly_pnl:+.2f} "
+                f"≤ -${abs(weekly_limit):.2f} "
+                f"({MOMENTUM_WEEKLY_LOSS_BUDGET_PCT:.1f}% of BUDGET ${budget:,.0f}) "
+                f"→ 今週末まで新規発注を停止 (月曜 04:00 ET リセット)"
+            )
+    # 連敗カウンタ更新
+    if pnl > 0:
+        if _momentum_consecutive_losses > 0:
+            log.info(
+                f"[モメンタム] ✓ 勝ちで連敗カウントリセット ({_momentum_consecutive_losses}→0)"
+            )
+        _momentum_consecutive_losses = 0
+        _momentum_last_win_time = datetime.datetime.now()
+    elif pnl < 0:
+        _momentum_consecutive_losses += 1
+        if _momentum_consecutive_losses == _MOMENTUM_CONSEC_LOSS_LIMIT:
+            log.warning(
+                f"[モメンタム] ⚠ {_MOMENTUM_CONSEC_LOSS_LIMIT}連敗到達 → "
+                f"次回以降サイズを {int(_MOMENTUM_CONSEC_LOSS_SIZE_RATIO*100)}% に縮小"
+            )
+
+
+def _momentum_is_daily_stopped() -> bool:
+    """1 日損失上限到達済みか判定。
+    ★ v3.9.54: 週次サーキットブレーカー (USD) も同時にチェック。
+    どちらかが発火していれば停止状態 (True) を返す。
+    """
+    _momentum_reset_daily_if_needed()
+    return _momentum_daily_stopped or _momentum_weekly_stopped
+
+
+def _momentum_side_allowed(symbol: str, side: str) -> bool:
+    """銘柄サイドが MOMENTUM_ENABLED_SIDES に含まれているか判定"""
+    key = f"{symbol}:{side}".upper()
+    return key in MOMENTUM_ENABLED_SIDES
+
+# 上級者向け個別オーバーライド (env 設定があれば LEVEL プリセットより優先)
+_MOMENTUM_QQQ_5M_OVERRIDE  = os.environ.get("MOMENTUM_QQQ_5M_PCT",  "").strip()
+_MOMENTUM_QQQ_15M_OVERRIDE = os.environ.get("MOMENTUM_QQQ_15M_PCT", "").strip()
+_MOMENTUM_SPY_5M_OVERRIDE  = os.environ.get("MOMENTUM_SPY_5M_PCT",  "").strip()
+_MOMENTUM_SPY_15M_OVERRIDE = os.environ.get("MOMENTUM_SPY_15M_PCT", "").strip()
+_MOMENTUM_SMH_5M_OVERRIDE  = os.environ.get("MOMENTUM_SMH_5M_PCT",  "").strip()
+_MOMENTUM_SMH_15M_OVERRIDE = os.environ.get("MOMENTUM_SMH_15M_PCT", "").strip()
+
+
+def _get_momentum_thresholds(symbol: str) -> tuple:
+    """★ v3.9.16: 銘柄別モメンタム閾値 (5min, 15min) を返す (絶対値%)。
+
+    優先順位:
+      ① MOMENTUM_{symbol}_5M_PCT / 15M_PCT が個別に設定されていれば使用
+      ② そうでなければ MOMENTUM_LEVEL のプリセット値を使用
+      ③ 未知の銘柄は MOMENTUM_TREND_*_PCT (旧・全銘柄共通) にフォールバック
+    """
+    # ① 個別オーバーライドのチェック
+    overrides_5m  = {"QQQ": _MOMENTUM_QQQ_5M_OVERRIDE,  "SPY": _MOMENTUM_SPY_5M_OVERRIDE,  "SMH": _MOMENTUM_SMH_5M_OVERRIDE}
+    overrides_15m = {"QQQ": _MOMENTUM_QQQ_15M_OVERRIDE, "SPY": _MOMENTUM_SPY_15M_OVERRIDE, "SMH": _MOMENTUM_SMH_15M_OVERRIDE}
+    raw_5m  = overrides_5m.get(symbol, "")
+    raw_15m = overrides_15m.get(symbol, "")
+    # ② LEVEL プリセット
+    preset = _MOMENTUM_LEVEL_PRESETS.get(MOMENTUM_LEVEL, _MOMENTUM_LEVEL_PRESETS[3])
+    base_5m, base_15m = preset.get(symbol, (MOMENTUM_TREND_5M_PCT, MOMENTUM_TREND_15M_PCT))
+    # オーバーライドがあれば上書き
+    if raw_5m:
+        try:
+            base_5m = max(0.01, min(2.0, float(raw_5m)))
+        except ValueError:
+            pass
+    if raw_15m:
+        try:
+            base_15m = max(0.02, min(3.0, float(raw_15m)))
+        except ValueError:
+            pass
+    return base_5m, base_15m
+# ★ v3.9.47: MOMENTUM_TIMEOUT_MIN を Phase 1 実発注で実際に使用するよう配線
+# (risk_monitor_loop で entry_ai_category == "MOMENTUM" のポジションに適用)。
+# 旧設計の TIMEOUT_EXIT_MINUTES (デフォルト 10 分) は「ニュースの鮮度」を前提とした
+# 値で、モメンタムには短すぎる。モメンタムはトレンド継続を狙う戦略のため、シャドー
+# 観察データの 60 分 PnL ベンチマークに合わせて 60 分をデフォルトに設定。
+# 0 を設定するとモメンタムのタイムアウト決済を無効化 (トレール / 損切り / 反転に委ねる)。
+MOMENTUM_TIMEOUT_MIN:         int   = _parse_momentum_int("MOMENTUM_TIMEOUT_MIN", 60, 0, 240)
+# ★ v3.9.63: MOMENTUM_STOP_LOSS_PCT は risk_monitor_loop の強制損切りで実際に
+#   適用されるようになった (entry_ai_category=="MOMENTUM" 時、MAX_LOSS_PCT の代わりに
+#   MOMENTUM_STOP_LOSS_PCT/100 を損切りラインに使用)。Wizard で選択可能。
+# 以下 MOMENTUM_STOP_PCT / MOMENTUM_TRAIL_* は将来のモメンタム専用トレール/反転決済用
+# (現状トレールは通常の TRAIL_TRIGGER_PCT / TRAIL_DROP_PCT を流用するため未参照)。
+MOMENTUM_STOP_PCT:            float = _parse_momentum_float("MOMENTUM_STOP_PCT", -0.30, -5.0, 0.0)
+MOMENTUM_TRAIL_TRIGGER_PCT:   float = _parse_momentum_float("MOMENTUM_TRAIL_TRIGGER_PCT", 0.30, 0.05, 2.0)
+MOMENTUM_TRAIL_DROP_PCT:      float = _parse_momentum_float("MOMENTUM_TRAIL_DROP_PCT", 0.20, 0.05, 1.0)
+# ★ v3.9.89: 既定を false（転換抑制）に変更。反対シグナルでの強制転換決済は実データで
+#   WR0%・純出血（6/17 -$749）。既定で「転換せず新規エントリーを見送り」、既存ポジは
+#   損切り/トレール/時間切れ/建玉トレールに委ねる。従来挙動に戻すなら MOMENTUM_REVERSE_EXIT=true。
+MOMENTUM_REVERSE_EXIT: bool = (
+    os.environ.get("MOMENTUM_REVERSE_EXIT", "false").strip().lower() == "true"
+)
+# ★ v3.9.85: PAN案（任意・既定OFF）。モメンタム建玉の損失保護を「固定の強制損切り
+#   (建値基準)」から「建玉時からのトレールストップ(幅=損切り幅)」に切り替える。
+#   peak が有利側へ動けば損切り線も切り上がるため、一度含み益が出てから反転した
+#   建玉の損失を縮小できる(下方向は固定損切りに劣らない=弱意味で優位)。trail_active
+#   到達後は既存の狭いトレール(TRAIL_DROP_PCT)が先に発火し、自然に2段階トレールになる。
+#   検証者のみ true 推奨。未設定(false)なら全受講生は従来どおりの固定損切り。
+# ★ v3.9.90: 既定を true（建玉トレール標準）に変更。実データで固定の強制損切りより1件あたりの
+#   損失がほぼ半分（建玉トレール −$34 vs 固定 −$67・131件）。v3.9.86でpeakを建値でfloor/cap済み＝
+#   下方向は固定損切りに劣らない（弱意味で優位）。従来の固定損切りに戻すなら MOMENTUM_TRAIL_FROM_ENTRY=false。
+MOMENTUM_TRAIL_FROM_ENTRY: bool = (
+    os.environ.get("MOMENTUM_TRAIL_FROM_ENTRY", "true").strip().lower() == "true"
+)
+# ★ v3.9.101: 約定直後の損失保護（建玉トレール/強制損切り）抑止の猶予秒数。
+#   発注時 avg_cost は指値の仮設定で、実約定単価が反映されるまでの過渡期に
+#   指値基準で誤発火するのを防ぐ保険（根本対策は sync_positions の確定判定）。0 で無効。
+MOMENTUM_ENTRY_GRACE_SEC: int = _parse_momentum_int("MOMENTUM_ENTRY_GRACE_SEC", 15, 0, 120)
+# ★ v3.9.103: 当日トレンド・フィルター（逆張り抑制）。上昇日のショート / 下落日のロングを
+#   抑制する。SPY（無ければQQQ）の LOOKBACK 分騰落が ±FILTER_PCT を超えたら「トレンド日」。
+#   既定は計測のみ（ENABLED=false＝売買は不変・観察ログに trend_filter_ab を残すだけ）。
+#   効果が確認できたら MOMENTUM_TREND_FILTER_ENABLED=true で against-trend の実発注を実ブロック。
+MOMENTUM_TREND_FILTER_PCT: float = _parse_momentum_float("MOMENTUM_TREND_FILTER_PCT", 0.5, 0.0, 10.0)
+MOMENTUM_TREND_LOOKBACK_MIN: int = _parse_momentum_int("MOMENTUM_TREND_LOOKBACK_MIN", 60, 5, 390)
+MOMENTUM_TREND_FILTER_ENABLED: bool = (
+    os.environ.get("MOMENTUM_TREND_FILTER_ENABLED", "false").strip().lower() == "true"
+)
+# ★ v3.9.104: プレマーケット新規エントリー抑制フィルター。premarket が恒常的な出血源のため、
+#   premarket 中の新規モメンタム実発注を抑制する。既定は計測のみ（ENABLED=false＝売買不変・
+#   観察ログに premarket_filter_ab を残すだけ）。効果が確認できたら
+#   MOMENTUM_PREMARKET_FILTER_ENABLED=true で premarket の実発注を実ブロック。
+MOMENTUM_PREMARKET_FILTER_ENABLED: bool = (
+    os.environ.get("MOMENTUM_PREMARKET_FILTER_ENABLED", "false").strip().lower() == "true"
+)
+# 対象銘柄 (env で絞り込み可、デフォルトは QQQ/SPY/SMH/IWM/DRAM)
+# ★ v3.9.33: IWM (Russell 2000 小型株 ETF) を追加。シャドー観察専用
+#   (MOMENTUM_ENABLED_SIDES に含めないため実発注対象外)。
+# ★ v3.9.62: DRAM (Roundhill Memory ETF) を追加。シャドー観察専用 (実発注対象外)。
+#   閾値は SPY×3 (_MOMENTUM_LEVEL_PRESETS)、強シグナル上限は DRAM 別枠 (≈2.4%)。
+_mom_syms_raw = os.environ.get("MOMENTUM_SYMBOLS", "QQQ,SPY,SMH,IWM,DRAM").strip()
+MOMENTUM_SYMBOLS: tuple = tuple(s.strip().upper() for s in _mom_syms_raw.split(",") if s.strip())
+
+# ── ★ v3.9.116: 戦略プロファイル（Wizard STEP 13 [0] で選択・既定 standard=従来どおり）──
+# select_v1（選抜プロファイル）: 実発注5週間+シャドー観察（2026/6/9〜7/10・ユニーク
+#   シグナル4,952件）の集計で、全期間・前半/後半スプリット・週別のいずれでも
+#   期待値がプラスだった条件の組み合わせ（過去観察に基づく設定であり将来を保証しない）:
+#     ① 方向   : SHORT のみ実発注（LONG はシャドー観察に格下げ）
+#     ② 銘柄   : SPY を実発注から除外（SPY ショートは全出口方式で期待値マイナス）
+#     ③ 時間帯 : ET 9・10・12・13 時台のみ新規実発注（11時台・14時以降は慢性赤字帯）
+#     ④ 出口   : 建玉トレール無効＝固定損切りに戻す（利益トレールは従来どおり。
+#                 建玉トレールは全期間 -$25,724/勝率6.5% と最大の出血源だった）
+#     ⑤ 安全網 : 日次損失予算の既定を 3.0%→1.5% に強化（env 明示があればそちら優先）
+#   シャドー観察は従来どおり全銘柄・全サイド・全時間帯で記録する（ブロックは実発注
+#   のみ）。これによりプロファイル自体の有効性を毎週の集計で検証し続けられる。
+#   ※ v3.9.41 の「固定時間帯フィルタ廃案」は 3 日間の検証に基づく判断だった。今回は
+#     5 週間・出口方式別の再検証で時間帯×方向の構造が安定して確認されたため、
+#     既定 OFF のオプトイン・プロファイル限定で復活させる（全体既定は変えない）。
+# ★★ プロファイルのバージョニング規約（PAN方針・2026-07-25）★★
+#   select_v1 のような選択式プロファイルの「中身（発注ルール）」を変更するときは、
+#   既存の名前を上書きせず、必ず新バージョン名（select_v2, select_v3 …）を新設すること。
+#     - 新バージョンを Wizard の選択肢に追加する。
+#     - 旧バージョンは「新規では選べない」ようにする（.env に既にある既存ユーザーは動作継続）。
+#     - Wizard に両者の違いの説明文を書く。
+#   狙い: 過去にどのルールで発注したかを名前で一意に追跡でき、集計・比較が壊れないようにするため。
+#   （標準プロファイルの建玉トレールOFF検証は select を変えず "+flatstop" タグで区別している＝この規約に沿う）
+MOMENTUM_STRATEGY_PROFILE: str = (
+    os.environ.get("MOMENTUM_STRATEGY_PROFILE", "standard").strip().lower() or "standard"
+)
+if MOMENTUM_STRATEGY_PROFILE not in ("standard", "select_v1"):
+    MOMENTUM_STRATEGY_PROFILE = "standard"   # 不正値は従来どおり（他configと同じ静かなfallback）
+MOMENTUM_PROFILE_SELECT: bool = (MOMENTUM_STRATEGY_PROFILE == "select_v1")
+_SELECT_V1_ENTRY_HOURS_ET: frozenset = frozenset({9, 10, 12, 13})
+_SELECT_V1_EXCLUDED_SYMBOLS: frozenset = frozenset({"SPY"})
+if MOMENTUM_PROFILE_SELECT:
+    # ④ プロファイルは検証済みルール一式のため、建玉トレールは env の値に関わらず無効化
+    MOMENTUM_TRAIL_FROM_ENTRY = False
+    # ⑤ 日次損失予算: env 未指定なら 1.5% に強化（明示指定はそのまま尊重）
+    if not _mom_daily_budget_pct_raw:
+        MOMENTUM_DAILY_LOSS_BUDGET_PCT = 1.5
+# ★ v3.9.116: プロファイル選択をデータ・ログの両方で判別できるようにするタグ。
+#   GAS 送信ペイロードの bot_version（settings 経由でシート「botバージョン」列に載る）
+#   に "+select_v1" を付けることで、GAS/シート側の変更なしに、決済記録・観察ログの
+#   どの行がプロファイル有効時のものかを後から集計・監査できる。standard は無印＝従来どおり。
+# ★ v3.9.128: 標準プロファイルで建玉トレールを固定損切り(0.5%)へ置換したテスト群を
+#   分離集計できるよう "+flatstop" タグを付ける（段階導入・Codex/週次レビュー優先度1）。
+#   建玉トレールは全期間 -$25,724/勝率6.5% と最大の出血源で、固定0.5%への置換は反実仮想で
+#   プラス。実運用でも効くかを、シートの botバージョン列で「標準(+無印)」対「標準+flatstop」
+#   として2週以上比較して検証する。select_v1 は別タグ優先（内部で建玉トレールOFFのため）。
+if MOMENTUM_PROFILE_SELECT:
+    _PROFILE_TAG = "+select_v1"
+elif not MOMENTUM_TRAIL_FROM_ENTRY:
+    _PROFILE_TAG = "+flatstop"     # 標準プロファイル × 建玉トレールOFF（固定損切り）
+else:
+    _PROFILE_TAG = ""
+BOT_VERSION_TAGGED: str = BOT_VERSION + _PROFILE_TAG
+_PROFILE_DISPLAY: str = (
+    "選抜プロファイル v1（絞り込み運転）" if MOMENTUM_PROFILE_SELECT
+    else ("標準＋固定損切り（建玉トレールOFF・検証中）" if _PROFILE_TAG == "+flatstop"
+          else "標準（今まで通り）")
+)
+
+# 状態管理: 最後にシグナルを記録した時刻 (クールダウン判定用)
+_last_momentum_signal: Dict[str, datetime.datetime] = {}
+
+# ── ダイナミック個別株機能（隠し機能・env未設定時は完全無効）────────────────────
+# DYNAMIC_STOCKS_ENABLED=true の場合のみ有効化。
+# AlpacaニュースのsymbolsフィールドからS&P500構成銘柄を動的に検出し発注する。
+DYNAMIC_STOCKS_ENABLED: bool = os.environ.get("DYNAMIC_STOCKS_ENABLED", "").strip().lower() == "true"
+_dyn_max_raw = os.environ.get("DYNAMIC_STOCKS_MAX_CALLS_PER_DAY", "").strip()
+DYNAMIC_STOCKS_MAX_CALLS_PER_DAY: int = int(_dyn_max_raw) if _dyn_max_raw.isdigit() else 50
+DYNAMIC_STOCKS_CONFIDENCE: float = float(os.environ.get("DYNAMIC_STOCKS_CONFIDENCE", "0.85"))
+_dyn_pos_raw = os.environ.get("DYNAMIC_STOCKS_MAX_POSITION_USD", "").strip()
+try:
+    DYNAMIC_STOCKS_MAX_POSITION_USD: float = float(_dyn_pos_raw) if _dyn_pos_raw else 0.0
+    # 0 = 上限なし（BUDGET_USD の通常計算に従う）
+except ValueError:
+    DYNAMIC_STOCKS_MAX_POSITION_USD = 0.0
+
+# ── 個別株・決算銘柄の1銘柄あたり予算上限 (v2.40) ────────────────────────────
+# STOCK_MAX_PCT: BUDGET_USD に対する 1 銘柄最大割合 (%) / 0 = 上限なし
+# 対象: STOCK_TICKERS / EARNINGS_PRE / EARNINGS_AFTER (実計算は _BUDGET_USD 後段)
+# ★ v3.9.66 (施策B'): 既定を 10% に変更 (旧 0=上限なし)。個別株のテール損失
+#   (5/27 BAC -$549・5/29 DELL -$153・6/2 NVDA -$240) は「上限なし」で建玉が
+#   過大化したことが一因。1 銘柄を BUDGET の 10% に制限し、悪材料の単独大損を抑える。
+#   env で明示すればその値が優先。0 を明示すると従来どおり上限なし。
+_stock_max_raw = os.environ.get("STOCK_MAX_PCT", "").strip()
+try:
+    _STOCK_MAX_PCT: float = float(_stock_max_raw) / 100.0 if _stock_max_raw else 0.10
+except ValueError:
+    _STOCK_MAX_PCT = 0.10
+
+# ★ v3.9.66 (施策B'): 個別株の 1 トレード絶対損失上限 (USD)。0 = 無効。
+# 含み損が -STOCK_MAX_LOSS_USD を下回ったら % 損切りラインに関係なく即決済する
+# (ギャップ・スリッページで % 損切りが間に合わず大損するのを防ぐ安全網)。
+# 既定 0 (無効)。受講生の BUDGET に依存するため、講師判断で .env 設定を推奨。
+_stock_maxloss_raw = os.environ.get("STOCK_MAX_LOSS_USD", "").strip()
+try:
+    STOCK_MAX_LOSS_USD: float = float(_stock_maxloss_raw) if _stock_maxloss_raw else 0.0
+    if STOCK_MAX_LOSS_USD < 0:
+        STOCK_MAX_LOSS_USD = 0.0
+except ValueError:
+    STOCK_MAX_LOSS_USD = 0.0
+
+# ── 決算銘柄の指値リトライ設定（v2.39）──────────────────────────────────────
+# LIMIT_RETRY_SEC: 指値が刺さらない場合に再発注するまでの待機秒数（デフォルト5秒）
+# LIMIT_RETRY_MAX: 最大リトライ回数（デフォルト6回 = 最大30秒間リトライ）
+# earnings_monitor_loop専用。pending_order_watchdog(1分)より短く設計。
+LIMIT_RETRY_SEC: int = int(os.environ.get("LIMIT_RETRY_SEC", "5"))
+LIMIT_RETRY_MAX: int = int(os.environ.get("LIMIT_RETRY_MAX", "6"))
+
+# S&P500 構成銘柄リスト（代表的な銘柄を収録。低流動性銘柄を自然に除外できる）
+_SP500_TICKERS: set = {
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","TSLA","BRK.B","AVGO",
+    "JPM","LLY","UNH","V","XOM","MA","COST","HD","PG","WMT",
+    "NFLX","CRM","BAC","ORCL","CVX","KO","MRK","PEP","AMD","ACN",
+    "TMO","ADBE","ABT","LIN","MCD","CSCO","WFC","TXN","PM","IBM",
+    "GE","MS","DHR","CAT","AXP","ISRG","SPGI","AMGN","RTX","GS",
+    "BLK","BKNG","NOW","SYK","VRTX","SBUX","PFE","GILD","MMC","T",
+    "ELV","MDT","ADI","REGN","MU","LRCX","KLAC","CDNS","SNPS","MCHP",
+    "PANW","CRWD","FTNT","ANET","FICO","NXPI","ON","TER","MPWR","WOLF",
+    "CME","ICE","MCO","MSCI","COF","AIG","PRU","MET","TRV","AFL",
+    "UNP","UPS","FDX","CSX","NSC","DAL","UAL","LUV","AAL","BA",
+    "LMT","NOC","GD","RTX","HII","TDG","HEI","LDOS","SAIC","CACI",
+    "DIS","CMCSA","WBD","PARA","FOX","FOXA","NYT","NWS","NWSA","OMC",
+    "CVS","CI","HUM","CNC","MOH","HCA","THC","UHS","CH","DVA",
+    "PLD","AMT","EQIX","CCI","SPG","O","WELL","CBRE","ARE","EQR",
+    "NEE","DUK","SO","D","AEP","EXC","XEL","WEC","ES","ETR",
+    "LIN","APD","ECL","SHW","PPG","IFF","EMN","CE","HUN","RPM",
+    "DE","CNH","AGCO","CF","MOS","NTR","FMC","CTX","VMC","MLM",
+    "DXCM","IDXX","MTD","WAT","ZBH","EW","HOLX","MMSI","ICUI","NVCR",
+    "WDAY","SNOW","DDOG","ZS","OKTA","NET","HUBS","TTD","RBLX","U",
+    "UBER","LYFT","ABNB","DASH","COIN","HOOD","SQ","PYPL","AFRM","SOFI",
+    "GPN","FIS","FISV","WEX","EPAM","CTSH","IT","INFY","WIT","GLOB",
+}
+# 決算登録銘柄・通常発注銘柄はダイナミック処理から除外（重複処理を防ぐ）
+_DYNAMIC_EXCLUDE: set = set()  # 起動時に ALL_TICKERS から構築する（後述）
+
+# 全ユニーク銘柄（価格取得・リスク監視対象）
+# ★ v3.9.61: モメンタム実発注銘柄 (_momentum_live_symbols) を必ず含める。
+# これにより sync_positions / _tracked_position_cost / risk_monitor_loop の
+# 全監視系統がモメンタム実発注ポジションを確実に追跡する (IWM orphan 再発防止)。
+# MOMENTUM_LIVE_TRADING=false (シャドーのみ) なら _momentum_live_symbols() は
+# 空集合のため ALL_TICKERS は従来通り。
+ALL_TICKERS = list(dict.fromkeys(
+    TRIGGER_TICKERS + STOCK_TICKERS + _all_earnings
+    + sorted(_momentum_live_symbols())
+))  # 重複排除・順序保持
+
+def to_moomoo_code(symbol: str) -> str:
+    """シンプルな銘柄コード（例: "SPY"）を moomoo 形式（"US.SPY"）に変換する"""
+    return f"US.{symbol}"
+
+def from_moomoo_code(code: str) -> str:
+    """moomoo 形式（"US.SPY"）をシンプルな銘柄コード（"SPY"）に変換する"""
+    return code.replace("US.", "", 1) if code.startswith("US.") else code
+
+# ── セクターキーワード → 発注銘柄（高速ニュースループで参照）──────────────────
+# resolve_execution_symbols でも使用
+# SECTOR_KEYWORDS: TRIGGER_TICKERSに応じて動的生成（v2.85）
+# SMHが含まれていればSEMI系キーワードはSMHにルーティング
+_semi_kw_sym  = ["SMH"] if "SMH" in TRIGGER_TICKERS else [_tech_sym]
+_tech_kw_sym  = [_tech_sym]
+_macro_kw_sym = [_macro_sym]
+SECTOR_KEYWORDS: Dict[str, List[str]] = {
+    # 半導体・AI チップ（SEMI カテゴリ → SMH or QQQ）
+    "semiconductor": _semi_kw_sym,
+    "chip":          _semi_kw_sym,
+    "nvidia":        _semi_kw_sym,
+    "taiwan semi":   _semi_kw_sym,
+    "intel":         _semi_kw_sym,
+    "micron":        _semi_kw_sym,
+    # テック（TECH カテゴリ → QQQ）
+    "nasdaq":        _tech_kw_sym,
+    "apple":         _tech_kw_sym,
+    "microsoft":     _tech_kw_sym,
+    "google":        _tech_kw_sym,
+    "meta ":         _tech_kw_sym,
+    "amazon":        _tech_kw_sym,
+    # マクロ（MACRO カテゴリ → SPY）
+    "s&p":           _macro_kw_sym,
+    "dow jones":     _macro_kw_sym,
+    "federal reserve": _macro_kw_sym,
+    "fomc":          _macro_kw_sym,
+}
+
+# ── 強シグナル閾値 ────────────────────────────────────────────────────────────
+# STRONG_BUY_CONFIDENCE / PANIC_CONFIDENCE は setup_wizard.py で設定
+_conf_raw = os.environ.get("STRONG_BUY_CONFIDENCE", "").strip()
+try:
+    STRONG_BUY_CONFIDENCE = float(_conf_raw) if _conf_raw else 0.75
+    STRONG_BUY_CONFIDENCE = max(0.5, min(1.0, STRONG_BUY_CONFIDENCE))
+except ValueError:
+    STRONG_BUY_CONFIDENCE = 0.75
+
+_panic_raw = os.environ.get("PANIC_CONFIDENCE", "").strip()
+try:
+    PANIC_CONFIDENCE = float(_panic_raw) if _panic_raw else STRONG_BUY_CONFIDENCE
+    PANIC_CONFIDENCE = max(0.5, min(1.0, PANIC_CONFIDENCE))
+except ValueError:
+    PANIC_CONFIDENCE = STRONG_BUY_CONFIDENCE
+
+# ── 時間帯別 Confidence しきい値（任意・未設定時は STRONG_BUY_CONFIDENCE を使用）──
+# 流動性の低い時間帯（プリマーケット・アフター・オーバーナイト）は高めに設定推奨
+# 例: .env に CONFIDENCE_PREMARKET=0.85 と書くとプリマーケット中のみしきい値が上がる
+def _parse_conf(key: str) -> float:
+    v = os.environ.get(key, "").strip()
+    try:
+        return max(0.5, min(1.0, float(v))) if v else 0.0
+    except ValueError:
+        return 0.0
+
+_CONF_RTH        = _parse_conf("CONFIDENCE_RTH")        # 例: 0.75
+_CONF_PREMARKET  = _parse_conf("CONFIDENCE_PREMARKET")  # 例: 0.85
+_CONF_AFTERHOURS = _parse_conf("CONFIDENCE_AFTERHOURS") # 例: 0.85
+_CONF_OVERNIGHT  = _parse_conf("CONFIDENCE_OVERNIGHT")  # 例: 0.90
+
+# ── ★ v3.9.6: 「発注しない」sentinel 検出 (Anthropic API コスト削減) ──────────
+# setup_wizard が「発注しない」選択時に CONFIDENCE_PREMARKET=2.00 等の sentinel
+# 値を .env に書き込む (AI confidence は 0.0〜1.0 の範囲なので 2.0 は絶対超えない)。
+# _parse_conf は [0.5, 1.0] に clamp するため、clamp 前の生値を別途保持し、
+# is_current_session_disabled() で「発注しない設定か」を判定可能にする。
+# これにより analyze_news() 直前で AI 呼び出し自体をスキップでき、消費 0 で済む。
+_DISABLED_CONF_SENTINEL: float = 2.0  # setup_wizard._DISABLED_CONF と一致させる
+
+def _raw_conf_disabled(key: str) -> bool:
+    """env の raw 値が sentinel (≥ 2.0) かを判定。clamp 前の値で判断する。"""
+    v = os.environ.get(key, "").strip()
+    if not v:
+        return False
+    try:
+        return float(v) >= _DISABLED_CONF_SENTINEL
+    except ValueError:
+        return False
+
+_DISABLED_RTH        = _raw_conf_disabled("CONFIDENCE_RTH")
+_DISABLED_PREMARKET  = _raw_conf_disabled("CONFIDENCE_PREMARKET")
+_DISABLED_AFTERHOURS = _raw_conf_disabled("CONFIDENCE_AFTERHOURS")
+_DISABLED_OVERNIGHT  = _raw_conf_disabled("CONFIDENCE_OVERNIGHT")
+
+
+def _is_session_disabled_by_name(session_name: str) -> bool:
+    """★ v3.9.6: 指定セッションが「発注しない」設定か (raw env ≥ 2.0 sentinel)。
+
+    session_name には get_session_info() の戻り値 ('premarket'/'rth'/...) を渡す。
+    None や未知の値は False (= 停止しない) として扱う (防御的)。
+    """
+    if not session_name:
+        return False
+    disabled_map = {
+        SESSION_RTH:        _DISABLED_RTH,
+        SESSION_PREMARKET:  _DISABLED_PREMARKET,
+        SESSION_AFTERHOURS: _DISABLED_AFTERHOURS,
+        SESSION_OVERNIGHT:  _DISABLED_OVERNIGHT,
+    }
+    return disabled_map.get(session_name, False)
+
+
+def is_current_session_disabled() -> tuple[bool, str]:
+    """★ v3.9.6: 現在のセッションが「発注しない」設定か判定。
+
+    setup_wizard で CONFIDENCE_* >= 2.0 sentinel を書き込んだセッションは、
+    AI が何を返しても発注に至らない (confidence は max 1.0)。それを analyze_news()
+    の直前で検出し、Anthropic API 呼び出し自体をスキップすることでコスト削減する。
+    なお session monitor 側 (_should_stop) でもこの判定を使い、ニュース取得・
+    AI判定・発注を完全停止する (market_open_event を clear)。
+
+    戻り値: (True/False, セッション名 short_code)
+    """
+    session, _short_code = get_session_info()
+    return _is_session_disabled_by_name(session), session
+
+
+def _session_label_jp(session_name: str) -> str:
+    """セッション名を日本語ラベルに変換 (Discord/ログ用)。"""
+    return {
+        SESSION_PREMARKET:  "プリマーケット",
+        SESSION_RTH:        "RTH",
+        SESSION_AFTERHOURS: "アフターアワーズ",
+        SESSION_OVERNIGHT:  "オーバーナイト",
+    }.get(session_name, (session_name or "UNKNOWN").upper())
+
+
+def get_confidence_threshold() -> float:
+    """現在のセッションに応じた Confidence しきい値を返す。
+    .env で時間帯別に設定されていればその値、なければ STRONG_BUY_CONFIDENCE を使用。
+    """
+    session, _ = get_session_info()
+    mapping = {
+        SESSION_RTH:        _CONF_RTH,
+        SESSION_PREMARKET:  _CONF_PREMARKET,
+        SESSION_AFTERHOURS: _CONF_AFTERHOURS,
+        SESSION_OVERNIGHT:  _CONF_OVERNIGHT,
+    }
+    override = mapping.get(session, 0.0)
+    return override if override > 0 else STRONG_BUY_CONFIDENCE
+
+# ── 発注クールダウン設定 (v2.99) ──────────────────────────────────────────────
+# COOLDOWN_STOCK_MIN: 個別株の発注後 N 分間は同銘柄の次回発注をブロック (重複抑制)
+# ETF_REENTRY_LOCKOUT_MIN: ETF 決済後 N 分間は新規エントリー禁止
+def _parse_int_env(key: str, default: int, min_val: int = 0, max_val: int = 1440) -> int:
+    v = os.environ.get(key, "").strip()
+    try:
+        n = int(v) if v else default
+        return max(min_val, min(max_val, n))
+    except ValueError:
+        return default
+
+COOLDOWN_STOCK_MIN: int       = _parse_int_env("COOLDOWN_STOCK_MIN", 60, 0, 1440)
+# ★ v2.99.4: 15分→30分に延長 (受講生フィードバック: 同テーマで何度も入り直す問題)
+ETF_REENTRY_LOCKOUT_MIN: int  = _parse_int_env("ETF_REENTRY_LOCKOUT_MIN", 30, 0, 1440)
+
+# ★ v3.9.31: 決済発注の連続失敗 N 回で sync_positions 強制 → 実態確認 (無限リトライ防止)
+# 5/21 利用者T事例: ショートカバーが 11 分間無限ループした構造バグへの対策。
+_CLOSE_FAIL_GIVEUP_LIMIT: int = 3
+
+# ★ v3.9.63: 決済時 moomoo が「Not enough positions」を返した = 建玉は既に決済済み
+# (二重決済レース / 既決済 pid)。失敗ではなく「解決済み」を表す内部 ret コード。
+# 5/25-6/1 ログで QQQ 20 件・SPY 12 件の「Not enough positions」ERROR を確認。
+_RET_ALREADY_CLOSED: int = -2
+
+# 個別株の発注時刻記録: {symbol: datetime}
+_stock_order_history: Dict[str, datetime.datetime] = {}
+# ETF の決済時刻記録: {symbol: datetime}
+_etf_close_history:   Dict[str, datetime.datetime] = {}
+
+# ETF 判定用セット (TRIGGER_TICKERS から動的に構築)
+_ETF_TICKER_SET: set = set(TRIGGER_TICKERS)
+
+
+def _is_etf_ticker(symbol: str) -> bool:
+    """指定銘柄がETF (TRIGGER_TICKERS に含まれる) かどうか判定する。"""
+    return symbol in _ETF_TICKER_SET
+
+
+def _is_stock_cooldown(symbol: str) -> tuple[bool, float]:
+    """個別株クールダウン中か判定する。 戻り値: (クールダウン中か, 経過分)"""
+    if COOLDOWN_STOCK_MIN <= 0:
+        return False, 0.0
+    last = _stock_order_history.get(symbol)
+    if last is None:
+        return False, 0.0
+    elapsed = (datetime.datetime.now() - last).total_seconds() / 60.0
+    return elapsed < COOLDOWN_STOCK_MIN, elapsed
+
+
+def _mark_stock_order(symbol: str) -> None:
+    """個別株の発注時刻を記録する。"""
+    _stock_order_history[symbol] = datetime.datetime.now()
+
+
+def _is_etf_reentry_locked(symbol: str) -> tuple[bool, float]:
+    """ETF 再エントリー禁止中か判定する。 戻り値: (禁止中か, 経過分)"""
+    if ETF_REENTRY_LOCKOUT_MIN <= 0:
+        return False, 0.0
+    last = _etf_close_history.get(symbol)
+    if last is None:
+        return False, 0.0
+    elapsed = (datetime.datetime.now() - last).total_seconds() / 60.0
+    return elapsed < ETF_REENTRY_LOCKOUT_MIN, elapsed
+
+
+def _mark_etf_close(symbol: str) -> None:
+    """ETF の決済時刻を記録する (place_close_all から呼ばれる)。"""
+    if _is_etf_ticker(symbol):
+        _etf_close_history[symbol] = datetime.datetime.now()
+
+
+# ── ★ v2.99.4: 決済 FAILED 時の新規エントリー一時停止 ─────────────────────────
+# place_close_all が False (全 position_id 失敗) を返した銘柄を _failed_close_lockout
+# に登録 → place_buy 冒頭でチェック → 新規 BUY スキップ (既存解消優先)。
+# 解除: ①place_close_all=True ②sync_positions で qty=0 確認 ③タイムアウト経過
+# サポーター v2.97 実口座運用フィードバック対応 (決済失敗中の新規BUY積上問題)。
+FAILED_CLOSE_LOCKOUT_MIN: int = _parse_int_env("FAILED_CLOSE_LOCKOUT_MIN", 30, 0, 1440)
+_failed_close_lockout: Dict[str, datetime.datetime] = {}
+
+
+def _mark_failed_close(symbol: str) -> None:
+    """決済失敗を記録する (place_close_all が False を返したときに呼ぶ)。"""
+    _failed_close_lockout[symbol] = datetime.datetime.now()
+
+
+def _clear_failed_close(symbol: str) -> None:
+    """決済成功 / qty=0 確認時に解除する。"""
+    _failed_close_lockout.pop(symbol, None)
+
+
+def _is_failed_close_locked(symbol: str) -> tuple[bool, float]:
+    """決済 FAILED 中で新規 BUY ブロック中か判定する。 戻り値: (ブロック中か, 経過分) タイムアウト経過時は自動解除して False を返す。"""
+    if FAILED_CLOSE_LOCKOUT_MIN <= 0:
+        return False, 0.0
+    last = _failed_close_lockout.get(symbol)
+    if last is None:
+        return False, 0.0
+    elapsed = (datetime.datetime.now() - last).total_seconds() / 60.0
+    if elapsed >= FAILED_CLOSE_LOCKOUT_MIN:
+        # タイムアウト → 自動解除 (放置による永久ロックを防ぐ)
+        _failed_close_lockout.pop(symbol, None)
+        return False, elapsed
+    return True, elapsed
+
+
+# ── ETF 影響ガード (v2.99) ────────────────────────────────────────────────────
+# AI が beneficiaries/victims に ETF (QQQ/SMH/SPY) を入れたとき、構成銘柄名が
+# 見出しに含まれているか照合して妥当性検証 (Azenta 小型株の決算ミスを QQQ 影響
+# と誤判定するケース等への二重防御)。SPY のみマクロキーワード (Fed/CPI/金利等)
+# の例外処理あり。
+QQQ_MAJOR_COMPANIES: set = {
+    # ティッカーシンボル (大文字も小文字も判定するため lower で)
+    "aapl", "msft", "googl", "goog", "amzn", "meta", "nvda", "tsla", "avgo",
+    "amd", "intc", "csco", "qcom", "amat", "lrcx", "klac", "mu", "mchp",
+    "snps", "cdns", "intu", "adbe", "nflx", "cmcsa", "pep", "cost", "tmus",
+    "sbux", "txn", "isrg", "regn", "vrtx", "gild", "panw", "crwd", "abnb",
+    # 企業名 (lower)
+    "apple", "microsoft", "google", "alphabet", "amazon", "meta platforms",
+    "facebook", "nvidia", "tesla", "broadcom", "advanced micro devices",
+    "intel", "cisco", "qualcomm", "applied materials", "lam research",
+    "kla corp", "micron", "microchip", "synopsys", "cadence design",
+    "intuit", "adobe", "netflix", "comcast", "pepsi", "pepsico", "costco",
+    "t-mobile", "tmobile", "starbucks", "texas instruments",
+    "intuitive surgical", "regeneron", "vertex pharma", "gilead",
+    "palo alto networks", "crowdstrike", "airbnb", "booking",
+}
+
+SMH_MAJOR_COMPANIES: set = {
+    # ティッカー
+    "nvda", "tsm", "avgo", "asml", "amd", "qcom", "intc", "mu", "amat",
+    "lrcx", "klac", "mrvl", "adi", "nxpi", "stm", "mchp", "snps", "cdns",
+    "arm", "mpwr", "on", "swks", "qrvo", "tmc", "ter", "entg",
+    # 企業名
+    "nvidia", "taiwan semiconductor", "tsmc", "broadcom", "asml",
+    "advanced micro devices", "qualcomm", "intel", "micron",
+    "applied materials", "lam research", "kla corp", "marvell",
+    "analog devices", "nxp semi", "stmicroelectronics", "microchip",
+    "synopsys", "cadence design", "monolithic power", "onsemi",
+    "on semiconductor", "skyworks", "qorvo", "teradyne", "entegris",
+}
+
+# SPY は構成銘柄 500 社で広いため、QQQ + 主要金融/ヘルスケア/エネルギー大型株を加える
+SPY_MAJOR_COMPANIES: set = QQQ_MAJOR_COMPANIES | {
+    # ティッカー
+    "brk.b", "brk-b", "brkb", "jpm", "v", "ma", "unh", "lly", "pg", "jnj",
+    "xom", "cvx", "wmt", "hd", "bac", "mrk", "abbv", "pfe", "ko", "wfc",
+    "dis", "crm", "orcl", "gs", "ms", "ba", "cat", "axp", "mcd", "nke",
+    # 企業名
+    "berkshire", "jpmorgan", "jp morgan", "visa", "mastercard",
+    "unitedhealth", "united health", "eli lilly", "lilly", "procter & gamble",
+    "procter and gamble", "johnson & johnson", "johnson and johnson",
+    "exxon", "chevron", "walmart", "home depot", "bank of america",
+    "merck", "abbvie", "pfizer", "coca-cola", "coca cola", "wells fargo",
+    "disney", "salesforce", "oracle", "goldman sachs", "morgan stanley",
+    "boeing", "caterpillar", "american express", "mcdonald", "nike",
+}
+
+# SPY 通過用マクロキーワード (これらが含まれれば SPY の影響を許可)
+_MACRO_KEYWORDS: set = {
+    # ── FED / 金融政策 ──
+    "fed ", "fomc", "federal reserve", "interest rate", "rate cut", "rate hike",
+    "powell", "yield curve",
+    # ★ v3.9.11 追加: FOMC 関連シノニム + dot plot
+    "dot plot", "fomc minutes", "fed minutes", "rate decision",
+    "basis points", "bps cut", "bps hike", "fed funds",
+    "hawkish", "dovish", "tightening", "easing cycle",
+
+    # ── インフレ指標 (CPI/PPI 系) ──
+    "inflation", "cpi", "ppi",
+    # ★ v3.9.11 追加: CPI/PPI のシノニム (5/12 「Consumer prices surged 3.8%」
+    # が _MACRO_KEYWORDS に該当せず SPY 発注を取り逃がした事例への対策)
+    "consumer prices", "consumer price index", "core prices", "core inflation",
+    "core cpi", "headline inflation", "headline cpi",
+    "wholesale prices", "producer prices", "producer price index",
+    "pce", "core pce", "personal consumption",
+
+    # ── 雇用統計 ──
+    "jobs report", "unemployment", "payroll",
+    # ★ v3.9.11 追加: 雇用統計シノニム
+    "nonfarm payrolls", "nfp", "unemployment rate", "jobless claims",
+    "initial claims", "weekly claims", "continuing claims",
+    "labor market", "wage growth", "average hourly earnings",
+    "jolts", "job openings",
+
+    # ── 経済成長指標 ──
+    "gdp",
+    # ★ v3.9.11 追加: 主要マクロ指標
+    "retail sales", "ism manufacturing", "ism services", "ism index",
+    "pmi", "manufacturing pmi", "services pmi",
+    "consumer confidence", "consumer sentiment", "michigan sentiment",
+    "housing starts", "existing home sales", "new home sales",
+    "industrial production", "capacity utilization",
+    "durable goods", "factory orders",
+    "trade deficit", "current account",
+
+    # ── 通商・地政学・財政 ──
+    "tariff", "trade war", "treasury yield", "treasury yields",
+    "recession", "stagflation",
+    # ★ v3.9.11 追加
+    "soft landing", "hard landing", "debt ceiling", "fiscal cliff",
+    "government shutdown", "credit rating",
+}
+
+# 各 ETF にマップ
+_ETF_MAJOR_MAP: Dict[str, set] = {
+    "QQQ": QQQ_MAJOR_COMPANIES,
+    "SMH": SMH_MAJOR_COMPANIES,
+    "SPY": SPY_MAJOR_COMPANIES,
+}
+
+# ETF セクター語 (構成銘柄に加えて通過させるブロード語)
+_ETF_SECTOR_WORDS: Dict[str, set] = {
+    "QQQ": {"qqq", "nasdaq", "nasdaq 100", "nasdaq composite",
+            "tech stocks", "tech sector", "big tech"},
+    "SMH": {"smh", "semiconductor", "semiconductors", "chip stocks",
+            "chip sector", "ai chip", "ai chips"},
+    "SPY": {"spy", "s&p 500", "s&p500", "sp500", "broader market",
+            "stocks rally", "stocks slide", "stocks plunge", "stocks surge"},
+}
+
+
+def _validate_etf_impact(
+    headlines: List[str],
+    etf_list: List[str],
+    list_label: str,  # "beneficiaries" / "victims"
+) -> List[str]:
+    """
+    AI が beneficiaries/victims に入れた ETF をニュース内容と照合し、
+    主要構成銘柄 / セクター語 / マクロキーワードのいずれも含まれない場合は除外する。
+
+    Azenta 等の小型株の決算ミスを QQQ への victims と誤判定するケースを防ぐ。
+
+    ★ v3.1.2 (方針C 二重防御): SPY のみ厳格化。SPY 通過には以下のいずれかが必須:
+      (1) マクロキーワード (Fed/CPI/金利/関税 等)
+      (2) SPY セクター語 (s&p 500/spy/broader market/stocks slide 等)
+    SPY_MAJOR_COMPANIES (構成銘柄名) の登場では通過させない。理由:
+      ・SPY構成銘柄は500社で広く、大型株名が1つ混入するだけで誤通過しやすい
+      ・大型株個別材料は QQQ 経路で十分カバーされる (SPY二重発注は不要)
+      ・小型株単独材料 (Herbalife 等) で SPY ショートが暴発する事故を防ぐ
+    """
+    if not etf_list:
+        return etf_list
+
+    combined = " ".join(headlines).lower()
+    has_macro = any(kw in combined for kw in _MACRO_KEYWORDS)
+
+    validated: List[str] = []
+    rejected: List[str] = []
+    rejected_reasons: Dict[str, str] = {}  # ★ v3.1.2: 除外理由の可視化
+
+    for sym in etf_list:
+        # ETF でない (個別株が直接指定されている) 場合はそのまま通す
+        if sym not in _ETF_MAJOR_MAP:
+            validated.append(sym)
+            continue
+
+        # ★ v3.1.2: SPY は厳格化 — マクロキーワード or SPYセクター語のみ通過
+        if sym == "SPY":
+            spy_sectors = _ETF_SECTOR_WORDS.get("SPY", set())
+            has_spy_kw  = any(w in combined for w in spy_sectors)
+            if has_macro or has_spy_kw:
+                validated.append(sym)
+            else:
+                rejected.append(sym)
+                rejected_reasons[sym] = (
+                    "SPY厳格モード: マクロキーワード(Fed/CPI/金利等)も "
+                    "SPYセクター語(s&p 500/broader market 等)も記事に登場しないため。"
+                    "小型株単独材料での SPY 暴発防止 (例: Herbalife)。"
+                )
+            continue
+
+        # SPY 以外 (QQQ / SMH) は従来通り: 主要構成銘柄 / セクター語のいずれか
+        majors  = _ETF_MAJOR_MAP[sym]
+        sectors = _ETF_SECTOR_WORDS.get(sym, set())
+        if any(name in combined for name in majors) or any(w in combined for w in sectors):
+            validated.append(sym)
+        else:
+            rejected.append(sym)
+            rejected_reasons[sym] = "主要構成銘柄/セクター語が記事に登場しないため"
+
+    if rejected:
+        # ★ v3.1.2: 除外理由を ETF 別にロギング (Herbalife系の再発時に即特定可能)
+        # ★ v3.8.5: 正常な filter 動作のため WARNING → INFO に降格 (受講生混乱を回避)
+        for _sym in rejected:
+            log.info(
+                f"[ETF影響ガード] {list_label} から {_sym} を除外: "
+                f"{rejected_reasons.get(_sym, '理由不明')}"
+            )
+
+    return validated
+
+
+# ── ニュースソース表示ヘルパー（v2.99）────────────────────────────────────────
+def _format_news_source(article) -> str:
+    """ニュース記事のソースを表示用文字列に整形する。 source_detail があれば二段表示 (例: "finnhub:reuters")、なければ source のみ。"""
+    src = getattr(article, "source", "") or "unknown"
+    detail = getattr(article, "source_detail", "") or ""
+    if detail:
+        return f"{src.lower()}:{detail.lower()}"
+    return src
+
+
+# ── 資金管理 (confidence 連動の動的ロットサイズ) ─────────────────────────────
+# BUDGET_USD: .env で設定する「1回の最大発注上限額」(未設定時 $50,000)。
+# 例: BUDGET_USD=100000 → confidence=0.7 で $5,000、confidence=1.0 で $100,000。
+# 内部比率 (変更不要): MAX=100%、MIN=40% [v2.71]、下限 MIN=$500/MAX=$1,000。
+_BUDGET_USD_RAW  = os.environ.get("BUDGET_USD", "")
+_BUDGET_USD: float
+# ★ v3.9.105 (H5): 値が「書いてあるのに不正」な場合は起動拒否に変更。
+#   従来は $50,000 フォールバックだったため、BUDGET_USD=5,000（カンマ入り）等の
+#   記載ミスで意図の数倍の予算で発注され得た。資金額は黙って既定値に倒さない。
+#   未設定（空欄）のみ従来どおり既定 $50,000。
+try:
+    _BUDGET_USD = float(_BUDGET_USD_RAW) if _BUDGET_USD_RAW.strip() else 50_000.0
+    if _BUDGET_USD <= 0:
+        raise ValueError("BUDGET_USD は正の数を指定してください")
+except ValueError:
+    print(f"[ERROR] BUDGET_USD の値が無効です（{_BUDGET_USD_RAW!r}）。")
+    print("        数値のみで指定してください（カンマ・$・空白は不可。例: BUDGET_USD=10000）。")
+    print("        安全のため起動を中止します。.env を修正して再起動してください。")
+    sys.exit(1)
+
+ORDER_SIZE_MAX_USD  = _BUDGET_USD                          # 予算の100%（スイートスポット時）
+ORDER_SIZE_MIN_USD  = max(500.0, _BUDGET_USD * 0.30)       # 予算の30%（弱シグナル時）
+# [v2.71] MIN を 10% → 40% に変更（往復手数料 $1.98 を下回るケース回避）
+# [v3.9.20] 山型サイズ配分導入に合わせて 40% → 30% に微調整（最低ロット下限）。
+# 信用口座のため上限チェックは BUDGET_USD 基準。
+
+# STOCK_MAX_USD: _BUDGET_USD が確定した後に計算（_STOCK_MAX_PCT は上で定義済み）
+STOCK_MAX_USD: float = _BUDGET_USD * _STOCK_MAX_PCT if _STOCK_MAX_PCT > 0 else 0.0
+
+# ── 損切りライン（MAX_LOSS_PCT）─────────────────────────────────────────────
+# setup_wizard.py の STEP2 で設定した「ポジションの何%損したら撤退するか」。
+# .env の MAX_LOSS_PCT を読み込む（例: 0.3 → 0.3%）。未設定時はデフォルト 0.3%。
+# ★ v3.9.46: デフォルトを 0.50% → 0.30% に引き下げ (TRAIL とセットで損益非対称性
+# を 5:1 → 2:1 に改善・損益分岐 WR 67% を目標)。
+_MAX_LOSS_PCT_RAW = os.environ.get("MAX_LOSS_PCT", "").strip()
+# ★ v3.9.105 (H5): 損切り幅も「書いてあるのに不正」なら起動拒否。
+#   併せて旧小数表記（例: 0.003 = 0.3% のつもり）を検出する。表記は「1=1%」なので
+#   0.003 と書くと 0.003% と解釈され即損切り連発になる。0 < 値 < 0.05 は旧表記の
+#   可能性が極めて高い（_pct_frac の新旧判別境界と同じ 0.05）ため推測変換せず停止する。
+try:
+    if _MAX_LOSS_PCT_RAW:
+        _mlp_val = float(_MAX_LOSS_PCT_RAW)
+        if 0 < _mlp_val < 0.05:
+            print(f"[ERROR] MAX_LOSS_PCT={_MAX_LOSS_PCT_RAW} は旧表記（小数）の可能性があります。")
+            print("        現在は「1=1%」表記です。0.3%なら MAX_LOSS_PCT=0.3 と書いてください。")
+            print("        安全のため起動を中止します。.env を修正して再起動してください。")
+            sys.exit(1)
+        MAX_LOSS_PCT = _mlp_val / 100
+    else:
+        MAX_LOSS_PCT = 0.003  # ★ v3.9.46: 未設定時デフォルト 0.3% (旧 0.5%)
+    if not (0 < MAX_LOSS_PCT <= 1.0):
+        raise ValueError
+except ValueError:
+    print(f"[ERROR] MAX_LOSS_PCT の値が無効です（{_MAX_LOSS_PCT_RAW!r}）。")
+    print("        %の数値で指定してください（例: MAX_LOSS_PCT=0.3 は 0.3% の意味）。")
+    print("        安全のため起動を中止します。.env を修正して再起動してください。")
+    sys.exit(1)
+
+# ── ★ v3.9.32: 高ボラ銘柄の損切り幅拡大 + ポジションサイズ縮小 ────────────────
+# 5/21 NVDA 利用者I -$41.80 事例: NVDA $223 の 0.5% = $1.12 は日中ノイズ範囲で、
+# 損切りが誤発動していた。高ボラ銘柄は損切り幅を拡げる必要があるが、幅を拡げる
+# だけだと 1 トレードあたりの損失額が増える。そこで「損切り幅 × N 倍」と同時に
+# 「ポジションサイズ ÷ N 倍」を行い、1 トレードの想定最大損失額 (ドル) を ETF と
+# 同水準に保つ (リスクパリティ設計)。
+#   例: MAX_LOSS_PCT=0.50% / 倍率 2.5 のとき
+#     ETF  : 損切り 0.50% / サイズ 100% → 最大損失 = サイズ × 0.50%
+#     NVDA : 損切り 1.25% / サイズ  40% → 最大損失 = (サイズ×0.4) × 1.25%
+#            = サイズ × 0.50%  ← ETF と同じドル損失
+# STOCK_HIGHVOL_LOSS_MULT=0 で機能無効化 (全銘柄一律 MAX_LOSS_PCT)。
+_HIGHVOL_SYMBOLS: set = {
+    "NVDA", "TSLA", "AMD", "MU", "AVGO", "SMH", "MRVL", "ARM",
+    "SMCI", "COIN", "MSTR", "PLTR", "SOXX",
+    # ★ v3.9.53: SOXL (Direxion Daily Semiconductor Bull 3X) は moomoo JP の
+    # 信用取引（特定口座）で取り扱い対象外のため削除。受講生から指摘。
+    # SOXS (3x bear) は元々リスト未掲載。SOXX (1x iShares Semi) は通常 ETF
+    # として継続。3x レバETF は基本的に信用取引対象外。
+}
+_highvol_mult_raw = os.environ.get("STOCK_HIGHVOL_LOSS_MULT", "").strip()
+try:
+    STOCK_HIGHVOL_LOSS_MULT = float(_highvol_mult_raw) if _highvol_mult_raw else 2.5
+    if not (0 <= STOCK_HIGHVOL_LOSS_MULT <= 5.0):
+        raise ValueError
+except ValueError:
+    STOCK_HIGHVOL_LOSS_MULT = 2.5
+
+# ── ★ v3.9.114: モメンタムETFのボラ別 損切り幅倍率（プロファイル×銘柄）──────────
+# 20日シャドーの変動幅（SMHは60分変動が最大・DRAMは5分バーストが最大）に基づく。
+# 損切り幅 = 基準(MOMENTUM_STOP_LOSS_PCT 等) × 倍率。
+# ★ v3.9.123 (PAN方針 7/21): モメンタム実発注は「幅のみ拡大・サイズは縮小しない」。
+#   高ボラ銘柄ほど手数料に勝ちやすくエッジの主力（SMH SHORT）のため、サイズを削らない。
+#   1トレード損失の総量は日次/週次サーキットブレーカーで管理する。
+#   ※ ニュース系（qty自動計算）の place_buy/short 内 ÷_symbol_loss_mult は従来どおり維持。
+_MOMENTUM_STOP_MULT = {
+    "narrow":   {"SMH": 2.0, "QQQ": 1.4, "SPY": 1.0, "DRAM": 1.4, "IWM": 0.7},
+    "standard": {"SMH": 3.0, "QQQ": 2.0, "SPY": 1.3, "DRAM": 2.0, "IWM": 1.0},
+    "wide":     {"SMH": 4.0, "QQQ": 2.6, "SPY": 1.7, "DRAM": 2.6, "IWM": 1.3},
+}
+_STOP_PROFILE = os.environ.get("MOMENTUM_STOP_PROFILE", "standard").strip().lower()
+if _STOP_PROFILE not in ("narrow", "standard", "wide", "flat"):
+    _STOP_PROFILE = "standard"
+
+
+def _symbol_loss_mult(symbol: str) -> float:
+    """★ v3.9.32/114: 銘柄の損切り幅倍率を返す。
+    優先順位: ①.env個別上書き MOMENTUM_STOP_MULT_<SYM> → ②profile=flatなら全銘柄1.0 →
+    ③ボラ別プロファイル表（SMH/QQQ/SPY/DRAM/IWM）→ ④その他の高ボラ株は STOCK_HIGHVOL_LOSS_MULT → ⑤1.0。"""
+    sym = (symbol or "").upper()
+    _ov = os.environ.get(f"MOMENTUM_STOP_MULT_{sym}", "").strip()
+    if _ov:
+        try:
+            _v = float(_ov)
+            if 0 < _v <= 6.0:
+                return _v
+        except ValueError:
+            pass
+    if _STOP_PROFILE == "flat":
+        return 1.0   # 一律（全銘柄 基準%のまま・従来）
+    _m = _MOMENTUM_STOP_MULT.get(_STOP_PROFILE, {}).get(sym)
+    if _m is not None:
+        return _m
+    if STOCK_HIGHVOL_LOSS_MULT <= 0:
+        return 1.0
+    return STOCK_HIGHVOL_LOSS_MULT if sym in _HIGHVOL_SYMBOLS else 1.0
+
+
+def _effective_max_loss_pct(symbol: str, base_pct: float) -> float:
+    """★ v3.9.32: 銘柄別の実効損切り% を返す (高ボラ銘柄は base × 倍率)。"""
+    return base_pct * _symbol_loss_mult(symbol)
+
+# ── ★ v3.9.35/v3.9.36: 取引不可セッション移行「前」の全決済 (CLOSE_BEFORE_INACTIVE) ──
+# 「発注しない設定」セッションや OVERNIGHT へ切り替わる CLOSE_BEFORE_INACTIVE_MIN 分前に
+# 保有ポジションを全決済する。true なら境界の N 分前に決済、false なら保持のまま。
+#
+# ★ v3.9.36: v3.9.35 の「移行を検知した時点」(=移行後) 決済を「移行 N 分前」決済へ変更。
+#   理由: 移行後に決済すると (1) 低流動性で不利な価格になる
+#         (2) OVERNIGHT 移行後はデモ口座が取引非対応で決済不能になる
+#   → まだ取引可能な現セッション内 (境界 N 分前) で決済する設計に修正。
+CLOSE_BEFORE_INACTIVE: bool = (
+    os.environ.get("CLOSE_BEFORE_INACTIVE", "false").strip().lower() == "true"
+)
+# 境界の何分前に決済を発火するか (デフォルト 5 分)
+_close_before_min_raw = os.environ.get("CLOSE_BEFORE_INACTIVE_MIN", "").strip()
+try:
+    CLOSE_BEFORE_INACTIVE_MIN: int = int(_close_before_min_raw) if _close_before_min_raw else 5
+    if not (1 <= CLOSE_BEFORE_INACTIVE_MIN <= 60):
+        raise ValueError
+except ValueError:
+    CLOSE_BEFORE_INACTIVE_MIN = 5
+
+# ── ★ v3.9.131: ハートビート監視（型B＝イベントループ凍結の検知） ───────────────
+#   独立OSスレッドで「最後の鼓動から N 分無音」を検知し、Discord＋端末に大声警告する。
+#   凍結中は asyncio が止まっても OS スレッドは動くため、「通知ゼロ(型B)」を破れる。
+#   安全のため通知のみ（自動再起動はしない＝実口座での再起動後ロック等の危険を避ける）。
+HEARTBEAT_WATCHDOG_ENABLED: bool = (
+    os.environ.get("HEARTBEAT_WATCHDOG_ENABLED", "true").strip().lower() == "true"
+)
+try:
+    HEARTBEAT_TIMEOUT_MIN: int = int(os.environ.get("HEARTBEAT_TIMEOUT_MIN", "10") or "10")
+    if not (2 <= HEARTBEAT_TIMEOUT_MIN <= 120):
+        raise ValueError
+except ValueError:
+    HEARTBEAT_TIMEOUT_MIN = 10
+_last_heartbeat_mono: float = time.monotonic()   # 直近の鼓動（beatループが更新）
+# ★ 初回抑制バグ回避: monotonic はOS起動からの経過秒のため、0.0 と比較すると
+#   「PC再起動→Bot起動→30分以内に凍結」で初回アラートが抑制される。None=未送信で管理する。
+_hb_last_alert_mono = None                        # 直近の凍結アラート送信 (None=未送信)
+_hb_alerted: bool = False                         # 凍結アラート送信済み（復帰通知用）
+_hb_freeze_start_mono = None                      # 凍結開始時点の鼓動 (復帰通知に凍結時間を載せる)
+
+# ── リスク監視 ───────────────────────────────────────────────────────────────
+RISK_CHECK_SEC = 15
+
+# ── トレイリングストップ ──────────────────────────────────────────────────────
+# setup_wizard.py STEP3 で設定。
+# ★ v3.9.46: デフォルトを TRIGGER 1.0% → 0.30% / DROP 0.5% → 0.15% に引き下げ。
+# MAX_LOSS_PCT (0.30%) とセットで損益非対称性を改善:
+#   旧: 損 -0.50% / 利 最小 +0.50% (1.0 - 0.5) → 1:1 だが TRIGGER に到達せず timeout が大半
+#   新: 損 -0.30% / 利 最小 +0.15% (0.30 - 0.15) → 2:1 / 損益分岐 WR 67%
+# 「稀な大勝でカバー」型から「頻繁な小勝でコツコツ積上げ」型へシフト。
+# ★ v3.9.73: 入力は「1=1%」に統一 (例 TRAIL_TRIGGER_PCT=0.30 → 0.30%。旧 0.003 も後方互換)。
+TRAIL_TRIGGER_PCT = _pct_frac("TRAIL_TRIGGER_PCT", 0.003, 0.001, 0.5)
+TRAIL_DROP_PCT    = _pct_frac("TRAIL_DROP_PCT", 0.0015, 0.001, 0.5)
+
+# ── 時間切れ決済 ─────────────────────────────────────────────────────────────
+# setup_wizard.py STEP3 で設定。0 = 無効化（損切り・トレイリングのみで決済）。
+_timeout_raw = os.environ.get("TIMEOUT_EXIT_MINUTES", "").strip()
+try:
+    TIMEOUT_EXIT_MINUTES = int(_timeout_raw) if _timeout_raw else 10
+    if TIMEOUT_EXIT_MINUTES < 0:
+        TIMEOUT_EXIT_MINUTES = 0
+except ValueError:
+    TIMEOUT_EXIT_MINUTES = 10
+
+# ── ニュース ─────────────────────────────────────────────────────────────────
+NEWS_DEDUP_SEC         = 300   # 5分
+EXTERNAL_NEWS_POLL_SEC = 10    # Finnhub 取得間隔（秒）
+RSS_POLL_SEC           = 5     # RSS 並列取得間隔（秒）
+
+# ── 指値バッファ ──────────────────────────────────────────────────────────────
+# ★ v2.99.4: ETF/個別株でバッファ分離。LIMIT_BUFFER_PCT は全体デフォルト (後方互換)。
+# ★ v3.9.73: 入力は「1=1%」に統一 (例 0.30 → 0.30%。旧 0.003 も後方互換・_pct_frac)。
+# 未設定時: ETF=0.30%, STOCK=0.50% / 旧 LIMIT_BUFFER_PCT 単独指定環境は両者に継承。
+LIMIT_BUFFER_PCT = _pct_frac("LIMIT_BUFFER_PCT", 0.010, 0.001, 0.05)
+# 旧 LIMIT_BUFFER_PCT 単独設定があれば ETF/STOCK の既定として継承、無ければ各既定。
+_buf_single_set = bool(os.environ.get("LIMIT_BUFFER_PCT", "").strip())
+LIMIT_BUFFER_PCT_ETF = _pct_frac(
+    "LIMIT_BUFFER_PCT_ETF", LIMIT_BUFFER_PCT if _buf_single_set else 0.003, 0.001, 0.05)
+LIMIT_BUFFER_PCT_STOCK = _pct_frac(
+    "LIMIT_BUFFER_PCT_STOCK", LIMIT_BUFFER_PCT if _buf_single_set else 0.005, 0.001, 0.05)
+
+def get_limit_buffer_pct(symbol: str) -> float:
+    """★ v2.99.4: シンボル種別に応じた指値バッファを返すヘルパー。
+
+    TRIGGER_TICKERS (ETF) なら LIMIT_BUFFER_PCT_ETF、それ以外は LIMIT_BUFFER_PCT_STOCK。
+    後方互換性: LIMIT_BUFFER_PCT 単独設定の旧環境では両方とも同じ値になる。
+    """
+    if symbol in TRIGGER_TICKERS:
+        return LIMIT_BUFFER_PCT_ETF
+    return LIMIT_BUFFER_PCT_STOCK
+
+# ── Claude モデル ─────────────────────────────────────────────────────────────
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+
+# ── セッション定数 ────────────────────────────────────────────────────────────
+SESSION_PREMARKET  = "premarket"
+SESSION_RTH        = "rth"
+SESSION_AFTERHOURS = "afterhours"
+SESSION_OVERNIGHT  = "overnight"
+SESSION_WEEKEND    = "weekend"
+SESSION_HOLIDAY    = "holiday"      # ★ v2.87 追加: NYSE 完全休場日
+
+# ── Ctrl+C 停止メッセージ ────────────────────────────────────────────────────
+# asyncio.run() がCtrl+Cを処理する前にSIGINTをキャッチして確実に表示する。
+# ★ v3.9.38: 旧実装は停止メッセージ表示後に SIG_DFL へ戻して os.kill しており、
+#   プロセスが即座に kill されて main() の finally (トレード集計の端末表示 +
+#   Discord 送信) が一切実行されなかった。KeyboardInterrupt を送出する方式に
+#   変更し、asyncio のタスクキャンセル経由で finally を確実に走らせる。
+_stop_message_shown = False
+
+def _sigint_handler(sig, frame):
+    global _stop_message_shown
+    if _stop_message_shown:
+        # 2 回目の Ctrl+C: シャットダウン処理 (集計表示・Discord 送信) が
+        # 固まっている場合に備え、ここで強制終了する。
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+        return
+    _stop_message_shown = True
+    try:
+        now_str = datetime.datetime.now(
+            ZoneInfo("America/New_York")
+        ).strftime("%Y-%m-%d %H:%M:%S ET")
+        sys.stderr.write("\n" + "═" * 52 + "\n")
+        sys.stderr.write("🛑  プログラムを停止しました\n")
+        sys.stderr.write(f"    停止時刻 : {now_str}\n")
+        sys.stderr.write("═" * 52 + "\n")
+        sys.stderr.write("    トレード集計を出力中… (もう一度 Ctrl+C で強制終了)\n")
+        sys.stderr.write("═" * 52 + "\n\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    # KeyboardInterrupt を送出 → asyncio がタスクをキャンセルし、main() の
+    # finally でトレード集計の端末表示 + Discord 送信が実行される。
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGINT, _sigint_handler)
+
+_ET           = ZoneInfo("America/New_York")
+# ★ v3.9.7 hotfix: クレジット切れ警告で参照されていた JST が module-level に
+# 未定義だったため、Ank 環境の RSS 高速ニュースループ等で NameError を発生
+# させていた。Asia/Tokyo の ZoneInfo を一度だけ作成して共有する。
+JST           = ZoneInfo("Asia/Tokyo")
+_MARKET_OPEN  = datetime.time(9, 30)
+_MARKET_CLOSE = datetime.time(16, 0)
+_PREMARKET_START = datetime.time(4, 0)
+_OVERNIGHT_START = datetime.time(20, 0)
+
+# ── 週末前強制決済の設定 ──────────────────────────────────────────────────────
+# 金曜 15:45 ET（通常市場クローズ15分前）に全ポジションを強制決済する。
+# この時刻以降は新規発注も停止し、月曜プリマーケット開始まで待機する。
+_FRIDAY_CLOSE_TIME = datetime.time(15, 45)
+
+# ── ★ v3.9.10: 終盤エントリーブロック設定 ────────────────────────────────────
+# 5/12 ログ分析で、デモ日次決済 (15:45 ET) の直前 1 分間に 22 件の新規 BUY が
+# 集中し、買った数秒〜数分後に強制決済で全件損切り (-$74.27 / 勝率 4.5%) という
+# 構造的バグを検出。close_trigger_time の N 分前以降は新規エントリーを禁止する。
+# 既存ポジションの管理 (損切り・トレール・時間切れ決済) は通常通り動作する。
+ENTRY_BLOCK_BEFORE_CLOSE_MIN: int = 15   # 強制決済の何分前から新規エントリー禁止か
+
+
+def _is_late_session_entry_blocked() -> tuple[bool, float]:
+    """★ v3.9.10: 強制決済発火時刻 (close_trigger_time) の N 分前以内なら True を返す。
+
+    戻り値: (block_flag, mins_to_close)
+      - block_flag: True なら新規エントリー禁止
+      - mins_to_close: 現在 ET 時刻から close_trigger_time までの残り分数 (負数 = 既に過ぎている)
+
+    対象セッション: RTH (プリマーケット/アフター/オーバーナイトでは適用しない)
+      理由: 15:45 ET は RTH 内の時刻なので、PRE/AFTER/OVN では概念的に発火しない。
+
+    対象モード: 平日のデモ口座 + 金曜の実口座 (15:45 ET 決済対象のセッション)
+      実口座 (LIVE) の平日は強制決済が走らないため、本ブロックは適用しない。
+      呼出側 (place_buy/place_short) で is_demo / is_friday の判定と組合せる想定だが、
+      最も単純には「現在の ET 時刻が close_trigger_time-N〜close_trigger_time の範囲内なら
+      安全側でブロック」する。誤検知時の機会損失は限定的 (15 分のみ)。
+    """
+    now_et = datetime.datetime.now(_ET).replace(tzinfo=None)
+    # close_trigger_time は通常日 15:45 ET、早期クローズ日は 12:45 ET。
+    # 簡易判定: 早期クローズ判定を読みやすくするため get_early_close_time を呼ぶ。
+    early_close = get_early_close_time(now_et.date())
+    if early_close:
+        close_minutes = early_close.hour * 60 + early_close.minute - _EARLY_CLOSE_PRECLOSE_MINUTES
+        close_t = datetime.time(close_minutes // 60, close_minutes % 60)
+    else:
+        close_t = _FRIDAY_CLOSE_TIME
+    close_dt = now_et.replace(hour=close_t.hour, minute=close_t.minute, second=0, microsecond=0)
+    mins_to_close = (close_dt - now_et).total_seconds() / 60.0
+    # close_trigger_time の N 分前 〜 当該時刻までを「終盤」とみなす
+    block = (0 < mins_to_close <= ENTRY_BLOCK_BEFORE_CLOSE_MIN)
+    return block, mins_to_close
+
+market_open_event: asyncio.Event = None  # type: ignore  → main() で初期化
+_main_loop: asyncio.AbstractEventLoop = None  # type: ignore  → main() で初期化
+
+# ── ★ v3.9.13: Anthropic API 並列呼出シリアライズ ────────────────────────────
+# 5/13 04:44 認定サポーター環境で観測: 異なるニュースループ (Alpaca + Yahoo) から
+# 並列に AI 呼出が同時発火 → サーバー側で 529 (Overloaded) を 2 連発した事例への対策。
+# semaphore で同時 1 接続のみ許可 + 最小間隔ガードで「サーバー側同時着弾」を排除。
+# SDK 自動リトライ + v3.9.8 正規化 dedup と組合せて 3 重防御。
+# Semaphore は main() で event loop 生成後に初期化 (モジュール読込時は None)。
+_anthropic_api_lock: Optional[asyncio.Semaphore] = None  # main() で asyncio.Semaphore(1) を代入
+_last_anthropic_call_time: Optional[datetime.datetime] = None
+# 連続呼出の最小間隔 (秒). env で 0 にすると間隔ガード無効化 (semaphore のみ機能)。
+def _parse_anthropic_min_interval() -> float:
+    raw = os.environ.get("ANTHROPIC_MIN_INTERVAL_SEC", "").strip()
+    if not raw:
+        return 0.5
+    try:
+        v = float(raw)
+        return max(0.0, min(10.0, v))
+    except ValueError:
+        return 0.5
+ANTHROPIC_MIN_INTERVAL_SEC: float = _parse_anthropic_min_interval()
+
+# ── ★ v3.9.60: Anthropic API リトライ ─────────────────────────────────────────
+# 5/27 21:57 のログで「Error code: 529 - Overloaded」を受けて即「中立扱い」と
+# なり、発注機会を逃した事象を確認。一時的なサーバー過負荷 (529/503/
+# overloaded) は数秒待てば復旧することが多いため、指数バックオフで 3 回まで
+# 再試行する。
+def _anthropic_create_with_retry(client, max_retries: int = 3, **kwargs):
+    """Anthropic client.messages.create を 529/503 で指数バックオフ再試行。
+
+    バックオフ間隔: 1秒 → 2秒 → 4秒 (max_retries=3 のとき合計最大 7 秒待機)。
+    リトライ対象外のエラー (認証失敗・無効リクエスト等) は即座に再 raise。
+    """
+    import time as _time
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return client.messages.create(**kwargs)
+        except Exception as e:
+            err_str = str(e).lower()
+            # ★ v3.9.77 (B-2): stop_sequences が Anthropic 400 で拒否された場合は、
+            #   stop_sequences を外して即リトライ（出力削減用の最適化なので無くても安全）。
+            #   Anthropic 側の stop_sequence 仕様変更に対して頑健にする。
+            if (("stop_sequence" in err_str or "stop sequences" in err_str)
+                    and kwargs.get("stop_sequences")):
+                log.warning(
+                    "[Anthropic API] stop_sequences が拒否されたため除外して再試行: "
+                    f"{str(e)[:120]}"
+                )
+                kwargs.pop("stop_sequences", None)
+                try:
+                    return client.messages.create(**kwargs)
+                except Exception as e2:
+                    e = e2
+                    err_str = str(e2).lower()
+            # 一時的・サーバー過負荷系エラーのみリトライ対象
+            is_retryable = any(
+                kw in err_str
+                for kw in ("529", "503", "overloaded", "unavailable", "rate_limit", "timeout")
+            )
+            if not is_retryable or attempt >= max_retries - 1:
+                raise
+            wait_sec = 2 ** attempt   # 1, 2, 4 秒
+            log.warning(
+                f"[Anthropic API] {type(e).__name__} (再試行 {attempt+1}/{max_retries}): "
+                f"{str(e)[:100]} → {wait_sec}秒後に再試行"
+            )
+            _time.sleep(wait_sec)
+            last_err = e
+    if last_err is not None:
+        raise last_err
+
+
+def _threadsafe_discord(text: str) -> None:
+    """スレッド安全なDiscord送信。 同期関数（to_threadで呼ばれる）からでも安全に呼び出せる。 _main_loop が未設定の場合は直接呼び出す。"""
+    try:
+        if _main_loop and _main_loop.is_running():
+            _main_loop.call_soon_threadsafe(
+                lambda: _threadsafe_future(
+                    asyncio.to_thread(send_discord_message, text)
+                )
+            )
+        else:
+            send_discord_message(text)
+    except Exception as _e:
+        # ★ v3.9.63: 通知失敗が呼び出し元 (発注経路等) に伝播しないよう必ず握りつぶす
+        log.debug(f"[スレッド] Discord 送信スキップ (例外): {_e}")
+
+def _threadsafe_future(coro) -> None:
+    """スレッド安全なコルーチン実行。 同期関数からasyncio.ensure_futureの代わりに使用する。
+
+    ★ v3.9.63: ループ未起動/終了間際でも例外を発注経路へ伝播させない。
+    過去ログの「[ORDER] BUY 例外: There is no current event loop」「[セッション監視]
+    予期しないエラー: no current event loop」(旧版・worker thread からの asyncio 直叩き) の
+    再発防止。run_coroutine_threadsafe が万一 raise しても握りつぶし、coro は確実に close する。
+    """
+    try:
+        if _main_loop and _main_loop.is_running():
+            asyncio.run_coroutine_threadsafe(coro, _main_loop)
+            return
+        log.warning("[スレッド] イベントループ未起動のためコルーチンをスキップ")
+    except Exception as _e:
+        log.warning(f"[スレッド] コルーチン投入に失敗 (スキップ): {_e}")
+    # スケジュールできなかった coroutine は明示 close して 'never awaited' 警告を防ぐ
+    try:
+        coro.close()
+    except Exception:
+        pass
+
+
+# ── ★ v3.9.42: API キー / Webhook URL の非ASCII文字サニタイザ ────────────────
+# 5/18-22 のログで「AI 呼出が 3,924 件全失敗 / UnicodeEncodeError "ascii" codec
+# can't encode characters in position 108-125」を確認。原因は受講生の .env で
+# ANTHROPIC_API_KEY の末尾にスマートクォート ("" U+201C/201D) や全角スペース、
+# コメント (日本語) が混入していたこと。httpx は HTTP ヘッダ値を ASCII エンコード
+# するため、非 ASCII 文字を含む API キーは毎回 UnicodeEncodeError で死ぬ。
+# このサニタイザで読み込み時に必ず非 ASCII 文字を除去し、警告を出す。
+def _sanitize_api_key(raw: str, key_name: str = "") -> str:
+    """API キー / Webhook URL から非 ASCII 文字と囲みクォートを除去する。
+
+    HTTP ヘッダ・URL は ASCII のみ許可されるため、コピペで混入した:
+      - スマートクォート ("" '' U+2018/U+2019/U+201C/U+201D)
+      - 全角スペース (　 U+3000)
+      - 日本語コメント
+      - BOM (U+FEFF)
+      - 末尾の改行・制御文字
+    を全て除去する。何か除去した場合は WARNING ログを出して受講生が気付ける
+    ようにする (キー自体は機密のためログに出さない)。
+    """
+    if not raw:
+        return ""
+    # 1) 非 ASCII を除去
+    clean = "".join(ch for ch in raw if ord(ch) < 128)
+    # 2) 前後の空白・制御文字 (\r\n\t など) を除去
+    clean = clean.strip()
+    # 3) 前後の囲みクォート (', ", `) を 1 組除去
+    if len(clean) >= 2 and clean[0] in ("'", '"', "`") and clean[-1] == clean[0]:
+        clean = clean[1:-1].strip()
+    # 4) 何か削除されたら警告 (本人が気付かないと再発するため)
+    if clean != raw.strip():
+        try:
+            dropped = len(raw) - len(clean)
+            log.warning(
+                f"[.env サニタイズ] {key_name or 'キー'} の前後 / 中に "
+                f"{dropped} 文字の非 ASCII 文字 または 囲みクォートを除去しました。"
+                f" (.env のコピペ時にスマートクォート/全角スペース/日本語コメントが"
+                f" 混入していた可能性があります。再起動後も警告が出る場合は .env を"
+                f" テキストエディタで開き、当該キーを半角の sk-ant-... 等そのまま"
+                f" 1 行に貼り直してください)"
+            )
+        except Exception:
+            pass
+    return clean
+
+
+# ── Discord / 外部ニュースAPI 設定 ──────────────────────────────────────────────────
+_raw_discord_url       = _sanitize_api_key(os.environ.get("DISCORD_WEBHOOK_URL", ""), "DISCORD_WEBHOOK_URL")
+FINNHUB_API_KEY        = _sanitize_api_key(os.environ.get("FINNHUB_API_KEY", ""), "FINNHUB_API_KEY")
+ALPACA_API_KEY_ID      = _sanitize_api_key(os.environ.get("ALPACA_API_KEY_ID", ""), "ALPACA_API_KEY_ID")        # Alpaca News WebSocket（任意）
+ALPACA_API_SECRET_KEY  = _sanitize_api_key(os.environ.get("ALPACA_API_SECRET_KEY", ""), "ALPACA_API_SECRET_KEY")  # Alpaca News WebSocket（任意）
+
+# ★ v3.9.31: Alpaca News の健全性追跡 (health_warning_loop が 5 分おきに参照)
+# 5/21 集計で Alpaca 認証/接続エラー 54 件。初回 ERROR 表示後は WARNING に埋もれ、
+# 受講生が「ニュースの半分が来ていない」状態に気づけなかった。
+_alpaca_news_health: Dict[str, Any] = {
+    "last_success_at": None,   # 最後に正常認証/受信した時刻 (datetime)
+    "auth_fail_count": 0,      # 連続認証失敗回数
+    "last_error":      "",     # 直近エラーの概要
+    # ★ v3.9.51: 警告の最終発火時刻 (非 RTH の 60 分間隔抑制用)
+    "last_warning_at": None,
+}
+_FINNHUB_URL         = "https://finnhub.io/api/v1/news"
+_FINNHUB_QUOTE_URL   = "https://finnhub.io/api/v1/quote"
+
+
+def _mask_secrets(text: str) -> str:
+    """
+    ログ出力前にAPIトークン・キー・Webhook URLをマスクする。
+    requests の例外メッセージにはリクエスト URL が含まれ、機密情報が
+    丸見えになるため、ログに出力する前に必ずこの関数を通す。
+    対象:
+      - token= / apikey= / api_key= / key= に続く英数字列
+      - Discord Webhook URL（/api/webhooks/ 以降をマスク）
+      - Google Apps Script URL（/macros/s/ 以降をマスク）
+    """
+    import re as _re
+    text = str(text)
+    # APIキー形式（クエリパラメータ）
+    text = _re.sub(r'(token|apikey|api_key|key)=([a-zA-Z0-9_\-]+)', r'\1=***', text)
+    # Discord Webhook URL
+    text = _re.sub(r'(https://discord(?:app)?\.com/api/webhooks/)\S+', r'\1***', text)
+    # Google Apps Script URL
+    text = _re.sub(r'(https://script\.google\.com/macros/s/)\S+', r'\1***', text)
+    return text
+
+# ── RSS フィード (無料・低遅延ニュースソース) ────────────────────────────────
+# 遅延目安: Yahoo Finance ~5分。標準ライブラリ xml.etree のみで解析。
+# v2.97: Reuters/AP の無料 RSS は廃止済み (feeds.reuters.com 2020年廃止 /
+# feeds.apnews.com 公開停止) → DNS解決失敗で5秒毎にログ汚染 → Yahoo Finance のみに整理。
+_RSS_FEEDS: List[Dict[str, str]] = [
+    {
+        "name": "Yahoo Finance",
+        "url":  "https://finance.yahoo.com/news/rssindex",
+    },
+]
+
+# ── .env プレースホルダーガード ────────────────────────────────────────────────
+# 「あなたの〜」という未設定のままのプレースホルダーを無効化する
+_PLACEHOLDER_MARKER = "あなたの"
+
+def _validate_env() -> None:
+    """起動直後に .env の主要キーがプレースホルダーのままでないか検査する。 問題があれば log.error で通知し、続行はするが機能が無効になる旨を伝える。"""
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if _PLACEHOLDER_MARKER in anthropic_key:
+        # ログは basicConfig 後に呼ばれるため print で出力
+        print(
+            "[ERROR] ANTHROPIC_API_KEY が未設定です（.env のプレースホルダーが残っています）。\n"
+            "  正しい API キーを設定してください。"
+        )
+    if _PLACEHOLDER_MARKER in _raw_discord_url:
+        print(
+            "[WARNING] DISCORD_WEBHOOK_URL が未設定です（.env のプレースホルダーが残っています）。\n"
+            "  Discord 通知は無効化されます。"
+        )
+
+_validate_env()
+
+# Discord URL のバリデーション: https:// で始まらない場合は無効化
+if _raw_discord_url and _raw_discord_url.startswith("https://") and _PLACEHOLDER_MARKER not in _raw_discord_url:
+    DISCORD_WEBHOOK_URL = _raw_discord_url
+else:
+    if _raw_discord_url:  # 空でなければ無効化ログを出す
+        print(
+            f"[WARNING] DISCORD_WEBHOOK_URL が無効です（https:// で始まらないか未設定）: "
+            f"{_raw_discord_url[:40]!r}\n  Discord 通知は無効化されます。"
+        )
+    DISCORD_WEBHOOK_URL = ""
+
+
+# ── ターミナルカラー出力ユーティリティ ───────────────────────────────────────────────────────
+# ★ v3.9.107: pythonw.exe / タスクスケジューラ等のコンソールなし実行では
+#   sys.stdout が None になり、import 時に AttributeError で即クラッシュしていた
+#   （受講生報告・無人運転環境）。None-safe にし、非TTY扱い（色なし）で継続する。
+try:
+    _IS_TTY = bool(sys.stdout is not None and sys.stdout.isatty())
+except Exception:
+    _IS_TTY = False
+
+def _c(text: str, code: str) -> str:
+    """ANSIカラーコードでラップ（TTY時のみ有効）"""
+    return f"\033[{code}m{text}\033[0m" if _IS_TTY else str(text)
+
+def pnl_colored(pnl: float, suffix: str = "") -> str:
+    """損益額を色付きで返す。 プラス → 緑（太字）  マイナス → 赤（太字）  ゼロ → そのまま suffix に単位（%など）を追加可能。"""
+    s = f"${pnl:+.2f}{suffix}"
+    if pnl > 0:
+        return _c(s, "1;92")   # 太字+明るい緑
+    elif pnl < 0:
+        return _c(s, "1;91")   # 太字+明るい赤
+    return s
+
+def pct_colored(pct: float) -> str:
+    """損益率を色付きで返す"""
+    s = f"{pct:+.2f}%"
+    if pct > 0:
+        return _c(s, "92")
+    elif pct < 0:
+        return _c(s, "91")
+    return s
+
+
+def _fmt_order_log(
+    symbol: str,
+    side: str,
+    qty: int,
+    price: float,
+    session: str,
+    trd_env=None,
+    confidence: float = 0.0,
+    amount: float = 0.0,
+    reason: str = "",
+) -> str:
+    """
+    案Bスタイルの発注ログ行を生成する。
+    例（ターミナル）:
+      ▲  BUY  │ 【UNH】 │ 187株 @ $325.10 │ premarket │ conf 0.90 │ 予定 $60,794 │ 実口座
+      ▼  SELL │ 【SPY】 │  52株 @ $519.40 │ rth       │ 損切り               │ 実口座
+      ▼▼ SHORT │ 【QQQ】 │  30株 @ $448.20 │ afterhours│ conf 0.85 │ 予定 $13,446 │ 実口座
+    ファイルログはANSIなし（_PlainFormatterが自動除去）。
+    side: "BUY" | "SHORT" | "SELL" | "SELL(決済)" | "SELL(部分)" | "BUY(緊急)"
+    price: 0 を渡すと「成行」と表示する。
+    """
+    _SEP = _c(" │ ", "2")   # 薄いグレーのセパレーター
+
+    # ── 方向インジケーター ──────────────────────────────────────────────
+    if side == "SHORT":
+        arrow = _c("▼▼ SHORT", "95")   # 紫（空売り）
+    elif "SELL" in side:
+        arrow = _c("▼  SELL ", "91")   # 赤（返済売り・決済）
+    elif side == "BUY(緊急)":
+        arrow = _c("▲! BUY  ", "91")   # 赤（緊急買い戻し）
+    else:
+        arrow = _c("▲  BUY  ", "92")   # 緑（買い）
+
+    # ── シンボル（黄）──────────────────────────────────────────────────
+    sym_str = _c(f"【{symbol}】", "93")
+
+    # ── 株数＋価格（白太字）。price=0は成行 ──────────────────────────────
+    qty_str   = f"{qty:>4}株 @ "
+    price_str = _c(f"${price:,.2f}", "1") if price > 0 else _c("成行", "91")
+    qty_price = qty_str + price_str
+
+    # ── セッション（シアン）─────────────────────────────────────────────
+    sess_str = _c(session, "36")
+
+    # ── 口座モード（橙）─────────────────────────────────────────────────
+    _is_real = (trd_env is not None and trd_env == TrdEnv.REAL)
+    mode_str = _c("実口座", "33") if _is_real else _c("デモ  ", "33")
+
+    # ── 組み立て ─────────────────────────────────────────────────────────
+    parts = [arrow, sym_str, qty_price, sess_str]
+
+    if confidence > 0:
+        parts.append(f"conf {_c(f'{confidence:.2f}', '93')}")   # 黄
+
+    if amount > 0:
+        parts.append(f"予定 {_c(f'${amount:,.0f}', '96')}")      # 明るい青
+
+    if reason:
+        parts.append(_c(reason[:35], "33"))                       # 橙（最大35文字）
+
+    parts.append(mode_str)
+
+    return _SEP.join(parts)
+
+def discord_pnl(pnl: float, pct: float = None, qty: int = None) -> str:
+    """
+    Discord通知用の損益フォーマット。絵文字でプラス/マイナスを明示する。
+    pnl  : 損益額（ドル）
+    pct  : 損益率（%）省略可
+    qty  : 株数（省略可）
+    例:
+      📈 利益  +$12.50 (+0.13%)  14株
+      📉 損失  -$48.20 (-0.51%)  14株
+    """
+    if pnl > 0:
+        icon  = "📈"
+        label = "利益 "
+        amt   = f"+${pnl:.2f}"
+    elif pnl < 0:
+        icon  = "📉"
+        label = "損失 "
+        amt   = f"-${abs(pnl):.2f}"
+    else:
+        icon  = "➡️"
+        label = "損益 "
+        amt   = f"$0.00"
+    pct_str = f" ({pct:+.2f}%)" if pct is not None else ""
+    qty_str = f"  {qty}株"    if qty is not None else ""
+    return f"{icon} {label} {amt}{pct_str}{qty_str}"
+
+# ── ★ v3.9.19: 重大エラー時のアラート音 ─────────────────────────────────────
+# 6 つの致命的イベント発生時に OS 組み込み音源を再生して即座に気づけるようにする。
+# 対象イベント:
+#   ① Anthropic クレジット切れ検知   ② moomoo SDK 古すぎる (起動拒否)
+#   ③ OpenD 接続失敗 (起動拒否)        ④ 取引ロック検出 (unlock エラー)
+#   ⑤ 強制損切り発注が全失敗           ⑥ ショートカバー全 position_id 失敗
+# デフォルトは無効 (ENABLE_ALERT_SOUND=true で有効化、setup_wizard 上級者向けで設定)。
+# クロスプラットフォーム: macOS=afplay / Windows=winsound / Linux=paplay。
+# SSH リモート / 音声デバイス無し環境では失敗してもエラー出力しない。
+ENABLE_ALERT_SOUND: bool = os.environ.get("ENABLE_ALERT_SOUND", "false").strip().lower() == "true"
+try:
+    ALERT_SOUND_COOLDOWN_SEC: int = max(0, int(os.environ.get("ALERT_SOUND_COOLDOWN_SEC", "60")))
+except (ValueError, TypeError):
+    ALERT_SOUND_COOLDOWN_SEC = 60
+# 夜間ミュート時間帯 (JST, "HH:MM-HH:MM" 形式)。日跨ぎ可。
+ALERT_SOUND_QUIET_HOURS: str = os.environ.get("ALERT_SOUND_QUIET_HOURS", "").strip()
+# macOS のカスタム音源パス (Sosumi / Glass / Funk / Submarine など)
+ALERT_SOUND_FILE_MACOS: str = os.environ.get(
+    "ALERT_SOUND_FILE_MACOS", "/System/Library/Sounds/Sosumi.aiff"
+).strip()
+
+_alert_sound_last_played: dict = {}  # {event_key: datetime} — クールダウン管理
+
+
+def _is_alert_quiet_hours() -> bool:
+    """ALERT_SOUND_QUIET_HOURS で指定された時間帯内なら True (JST 基準)。"""
+    if not ALERT_SOUND_QUIET_HOURS:
+        return False
+    try:
+        start_str, end_str = ALERT_SOUND_QUIET_HOURS.split("-", 1)
+        start_h, start_m = map(int, start_str.strip().split(":"))
+        end_h,   end_m   = map(int, end_str.strip().split(":"))
+        now_jst = datetime.datetime.now(JST).time()
+        start_t = datetime.time(start_h, start_m)
+        end_t   = datetime.time(end_h, end_m)
+        if start_t <= end_t:
+            return start_t <= now_jst < end_t
+        # 日跨ぎ (例: 23:00-06:00)
+        return now_jst >= start_t or now_jst < end_t
+    except Exception:
+        return False
+
+
+# ★ v3.9.119: 重大アラート6条件の日本語ラベル（Discord通知用）
+_ALERT_EVENT_LABELS = {
+    "credit_exhausted":        "Anthropic API クレジット切れ検知（AI判定が全件失敗）",
+    "moomoo_sdk_outdated":     "moomoo SDK が古すぎます（起動拒否）",
+    "opend_connection_failed": "OpenD に接続できません（起動拒否）",
+    "trade_locked":            "取引ロック検出（unlock エラー・全発注停止）",
+    "force_loss_cut_failed":   "強制損切りの発注が全失敗（損失拡大リスク）",
+    "short_cover_all_failed":  "ショートカバー全 position_id 発注失敗（損失拡大リスク）",
+}
+_alert_discord_last_sent: dict = {}   # {event_key: datetime} — Discord用クールダウン
+_ALERT_DISCORD_COOLDOWN_SEC = 600     # 同一イベントのDiscord再通知は10分に1回まで
+_ALERT_DISCORD_LOCK = threading.Lock()  # ★ v3.9.120: クールダウンの check-then-set を排他
+
+
+def _notify_alert_discord(event_key: str) -> None:
+    """★ v3.9.119: 重大アラートを Discord にも通知する。
+    アラート音の有効/無効・夜間ミュートとは独立（Webhook 設定時のみ・静かな通知）。
+    連発防止のため同一イベントは _ALERT_DISCORD_COOLDOWN_SEC に1回まで。
+    ★ v3.9.120: 送信は常に daemon スレッドで実行（メインループ不在時に同期送信へ
+    フォールバックして呼び出し元＝エラー処理経路をブロックする穴を塞ぐ）。
+    クールダウン判定もロックで排他（同時発火時の二重送信防止）。外部AIレビュー指摘。"""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    now = datetime.datetime.now()
+    with _ALERT_DISCORD_LOCK:
+        last = _alert_discord_last_sent.get(event_key)
+        if last is not None and (now - last).total_seconds() < _ALERT_DISCORD_COOLDOWN_SEC:
+            return
+        _alert_discord_last_sent[event_key] = now
+    label = _ALERT_EVENT_LABELS.get(event_key, event_key)
+    msg = (
+        f"🚨 **重大アラート**: {label}\n"
+        f"発生: {now.strftime('%Y-%m-%d %H:%M:%S')} JST\n"
+        f"（同一イベントは {_ALERT_DISCORD_COOLDOWN_SEC // 60} 分間 再通知しません）"
+    )
+    def _send():
+        try:
+            send_discord_message(msg)
+        except Exception:
+            pass  # 通知失敗で本体を止めない
+    try:
+        threading.Thread(target=_send, daemon=True).start()
+    except Exception:
+        pass
+
+
+def _play_alert_sound(event_key: str) -> None:
+    """重大イベント時にアラート音を再生する。 デフォルト無効 / クールダウン / 夜間ミュート対応。
+    ★ v3.9.119: 同じ6条件で Discord 通知も送る（音設定と独立・上の _notify_alert_discord）。"""
+    _notify_alert_discord(event_key)   # ★ v3.9.119: 音が無効でも Discord には通知
+    if not ENABLE_ALERT_SOUND:
+        return
+    if _is_alert_quiet_hours():
+        return
+    # 同一イベントのクールダウン (連発防止)
+    now = datetime.datetime.now()
+    last = _alert_sound_last_played.get(event_key)
+    if last is not None and (now - last).total_seconds() < ALERT_SOUND_COOLDOWN_SEC:
+        return
+    _alert_sound_last_played[event_key] = now
+    # 別スレッドで再生 (ロガーをブロックしない)
+    def _play():
+        try:
+            import platform as _pf
+            import subprocess as _sp
+            sys_name = _pf.system()
+            if sys_name == "Darwin":
+                _sp.Popen(
+                    ["afplay", ALERT_SOUND_FILE_MACOS],
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
+                )
+            elif sys_name == "Windows":
+                try:
+                    import winsound as _ws
+                    _ws.MessageBeep(_ws.MB_ICONHAND)
+                except Exception:
+                    pass
+            elif sys_name == "Linux":
+                _sp.Popen(
+                    ["paplay", "/usr/share/sounds/freedesktop/stereo/dialog-warning.oga"],
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
+                )
+        except Exception:
+            pass  # 音声デバイス無し / コマンド不在は無視
+    try:
+        threading.Thread(target=_play, daemon=True).start()
+    except Exception:
+        pass
+
+
+# ── 取引ロック状態管理 ────────────────────────────────────────────────────────
+# 取引ロックエラーが検出されたら True にセットし、
+# リスク監視ループで60秒ごとに赤い警告を繰り返し表示する。
+_trade_locked: bool = False
+_trade_lock_last_warned: Optional[datetime.datetime] = None
+_TRADE_LOCK_WARN_INTERVAL_SEC = 60   # 警告の繰り返し間隔
+
+def _warn_trade_locked() -> None:
+    """取引ロック検出時に赤いボックスで警告を表示する。 ターミナルには ANSI 赤色、ファイルログには色なし。"""
+    _play_alert_sound("trade_locked")  # ★ v3.9.19: アラート音
+    lines = [
+        "╔══════════════════════════════════════════════════════════╗",
+        "║  ⛔  取引ロックが検出されました（発注がブロックされています） ║",
+        "║                                                          ║",
+        "║  以下のいずれかを確認・操作してください:                  ║",
+        "║                                                          ║",
+        "║  【OpenD の場合】                                         ║",
+        "║    OpenD ウィンドウ → 設定 → トレードロック解除           ║",
+        "║    → 取引パスワードを入力して解除                         ║",
+        "║                                                          ║",
+        "║  【moomoo アプリの場合】                                  ║",
+        "║    右上アイコン → セキュリティ → 取引パスワード入力        ║",
+        "║                                                          ║",
+        "║  解除後は再起動不要。次のシグナルで自動的に発注します。    ║",
+        "╚══════════════════════════════════════════════════════════╝",
+    ]
+    # ターミナル: 赤太字で表示
+    if _IS_TTY:
+        print("\033[1;91m")   # 赤太字 開始
+        for line in lines:
+            print(f"  {line}")
+        print("\033[0m")      # リセット
+    # ファイルログ: ANSI なしで WARNING として記録
+    log.warning("\n" + "\n".join(f"  {l}" for l in lines))
+
+
+class _PlainFormatter(logging.Formatter):
+    """ANSIエスケープコードを除去してログファイルに書き込む"""
+    import re
+    _ANSI = re.compile(r"\033\[[0-9;]*m")
+    def format(self, record):
+        msg = super().format(record)
+        return self._ANSI.sub("", msg)
+
+# ── ★ v3.8.7: 週次ログアーカイブ・ハンドラ (logbackup/ + 8週保持) ─────────
+# 毎週月曜 00:00 (システムローカル時刻、JST 想定) にログを logbackup/ へ
+# 以下のファイル名で移動し、新しい moomoo_trade_v1.log を開始する。
+#   moomoo_trade_v1.YYYY-MM-DD_to_YYYY-MM-DD.log
+#       週開始日(月)    週末了日(日)
+# 8 週間より古いアーカイブはローテーション時に自動削除する。
+# 既存累積ログ (v3.8.6 以前) がある場合は、ファイル先頭のタイムスタンプを
+# 週開始日として採用するため、初回アーカイブは累積開始日 〜 直前の日曜となる。
+class WeeklyLogbackupHandler(TimedRotatingFileHandler):
+    """毎週月曜 00:00 にログを logbackup/ へアーカイブする週次ローテーション。
+
+    ★ v3.9.43: アーカイブ形式を ZIP に変更 (圧縮率 約 90%・容量 1/10)。
+                .log → .zip の移行は起動時に 1 回だけ自動で実施する。
+    """
+
+    _LOG_HEADER_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+    # ★ v3.9.43: 旧形式 .log と新形式 .zip の両方にマッチ (移行期間中・cleanup 用)
+    _ARCHIVE_NAME_RE = re.compile(
+        r"^(?P<stem>.+)\.(?P<start>\d{4}-\d{2}-\d{2})_to_(?P<end>\d{4}-\d{2}-\d{2})"
+        r"(?P<sfx>_\d+)?(?P<ext>\.log|\.zip)$"
+    )
+
+    def __init__(self, filename: str, archive_dir: str = "logbackup",
+                 retention_weeks: int = 8, encoding: Optional[str] = None) -> None:
+        super().__init__(
+            filename,
+            when="W0",          # W0 = Monday
+            interval=1,
+            backupCount=0,      # 削除は self._cleanup_old_archives() で自前管理
+            encoding=encoding,
+            atTime=datetime.time(0, 0),
+        )
+        self.archive_dir = archive_dir
+        self.retention_weeks = retention_weeks
+        try:
+            os.makedirs(self.archive_dir, exist_ok=True)
+        except OSError:
+            pass  # 作成失敗してもログ書き込みは継続
+        # ★ v3.9.43: 既存の旧形式 .log アーカイブを起動時 1 回だけ .zip に圧縮変換。
+        # 失敗時は元 .log を残してログ書き込みは継続。log オブジェクト未初期化のため
+        # 通知は print(stderr) を使う。
+        self._migrate_existing_logs_to_zip()
+        self._current_week_start = self._initial_week_start()
+        # ★ v3.8.8: 起動時 catch-up ローテーション (月曜 00:00 を跨いで停止していた
+        # 場合に備えて起動時にも実行)。Bot が月曜 00:00 ちょうどに稼働している
+        # 必要がなくなるため、v3.8.0 以降の WEEKEND 停止と共存できる。
+        self._maybe_catch_up_rollover()
+
+    def _migrate_existing_logs_to_zip(self) -> None:
+        """★ v3.9.43: 旧形式 .log アーカイブを .zip に一括変換 (起動時 1 回のみ)。
+
+        logbackup/ 内に残る v3.9.42 以前の非圧縮 .log を見つけて、それぞれ
+        個別の .zip に圧縮する。圧縮失敗時は元 .log を残し、ログ書き込みは継続。
+        既に同名 .zip が存在する場合 (前回中断等) は .log だけ安全に削除する。
+        """
+        import zipfile  # 標準ライブラリ・追加 pip 不要
+        try:
+            files = os.listdir(self.archive_dir)
+        except OSError:
+            return
+        for fname in files:
+            m = self._ARCHIVE_NAME_RE.match(fname)
+            if not m or m.group("ext") != ".log":
+                continue
+            log_path = os.path.join(self.archive_dir, fname)
+            zip_name = fname[:-4] + ".zip"   # .log → .zip
+            zip_path = os.path.join(self.archive_dir, zip_name)
+            # 既に .zip 化済みなら .log を削除して完了
+            if os.path.exists(zip_path):
+                try:
+                    os.remove(log_path)
+                    print(
+                        f"[WeeklyLogbackup] 既存 .zip と重複していた .log を削除: {fname}",
+                        file=sys.stderr,
+                    )
+                except OSError:
+                    pass
+                continue
+            tmp_path = zip_path + ".tmp"
+            try:
+                _orig_size = os.path.getsize(log_path)
+                with zipfile.ZipFile(
+                    tmp_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9
+                ) as zf:
+                    zf.write(log_path, arcname=fname)
+                os.replace(tmp_path, zip_path)  # アトミック rename
+                os.remove(log_path)
+                _new_size = os.path.getsize(zip_path)
+                _ratio = (1.0 - _new_size / _orig_size) * 100 if _orig_size > 0 else 0
+                print(
+                    f"[WeeklyLogbackup] 旧 .log を圧縮: {fname} "
+                    f"({_orig_size/1024/1024:.1f}MB → "
+                    f"{_new_size/1024/1024:.1f}MB, -{_ratio:.0f}%)",
+                    file=sys.stderr,
+                )
+            except Exception as _e:
+                # 圧縮失敗: tmp を削除し、元 .log は保持 (次回起動時に再試行)
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                print(
+                    f"[WeeklyLogbackup] 圧縮失敗 (旧 .log は保持・次回起動時に再試行): "
+                    f"{fname} ({type(_e).__name__}: {_e})",
+                    file=sys.stderr,
+                )
+
+    def _maybe_catch_up_rollover(self) -> None:
+        """起動時に月曜境界を跨いだログを検出して即ローテーションする。
+
+        旧版 (v3.8.7) は TimedRotatingFileHandler の自動ローテーションのみに依存し、
+        Bot が月曜 00:00 の瞬間に稼働していないと永久にローテーションが発生しない
+        問題があった (v3.8.0 以降は WEEKEND/OVERNIGHT で月曜深夜は停止中)。
+        v3.8.8 では起動時にログファイル先頭のタイムスタンプをチェックし、
+        現在の週の月曜 00:00 以前のデータが含まれていれば catch-up を実行。
+        """
+        if not os.path.exists(self.baseFilename):
+            return  # 新規環境: ログがまだ無い
+        first_date: Optional[datetime.date] = None
+        try:
+            with open(self.baseFilename, "r",
+                      encoding=self.encoding or "utf-8",
+                      errors="ignore") as _fh:
+                first_line = _fh.readline()
+            m = self._LOG_HEADER_RE.match(first_line or "")
+            if m:
+                first_date = datetime.date.fromisoformat(m.group(1))
+        except OSError:
+            return
+        if first_date is None:
+            return
+        today = datetime.date.today()
+        current_monday = today - datetime.timedelta(days=today.weekday())
+        # 先頭タイムスタンプが今週月曜 00:00 より前なら、月曜境界を跨いだ
+        # ログがファイルに残っている → catch-up ローテーション
+        if first_date < current_monday:
+            print(
+                f"[WeeklyLogbackup] 起動時 catch-up ローテーション: "
+                f"ログ先頭 {first_date.isoformat()} が今週月曜 "
+                f"{current_monday.isoformat()} より前 → logbackup/ へアーカイブ",
+                file=sys.stderr,
+            )
+            self.doRollover()
+
+    def _initial_week_start(self) -> datetime.date:
+        """現在書き込み中のログの「週開始日」を決定する。
+
+        既存ログがあり、その先頭タイムスタンプが今週月曜より前ならその日を採用
+        (v3.8.6 以前の累積ログを 1 ファイルとしてアーカイブするため)。
+        それ以外は今週の月曜。
+        """
+        today = datetime.date.today()
+        current_monday = today - datetime.timedelta(days=today.weekday())
+        if os.path.exists(self.baseFilename):
+            try:
+                with open(self.baseFilename, "r",
+                          encoding=self.encoding or "utf-8",
+                          errors="ignore") as _fh:
+                    first_line = _fh.readline()
+                m = self._LOG_HEADER_RE.match(first_line or "")
+                if m:
+                    first_date = datetime.date.fromisoformat(m.group(1))
+                    if first_date < current_monday:
+                        return first_date
+            except OSError:
+                pass
+        return current_monday
+
+    def doRollover(self) -> None:
+        """月曜 00:00 のローテーション: 現在ログを logbackup/ へ ZIP 圧縮して移動 + 古い分削除。
+
+        ★ v3.9.43: アーカイブ形式を .log → .zip に変更 (圧縮率 約 90%)。
+                     圧縮は ZIP_DEFLATED + 最大圧縮レベル 9。
+                     一時ファイル .zip.tmp に書き出してから rename することで
+                     クラッシュ耐性を確保。
+                     圧縮失敗時は非圧縮 .log への移動にフォールバック。
+        """
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+
+        today = datetime.date.today()
+        # 週末了日 = ローテーション直前日 (= 直近の日曜)
+        week_end = today - datetime.timedelta(days=1)
+        week_start = self._current_week_start
+
+        stem, ext = os.path.splitext(os.path.basename(self.baseFilename))
+        # ★ v3.9.43: アーカイブ拡張子は .zip 固定 (元 ext は ZIP 内部のファイル名に使用)
+        base_archive = f"{stem}.{week_start.isoformat()}_to_{week_end.isoformat()}"
+        archive_name = f"{base_archive}.zip"
+        archive_path = os.path.join(self.archive_dir, archive_name)
+        # ZIP 内部に格納するファイル名は従来通り .log 形式
+        inner_name = f"{base_archive}{ext}"
+
+        # 同名ファイル衝突回避 (極めて稀: 同日に複数回ローテーションした場合等)
+        if os.path.exists(archive_path):
+            ts_suffix = datetime.datetime.now().strftime("%H%M%S")
+            archive_name = f"{base_archive}_{ts_suffix}.zip"
+            archive_path = os.path.join(self.archive_dir, archive_name)
+            inner_name   = f"{base_archive}_{ts_suffix}{ext}"
+
+        if os.path.exists(self.baseFilename):
+            import zipfile  # 標準ライブラリ
+            tmp_path = archive_path + ".tmp"
+            try:
+                _orig_size = os.path.getsize(self.baseFilename)
+                with zipfile.ZipFile(
+                    tmp_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9
+                ) as zf:
+                    zf.write(self.baseFilename, arcname=inner_name)
+                os.replace(tmp_path, archive_path)  # アトミック rename
+                os.remove(self.baseFilename)
+                _new_size = os.path.getsize(archive_path)
+                _ratio = (1.0 - _new_size / _orig_size) * 100 if _orig_size > 0 else 0
+                print(
+                    f"[WeeklyLogbackup] アーカイブ完了: {archive_name} "
+                    f"({_orig_size/1024/1024:.1f}MB → "
+                    f"{_new_size/1024/1024:.1f}MB, -{_ratio:.0f}%)",
+                    file=sys.stderr,
+                )
+            except Exception as _e:
+                # 圧縮失敗時のフォールバック: tmp を削除し、非圧縮 .log として移動
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                fallback_path = os.path.join(self.archive_dir, inner_name)
+                try:
+                    shutil.move(self.baseFilename, fallback_path)
+                    print(
+                        f"[WeeklyLogbackup] 圧縮失敗 ({type(_e).__name__}: {_e}) → "
+                        f"非圧縮 .log でアーカイブ: {inner_name} "
+                        f"(次回起動時に .zip 化を再試行します)",
+                        file=sys.stderr,
+                    )
+                except OSError as _e2:
+                    # ディスク満杯等: 移動失敗してもログ書込みは継続させる
+                    print(
+                        f"[WeeklyLogbackup] アーカイブ失敗: {self.baseFilename} → "
+                        f"{fallback_path} ({_e2}) → 旧ファイルを上書きで再開",
+                        file=sys.stderr,
+                    )
+
+        # 次の週開始日 = 今日 (= 月曜)
+        self._current_week_start = today
+
+        # 8 週間より古いアーカイブを削除
+        self._cleanup_old_archives()
+
+        # 新しいログファイルを開く
+        if not self.delay:
+            self.stream = self._open()
+
+        # 次回ローテーション時刻を再計算 (TimedRotatingFileHandler 標準処理)
+        currentTime = int(datetime.datetime.now().timestamp())
+        newRolloverAt = self.computeRollover(currentTime)
+        while newRolloverAt <= currentTime:
+            newRolloverAt = newRolloverAt + self.interval
+        self.rolloverAt = newRolloverAt
+
+    def _cleanup_old_archives(self) -> None:
+        """保持期間 (retention_weeks) を超えた古いアーカイブを logbackup/ から削除。"""
+        if self.retention_weeks <= 0:
+            return
+        cutoff = datetime.date.today() - datetime.timedelta(weeks=self.retention_weeks)
+        try:
+            files = os.listdir(self.archive_dir)
+        except OSError:
+            return
+        for fname in files:
+            m = self._ARCHIVE_NAME_RE.match(fname)
+            if not m:
+                continue
+            try:
+                file_end = datetime.date.fromisoformat(m.group("end"))
+            except ValueError:
+                continue
+            if file_end < cutoff:
+                try:
+                    os.remove(os.path.join(self.archive_dir, fname))
+                except OSError:
+                    pass
+
+
+# ── ★ v3.9.44: 機密情報マスキング・フィルタ ──────────────────────────────────
+# 5/18-22 の受講生環境ログで Alpaca API キー (PKAPZ...) と Secret (DDSnr3...) が
+# 平文記録されているのを確認した。原因は websockets ライブラリ (Alpaca News で
+# 使用) の DEBUG ログが root logger に流れていたこと。本フィルタは万一機密文字列が
+# ログレコードに含まれていても、ハンドラへの出力前に自動マスクする二段防御。
+class _SecretMaskingFilter(logging.Filter):
+    """機密情報をログ出力前にマスクするフィルタ。
+
+    起動時に .env から取得した API キー類を「完全一致マスク」する第 1 層と、
+    汎用パターン (sk-ant- / discord webhook URL 等) でマスクする第 2 層の
+    組合せで、未来のライブラリ追加にも備える防御層。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # 既知の env 値を起動時に一度だけ収集 (.env サニタイズ済み)
+        self._known_secrets: List[str] = []
+        for _env_name in (
+            "ANTHROPIC_API_KEY", "FINNHUB_API_KEY",
+            "ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY",
+            "DISCORD_WEBHOOK_URL",
+        ):
+            _v = _sanitize_api_key(os.environ.get(_env_name, ""), "")
+            if len(_v) >= 8:
+                self._known_secrets.append(_v)
+        # Discord webhook URL からトークン部分を追加抽出
+        for _v in list(self._known_secrets):
+            if "discord.com/api/webhooks/" in _v:
+                _parts = _v.split("/")
+                if len(_parts) >= 2 and len(_parts[-1]) >= 8:
+                    self._known_secrets.append(_parts[-1])
+        # 長い順にソート (短い文字列で部分マッチさせないため)
+        self._known_secrets = sorted(set(self._known_secrets), key=len, reverse=True)
+        # パターンベース (env 値が未設定でも未来の追加・SDK 変更に対する防御)
+        self._patterns = [
+            # Anthropic API キー
+            re.compile(r"sk-ant-api[0-9]{2}-[A-Za-z0-9_\-]{20,}"),
+            # Discord Webhook URL (token 部分)
+            re.compile(r"discord\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+"),
+            # Alpaca paper / live API key (PK / AK + 大文字英数 16+)
+            re.compile(r"\b(?:PK|AK)[A-Z0-9]{16,}\b"),
+            # JSON 形式の "key": "..." / "secret": "..." (auth メッセージ等)
+            re.compile(r'("(?:key|secret|api_key|apikey|token)"\s*:\s*")[^"]{8,}(")', re.I),
+            # APCA-API-(KEY-ID|SECRET-KEY): ヘッダ値
+            re.compile(r"(APCA-API-(?:KEY-ID|SECRET-KEY)\s*:\s*)\S+", re.I),
+        ]
+
+    @staticmethod
+    def _mask(s: str) -> str:
+        # 8 文字以上なら先頭 4 + *** + 末尾 2、それ未満は ***
+        if len(s) > 10:
+            return s[:4] + "***" + s[-2:]
+        return "***"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            modified = False
+            # 第 1 層: 既知の env 値を完全一致で除去
+            for secret in self._known_secrets:
+                if secret in msg:
+                    msg = msg.replace(secret, self._mask(secret))
+                    modified = True
+            # 第 2 層: パターンマスク
+            for pat in self._patterns:
+                def _repl(m: "re.Match") -> str:
+                    # JSON / ヘッダ系の捕獲グループ付きパターン
+                    if m.lastindex == 2:
+                        return f"{m.group(1)}***{m.group(2)}"
+                    if m.lastindex == 1:
+                        return f"{m.group(1)}***"
+                    # 単純パターン (sk-ant-, PK*, AK*, webhook URL)
+                    s = m.group(0)
+                    return s[:8] + "***" if len(s) > 10 else "***"
+                new_msg = pat.sub(_repl, msg)
+                if new_msg != msg:
+                    modified = True
+                    msg = new_msg
+            if modified:
+                record.msg = msg
+                record.args = ()  # フォーマット済みなので args はクリア
+        except Exception:
+            # フィルタは絶対に失敗してはいけない (ログ全体を止めるため)
+            pass
+        return True
+
+
+# ── ログ設定 ────────────────────────────────────────────────────────────────────
+_log_fmt = "%(asctime)s [%(levelname)s] %(message)s"
+_secret_filter = _SecretMaskingFilter()  # ★ v3.9.44: 両ハンドラで共有
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setFormatter(logging.Formatter(_log_fmt))
+_stream_handler.setLevel(logging.INFO)   # コンソール: INFO以上のみ（RAWログ・パターン詳細は非表示）
+_stream_handler.addFilter(_secret_filter)  # ★ v3.9.44: 機密マスキング
+# ★ v3.8.7: 週次ログアーカイブ (logbackup/ + 8 週保持) に対応した FileHandler。
+# 旧版 (v3.8.6 以前) の logging.FileHandler はローテーションなしでログが
+# 無限肥大化していたため、WeeklyLogbackupHandler に置き換え。
+_file_handler = WeeklyLogbackupHandler(
+    "moomoo_trade_v1.log",
+    archive_dir="logbackup",
+    retention_weeks=8,
+    encoding="utf-8",
+)
+_file_handler.setFormatter(_PlainFormatter(_log_fmt))  # ファイルはANSIなし
+_file_handler.setLevel(logging.DEBUG)    # ファイル: DEBUG以上をすべて記録（RAWログ含む）
+_file_handler.addFilter(_secret_filter)   # ★ v3.9.44: 機密マスキング
+logging.basicConfig(level=logging.DEBUG, handlers=[_stream_handler, _file_handler])
+log = logging.getLogger(__name__)
+
+# ── サードパーティライブラリの DEBUG ログを抑制 ────────────────────────────
+# urllib3 / requests は DEBUG レベルで全 HTTP リクエスト URL をログに出力する。
+# Discord Webhook URL・Finnhub token・Alpaca キー等が丸ごと記録されるため、
+# これらのロガーを WARNING 以上に制限して機密情報の露出を防ぐ。
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("websocket").setLevel(logging.WARNING)        # websocket-client (旧)
+# ★ v3.9.44: websockets ライブラリ (Alpaca News で使用・モダンな async 版) は
+# DEBUG レベルで "> APCA-API-KEY-ID: ..." 等の送受信ペイロードを全件出力するため、
+# 受講生環境のログに Alpaca キー / Secret が平文で記録されていた。サブロガーも含めて
+# 一括で WARNING 以上に制限する。anthropic / httpx / httpcore も同様に抑制。
+for _noisy in (
+    "websockets", "websockets.client", "websockets.server",
+    "websockets.protocol", "websockets.legacy.client", "websockets.legacy.protocol",
+    "anthropic", "httpx", "httpcore", "asyncio",
+):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# エラー対処法ハンドラー (v2.64): ERROR/WARNING を検知して対処法をコンソール表示。
+# ①静的リスト一致→即表示  ②不一致→Anthropic AI で対処法生成 (1時間キャッシュ)
+# AI判定は別スレッド実行で Bot動作をブロックしない。ファイルログには出力しない。
+# ─────────────────────────────────────────────────────────────────────────────
+
+_KNOWN_ERROR_FIXES = [
+    (r"cannot connect to opend|connection refused.*opend|opend.*connection refused",
+     "OpenDを起動してConnectedにする。moomoo PCアプリも起動確認"),
+    (r"anthropic.*529|529.*overloaded|overloaded.*anthropic|apierror.*anthropic",
+     "Anthropicサーバー過負荷。数分待ってから再起動してください"),
+    (r"anthropic.*api.*key|invalid.*api.*key|authentication.*error",
+     "ANTHROPICのAPIキー確認。setup_wizard.pyでキー再設定"),
+    (r"no module named|modulenotfounderror",
+     "pip install <モジュール名> を実行してインストール（例: pip install moomoo-api）"),
+    (r"wizard_completed|セットアップウィザード",
+     "setup_wizard.pyを再実行してWIZARD_COMPLETED=trueを生成する"),
+    (r"insufficient.*positions|borrow.*unavailable|short.*unavailable|貸株",
+     "貸株在庫なし（正常スキップ）。ショートを減らすか銘柄変更を検討"),
+    (r"position_list_query|ポジション.*不明|ポジション詳細不明",
+     "moomoo口座種別(MARGIN/特定口座)確認。OpenD再起動。サポート講師に連絡"),
+    (r"quote right|lv2.*not.*granted|market data.*not.*granted",
+     "OpenDでUS Securities LV2以上の権限を確認。moomooサポートに問い合わせ"),
+    (r"unicodeencodeerror|charmap.*codec",
+     "コマンドプロンプトで chcp 65001 を実行してから再起動"),
+    (r"cannot connect.*127\.0\.0\.1|opend.*11111|port.*11111",
+     "OpenDがConnectedか確認。IPは127.0.0.1、ポートは11111を確認"),
+    (r"moomoo_acc_id|acc_id.*未設定|acc_id.*not.*set",
+     "MOOMOO_ACC_IDを.envに設定（Wizardの自動取得、または --live 起動時に自動設定）"),
+    (r"trade.*lock|取引.*ロック",
+     "moomooアプリまたはOpenDで取引ロックを解除する"),
+    (r"anthropic_api_key.*未設定|anthropic_api_key.*not.*set",
+     "setup_wizard.pyを再実行してANTHROPIC_API_KEYを設定する"),
+]
+
+
+def _get_error_fix(message: str) -> str:
+    """エラーメッセージに対応する対処法を返す。見つからなければ空文字。"""
+    msg_lower = message.lower()
+    for pattern, fix in _KNOWN_ERROR_FIXES:
+        if re.search(pattern, msg_lower):
+            return fix
+    return ""
+
+# ANSI カラー定義（既存コードに合わせる）
+_ANSI_YELLOW  = "\033[33m"
+_ANSI_BOLD    = "\033[1m"
+_ANSI_RESET   = "\033[0m"
+_ANSI_BG_YELLOW = "\033[43m\033[30m"
+
+# AI自動判定: スキップすべきパターン（Anthropic自身のエラー・タイムアウト等）
+_AI_FIX_SKIP_PATTERNS = [
+    r"anthropic|api.*error|overloaded",   # Anthropic APIエラーは再帰呼び出しを避ける
+    r"read timed out|timeout.*finnhub",   # Finnhubタイムアウトは頻発するためスキップ
+    r"discord.*webhook|discord.*post",    # Discord通知失敗もスキップ
+    r"\[データ収集\]",                      # データ収集失敗もスキップ
+]
+
+# AI判定結果キャッシュ {エラーメッセージ先頭80文字: (datetime, 対処法文字列)}
+_ai_fix_cache: dict = {}
+_AI_FIX_CACHE_SEC = 3600  # 1時間キャッシュ
+
+def _should_skip_ai_fix(msg: str) -> bool:
+    """AIによる対処法判定をスキップすべきエラーかどうか"""
+    msg_lower = msg.lower()
+    for pat in _AI_FIX_SKIP_PATTERNS:
+        if re.search(pat, msg_lower):
+            return True
+    return False
+
+def _get_ai_error_fix(msg: str) -> str:
+    """未知エラーに対してAnthropicのAIで対処法を生成する。 キャッシュヒット時はAPIを呼び出さない。 失敗した場合は空文字を返す（エラーは握りつぶす）。"""
+    import datetime as _dt, json as _json, urllib.request as _ureq
+
+    # ★ v3.9.42: x-api-key ヘッダに非 ASCII 文字が混入すると urllib が
+    #   UnicodeEncodeError を出すため、サニタイズしてから使う。
+    api_key = _sanitize_api_key(os.environ.get("ANTHROPIC_API_KEY", ""), "ANTHROPIC_API_KEY")
+    if not api_key or "placeholder" in api_key.lower():
+        return ""
+
+    cache_key = msg[:80]
+    now = _dt.datetime.now()
+
+    # キャッシュ確認
+    if cache_key in _ai_fix_cache:
+        cached_time, cached_fix = _ai_fix_cache[cache_key]
+        if (now - cached_time).total_seconds() < _AI_FIX_CACHE_SEC:
+            return cached_fix
+
+    prompt = (
+        "あなたはmoomooアルゴ取引Botのサポートエキスパートです。\n"
+        "以下のエラーメッセージに対して、受講生が取るべき対処法を\n"
+        "日本語で1〜2文（50文字以内）で簡潔に答えてください。\n"
+        "対処法のみを返し、説明・前置き・記号は不要です。\n\n"
+        f"エラー: {msg[:200]}"
+    )
+
+    try:
+        payload = _json.dumps({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": prompt}]
+        }, ensure_ascii=False).encode("utf-8")
+
+        req = _ureq.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        with _ureq.urlopen(req, timeout=8) as resp:
+            result = _json.loads(resp.read().decode())
+            fix = result.get("content", [{}])[0].get("text", "").strip()
+            if fix:
+                _ai_fix_cache[cache_key] = (now, fix)
+                return fix
+    except Exception:
+        pass
+    return ""
+
+def _print_fix_to_console(fix: str, is_ai: bool = False) -> None:
+    """対処法をコンソールに色付きで表示する"""
+    try:
+        prefix = f"  🤖 AI対処法: " if is_ai else f"  💡 対処法: "
+        line = f"{_ANSI_YELLOW}{_ANSI_BOLD}{prefix}{fix}{_ANSI_RESET}"
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+class _ErrorFixHandler(logging.Handler):
+    """
+    ERROR/WARNING ログを傍受し、対処法をコンソールに表示する。
+    ① 静的リスト一致 → 即座に表示
+    ② 未知エラー     → 別スレッドでAI判定して表示（Botをブロックしない）
+    ファイルログには書き出さない（コンソール専用）。
+    """
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno < logging.WARNING:
+            return
+        msg = record.getMessage()
+
+        # ① 静的リストで即座に判定
+        fix = _get_error_fix(msg)
+        if fix:
+            _print_fix_to_console(fix, is_ai=False)
+            return
+
+        # ② 未知エラー → AIで非同期判定（スキップ対象は除く）
+        if _should_skip_ai_fix(msg):
+            return
+
+        import threading as _threading
+        def _ai_lookup():
+            ai_fix = _get_ai_error_fix(msg)
+            if ai_fix:
+                _print_fix_to_console(ai_fix, is_ai=True)
+        _threading.Thread(target=_ai_lookup, daemon=True).start()
+
+_error_fix_handler = _ErrorFixHandler()
+_error_fix_handler.setLevel(logging.WARNING)
+logging.getLogger().addHandler(_error_fix_handler)
+
+# ★ v3.9.87 (B-1): エラーログ(GAS「エラーログ詳細」)に送らない"情報バナー/状態通知"の
+#   識別タグ。これらは端末では WARNING で表示するが、エラーではない（起動バナー・
+#   設定通知・定常的な移行決済・送信バックオフ等）。エラーシートに混入すると
+#   "エラー"件数を水増しし、本当のエラーが埋もれるため、日次サマリのエラー収集時に除外する。
+#   ※ 売買やデータ送信には一切影響しない（ログの選別のみ）。
+_ERROR_LOG_EXCLUDE_TAGS = (
+    "[PCT単位]",            # 旧表記検出の起動時通知
+    "[デモ空売り]",         # 起動バナー
+    "[実口座ショート]",     # 起動バナー
+    "[建玉トレール]",       # 起動バナー (v3.9.85+)
+    "[起動時検証]",         # OpenD到達・SDK確認等のOK通知
+    "[移行前全決済]",       # セッション移行時の定常決済通知
+    "[モメンタム監視整合]", # 実発注対象の定常リコンサイル通知
+    "実発注モード有効",     # [モメンタム] ⚡ 実発注モード有効: ... の起動バナー
+    "[gas_cooldown]",       # 送信側オートバックオフ(設計どおりの一時休止)
+    # ── ★ v3.9.92 (A-2): GAS送信失敗・再送退避（売買影響なし）はエラーではない ──
+    "記録送信のみ失敗",     # OBSERVATION_TIMEOUT/ERR/EMPTYRESP・DATA_COLLECT_* 共通の語
+    "[データ収集] 通信エラー",  # 送信タイムアウト（再送キューが処理・売買影響なし）
+    # ── ★ v3.9.92 (A-2): 正常なトレードイベント（決済・発注・CB）はエラーではない ──
+    "強制損切り",           # 【X】⚠ 強制損切り！ … 通常の損切り発動
+    "トレイリングストップ", # 【X】★ トレイリングストップ！ … 通常のトレール決済
+    "建玉トレールストップ", # 建玉トレールによる通常決済
+    "パニックセル",         # 急落時の通常決済イベント
+    "時間切れ",             # ⏰ 時間切れ決済／再同期後ポジションなし等の通常処理
+    "[モメンタム実発注]",   # 発注実行の情報ログ
+    "サーキットブレーカー", # 日次/週次の停止状態通知
+    "1日損失上限",          # RiskLevel 到達の通知（設計どおりの停止）
+    "デモ日次決済",         # デモ口座の引け決済（定常）
+    "週末前強制決済",       # 金曜引けの定常決済
+    # ── ★ v3.9.104: 起動時のJP口座API不安定による良性の空応答（ブロックなし）──
+    #   「position_list_queryは空だが accinfo=$… → JP口座APIの既知の不安定さ」は
+    #   多数の受講生で毎起動発生し、エラーシートを水増ししていた（売買影響なし）。
+    #   ※ 他の[起動時復元]警告（accinfoエラー/position_id取得不能）は除外しない。
+    "position_list_queryは空だが",
+    # ── ★ v3.9.132: 今週(8/3-8/7)の実データで漏れが判明した情報バナー ──────────
+    #   1,548件のエラーのうち 226件(15%)がこの2種で、本物のエラーが埋もれていた。
+    "戦略プロファイル:",     # [モメンタム] 🎛 戦略プロファイル: 選抜プロファイル v1 …（起動バナー・165件）
+    "実口座モードが有効",     # 実口座モードが有効です。5秒後に開始します…（起動バナー・61件）
+    "3連敗到達",             # [モメンタム] ⚠ 3連敗到達 → サイズ縮小（設計どおりの自動調整）
+    "サイズを 50% に縮小",   # 同上（連敗時の自動縮小は正常動作）
+    "Bot 以外の建玉のため自動売買は停止中",  # 管理対象外建玉の定常ステータス表示
+)
+
+# ★ v3.9.132: 「再試行で回復した一時的エラー」は、最終的に失敗した時だけ記録する。
+#   Alpaca/Anthropic の再接続・再試行は設計どおりの動作で、途中経過を毎回エラー扱いすると
+#   件数が水増しされる（今週: Alpaca再接続395件・Anthropic再試行262件）。
+#   ※ 「再試行 N/M」の途中経過のみ除外し、最終失敗（再試行後も回復せず）は残す。
+_ERROR_LOG_TRANSIENT_TAGS = (
+    "接続エラー・再接続待機",   # [Alpaca News] 接続エラー・再接続待機 (10秒): no close frame …
+    "OverloadedError (再試行",  # [Anthropic API] OverloadedError (再試行 1/3) …
+    "APITimeoutError (再試行",  # [Anthropic API] APITimeoutError (再試行 1/3) …
+    "APIConnectionError (再試行",
+    "取得エラー (初回)",        # [RSS:…] 取得エラー (初回): … （2回目以降で回復する定常事象）
+)
+
+
+# ── ★ v3.9.111: エラーの「売買影響」区分（利用者B要望B案・解析で真の要因を切り分ける）──
+#   execution_risk = 実売買に影響し得る（OpenD/建玉同期/購買力/貸株/発注・決済系）
+#   data_send_only = 記録・送信のみ（GAS/Sheets/観察送信・売買影響なし）
+#   warning_only   = それ以外の警告
+def _classify_error_impact(msg: str) -> str:
+    m = str(msg or "")
+    # ★ v3.9.132: 設定内容の説明文（「実発注は SHORTのみ」等）が「発注」に反応して
+    #   execution_risk に誤分類されていた（今週の実データで178件）。売買に影響しない
+    #   起動バナー/設定通知は、キーワード判定より先に warning_only へ確定させる。
+    _info = ("戦略プロファイル", "実口座モードが有効", "3連敗到達", "サイズを 50% に縮小",
+             "実発注モード有効", "[モメンタム監視整合]", "[起動時検証]")
+    if any(k in m for k in _info):
+        return "warning_only"
+    _exec = ("OpenD", "opend", "建玉", "ポジション同期", "sync_positions", "position_id",
+             "購買力", "buying power", "Insufficient", "貸株", "borrow",
+             "発注", "注文", "決済", "約定", "order")
+    if any(k in m for k in _exec):
+        return "execution_risk"
+    _send = ("GAS", "DATA_COLLECT", "OBSERVATION", "送信", "記録", "Sheets", "スプレッドシート", "webhook")
+    if any(k in m for k in _send):
+        return "data_send_only"
+    return "warning_only"
+
+
+# ── moomoo SDK 内部ログを完全抑制 ─────────────────────────────────────────
+# SDKはPythonのloggingに独自ハンドラーを追加しつつprint/stderrにも書き込む。
+# 以下の3段構えで確実に除去する。
+
+# ── Windows コンソール UTF-8 対応 ──────────────────────────────────────────
+# Windowsのコンソールはデフォルトで CP932（Shift-JIS系）のため、
+# 絵文字や一部Unicode文字の出力時に UnicodeEncodeError が発生する。
+# reconfigure() で UTF-8 に切り替え、対応できない文字は '?' に置換する。
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        # reconfigure未対応の環境（リダイレクト先がファイルなど）は無視
+        pass
+    # httpx は HTTPヘッダ値を ASCII エンコード仕様。Anthropic SDK が収集する
+    # PC情報 (ホスト名/OS版) の非ASCII文字で UnicodeEncodeError が発生する。
+    # httpx 内部関数をパッチして '?' に置換して回避。
+    try:
+        import httpx._models as _hm
+        _hm_orig_normalize = _hm._normalize_header_value
+        def _ascii_safe_normalize(v, encoding):
+            if isinstance(v, str):
+                v = v.encode("ascii", errors="replace").decode("ascii")
+            return _hm_orig_normalize(v, encoding)
+        _hm._normalize_header_value = _ascii_safe_normalize
+    except Exception:
+        pass
+
+# ① stdout/stderr ラッパー（print() や StreamHandler が使う先を置き換える）
+class _MoomooFilter:
+    """moomoo SDK 内部接続ログを識別するマーカー群"""
+    MARKERS = ("open_context_base.py", "_init_connect_sync",
+               "on_disconnect", "New connect ready", "reason=CallClose",
+               "HTTP Request: POST", "HTTP Request: GET")
+    @classmethod
+    def is_sdk_log(cls, text: str) -> bool:
+        return any(m in text for m in cls.MARKERS)
+
+class _FilteredStream:
+    def __init__(self, wrapped):
+        self._w = wrapped
+    def write(self, s: str):
+        if not _MoomooFilter.is_sdk_log(s):
+            try:
+                self._w.write(s)
+            except UnicodeEncodeError:
+                # Windows CP932等でエンコードできない文字を '?' に置換して出力
+                self._w.write(s.encode(self._w.encoding or "utf-8", errors="replace").decode(self._w.encoding or "utf-8", errors="replace"))
+    def flush(self):   self._w.flush()
+    def isatty(self):  return self._w.isatty()
+    def fileno(self):  return self._w.fileno()
+    def __getattr__(self, name): return getattr(self._w, name)
+
+sys.stdout = _FilteredStream(sys.stdout)
+sys.stderr = _FilteredStream(sys.stderr)
+
+# ② logging.Filter（logging.Handler 経由の出力を除去）
+class _MoomooLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        text = (record.pathname or "") + record.getMessage()
+        return not _MoomooFilter.is_sdk_log(text)
+
+_mlf = _MoomooLogFilter()
+
+# ③ root logger に付いている全ハンドラーにフィルターを追加し
+#    StreamHandler の stream を filtered 版に差し替える
+def _suppress_sdk_logs():
+    """全ロガー・全ハンドラーを走査して moomoo SDK ログを完全抑制する。"""
+    _our = {_stream_handler, _file_handler}
+    _orig_err = sys.__stderr__
+    _orig_out = sys.__stdout__
+
+    # root を含む全ロガーを対象にする
+    _all_loggers = [logging.root] + [
+        v for v in logging.Logger.manager.loggerDict.values()
+        if isinstance(v, logging.Logger)
+    ]
+    for _lg in _all_loggers:
+        for _h in _lg.handlers[:]:
+            if _h in _our:
+                continue
+            _h.addFilter(_mlf)
+            # stderr / stdout に書いているハンドラーは filtered 版に差し替え
+            if isinstance(_h, logging.StreamHandler):
+                if getattr(_h, "stream", None) in (_orig_err, _orig_out):
+                    _h.stream = sys.stderr   # _FilteredStream 経由に変える
+
+    # root に自分のハンドラー以外があれば除去
+    for _h in logging.root.handlers[:]:
+        if _h not in _our:
+            logging.root.removeHandler(_h)
+
+    # root logger 自体にもフィルター
+    logging.root.addFilter(_mlf)
+
+    # httpx / httpcore のリクエストログを抑制（Anthropic SDK が使用）
+    for _n in ("httpx", "httpcore", "httpcore.http11", "httpcore.connection"):
+        logging.getLogger(_n).setLevel(logging.WARNING)
+
+_suppress_sdk_logs()
+
+# ── 状態管理 ────────────────────────────────────────────────────────────────────
+@dataclass
+class TickerState:
+    """1銘柄分のトレード状態"""
+    symbol:       str   = ""
+    position_qty: int   = 0
+    avg_cost:     float = 0.0
+    last_price:   float = 0.0
+    peak_price:   float = 0.0
+    trail_active: bool  = False
+    total_orders: int   = 0
+    forced_exits: int   = 0
+    trail_exits:  int   = 0
+    panic_exits:  int   = 0
+    entry_time:        object = field(default=None)  # ポジション開始時刻（datetime）
+    entry_count:        int    = 0               # ピラミッディング発注回数（0=未エントリー）
+    # v3.9.20: last_entry_price はピラミッディング撤去で実際の使用箇所はなくなったが、
+    # 過去ログ互換のためフィールドは残置 (シリアライゼーション差分を防ぐ)。
+    last_entry_price:   float  = 0.0             # ★ 廃止予定 (v3.9.20 で未使用)
+    # ── TRADE_RESULT 分析用（センシティブ情報を含まない）─────────────────
+    entry_ai_score:     int    = 0               # エントリー時AI判定スコア
+    entry_ai_conf:      float  = 0.0             # エントリー時AI信頼度
+    entry_ai_category:  str    = ""              # AI判定カテゴリ（SEMI/TECH/MACRO）
+    entry_news_source:  str    = ""              # ニュースソース（Alpaca/Finnhub/RSS等）
+    entry_reason:       str    = ""              # AI判定理由（日本語）
+    # ★ v3.9.111: エントリー時モメンタム5分/15分%（モメンタム実発注時に記録・決済ログへ相乗り）
+    entry_pct_5m:       object = field(default=None)
+    entry_pct_15m:      object = field(default=None)
+    # ★ v3.9.133: risk_monitor_loop が実際に適用した損切り%（%単位・例 0.50）。
+    #   記録用に「後からグローバル値で再計算」すると実挙動とズレるため（モメンタムは
+    #   高ボラ倍率をスキップする＝v3.9.93 の仕様）、監視ループ側で確定した値をここへ保存し、
+    #   決済記録はこれをそのまま出す。None = 監視ループが一度も評価していない。
+    enforced_stop_pct:  object = field(default=None)
+    # ★ v3.9.134: Bot が建てた建玉ではない（＝台帳にこの銘柄が無い）ことを示すフラグ。
+    #   True の間はこの銘柄を「見るだけ・触らない」に切り替える:
+    #     ・自動決済を一切しない（時間切れ/損切り/トレール/パニック等すべて）
+    #     ・新規エントリーもしない（決済は銘柄単位の全決済なので混ぜられない）
+    #   建玉が口座から消えたら False に戻り、通常運転を再開する。
+    externally_held:      bool   = False
+    pending_close_reason: str  = ""              # 決済理由（place_close_allから保存）
+    pending_entry_time:   object = field(default=None)  # 決済発注時にentry_timeを保存（TRADE_RESULTのhold_min用）
+    pending_avg_cost:     float  = 0.0           # 決済発注時にavg_costを保存（sync_positionsによる上書き防止用）
+    is_short:             bool   = False         # 意図的なショートポジション中フラグ（緊急買い戻し誤発動防止）
+    # ── ★ v2.98: position_id 対応 (JP 信用口座建玉ごとの個別決済用) ────────
+    # moomoo SDK 10.4+ の place_order が受け付ける隠しパラメータ。
+    # JP 信用は同銘柄 LONG/SHORT 共存可で決済時に position_id 指定必須。
+    # sync_positions で取得した pid を方向別リストで保持。部分約定で複数pid可。
+    # 構造: {"LONG": [{pid, qty, cost}, ..], "SHORT": [..]}  ※ qty は絶対値
+    position_ids: dict = field(default_factory=lambda: {"LONG": [], "SHORT": []})
+    # ── ★ v2.95: GAS連携用の追加フィールド (Google Sheets への詳細送信) ─────
+    entry_headlines:      list   = field(default_factory=list)  # ヘッドライン上位3件
+    entry_beneficiaries:  list   = field(default_factory=list)  # AI beneficiaries
+    entry_victims:        list   = field(default_factory=list)  # AI victims
+    entry_price_trend:    float  = 0.0           # エントリー前5分の価格変動率(%)
+    entry_peak_pnl:       float  = 0.0           # 保有中最大含み益 (USD)
+    # ── v3.9.17: 約定確認待ちフラグ ──────────────────────────────────────
+    # 発注成功 → 約定確認 (FILLED_ALL) / sync_positions 反映までの間 True。
+    # この間 avg_cost は指値価格の仮設定のままで実約定均価ではないため、
+    # 強制損切り / トレール / パニックセル等の PnL ベース判定をスキップする。
+    # 5/13 22:49 SPY 事例: SHORT 発注後 2.7 秒で limit=$732.32 vs 現値$736.05 から
+    # 誤った PnL=-$26 (-0.51%) を算出し強制損切り誤発動 → BUY_BACK で自己決済。
+    entry_pending_fill:   bool   = False
+    # ── ★ v3.9.101: avg_cost が実約定単価で確定済みか（指値の仮設定でないか）─────
+    # 発注直後は avg_cost = 指値(仮設定)。_check_order_filled で実約定単価に上書きした
+    # 時点で True。sync_positions はこれが True の時のみ entry_pending_fill を解除する。
+    # 未確定のまま解除すると建玉トレール/強制損切りが指値基準で誤発火する
+    # （5/13 SPY・6/29 SMH 事例）。
+    avg_cost_confirmed:   bool   = False
+    # ── ★ v3.9.31: 決済発注の連続失敗カウント (無限リトライ防止) ──────────
+    # 5/21 利用者T事例: QQQ ショートカバーが moomoo に拒否され続け、
+    # 時間切れ決済が 11 分間 60 秒ごとに無限リトライした。
+    # N 回連続失敗で sync_positions を強制実行し、実態 qty=0 なら諦める。
+    close_fail_count:     int    = 0
+
+    def reset_trail(self):
+        self.peak_price   = 0.0
+        self.trail_active = False
+
+
+@dataclass
+class GlobalState:
+    seen_articles:   dict = field(default_factory=dict)  # {articleId: datetime}
+    seen_prefixes:   dict = field(default_factory=dict)  # {先頭35文字: datetime}
+    ai_cache:        dict = field(default_factory=dict)  # {trigger_sym: (datetime, result)}
+    seen_topics:     dict = field(default_factory=dict)  # {トピックキー: datetime} ③重複防止
+    simulation_mode: bool = True
+    tickers:         dict = field(default_factory=dict)  # {symbol: TickerState}
+
+    # AI 判定キャッシュの有効期間（秒）
+    # 同一ニュースが15分以上の間隔で再送信されるケースに対応するため900秒（15分）に延長。
+    # TOPIC_COOLDOWN_SEC（30分）より短いため、キャッシュ期限切れ後はトピック重複チェックが
+    # セカンドラインとして機能する。
+    AI_CACHE_SEC: int = field(default=900, init=False, repr=False)
+
+    # キャッシュをバイパスして必ず AI を呼ぶ強制キーワード（相場に大きく影響するイベント語）
+    # ★ v2.88: 単語境界マッチ (\\b{kw}\\b) に変更。複数形・活用形を明示登録する必要あり。
+    # 例: tariff/tariffs, merger/mergers, recall/recalls, beat/beats, miss/misses
+    # 不可算名詞や不変化語 (inflation, fed, war, recession 等) は単数形のみ。
+    AI_FORCE_KEYWORDS: frozenset = field(
+        default_factory=lambda: frozenset({
+            # 金融政策・マクロ
+            "fed", "fomc", "rate", "rates", "interest", "inflation",
+            "cpi", "gdp", "recession",
+            # 企業破綻・市場暴落
+            "bankruptcy", "crash", "collapse",
+            # 制裁・地政学
+            "sanction", "sanctions", "war", "tariff", "tariffs",
+            # 決算
+            "earnings", "beat", "beats", "miss", "misses", "guidance",
+            # M&A・上場
+            "acquisition", "acquisitions", "merger", "mergers",
+            "ipo", "ipos",
+            # 企業イベント
+            "layoff", "layoffs", "recall", "recalls", "sec",
+        }),
+        init=False, repr=False,
+    )
+
+    def get(self, symbol: str) -> TickerState:
+        if symbol not in self.tickers:
+            self.tickers[symbol] = TickerState(symbol=symbol)
+        return self.tickers[symbol]
+
+    def is_new_article(self, article_id: str) -> bool:
+        now = datetime.datetime.now()
+        if article_id in self.seen_articles:
+            if (now - self.seen_articles[article_id]).total_seconds() < NEWS_DEDUP_SEC:
+                return False
+        self.seen_articles[article_id] = now
+        cutoff = now - datetime.timedelta(seconds=NEWS_DEDUP_SEC * 2)
+        self.seen_articles = {k: v for k, v in self.seen_articles.items() if v > cutoff}
+        return True
+
+    def is_new_headline_prefix(self, headline: str) -> bool:
+        """先頭35文字による類似重複排除。
+        20文字では助詞（への/に など）の違いで同一ニュースが通り抜けるため35文字に拡大。
+        """
+        prefix = headline[:35]
+        now    = datetime.datetime.now()
+        if prefix in self.seen_prefixes:
+            if (now - self.seen_prefixes[prefix]).total_seconds() < NEWS_DEDUP_SEC:
+                return False
+        self.seen_prefixes[prefix] = now
+        cutoff = now - datetime.timedelta(seconds=NEWS_DEDUP_SEC * 2)
+        self.seen_prefixes = {k: v for k, v in self.seen_prefixes.items() if v > cutoff}
+        return True
+
+    def get_ai_cache(self, trigger_sym: str, headlines: List[str]) -> Optional[Dict]:
+        """
+        同じトリガー＋同一ニュース内容に対して AI_CACHE_SEC 以内に判定済みの結果があればキャッシュを返す。
+        ★ キャッシュキーにニュース内容のハッシュを含める（異なるニュースへの誤流用を防止）
+
+        ★ v2.88 修正: AI_FORCE_KEYWORDS の判定を単純な部分一致から単語境界マッチに変更。
+        旧コード `kw in combined_lower` では `miss` が `missile`/`mission`/`dismiss` に、
+        `rate` が `corporate`/`separate`/`accelerate` に、
+        `war` が `award`/`warn`/`warner` に誤マッチしていた。
+        英文ニュースタイトルにこれらの単語が含まれない記事はほぼ無いため、
+        AI判定キャッシュが事実上機能せず、Anthropic API への呼び出し回数が
+        想定の数倍に膨らんでいた可能性があった。
+        """
+        combined_lower = " ".join(headlines).lower()
+        # ★ v2.88: 単語境界マッチで完全単語のみヒットさせる
+        if any(re.search(rf"\b{re.escape(kw)}\b", combined_lower) for kw in self.AI_FORCE_KEYWORDS):
+            return None
+        import hashlib
+        _content_hash = hashlib.md5(" ".join(sorted(headlines)).encode()).hexdigest()[:8]
+        _cache_key = f"{trigger_sym}:{_content_hash}"
+        if _cache_key in self.ai_cache:
+            cached_at, cached_result = self.ai_cache[_cache_key]
+            elapsed = (datetime.datetime.now() - cached_at).total_seconds()
+            if elapsed < self.AI_CACHE_SEC:
+                return cached_result
+        return None
+
+    def set_ai_cache(self, trigger_sym: str, result: dict, headlines: List[str] = None) -> None:
+        """AI 判定結果をキャッシュに保存する"""
+        import hashlib
+        _content_hash = hashlib.md5(" ".join(sorted(headlines or [])).encode()).hexdigest()[:8]
+        _cache_key = f"{trigger_sym}:{_content_hash}"
+        self.ai_cache[_cache_key] = (datetime.datetime.now(), result)
+
+    # ── ③ トピック重複防止 (同一トピック60分以内は再判定しない) ──────────────
+    # 地政学/金利/関税など既報トピックの過剰反応を防ぐ。
+    # ★ v2.92: 価格乖離による動的解除追加。前回から QQQ が±0.3%以上動けば
+    # 「市場が織り込み中=情報は新鮮」とみなして重複扱い解除。
+    # 5/4 NY11時のイラン情勢20件全スキップ事案 (価格下落中に反応できず) への対策。
+    # ★ v3.8.4: 30分→60分に延長。価格乖離による動的解除があるため重要トピック
+    # (急激な相場変動を伴うニュース) はそのまま再判定可能。重複削減によるコスト
+    # 削減効果は月 $15-20 程度を想定。
+    TOPIC_COOLDOWN_SEC: int = field(default=3600, init=False, repr=False)  # 60分
+    TOPIC_PRICE_DEVIATION_PCT: float = field(default=0.003, init=False, repr=False)  # 0.3%
+    TOPIC_KEYWORDS: dict = field(default_factory=lambda: {
+        # キーワード: トピックキー（同じキーが30分以内に出たらスキップ）
+        "iran":         "iran_war",
+        "hormuz":       "iran_war",
+        "ukraine":      "ukraine_war",
+        "tariff":       "tariff",
+        "trade war":    "tariff",
+        "fed ":         "fed_policy",
+        "fomc":         "fed_policy",
+        "interest rate": "fed_policy",
+        "inflation":    "inflation",
+        "cpi":          "inflation",
+        "recession":    "recession",
+        "opec":         "opec_oil",
+        "oil price":    "opec_oil",
+        # ── 半導体・輸出規制・地政学（v2.70追加）────────────────────────────
+        # 同一ニュースが表現を変えて15分おきに複数回流れるケースへの対処。
+        # 「華虹」「輸出制限」「semiconductor export」等が30分以内に再出現した場合スキップ。
+        "export control":    "semi_export",
+        "export restrict":   "semi_export",
+        "export ban":        "semi_export",
+        "chip ban":          "semi_export",
+        "semiconductor export": "semi_export",
+        "huahong":           "semi_export",
+        "华虹":              "semi_export",
+        "輸出制限":          "semi_export",
+        "輸出規制":          "semi_export",
+        "出荷停止":          "semi_export",
+        "sanctions":         "sanctions",
+        "blacklist":         "sanctions",
+        "entity list":       "sanctions",
+        "china tech":        "china_tech",
+        "china chip":        "china_tech",
+        "中国 半導体":       "china_tech",
+    }, init=False, repr=False)
+
+    def check_topic_cooldown(self, headlines: list) -> tuple:
+        """
+        ヘッドラインに既報トピックが含まれるか確認する。
+        戻り値: (is_blocked: bool, matched_topic: str)
+        is_blocked=True の場合、そのトピックは30分以内に既出なのでスキップ推奨。
+
+        ★ v2.92: 価格乖離による動的解除
+        前回判定時の QQQ 価格と現在の QQQ 価格を比較し、±0.3% 以上動いていれば
+        「市場が織り込み中＝情報は新鮮」とみなして重複扱いを解除する。
+        QQQ 価格が取得できないケース（ネットワーク不安定等）は従来通り重複スキップ。
+        """
+        combined = " ".join(headlines).lower()
+        now = datetime.datetime.now()
+        # 期限切れトピックを削除
+        cutoff = now - datetime.timedelta(seconds=self.TOPIC_COOLDOWN_SEC)
+        # ★ v2.92: 値が dict 形式 {time, qqq_price} に変更されたが、
+        # 後方互換のため datetime のままのエントリーも有効として扱う。
+        def _entry_time(v):
+            return v["time"] if isinstance(v, dict) else v
+        self.seen_topics = {
+            k: v for k, v in self.seen_topics.items()
+            if _entry_time(v) > cutoff
+        }
+        for kw, topic_key in self.TOPIC_KEYWORDS.items():
+            if kw in combined:
+                if topic_key in self.seen_topics:
+                    entry = self.seen_topics[topic_key]
+                    last_time = _entry_time(entry)
+                    elapsed = (now - last_time).total_seconds()
+
+                    # ★ v2.92: 価格乖離による動的解除をチェック
+                    # entry が dict 形式で qqq_price が記録されていて、かつ
+                    # 現在の QQQ 価格が取得できる場合のみ判定。
+                    if isinstance(entry, dict) and entry.get("qqq_price", 0) > 0:
+                        try:
+                            _qq = get_quote("QQQ")
+                            _qqq_now = _qq.get("last", 0) or _qq.get("ask", 0) or 0
+                            if _qqq_now > 0:
+                                _qqq_then = entry["qqq_price"]
+                                _pct = abs(_qqq_now - _qqq_then) / _qqq_then
+                                if _pct >= self.TOPIC_PRICE_DEVIATION_PCT:
+                                    log.info(
+                                        f"[トピック重複解除] {topic_key}: 前回判定から"
+                                        f" QQQ ${_qqq_then:.2f} → ${_qqq_now:.2f}"
+                                        f" ({_pct*100:+.2f}% 変動) → 再判定対象"
+                                    )
+                                    return False, ""
+                        except Exception as _e:
+                            # 価格取得失敗は従来通り重複スキップ（安全側）
+                            log.debug(f"[トピック重複解除] QQQ価格取得失敗（従来通り重複スキップ）: {_e}")
+
+                    return True, f"{topic_key}（{int(elapsed//60)}分前に既出）"
+        return False, ""
+
+    def mark_topic_seen(self, headlines: list) -> None:
+        """判定を行ったヘッドラインのトピックを記録する。
+
+        ★ v2.92: 判定時の QQQ 価格も併せて記録し、次回の重複チェック時に
+        価格乖離が ±0.3% を超えていれば重複扱いを解除する判断材料とする。
+        QQQ 価格が取得できない場合は従来通り time のみ記録（後方互換）。
+        """
+        combined = " ".join(headlines).lower()
+        now = datetime.datetime.now()
+        # ★ v2.92: 判定時の QQQ 価格を取得（取得失敗時は 0.0 で記録 → 重複解除は機能しない）
+        _qqq_price = 0.0
+        try:
+            _qq = get_quote("QQQ")
+            _qqq_price = _qq.get("last", 0) or _qq.get("ask", 0) or 0
+        except Exception as _e:
+            log.debug(f"[mark_topic_seen] QQQ価格取得失敗（time のみ記録）: {_e}")
+        for kw, topic_key in self.TOPIC_KEYWORDS.items():
+            if kw in combined:
+                self.seen_topics[topic_key] = {"time": now, "qqq_price": _qqq_price}
+
+    # ── ★ v3.9.8: 正規化ヘッドライン dedup (任意の繰り返し記事を 60 分間吸収) ───
+    # TOPIC_KEYWORDS dedup (iran/fed/tariff等の固定キーワード) では拾えない
+    # 「同一ヘッドラインの繰り返し配信」を補完するための層。
+    # 5/11 PAN ログで観測された無駄判定:
+    #   - "OpenAI 600 employees scored $6.6 billion" → 11 回
+    #   - "Tech stocks today: Cerebras IPO..."         → 9 回
+    #   - "OpenAI creates new unit with $4B"            → 6 回
+    #   - "Trump backs gas tax holiday"                 → 3 回連続 AI 判定
+    # Yahoo Finance の GUID 更新で URL dedup を素通りする問題への対策。
+    seen_normalized_headlines: dict = field(default_factory=dict, init=False, repr=False)
+    # {正規化キー (sha1[:16]): {time: datetime, original: str (最初に見た原文)}}
+    HEADLINE_DEDUP_TTL_SEC: int = field(default=3600, init=False, repr=False)  # 60分
+
+    @staticmethod
+    def _normalize_headline_key(headline: str) -> str:
+        """ヘッドラインを正規化して dedup キー (sha1[:16]) を返す。
+
+        正規化レベル (誤マージを避けるため控えめに):
+          ① HTML エンティティ復号: &#39; → '
+          ② 金額・割合・数値を # に置換: $4 billion / 25.1% / 1.05 → #
+             (注: 数字は別ニュース判定の手がかりにもなるが、速報の小さな更新を
+              吸収するメリットの方が大きい。Q1/Q2 は 60min TTL の範囲外なので
+              実質的な誤マージは起きない)
+          ③ 小文字化 + 連続空白を 1 つに圧縮
+          ④ sha1 ハッシュで 16 桁に圧縮 (メモリ節約)
+
+        意図的にやらないこと:
+          - "beats/misses/cuts" 等の動詞は正規化しない (方向情報を保持)
+          - 同義語マージはしない (AI 判定領域)
+          - stemming はしない (情報損失大)
+        """
+        import hashlib, html as _html, re as _re
+        h = _html.unescape(headline or "")
+        # 金額・億/百万単位・割合・センティアル
+        h = _re.sub(
+            r'\$?\d[\d.,]*\s*(?:billion|million|trillion|B\b|M\b|K\b|%|cents?|bps)?',
+            '#', h, flags=_re.I
+        )
+        # 残った素の数値も # に
+        h = _re.sub(r'\d+', '#', h)
+        # 小文字化 + 空白圧縮
+        h = _re.sub(r'\s+', ' ', h.lower().strip())
+        return hashlib.sha1(h.encode('utf-8')).hexdigest()[:16]
+
+    def check_headline_seen(self, headline: str) -> tuple[bool, int, int]:
+        """正規化ヘッドラインが TTL 以内に既出か判定。
+
+        戻り値: (is_duplicate, elapsed_seconds, total_seen_count)
+          - is_duplicate: True なら 60 分以内に同一正規化キーを判定済み
+          - elapsed_seconds: 前回判定からの経過秒数 (新規時は 0)
+          - total_seen_count: このキーで今まで何回 dedup されたか (新規時は 0)
+        """
+        if not headline:
+            return False, 0, 0
+        key = self._normalize_headline_key(headline)
+        now = datetime.datetime.now()
+        cutoff = now - datetime.timedelta(seconds=self.HEADLINE_DEDUP_TTL_SEC)
+        # 期限切れエントリーを削除 (メモリリーク対策)
+        self.seen_normalized_headlines = {
+            k: v for k, v in self.seen_normalized_headlines.items()
+            if v.get("time", now) > cutoff
+        }
+        entry = self.seen_normalized_headlines.get(key)
+        if entry is not None:
+            elapsed = int((now - entry["time"]).total_seconds())
+            return True, elapsed, entry.get("hit_count", 0)
+        return False, 0, 0
+
+    def mark_headline_seen(self, headline: str) -> None:
+        """ヘッドラインを正規化して dedup 辞書に記録 (or hit_count をインクリメント)。"""
+        if not headline:
+            return
+        key = self._normalize_headline_key(headline)
+        now = datetime.datetime.now()
+        entry = self.seen_normalized_headlines.get(key)
+        if entry is None:
+            self.seen_normalized_headlines[key] = {
+                "time":      now,
+                "original":  (headline or "")[:200],
+                "hit_count": 0,
+            }
+        else:
+            entry["hit_count"] = entry.get("hit_count", 0) + 1
+            # time は最初に見た時刻を保持 (= 経過時間が正しく計算される)
+
+    def total_summary(self) -> str:
+        lines = []
+        for sym, ts in self.tickers.items():
+            if ts.total_orders > 0:
+                lines.append(
+                    f"  {sym}: 発注={ts.total_orders} "
+                    f"損切={ts.forced_exits} トレール={ts.trail_exits} パニック={ts.panic_exits}"
+                )
+        return "\n".join(lines) if lines else "  (取引なし)"
+
+
+state = GlobalState()
+
+# ── 銘柄単位 asyncio.Lock (並列発注 race 対策 / v2.86) ────────────────────────
+# process_headlines (マクロ) と process_stock_news (個別株) が同じ銘柄に対して
+# 並列に発注 → 両方が予算チェック通過で 2 倍ポジ保有する race を防ぐ。
+# 対策: 銘柄毎に Lock 発行、async 経路発注を `async with _get_sym_lock(sym):` で囲む。
+# 同期関数同士の内部呼出はロック保持中は他 async が入らないため追加処理不要。
+_sym_locks: dict = {}
+
+def _get_sym_lock(sym: str) -> asyncio.Lock:
+    """銘柄単位の asyncio.Lock を返す。初回参照時に生成。
+    asyncio.Lock() は引数なしでイベントループに依存せず生成可能（Python 3.10+）。
+    """
+    lock = _sym_locks.get(sym)
+    if lock is None:
+        lock = asyncio.Lock()
+        _sym_locks[sym] = lock
+    return lock
+
+# ── Discord 通知 ──────────────────────────────────────────────────────────────
+def send_discord_message(text: str) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": text}, timeout=10)
+        if resp.status_code in (200, 204):
+            log.info("[Discord] 送信成功")
+        else:
+            log.warning(f"[Discord] 送信失敗 status={resp.status_code}  body={resp.text[:200]!r}")
+    except requests.RequestException as e:
+        log.warning(f"[Discord] 通信エラー: {_mask_secrets(e)}")
+    except Exception as e:
+        log.warning(f"[Discord] 予期しないエラー: {type(e).__name__}: {_mask_secrets(e)}")
+
+# ── セッション判定ユーティリティ ──────────────────────────────────────────────────────────
+
+# ── NYSE 取引カレンダー ヘルパー（v2.87 追加）─────────────────────────────────
+# すべて純粋関数（外部 I/O・ログ・state 変更なし）。
+# 引数は必ず ET タイムゾーン基準の date オブジェクトを渡すこと。
+def is_nyse_holiday(d: datetime.date) -> bool:
+    """指定日が NYSE 完全休場日か。
+
+    Args:
+        d: ET タイムゾーン基準の日付。
+    Returns:
+        True なら完全休場、False なら通常営業 or 早期クローズ日 or 週末。
+        注意: 週末（土日）は False を返す（休日とは別概念）。
+              週末 + 休日の判定は is_trading_day() を使う。
+    """
+    return d.strftime("%Y-%m-%d") in NYSE_HOLIDAYS
+
+
+def get_early_close_time(d: datetime.date) -> Optional[datetime.time]:
+    """早期クローズ日の場合はクローズ時刻（ET）を返す。それ以外は None。
+
+    Args:
+        d: ET タイムゾーン基準の日付。
+    Returns:
+        早期クローズ時刻（datetime.time）、または None（通常クローズ or 休場）。
+    """
+    hm = NYSE_EARLY_CLOSE.get(d.strftime("%Y-%m-%d"))
+    if hm is None:
+        return None
+    return datetime.time(hm[0], hm[1])
+
+
+def is_trading_day(d: datetime.date) -> bool:
+    """指定日が取引可能日か（平日 AND 非休場日）。
+
+    Args:
+        d: ET タイムゾーン基準の日付。
+    Returns:
+        True なら取引可能（早期クローズ日も True）、False なら週末 or 休場。
+    """
+    if d.weekday() >= 5:    # 5=土, 6=日
+        return False
+    return not is_nyse_holiday(d)
+
+
+def next_trading_day(d: datetime.date) -> datetime.date:
+    """指定日の翌取引可能日（最大 14 日先まで探索）。
+
+    Args:
+        d: 起点となる日付（この日自身は対象外、必ず翌日以降を返す）。
+    Returns:
+        次の取引可能日。14 日先までに見つからない場合は 14 日後を返す
+        （祝日リストの異常を避けるためのフォールバック）。
+    """
+    for offset in range(1, 15):
+        candidate = d + datetime.timedelta(days=offset)
+        if is_trading_day(candidate):
+            return candidate
+    return d + datetime.timedelta(days=14)
+
+
+def previous_trading_day(d: datetime.date) -> datetime.date:
+    """指定日の前取引可能日（最大 14 日前まで探索）。
+
+    Args:
+        d: 起点となる日付（この日自身は対象外、必ず前日以前を返す）。
+    Returns:
+        前の取引可能日。14 日前までに見つからない場合は 14 日前を返す。
+    """
+    for offset in range(1, 15):
+        candidate = d - datetime.timedelta(days=offset)
+        if is_trading_day(candidate):
+            return candidate
+    return d - datetime.timedelta(days=14)
+
+
+def get_session_info() -> Tuple[str, str]:
+    """
+    現在のトレーディングセッションと注文 TIF 文字列を返す。
+    TIF 文字列は moomoo API の TimeInForce に対応させる際に参照する。
+
+    ★ v2.87: NYSE 休日・早期クローズ日に対応
+      - 完全休場日 → SESSION_HOLIDAY を返す（最優先）
+      - 早期クローズ日 → RTH 終了時刻を 13:00 ET に短縮（AFTERHOURS への遷移を早める）
+
+    戻り値タプル長（str, str）は変更なし。互換性維持。
+    """
+    now_et = datetime.datetime.now(_ET)
+    today  = now_et.date()
+    dow    = now_et.weekday()
+    t      = now_et.time()
+
+    # ★ v2.87: 休日判定（最優先 — 週末判定より前）
+    # 平日でも休場日なら SESSION_HOLIDAY。週末 + 休日の場合も
+    # SESSION_HOLIDAY を返す（次の取引日まで停止する点では同じ扱い）。
+    if is_nyse_holiday(today):
+        return SESSION_HOLIDAY, "DAY"
+
+    # 週末判定: 土曜終日 + 日曜20:00まで（moomooの24時間取引は日曜20:00 ET開始）
+    if dow == 6 and t < _OVERNIGHT_START:   # 日曜 00:00〜19:59 ET → 週末停止
+        return SESSION_WEEKEND, "DAY"
+    if dow == 5:                             # 土曜終日 → 週末停止
+        return SESSION_WEEKEND, "DAY"
+    if t < _PREMARKET_START:
+        return SESSION_OVERNIGHT, "OVT"
+    if _PREMARKET_START <= t < _MARKET_OPEN:
+        return SESSION_PREMARKET, "DAY"
+
+    # ★ v2.87: 早期クローズ日は RTH 終了時刻を 13:00 ET に短縮
+    early_close = get_early_close_time(today)
+    rth_end = early_close if early_close else _MARKET_CLOSE
+
+    if _MARKET_OPEN <= t < rth_end:
+        return SESSION_RTH, "DAY"
+    if rth_end <= t < _OVERNIGHT_START:
+        return SESSION_AFTERHOURS, "DAY"
+    return SESSION_OVERNIGHT, "OVT"
+
+
+def seconds_until_premarket() -> float:
+    """★ v2.87: 休日も非取引日として扱い、最大 14 日先まで探索。 連休（例: Thanksgiving 木 + Black Friday 早期クローズ）にも対応。"""
+    now_et = datetime.datetime.now(_ET)
+    for days_ahead in range(15):  # 8 → 15 に拡張（連休対応）
+        candidate = (now_et + datetime.timedelta(days=days_ahead)).replace(
+            hour=_PREMARKET_START.hour, minute=0, second=0, microsecond=0,
+        )
+        if candidate <= now_et:
+            continue
+        # ★ v2.87: 週末 + 休日も除外（is_trading_day で一括判定）
+        if not is_trading_day(candidate.date()):
+            continue
+        return (candidate - now_et).total_seconds()
+    return 3 * 24 * 3600
+
+
+# ── ★ v3.9.36: 次セッション境界の判定 (CLOSE_BEFORE_INACTIVE 用) ────────────────
+def _next_session_boundary() -> Tuple[datetime.time, str]:
+    """現在の ET 時刻から見た「次のセッション境界時刻」と「その後のセッション名」を返す。
+    早期クローズ日は RTH 終了を短縮時刻に合わせる。
+    戻り値: (境界 ET 時刻, 境界後のセッション名)
+    """
+    now_et = datetime.datetime.now(_ET)
+    today  = now_et.date()
+    t      = now_et.time()
+    early_close = get_early_close_time(today)
+    rth_end = early_close if early_close else _MARKET_CLOSE
+    # (境界時刻, 境界後のセッション) を時刻順に並べる
+    boundaries = [
+        (_PREMARKET_START, SESSION_PREMARKET),   # 04:00 → PREMARKET
+        (_MARKET_OPEN,     SESSION_RTH),          # 09:30 → RTH
+        (rth_end,          SESSION_AFTERHOURS),   # 16:00(or短縮) → AFTERHOURS
+        (_OVERNIGHT_START, SESSION_OVERNIGHT),    # 20:00 → OVERNIGHT
+    ]
+    for btime, nxt in boundaries:
+        if t < btime:
+            return (btime, nxt)
+    # 20:00 以降 → 翌 04:00 PREMARKET
+    return (_PREMARKET_START, SESSION_PREMARKET)
+
+
+def _should_preclose_before_inactive() -> Tuple[bool, str]:
+    """★ v3.9.36: CLOSE_BEFORE_INACTIVE — 次セッションが取引不可で、境界まで
+    CLOSE_BEFORE_INACTIVE_MIN 分以内なら (True, 理由) を返す。
+
+    「取引不可セッション」= OVERNIGHT または「発注しない設定」(CONFIDENCE_*=2.00)
+    のセッション。これらへ移行する N 分前に、まだ取引可能な現セッション内で
+    全決済することで、移行後の低流動性 / OVN 決済不能を回避する。
+    """
+    if not CLOSE_BEFORE_INACTIVE:
+        return (False, "")
+    btime, nxt = _next_session_boundary()
+    # 次セッションが取引不可か
+    next_inactive = (nxt == SESSION_OVERNIGHT) or _is_session_disabled_by_name(nxt)
+    if not next_inactive:
+        return (False, "")
+    # 境界までの残り分数
+    now_et  = datetime.datetime.now(_ET)
+    cur_min = now_et.hour * 60 + now_et.minute
+    b_min   = btime.hour * 60 + btime.minute
+    remaining = b_min - cur_min
+    if 0 < remaining <= CLOSE_BEFORE_INACTIVE_MIN:
+        _nxt_jp = "OVERNIGHT" if nxt == SESSION_OVERNIGHT else f"{nxt}(発注しない設定)"
+        return (True, f"{_nxt_jp} 移行 {remaining}分前")
+    return (False, "")
+
+
+# ── 週末前強制全決済 ────────────────────────────────────────────────────────────────
+# ロング決済後のqty一時的負値によるショート誤検知防止（v2.63追加）
+# {symbol: datetime} 形式でロング決済完了時刻を記録し、60秒間は緊急買い戻しをスキップ
+_long_close_grace: dict = {}
+
+# ★ v2.99.2: 決済発注全失敗後の再試行クールダウン
+# place_close_all=False の直後 N 秒間は同銘柄への再発注を見送る (失敗連射防止)。
+_close_retry_cooldown: dict = {}
+_CLOSE_RETRY_COOLDOWN_SEC = 60  # 60秒間は再発注をスキップ
+
+
+def _is_in_close_retry_cooldown(symbol: str) -> tuple[bool, float]:
+    """決済再試行クールダウン中か判定。
+    戻り値: (クールダウン中か, 経過秒数)
+    """
+    last = _close_retry_cooldown.get(symbol)
+    if last is None:
+        return False, 0.0
+    elapsed = (datetime.datetime.now() - last).total_seconds()
+    return (elapsed < _CLOSE_RETRY_COOLDOWN_SEC), elapsed
+
+
+def _mark_close_retry_cooldown(symbol: str) -> None:
+    """決済発注全失敗時にクールダウン開始時刻を記録。"""
+    _close_retry_cooldown[symbol] = datetime.datetime.now()
+
+
+def _clear_close_retry_cooldown(symbol: str) -> None:
+    """決済発注成功時にクールダウンをクリア。"""
+    _close_retry_cooldown.pop(symbol, None)
+
+def close_all_for_weekend(trd_env: TrdEnv,
+                          reason: str = "週末前強制決済（金曜15:45 ET）",
+                          log_prefix: Optional[str] = None) -> None:
+    """
+    全ポジションを強制決済する同期関数。
+    金曜週末クローズ / デモ口座の平日日次クローズ / 発注しない設定セッション移行
+    から呼ばれる。place_close_all を再利用するため新規ロジックは最小限。
+
+    Args:
+        trd_env: 取引環境（REAL / SIMULATE）
+        reason:  place_close_all に渡す決済理由ラベル。
+        log_prefix: ログプレフィックス。None の場合は reason から自動判定。
+                    ★ v3.9.35: 移行前全決済から呼ぶ際に "移行前全決済" を渡す。
+    """
+    # ログプレフィックスを呼び出し元によって出し分け
+    is_weekly = (reason == "週末前強制決済（金曜15:45 ET）")
+    if log_prefix is None:
+        log_prefix = "週末決済" if is_weekly else "デモ日次決済"
+    # ★ v3.9.113: スイープ前に実口座と同期し、内部状態のズレ（orphan建玉）を再捕捉する。
+    #   内部stateだけを信じると、同期漏れで position_qty=0 扱いの実建玉が決済されず放置される
+    #   （7/6: QQQ/SPY SHORT が22時間放置→翌日時間切れで大損）。実口座の建玉を基準に全決済する。
+    try:
+        sync_positions(trd_env)
+    except Exception as _e_sync_sweep:
+        log.warning(f"[{log_prefix}] 事前同期に失敗（内部state基準で続行）: {_mask_secrets(_e_sync_sweep)}")
+    # ★ v3.9.61: モメンタム実発注銘柄も週末/日次決済の対象に含める (IWM orphan 防止)
+    exec_syms = (
+        {sym for syms in EXECUTION_MAP.values() for sym in syms}
+        | set(STOCK_TICKERS)
+        | set(EARNINGS_PRE_TICKERS)
+        | set(EARNINGS_AFTER_TICKERS)
+        | _momentum_live_symbols()
+    )
+    # ★ v3.9.113: 設定universe外の建玉も取りこぼさないよう、同期後に qty!=0 の全銘柄を対象化。
+    targets = sorted({
+        sym for sym in (exec_syms | set(state.tickers.keys()))
+        if state.get(sym).position_qty != 0
+    })
+
+    if not targets:
+        log.info(f"[{log_prefix}] 決済対象ポジションなし → スキップ")
+        return
+
+    targets_str = ", ".join(targets)
+    if is_weekly:
+        log.warning(f"[{log_prefix}] 🏁 金曜強制全決済開始  対象: {targets_str}")
+        _threadsafe_discord(
+            f"[Bot] 🏁 週末前強制全決済\n"
+            f"対象: {targets_str}\n"
+            f"理由: 週末金利（土日3日分）・地政学リスク回避\n"
+            f"ニュース取得・発注を停止し、月曜プリマーケットまで待機します"
+        )
+    else:
+        log.warning(f"[{log_prefix}] 🌙 デモ日次全決済開始  対象: {targets_str}")
+    for sym in targets:
+        place_close_all(sym, trd_env, reason)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ★ v3.8.6: 当日トレード集計 (Discord 自動送信 + Ctrl+C 終了時の端末表示で共通化)
+# ─────────────────────────────────────────────────────────────────────────────
+# 受講生から「moomoo 証券アプリで取引履歴を見るのが手間」という意見を受けて
+# 追加。同じ整形関数を Discord メッセージ (毎日 ET 15:50) と Ctrl+C 終了時の
+# 端末出力で共通化することで保守箇所を 1 つに集約。
+_today_trades: list[dict] = []
+_today_trades_date: Optional["datetime.date"] = None
+_daily_summary_sent_date: Optional["datetime.date"] = None
+# ★ v3.9.126: 日次サマリの送信時刻を「一日の取引終了後」に動的化。
+#   - デモ口座: RTH 後は価格更新されず close_trigger_time(15:45 等)で日次決済・停止するため、
+#     実質 RTH 終了が一日の終わり → RTH 終了時刻に送る。
+#   - 実口座 × アフター非対象(CONFIDENCE_AFTERHOURS≧2.0): RTH 終了後に送る。
+#   - 実口座 × アフター対象: アフターアワーズ終了(=オーバーナイト開始 20:00 ET)後に送る。
+#   早期クローズ日は get_early_close_time() の時刻を RTH 終了として用いる。
+def _daily_summary_send_time(trd_env: "TrdEnv", today_et_date: "datetime.date") -> datetime.time:
+    early   = get_early_close_time(today_et_date)
+    rth_end = early if early else _MARKET_CLOSE          # 16:00 ET（早期クローズ日はその時刻）
+    is_demo = (trd_env == TrdEnv.SIMULATE)
+    if is_demo or _DISABLED_AFTERHOURS:
+        return rth_end
+    return _OVERNIGHT_START                              # 20:00 ET＝アフター終了
+
+# ── ★ v3.9.30: シャドー取引集計バッファ (受講生が自分の成績を確認できるように) ──
+# 日次サマリ (Discord + 端末) に「もし発注していたら」の集計を表示する。
+# シャドー SHORT エグジット時と、シャドーモメンタムシグナル検知時に追記する。
+_today_shadow_short: list[dict] = []      # 決済確定したシャドー SHORT のみ集計
+_today_shadow_momentum: list[dict] = []   # シャドーモメンタム シグナル検知ログ
+
+# ── ★ v3.9.115: 当日サマリ集計のディスク永続化 ─────────────────────────────
+# 認定サポーター指摘 (7/10): 上記バッファはメモリのみで、Bot 再起動でクリアされる
+# ため、再起動前に決済したトレードが日次サマリ(端末/Discord)から抜け、過小表示に
+# なっていた (全件は Google シートに記録済みで、あくまで表示側の欠落)。当日分を
+# ファイルに保存し、起動時に同一 ET 日付なら読み戻してマージする。GAS 非依存・
+# 送信負荷ゼロ。ファイルは ET 日付が変われば自動で当日分に置き換わる。
+_TODAY_STATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "today_summary_state.json"
+)
+_TODAY_STATE_LOCK = threading.Lock()
+
+
+def _save_today_state() -> None:
+    """当日サマリ3バッファをファイルへ保存 (原子的置換)。失敗は黙殺 (表示専用のため)。"""
+    try:
+        state = {
+            "date":            _today_trades_date.isoformat() if _today_trades_date else None,
+            "trades":          _today_trades,
+            "shadow_short":    _today_shadow_short,
+            "shadow_momentum": _today_shadow_momentum,
+        }
+        with _TODAY_STATE_LOCK:
+            tmp = _TODAY_STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False)
+            os.replace(tmp, _TODAY_STATE_PATH)
+    except Exception as _e:
+        log.debug(f"[当日サマリ永続化] 保存失敗(黙殺): {_mask_secrets(_e)}")
+
+
+def _load_today_state() -> int:
+    """起動時に当日サマリを読み戻す (保存日付が当日 ET のときのみ)。戻り値=復元トレード件数。"""
+    global _today_trades, _today_trades_date
+    global _today_shadow_short, _today_shadow_momentum
+    try:
+        if not os.path.exists(_TODAY_STATE_PATH):
+            return 0
+        with _TODAY_STATE_LOCK:
+            with open(_TODAY_STATE_PATH, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        today_et = datetime.datetime.now(_ET).date()
+        saved = state.get("date")
+        if not saved or datetime.date.fromisoformat(saved) != today_et:
+            return 0  # 別日の残骸は無視 (次の記録/リセットで上書きされる)
+        _today_trades         = list(state.get("trades") or [])
+        _today_shadow_short   = list(state.get("shadow_short") or [])
+        _today_shadow_momentum= list(state.get("shadow_momentum") or [])
+        _today_trades_date    = today_et
+        return len(_today_trades)
+    except Exception as _e:
+        log.debug(f"[当日サマリ永続化] 読込失敗(黙殺): {_mask_secrets(_e)}")
+        return 0
+
+
+# ── ★ v3.9.134: 建玉台帳（Bot が建玉を持っている銘柄を記録するだけ）────────────
+# 従来、Bot は「口座にある建玉はすべて自分のもの」として起動時に取り込み、
+# 時間切れ・損切り・トレールの管理下に置いていた。このため、利用者が同じ口座で
+# SPY/QQQ/SMH を手で保有していると Bot がそれを決済してしまう（2026-08-11 に
+# 実口座で発生。別用途で買った QQQ 1株が起動 232 分後の時間切れ決済で処分された）。
+#
+# 台帳が答えるのは **「この銘柄で Bot は建玉を持っているか」だけ**。
+# 株数は突き合わせない。株数は部分約定・発注受付・取消・再起動・API 遅延で常に
+# ズレるため、それを判定材料にすると「一時的なズレ」と「本物の食い違い」を
+# 取り違えて Bot 自身の損切りを止めてしまう（開発中に実際に起きた）。
+#
+#   台帳にこの銘柄が無い ＋ 口座に建玉がある → 管理対象外（触らない）
+#   台帳にこの銘柄がある                     → 従来どおり管理（挙動は不変）
+#
+# 残る限界: Bot がすでにその銘柄を持っている最中に手で買い増された分は
+# 巻き込まれる。ただしこれは v3.9.133 以前と同じ挙動で、悪化はしない。
+_LEDGER_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "bot_position_ledger.json"
+)
+# 「台帳をこの環境で一度でも作ったか」の目印。台帳ファイルが消えたときに
+# 「アップグレード直後の初回」と区別するために使う（初回だけ既存建玉を取り込む）。
+_LEDGER_INIT_MARK = _LEDGER_PATH + ".initialized"
+_LEDGER_LOCK = threading.RLock()
+_position_ledger: dict = {}        # {env: {symbol: {entry_time}}}
+_ledger_first_run: bool = False    # 台帳をこの環境で初めて作る起動か
+_ledger_broken: bool = False       # 台帳が読めなかった（＝建玉を判別できない）
+
+
+def _ledger_env_key(trd_env=None) -> str:
+    """台帳のキー（REAL / DEMO）。実口座とデモで分けて持つ。"""
+    try:
+        if trd_env is None:
+            return "REAL" if _RUN_TRADE_ENV == "REAL" else "DEMO"
+        if isinstance(trd_env, str):
+            return "REAL" if trd_env.strip().upper() == "REAL" else "DEMO"
+        return "REAL" if trd_env == TrdEnv.REAL else "DEMO"
+    except Exception:
+        return "REAL" if _RUN_TRADE_ENV == "REAL" else "DEMO"
+
+
+def _ledger_init_mark_path(trd_env=None) -> str:
+    """初回移行マーカーのパス。REAL / DEMO を独立して初期化する。"""
+    return f"{_LEDGER_INIT_MARK}.{_ledger_env_key(trd_env)}"
+
+
+def _ledger_save() -> bool:
+    """台帳をファイルへ保存（原子的置換）。成功なら True。
+
+    保存に失敗したまま再起動すると建玉を見失うため、握り潰さず知らせる。
+    """
+    try:
+        with _LEDGER_LOCK:
+            tmp = _LEDGER_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(_position_ledger, f, ensure_ascii=False)
+            os.replace(tmp, _LEDGER_PATH)
+        return True
+    except Exception as _e:
+        log.error(f"[建玉台帳] 🔴 保存失敗（次回起動で建玉を見失う恐れ）: {_mask_secrets(_e)}")
+        if not getattr(_ledger_save, "_notified", False):
+            setattr(_ledger_save, "_notified", True)
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                "🔴 【重要】建玉の管理台帳を保存できませんでした\n"
+                "このまま再起動すると、保有中の建玉を『Bot のものではない』と判断し、\n"
+                "**損切り・時間切れ決済を行わなくなります。**\n"
+                "ディスクの空き容量とフォルダの書き込み権限をご確認ください。"
+            ))
+        return False
+
+
+def _ledger_load() -> int:
+    """起動時に台帳を読み込む。戻り値=記録されている銘柄数。"""
+    global _position_ledger, _ledger_first_run, _ledger_broken
+    _ledger_first_run = False
+    _ledger_broken    = False
+    try:
+        _init_mark = _ledger_init_mark_path()
+        # v3.9.134開発版で作られた旧・環境共通マーカーも「初回済み」として扱う。
+        # 台帳消失時に既存建玉を再取り込みする危険を避けるための互換措置。
+        _initialized = os.path.exists(_init_mark) or os.path.exists(_LEDGER_INIT_MARK)
+        if not os.path.exists(_LEDGER_PATH):
+            # 目印も無ければ「この版に上げてからの初回起動」。旧版は口座の建玉を
+            # すべて Bot のものとして扱っていたので、初回だけその前提を引き継ぐ
+            # （そうしないと、建玉を持ったまま版を上げた利用者の損切りが一斉に止まる）。
+            # 目印だけある＝台帳が消えた・壊れた → 初回ではないので取り込まない。
+            _ledger_first_run = not _initialized
+            if not _ledger_first_run:
+                _ledger_broken = True
+            with _LEDGER_LOCK:
+                _position_ledger = {}
+            return 0
+        with _LEDGER_LOCK:
+            with open(_LEDGER_PATH, "r", encoding="utf-8") as f:
+                _position_ledger = json.load(f) or {}
+        # 台帳ファイルは共有だが、初回移行は環境ごとに一度ずつ必要。
+        _ledger_first_run = not _initialized
+        return sum(len(v or {}) for v in _position_ledger.values())
+    except Exception as _e:
+        # 読めない＝自分の建玉を判別できない。既存建玉は触らない側に倒す（安全側）。
+        _ledger_broken = True
+        log.error(f"[建玉台帳] 🔴 読込失敗（既存建玉はすべて管理対象外にします）: {_mask_secrets(_e)}")
+        with _LEDGER_LOCK:
+            _position_ledger = {}
+        return 0
+
+
+def _ledger_touch_mark(trd_env=None) -> None:
+    """「この環境で台帳を作った」目印を残す（次回以降は初回扱いしない）。"""
+    try:
+        with open(_ledger_init_mark_path(trd_env), "w", encoding="utf-8") as f:
+            f.write(datetime.datetime.now().isoformat())
+    except Exception as _e:
+        log.warning(f"[建玉台帳] 目印の作成に失敗: {_mask_secrets(_e)}")
+
+
+def _ledger_mark(symbol: str, trd_env=None, entry_time=None) -> None:
+    """この銘柄で Bot が建玉を持ったことを記録する。"""
+    try:
+        with _LEDGER_LOCK:
+            env = _ledger_env_key(trd_env)
+            _position_ledger.setdefault(env, {})[symbol] = {
+                "entry_time": (entry_time or datetime.datetime.now()).isoformat(),
+            }
+        if _ledger_save() and not _ledger_first_run:
+            # 初回移行中は、全既存建玉の取り込みが終わる前に完了マーカーを
+            # 作らない。途中終了すると次回起動で未移行建玉を見失うため。
+            _ledger_touch_mark(trd_env)
+    except Exception as _e:
+        log.warning(f"[建玉台帳] 記録失敗 {symbol}: {_mask_secrets(_e)}")
+
+
+def _ledger_unmark(symbol: str, trd_env=None) -> None:
+    """建玉が無くなったので台帳から消す。"""
+    try:
+        with _LEDGER_LOCK:
+            env = _ledger_env_key(trd_env)
+            _removed = _position_ledger.get(env, {}).pop(symbol, None)
+        if _removed is not None:
+            _ledger_save()
+    except Exception as _e:
+        log.warning(f"[建玉台帳] 削除失敗 {symbol}: {_mask_secrets(_e)}")
+
+
+def _ledger_has(symbol: str, trd_env=None) -> bool:
+    """Bot の建玉としてこの銘柄が台帳にあるか。"""
+    try:
+        with _LEDGER_LOCK:
+            return symbol in _position_ledger.get(_ledger_env_key(trd_env), {})
+    except Exception:
+        return False
+
+
+def _ledger_entry_time(symbol: str, trd_env=None):
+    """台帳に記録した建玉の開始時刻（読めなければ None）。"""
+    try:
+        with _LEDGER_LOCK:
+            _rec = _position_ledger.get(_ledger_env_key(trd_env), {}).get(symbol) or {}
+        return datetime.datetime.fromisoformat(_rec.get("entry_time", ""))
+    except Exception:
+        return None
+
+
+# ── ★ v3.9.134: 管理対象外の銘柄を「気づける」ようにする ──────────────────────
+# 自動売買が止まっていることに利用者が気づけないと、「なぜ発注されないのか
+# 分からない」状態になる。次の4箇所で繰り返し知らせる:
+#   ① 検出した瞬間に Discord
+#   ② 画面の [状況] 行に常時表示
+#   ③ 一定時間ごとに Discord で再通知（既定6時間）
+#   ④ 日次サマリに表示
+_EXT_REMIND_HOURS: float = float(os.environ.get("EXT_HOLD_REMIND_HOURS", "6") or "6")
+_ext_last_remind: dict = {}
+
+
+def _ext_blocked_symbols() -> list:
+    """いま管理対象外になっている銘柄の一覧（画面表示・日次サマリ用）。"""
+    try:
+        return [s for s in ALL_TICKERS if getattr(state.get(s), "externally_held", False)]
+    except Exception:
+        return []
+
+
+def _ext_status_suffix() -> str:
+    """[状況] 行に足す注意書き。管理対象外が無ければ空文字。"""
+    _b = _ext_blocked_symbols()
+    return f"  ⚠️ 自動売買停止中: {'/'.join(_b)}（Bot以外の建玉あり）" if _b else ""
+
+
+def _ext_remind_if_due() -> None:
+    """管理対象外が続いている銘柄を、一定時間ごとに Discord で再通知する。"""
+    if _EXT_REMIND_HOURS <= 0:
+        return
+    _b = _ext_blocked_symbols()
+    if not _b:
+        return
+    _now = datetime.datetime.now()
+    _due = [
+        s for s in _b
+        if (_now - _ext_last_remind.get(s, datetime.datetime.min)).total_seconds()
+        >= _EXT_REMIND_HOURS * 3600
+    ]
+    if not _due:
+        return
+    for s in _due:
+        _ext_last_remind[s] = _now
+    _threadsafe_future(asyncio.to_thread(
+        send_discord_message,
+        f"⏸️ 【{'/'.join(_due)}】 の自動売買は停止したままです\n"
+        f"Bot が建てていない建玉が口座に残っているためです。\n"
+        f"この建玉を moomoo アプリで決済すると、自動売買はすぐに再開します。\n"
+        f"（そのまま保有される場合は、この銘柄だけ Bot が動きません）"
+    ))
+
+
+def _ext_set_held(symbol: str, held: bool, reason: str = "",
+                  resume_reason: str = "Bot 以外の建玉が無くなったため") -> None:
+    """管理対象外フラグを切り替え、切り替わった瞬間だけ通知する。"""
+    ts = state.get(symbol)
+    if bool(getattr(ts, "externally_held", False)) == bool(held):
+        return
+    ts.externally_held = held
+    if held:
+        _ext_last_remind[symbol] = datetime.datetime.now()
+        log.warning(f"[建玉台帳] 🛡️ 【{symbol}】 {reason} → 自動売買を停止します（決済も新規発注もしません）")
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"🛡️ 【{symbol}】 Bot が建てていない建玉を見つけました\n"
+            f"{reason}\n"
+            f"**この銘柄の自動売買を停止します**（勝手に決済しないための措置です）。\n"
+            f"・手動で保有されている場合は、そのままで問題ありません\n"
+            f"・自動売買を再開したい場合は、moomoo アプリでこの建玉を決済してください\n"
+            f"決済されれば自動的に再開します。"
+        ))
+    else:
+        _ext_last_remind.pop(symbol, None)
+        setattr(place_close_all, f"_ext_close_notified_{symbol}", False)
+        setattr(_skip_if_externally_held, f"_ext_entry_notified_{symbol}", False)
+        log.info(f"[建玉台帳] ✅ 【{symbol}】 {resume_reason} → 自動売買を再開します")
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"✅ 【{symbol}】 {resume_reason}、自動売買を再開します。"
+        ))
+
+
+def _skip_if_externally_held(symbol: str, what: str) -> bool:
+    """管理対象外の銘柄なら True（＝発注を見送る）。"""
+    if not getattr(state.get(symbol), "externally_held", False):
+        return False
+    log.info(f"[建玉台帳] 【{symbol}】 Bot 以外の建玉があるため {what} を見送ります")
+    _key = f"_ext_entry_notified_{symbol}"
+    if not getattr(_skip_if_externally_held, _key, False):
+        setattr(_skip_if_externally_held, _key, True)
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"⏸️ 【{symbol}】 発注の機会がありましたが、自動売買を停止中のため見送りました\n"
+            f"Bot が建てていない建玉が口座に残っています。\n"
+            f"決済すると自動売買が再開し、次の機会から発注されます。"
+        ))
+    return True
+
+
+def _record_today_shadow_short(rec: dict) -> None:
+    """シャドー SHORT 決済時の集計に追記 (_shadow_short_close から呼ぶ)。"""
+    _maybe_reset_today_trades()
+    _today_shadow_short.append(rec)
+    _save_today_state()
+
+
+def _record_today_shadow_momentum(rec: dict) -> None:
+    """シャドーモメンタム シグナル検知時に追記 (momentum_shadow_loop から呼ぶ)。"""
+    _maybe_reset_today_trades()
+    _today_shadow_momentum.append(rec)
+    _save_today_state()
+
+
+def _maybe_reset_today_trades() -> None:
+    """ET 日付が変わっていれば当日バッファをリセットする。"""
+    global _today_trades, _today_trades_date
+    global _today_shadow_short, _today_shadow_momentum
+    today_et = datetime.datetime.now(_ET).date()
+    if _today_trades_date != today_et:
+        _today_trades = []
+        _today_shadow_short = []
+        _today_shadow_momentum = []
+        _today_trades_date = today_et
+        _save_today_state()   # ★ v3.9.115: 日付跨ぎで永続ファイルも当日(空)へ更新
+
+
+def _record_today_trade(rec: dict) -> None:
+    """1 トレード終了時に集計用バッファに追記する (_send_trade_result から呼ぶ)。"""
+    _maybe_reset_today_trades()
+    _today_trades.append(rec)
+    _save_today_state()
+
+
+def _format_shadow_summary_block() -> Optional[str]:
+    """★ v3.9.30: シャドー SHORT + シャドーモメンタム のサマリブロックを整形して返す。
+    Discord・端末両方で使うので、_format_daily_summary 末尾に追記する形で使う。
+    シャドーデータがゼロなら None を返す。
+    """
+    if not _today_shadow_short and not _today_shadow_momentum:
+        return None
+    lines = []
+    lines.append("")
+    lines.append("─" * 56)
+    lines.append("★ シャドー成績 (もし発注していたら…の集計)")
+    lines.append("─" * 56)
+
+    # ── シャドー SHORT サマリ ──────────────────────────────────────
+    if _today_shadow_short:
+        n_total = len(_today_shadow_short)
+        wins   = [s for s in _today_shadow_short if s.get('pnl_usd', 0) > 0]
+        losses = [s for s in _today_shadow_short if s.get('pnl_usd', 0) < 0]
+        n_w, n_l = len(wins), len(losses)
+        win_rate = n_w / max(n_total, 1) * 100
+        total_pnl = sum(s.get('pnl_usd', 0) for s in _today_shadow_short)
+
+        lines.append("")
+        lines.append(f"▼ シャドーSHORT  {n_total}件  勝率 {win_rate:.0f}% ({n_w}勝 {n_l}敗)")
+        lines.append(f"  仮想 損益  {total_pnl:+.2f}")
+
+        # 銘柄別
+        by_sym: dict = {}
+        for s in _today_shadow_short:
+            agg = by_sym.setdefault(s['symbol'], {'n': 0, 'pnl': 0.0, 'w': 0})
+            agg['n']   += 1
+            agg['pnl'] += s.get('pnl_usd', 0)
+            if s.get('pnl_usd', 0) > 0:
+                agg['w'] += 1
+        for sym, agg in sorted(by_sym.items(), key=lambda kv: -kv[1]['pnl']):
+            wr = agg['w'] / max(agg['n'], 1) * 100
+            lines.append(f"    {sym:6s}  {agg['n']:2d}件  勝率{wr:3.0f}%  {agg['pnl']:+8.2f}")
+    else:
+        lines.append("")
+        lines.append("▼ シャドーSHORT  本日の決済なし")
+
+    # ── シャドーモメンタム サマリ ──────────────────────────────────
+    if _today_shadow_momentum:
+        n_total = len(_today_shadow_momentum)
+        lines.append("")
+        lines.append(f"▼ シャドーモメンタム  シグナル検知 {n_total}件")
+
+        # 銘柄 × 方向別
+        by_sd: dict = {}
+        for m in _today_shadow_momentum:
+            key = f"{m.get('symbol', '?')}-{m.get('direction', '?')}"
+            agg = by_sd.setdefault(key, {'n': 0})
+            agg['n'] += 1
+        for key, agg in sorted(by_sd.items(), key=lambda kv: -kv[1]['n']):
+            lines.append(f"    {key:14s}  {agg['n']:2d}件")
+    else:
+        lines.append("")
+        lines.append("▼ シャドーモメンタム  本日のシグナルなし")
+
+    return '\n'.join(lines)
+
+
+def _format_daily_summary() -> Optional[str]:
+    """当日トレード集計を整形して返す。実トレード/シャドー両方ゼロなら None。
+
+    返り値は Discord ``` ``` 内および端末出力の両方で使えるプレーンテキスト。
+    v3.9.30: 実トレードゼロでもシャドーデータがあれば表示するように変更。
+    """
+    _maybe_reset_today_trades()
+    # 実トレードもシャドーも完全ゼロなら None
+    if not _today_trades and not _today_shadow_short and not _today_shadow_momentum:
+        return None
+    # ── 実トレードゼロでシャドーだけある場合の簡易ヘッダ ──────────────
+    if not _today_trades:
+        today_et = datetime.datetime.now(_ET)
+        header = []
+        header.append(f"📊 本日のトレード集計  {today_et.strftime('%Y-%m-%d (%a) %H:%M ET')}")
+        header.append('=' * 56)
+        header.append(f"🎛 戦略プロファイル: {_PROFILE_DISPLAY}")   # ★ v3.9.116
+        header.append("本日の実トレードはありません")
+        shadow = _format_shadow_summary_block()
+        if shadow:
+            header.append(shadow)
+        return '\n'.join(header)
+    today_et = datetime.datetime.now(_ET)
+    n_total = len(_today_trades)
+    wins   = [t for t in _today_trades if t['pnl'] > 0]
+    losses = [t for t in _today_trades if t['pnl'] < 0]
+    n_w, n_l = len(wins), len(losses)
+    win_rate = n_w / max(n_total, 1) * 100
+    total_pnl = sum(t['pnl'] for t in _today_trades)
+    avg_w = sum(t['pnl'] for t in wins)   / n_w if n_w else 0.0
+    avg_l = sum(t['pnl'] for t in losses) / n_l if n_l else 0.0
+    # ★ v3.9.23: best/worst は wins/losses から抽出 (全件マイナス時の誤表示防止)
+    # 旧版は max(_today_trades, ...) のため全件マイナス日に「最もマシな負け」を
+    # 「最高勝ち」と誤表示していた (受講生報告 5/15 SPY 1件 -$3.28 の事例)。
+    best  = max(wins,   key=lambda t: t['pnl']) if wins   else None
+    worst = min(losses, key=lambda t: t['pnl']) if losses else None
+
+    # 銘柄別 / 決済理由別 / カテゴリ別の集計
+    by_sym: dict    = {}
+    by_reason: dict = {}
+    by_cat: dict    = {}
+    for t in _today_trades:
+        s = by_sym.setdefault(t['symbol'], {'n': 0, 'w': 0, 'pnl': 0.0})
+        s['n']  += 1
+        s['pnl'] += t['pnl']
+        if t['pnl'] > 0:
+            s['w'] += 1
+        # 決済理由は短縮ラベルに正規化
+        reason = (t.get('exit_reason') or '')
+        if   '時間切れ' in reason:                   r_key = '時間切れ'
+        elif 'トレール' in reason:                   r_key = 'トレール'
+        elif 'パニック' in reason:                   r_key = 'パニックセル'
+        elif '強制損切り' in reason or '損切' in reason: r_key = '強制損切り'
+        elif '週末' in reason or '日次' in reason:   r_key = '日次/週末決済'
+        elif 'シグナル' in reason or '切替' in reason: r_key = 'シグナル切替'
+        else:                                          r_key = 'その他'
+        r = by_reason.setdefault(r_key, {'n': 0, 'pnl': 0.0})
+        r['n']  += 1
+        r['pnl'] += t['pnl']
+        cat = t.get('ai_category', '?') or '?'
+        c = by_cat.setdefault(cat, {'n': 0, 'pnl': 0.0})
+        c['n']  += 1
+        c['pnl'] += t['pnl']
+
+    lines = []
+    lines.append(f"📊 本日のトレード集計  {today_et.strftime('%Y-%m-%d (%a) %H:%M ET')}")
+    lines.append('=' * 56)
+    lines.append(f"🎛 戦略プロファイル: {_PROFILE_DISPLAY}")   # ★ v3.9.116
+    lines.append(f"合計 {n_total}件   勝率 {win_rate:.0f}% ({n_w}勝 {n_l}敗)")
+    lines.append(f"損益  {total_pnl:+.2f}   平均勝ち {avg_w:+.2f} / 平均負け {avg_l:+.2f}")
+    lines.append("")
+    # v3.9.23: 該当トレードがあるときのみ表示 (全件勝ち/全件負けで片方欠落するケース対応)
+    if best is not None:
+        lines.append(f"💰 最高勝ち  【{best['symbol']}】 {best['pnl']:+.2f}  "
+                     f"({best.get('trade_type', 'LONG')}, {best.get('hold_min', 0):.1f}分)")
+    else:
+        lines.append("💰 最高勝ち  -- (勝ちトレードなし)")
+    if worst is not None:
+        lines.append(f"💸 最大負け  【{worst['symbol']}】 {worst['pnl']:+.2f}  "
+                     f"({worst.get('trade_type', 'LONG')}, {worst.get('hold_min', 0):.1f}分)")
+    else:
+        lines.append("💸 最大負け  -- (負けトレードなし)")
+    lines.append("")
+    lines.append("▼ 銘柄別")
+    for sym, s in sorted(by_sym.items(), key=lambda kv: -kv[1]['pnl']):
+        wr = s['w'] / max(s['n'], 1) * 100
+        lines.append(f"  {sym:6s}  {s['n']:2d}件  勝率{wr:3.0f}%  {s['pnl']:+8.2f}")
+    lines.append("")
+    lines.append("▼ 決済理由別")
+    for r, s in sorted(by_reason.items(), key=lambda kv: -kv[1]['pnl']):
+        lines.append(f"  {r:12s}  {s['n']:2d}件  {s['pnl']:+8.2f}")
+    lines.append("")
+    lines.append("▼ AI カテゴリ別")
+    for c, s in sorted(by_cat.items(), key=lambda kv: -kv[1]['pnl']):
+        lines.append(f"  {c:12s}  {s['n']:2d}件  {s['pnl']:+8.2f}")
+    # ★ v3.9.30: シャドー成績を末尾に追記 (Discord・端末両方で表示される)
+    shadow = _format_shadow_summary_block()
+    if shadow:
+        lines.append(shadow)
+    return '\n'.join(lines)
+
+
+async def _send_daily_summary_if_needed(trd_env: "TrdEnv") -> None:
+    """一日の取引終了後に当日サマリを Discord 送信 (1 日 1 回・取引なしならスキップ)。
+
+    送信時刻は _daily_summary_send_time() が口座種別とアフター設定から決める
+    （★ v3.9.126: 従来は固定 15:50 ET → RTH 終了後 / アフター終了後に変更）。
+    market_schedule_loop の毎分ポーリングから呼ばれる前提。
+    """
+    global _daily_summary_sent_date
+    now_et = datetime.datetime.now(_ET)
+    today_et = now_et.date()
+    if _daily_summary_sent_date == today_et:
+        return  # 既に当日送信済
+    if now_et.time() < _daily_summary_send_time(trd_env, today_et):
+        return  # 送信時刻(RTH終了後 / アフター終了後)に未到達
+    summary = _format_daily_summary()
+    if summary is None:
+        # 取引ゼロ: 送信せずフラグだけ立て、毎分実行を回避
+        _daily_summary_sent_date = today_et
+        return
+    log.info(f"[日次サマリ]\n{summary}")
+    msg = "```\n" + summary + "\n```"
+    try:
+        await asyncio.to_thread(send_discord_message, msg)
+    except Exception as e:
+        log.warning(f"[日次サマリ] Discord 送信失敗: {_mask_secrets(e)}")
+    _daily_summary_sent_date = today_et
+
+
+def _print_daily_summary_to_terminal() -> None:
+    """Ctrl+C / 終了時に端末へ当日サマリを表示する (Discord と同じ整形)。
+
+    ★ v3.9.23: print() で枠付き出力に変更 (log.info だとログ行に埋もれるため)。
+    ANSI 色は使わず、stderr に出して flush で確実に表示。
+    """
+    summary = _format_daily_summary()
+    if summary is None:
+        # 取引ゼロでも「本日トレードなし」を明示
+        try:
+            sys.stderr.write("\n" + "─" * 56 + "\n")
+            sys.stderr.write("📊 本日のトレード集計  (本日のトレードなし)\n")
+            sys.stderr.write("─" * 56 + "\n\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return
+    # 通常: 枠付きで端末表示（stderr）
+    try:
+        sys.stderr.write("\n" + "═" * 56 + "\n")
+        sys.stderr.write(summary + "\n")
+        sys.stderr.write("═" * 56 + "\n\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    # ★ v3.9.112: ログファイルにのみ記録する（端末は上のstderrで表示済み）。
+    #   以前は log.info で出していたが、StreamHandler(stdout) 経由で画面にも出るため
+    #   「集計が2回表示される」不具合になっていた。ファイルハンドラへ直接記録して重複を解消。
+    try:
+        _rec = log.makeRecord(log.name, logging.INFO, __file__, 0,
+                              f"[終了サマリ]\n{summary}", None, None)
+        _file_handler.handle(_rec)
+    except Exception:
+        pass
+
+
+async def market_schedule_loop(trd_env: TrdEnv) -> None:
+    """
+    セッション状態を60秒ごとに監視し、market_open_event を制御する。
+
+    追加機能①: 金曜 15:45 ET に到達したら（全モード共通）
+      1. 全ポジションを強制決済（close_all_for_weekend）
+      2. market_open_event を clear してニュース取得・発注を停止
+      3. 以降は週末判定ブロックで月曜プリマーケットまで待機
+
+    追加機能②: デモ口座（SIMULATE）限定 — 毎日 15:45 ET に全決済・停止
+      - デモ口座は RTH 終了後に株価が更新されないため、
+        価格が見えている RTH 内（15:45 ET）で毎日全決済する
+      - 翌日のプリマーケット開始（04:00 ET）に自動再開
+      - 実口座（REAL）では本ロジックは発火しない
+        → 実口座は夜間取引セッションも株価取得・発注が可能
+
+    追加機能③ (★ v2.87): NYSE 休日対応
+      - 完全休場日 → market_open_event を clear して停止
+      - 早期クローズ日（13:00 ET）→ 決済発火を 12:45 ET に変更
+      - 連休前（翌取引日が翌日以降にある）→ 前日 15:45 ET に強制決済
+        例: Good Friday の前日（木）15:45 ET、Thanksgiving の前日（水）など
+
+    追加機能④ (★ v3.8.0): OVERNIGHT (20:00〜04:00 ET) を全モード停止対象に
+      - 旧仕様: LIVE は moomoo 24h 取引対応で OVERNIGHT も継続稼働
+      - 新仕様: LIVE/DEMO 共に OVERNIGHT はニュース取得・AI判定・発注を停止
+        理由: アフター終了後は新規ニュースの取引価値が低く、無駄な API コスト
+        (ニュース取得 + Anthropic 判定) が発生していたため
+      - 翌プリマーケット (04:00 ET) で自動再開
+    """
+    log.info("=== セッション監視ループ 開始 ===")
+    prev_session        = None
+    _weekend_close_done = False  # 金曜決済を1回だけ実行するフラグ
+    _demo_daily_close_done = False  # デモ口座：当日の日次決済実行フラグ
+    _live_last_sent_date = None  # 実口座：日次データ送信済み日付（ET）
+    _holiday_close_done_date: Optional[datetime.date] = None  # ★ v2.87: 連休前決済を1日1回だけ実行
+    is_demo = (trd_env == TrdEnv.SIMULATE)
+
+    while True:
+        session, tif = get_session_info()
+        now_et       = datetime.datetime.now(_ET)
+        today_et     = now_et.date()
+        dow_et       = now_et.weekday()   # 月=0 … 金=4 / 土=5 / 日=6
+        t_et         = now_et.time()
+
+        # ── ★ v2.87: 休日ブロック（最優先 — 既存ロジックの前に挿入）─────────
+        # 完全休場日は決済も発注も不要。市場が動いていないので何もせず待機。
+        # 注: 連休前決済（前日 15:45 ET）は通常曜日として下のブロックで実行済みのため、
+        #     ここに到達した時点では既に決済済み or 当日休場で発注対象なし。
+        if session == SESSION_HOLIDAY:
+            if prev_session != SESSION_HOLIDAY:
+                market_open_event.clear()
+                next_td = next_trading_day(today_et)
+                wait_sec = seconds_until_premarket()
+                wait_h, r = divmod(int(wait_sec), 3600)
+                wait_m   = r // 60
+                log.info(
+                    f"[休日] 📅 NYSE 休場日（{today_et}）→ 取引停止"
+                    f" 次の取引日: {next_td}（プリマーケットまで約 {wait_h}h{wait_m}m）"
+                )
+                _threadsafe_future(asyncio.to_thread(
+                    send_discord_message,
+                    f"📅 NYSE 休場日のため取引停止\n"
+                    f"本日: {today_et} ({now_et.strftime('%a')})\n"
+                    f"次の取引日: {next_td}\n"
+                    f"プリマーケット再開まで約 {wait_h}時間{wait_m}分"
+                ))
+            prev_session = SESSION_HOLIDAY
+            await asyncio.sleep(60)
+            continue
+
+        # ── ★ v2.87: 早期クローズ日の決済発火時刻を 12:45 ET に変更 ──────────
+        # 早期クローズ日（13:00 ET）はクローズ 15 分前（12:45 ET）に決済発火。
+        # 通常日は _FRIDAY_CLOSE_TIME（15:45 ET）を使用。
+        early_close_today = get_early_close_time(today_et)
+        if early_close_today:
+            _ec_minutes = early_close_today.hour * 60 + early_close_today.minute
+            _ec_minutes -= _EARLY_CLOSE_PRECLOSE_MINUTES
+            close_trigger_time = datetime.time(_ec_minutes // 60, _ec_minutes % 60)
+        else:
+            close_trigger_time = _FRIDAY_CLOSE_TIME
+
+        # ── ★ v2.87: 連休前判定 ──────────────────────────────────────────────
+        # 翌取引日が 2 日以上後 → 連休前夜とみなして強制決済 (通常金曜も対象)。
+        # 休日/週末は上の SESSION_HOLIDAY 分岐で抜けているのでここでは取引可能日確定。
+        next_td_for_close = next_trading_day(today_et)
+        is_pre_holiday = (next_td_for_close - today_et).days >= 2
+        # ただし「連休前決済を 1 日 1 回だけ実行」フラグで重複防止
+        not_yet_done_today = (_holiday_close_done_date != today_et)
+
+        # ── 週末/連休前 強制全決済 ────────────────────────────────────────────
+        # 「金曜 15:45 ET」を連休前 close_trigger_time に拡張。
+        # 例: 金→月(3日)/木→月(4日)/水→金(2日) すべて is_pre_holiday=True
+        # ★ v2.89: 平日 (dow_et<5) + RTH/AFTERHOURS ガード追加。
+        # 旧版は土曜任意時刻起動で next_td=月曜→is_pre_holiday=True となり
+        # SESSION_WEEKEND でも誤発火する重大バグ (全決済注文が出る) があった。
+        if (is_pre_holiday
+            and dow_et < 5                                          # ★ v2.89: 平日のみ
+            and session in (SESSION_RTH, SESSION_AFTERHOURS)        # ★ v2.89: 市場開場中のみ
+            and t_et >= close_trigger_time
+            and not_yet_done_today
+            and not _weekend_close_done):
+            _weekend_close_done = True
+            _demo_daily_close_done = True  # デモ日次決済と重複しないよう
+            _holiday_close_done_date = today_et
+            # 決済理由ラベルを状況に応じて切り替え
+            if early_close_today:
+                close_reason = (
+                    f"早期クローズ前強制決済（{close_trigger_time.strftime('%H:%M')} ET / "
+                    f"クローズ {early_close_today.strftime('%H:%M')} ET）"
+                )
+            elif dow_et == 4:
+                close_reason = "週末前強制決済（金曜15:45 ET）"
+            else:
+                # 平日連休前（Good Friday の前日木曜など）
+                close_reason = (
+                    f"連休前強制決済（{now_et.strftime('%a')} {close_trigger_time.strftime('%H:%M')} ET / "
+                    f"次の取引日: {next_td_for_close}）"
+                )
+            log.warning(
+                f"[週末決済] {now_et.strftime('%a')} {close_trigger_time.strftime('%H:%M')} ET 到達"
+                f" → 全ポジション強制決済・ニュース停止 (理由: {close_reason})"
+            )
+            # 同期関数なので to_thread でブロッキングを回避
+            await asyncio.to_thread(close_all_for_weekend, trd_env, close_reason)
+            # EOD後データ収集（DATA_COLLECT=trueの場合のみ送信）
+            _threadsafe_future(asyncio.to_thread(run_daily_data_collect))
+            # ニュースループ・リスク監視を停止（週末と同じ扱い）
+            market_open_event.clear()
+            wait_sec  = seconds_until_premarket()
+            wait_h, r = divmod(int(wait_sec), 3600)
+            wait_m    = r // 60
+            log.info(f"[週末決済] 次のプリマーケットまで {wait_h}h{wait_m}m 待機")
+            prev_session = SESSION_WEEKEND  # 以降の週末ブロックで重複通知しないよう設定
+            await asyncio.sleep(60)
+            continue
+
+        # ── デモ口座限定：通常営業日 15:45 ET に日次全決済・翌日プリマーケットまで停止 ──
+        # 理由: デモは RTH 終了後に株価が更新されないため。実口座は夜間取引対応で不要。
+        # is_pre_holiday=False の通常曜日のみ発火。早期クローズ日は 12:45 で発火。
+        # ★ v2.89: 平日 + RTH/AFTERHOURS ガード追加。
+        # 旧版は曜日と時刻だけで判定 → 日曜夕方/月曜深夜 OVERNIGHT 起動で誤発火し、
+        # 市場閉鎖中に決済注文を出す重大バグ (2026-05-03 LLY 15株 SELL 事案) があった。
+        if (is_demo
+            and not is_pre_holiday
+            and dow_et < 5                                          # ★ v2.89: 平日のみ
+            and session in (SESSION_RTH, SESSION_AFTERHOURS)        # ★ v2.89: 市場開場中のみ
+            and t_et >= close_trigger_time
+            and not _demo_daily_close_done):
+            _demo_daily_close_done = True
+            log.warning(
+                f"[デモ日次決済] {close_trigger_time.strftime('%H:%M')} ET 到達 "
+                f"→ デモ口座のため全ポジション決済・翌プリマーケットまで停止"
+            )
+            await asyncio.to_thread(close_all_for_weekend, trd_env, f"デモ日次決済（{close_trigger_time.strftime('%H:%M')} ET）")
+            _threadsafe_future(asyncio.to_thread(run_daily_data_collect))
+            market_open_event.clear()
+            wait_sec  = seconds_until_premarket()
+            wait_h, r = divmod(int(wait_sec), 3600)
+            wait_m    = r // 60
+            log.info(f"[デモ日次決済] 次のプリマーケット開始まで {wait_h}h{wait_m}m 待機")
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                f"🌙 [デモ] RTH終了前 日次決済\n"
+                f"デモ口座は RTH 後に株価が更新されないため毎日 {close_trigger_time.strftime('%H:%M')} ET に全決済\n"
+                f"次のプリマーケット開始まで約 {wait_h}時間{wait_m}分"
+            ))
+            prev_session = "demo_closed"
+            await asyncio.sleep(60)
+            continue
+
+        # ── ★ v3.9.36: 取引不可セッション移行 N 分前の全決済 (CLOSE_BEFORE_INACTIVE) ──
+        # 「発注しない設定」セッション / OVERNIGHT へ移行する N 分前に、まだ取引可能な
+        # 現セッション内で全決済する。移行後の低流動性 / OVN 決済不能を回避する。
+        # boundary をキーに 1 回だけ発火 (毎分ポーリングで重複しないよう dedup)。
+        _pc_should, _pc_reason = _should_preclose_before_inactive()
+        if _pc_should:
+            _pc_btime, _pc_nxt = _next_session_boundary()
+            _pc_key = f"{today_et}-{_pc_btime.strftime('%H:%M')}"
+            if getattr(market_schedule_loop, "_preclose_done_for", None) != _pc_key:
+                log.warning(
+                    f"[移行前全決済] {_pc_reason} → CLOSE_BEFORE_INACTIVE=true のため"
+                    f"全ポジションを決済します (まだ取引可能な現セッション内で実行)"
+                )
+                # ★ v3.9.120: 完了マークは決済処理の「成功後」に付ける（外部AIレビュー指摘）。
+                #   旧実装は試行前にマークしていたため、OpenD瞬断などで例外になると
+                #   残りの猶予時間内に再試行されず、ポジションを持ったまま移行していた。
+                #   失敗時はマークせず、次の1分ポーリングで境界までの間リトライする。
+                try:
+                    await asyncio.to_thread(
+                        close_all_for_weekend, trd_env,
+                        f"移行前全決済（{_pc_reason}）", "移行前全決済",
+                    )
+                    setattr(market_schedule_loop, "_preclose_done_for", _pc_key)
+                    _threadsafe_future(asyncio.to_thread(
+                        send_discord_message,
+                        f"⚡ [移行前全決済] {_pc_reason}\n"
+                        f"{now_et.strftime('%Y-%m-%d %H:%M')} ET\n"
+                        f"取引不可セッションへの移行前に保有ポジションを全決済しました\n"
+                        f"(CLOSE_BEFORE_INACTIVE=true / {CLOSE_BEFORE_INACTIVE_MIN}分前決済)"
+                    ))
+                except Exception as _e_pc:
+                    log.warning(
+                        f"[移行前全決済] 決済処理エラー → 1分後に再試行します: "
+                        f"{_mask_secrets(_e_pc)}"
+                    )
+
+        # ── 実口座限定: 通常営業日 close_trigger_time に当日分データ送信 ──────
+        # is_demo=True / is_pre_holiday=True は上で発火済 → ここは実口座通常曜日のみ。
+        # 取引は停止せずデータ送信のみ (実口座は夜間取引継続可)。
+        # ★ v2.89: 平日 + RTH/AFTERHOURS ガード (旧版は土日月深夜起動で誤発火)。
+        if (not is_demo
+            and not is_pre_holiday
+            and dow_et < 5                                          # ★ v2.89: 平日のみ
+            and session in (SESSION_RTH, SESSION_AFTERHOURS)        # ★ v2.89: 市場開場中のみ
+            and t_et >= close_trigger_time
+            and _live_last_sent_date != today_et):
+            _live_last_sent_date = today_et
+            log.info(
+                f"[実口座日次送信] {close_trigger_time.strftime('%H:%M')} ET 到達 "
+                f"→ 当日分データ送信（取引は継続）"
+            )
+            _threadsafe_future(asyncio.to_thread(run_daily_data_collect))
+
+        # 日次フラグ：翌日プリマーケット開始（04:00〜）でリセット
+        if _demo_daily_close_done:
+            if t_et >= datetime.time(4, 0) and t_et < close_trigger_time:
+                _demo_daily_close_done = False
+                log.info("[日次決済] フラグリセット → 本日の取引を開始します")
+
+        # 月曜以降になったらフラグをリセット（翌週の金曜決済に備える）
+        if dow_et < 4:
+            _weekend_close_done = False
+
+        # ── 通常のセッション管理 ─────────────────────────────────────────────
+        # 停止条件：週末は全モード / オーバーナイトも全モード共通で停止 / デモ日次決済後は翌プリマーケットまで
+        # ★ v3.8.0: LIVE モードでも OVERNIGHT (20:00〜04:00 ET) はニュース取得を停止する。
+        # アフター終了後は新規ニュースの取引価値が低い & API コスト削減のため。
+        # 翌プリマーケット (04:00 ET) で自動再開する。
+        # ★ v3.9.6: setup_wizard で「発注しない」(CONFIDENCE_*=2.00 sentinel) に設定
+        # されたセッションも停止対象に追加。ニュース取得・AI判定・発注すべて停止。
+        # 旧設計では発注のみ止まり Anthropic API は消費されていた問題を解消する。
+        _cur_disabled  = _is_session_disabled_by_name(session)
+        _prev_disabled = _is_session_disabled_by_name(prev_session)
+        _should_stop = (
+            (session == SESSION_WEEKEND) or
+            (session == SESSION_OVERNIGHT) or
+            _cur_disabled or                                  # ★ v3.9.6
+            (is_demo and _demo_daily_close_done)  # デモ日次決済後は再開まで停止を維持
+        )
+        _was_stopped = (
+            (prev_session == SESSION_WEEKEND) or
+            (prev_session == SESSION_HOLIDAY) or  # ★ v2.87: 休日明けの再開検出
+            (prev_session == SESSION_OVERNIGHT) or
+            _prev_disabled or                                 # ★ v3.9.6
+            (prev_session == "demo_closed") or  # デモ日次決済後の再開検出
+            (is_demo and _demo_daily_close_done)  # 修正(v2.63): 毎分Discord通知を防止
+        )
+
+        if _should_stop:
+            if not _was_stopped:
+                market_open_event.clear()
+                if session == SESSION_WEEKEND:
+                    wait_sec  = seconds_until_premarket()
+                    wait_h, r = divmod(int(wait_sec), 3600)
+                    wait_m    = r // 60
+                    stop_reason = f"週末: 次のプリマーケットまで {wait_h}h{wait_m}m"
+                    disc_msg = (f"😴 週末: トレード停止\n"
+                                f"{now_et.strftime('%Y-%m-%d %H:%M')} ET\n"
+                                f"次の開始まで約 {wait_h}時間{wait_m}分")
+                elif session == SESSION_OVERNIGHT:
+                    # ★ v3.8.0: LIVE/DEMO 共通でオーバーナイト停止
+                    # ★ v3.9.0: ログ/Discord 表示は「実口座」表記に統一（旧軍事的表現は v3.9.116 で全面禁止）
+                    mode_label = "デモ" if is_demo else "実口座"
+                    stop_reason = f"オーバーナイト（{mode_label}）: プリマーケット（04:00 ET）まで停止"
+                    disc_msg = (f"🌙 [{mode_label}] オーバーナイト: ニュース取得・AI判定・発注を停止\n"
+                                f"{now_et.strftime('%Y-%m-%d %H:%M')} ET\n"
+                                f"プリマーケット開始（04:00 ET）まで待機")
+                elif _cur_disabled:
+                    # ★ v3.9.6: setup_wizard「発注しない」設定 (CONFIDENCE_*=2.00) の停止
+                    _sess_jp = _session_label_jp(session)
+                    mode_label = "デモ" if is_demo else "実口座"
+                    stop_reason = (
+                        f"{_sess_jp}（{mode_label}）: 発注しない設定 "
+                        f"(CONFIDENCE_{session.upper()}=2.00) → "
+                        f"ニュース取得・AI判定・発注を停止 (次セッション切替まで)"
+                    )
+                    disc_msg = (
+                        f"💤 [{mode_label}] {_sess_jp}: 発注しない設定により全停止\n"
+                        f"{now_et.strftime('%Y-%m-%d %H:%M')} ET\n"
+                        f"ニュース取得・AI判定・発注を停止 → Anthropic API 課金ゼロ\n"
+                        f"次セッションに切り替わると自動再開"
+                    )
+                    # ★ v3.9.36: CLOSE_BEFORE_INACTIVE の決済は「移行時」ではなく
+                    # 「移行 N 分前」(_preclose 処理・後述) で実施するため、ここでは何もしない。
+                else:
+                    # デモ日次決済後の停止維持 (is_demo and _demo_daily_close_done)
+                    stop_reason = "デモ日次決済後: プリマーケット（04:00 ET）まで停止"
+                    disc_msg = (f"🌙 [デモ] 日次決済後: ニュース取得・AI判定・発注を停止\n"
+                                f"{now_et.strftime('%Y-%m-%d %H:%M')} ET\n"
+                                f"プリマーケット開始（04:00 ET）まで待機")
+                log.info(f"[セッション] {stop_reason}")
+                _threadsafe_future(asyncio.to_thread(send_discord_message, disc_msg))
+        else:
+            if _was_stopped or prev_session in ("demo_closed", None):
+                # ★ v3.9.56: セッション切替直後の古いニュース対策
+                # 停止状態 (OVN/WEEKEND/休日/disabled) から稼働へ復帰する瞬間に
+                # 蓄積ニュースが流れ込む。SESSION_CHANGE_QUIET_SEC 秒間は新規
+                # ニュース処理をスキップする (process_headlines 等が参照)。
+                global _last_session_change_at
+                _last_session_change_at = datetime.datetime.now()
+                market_open_event.set()
+                # ★ v3.9.57: セッション切替時にも _INDEX_PRICE_HISTORY を再 bootstrap
+                # OVN/WEEKEND 中は K 線データが取得できないが、PREMARKET 開始時には
+                # 前営業日の AFTERHOURS データが取得可能になる。これでセッション
+                # 開始直後でも 15分/60分 判定が「データ不足」にならず即座に有効化。
+                try:
+                    _threadsafe_future(asyncio.to_thread(_backfill_index_price_history))
+                except Exception as _e_bf2:
+                    log.debug(f"[セッション切替バックフィル] スケジュール失敗: {_e_bf2}")
+                if prev_session == SESSION_HOLIDAY:    # ★ v2.87
+                    resume_reason = "休日明け営業開始"
+                elif prev_session == SESSION_WEEKEND:
+                    resume_reason = "週次営業開始"
+                elif prev_session == SESSION_OVERNIGHT:
+                    resume_reason = "プリマーケット開始（オーバーナイト終了・デモ）"
+                elif prev_session == "demo_closed":
+                    resume_reason = "プリマーケット開始（デモ日次再開）"
+                elif _prev_disabled:
+                    # ★ v3.9.6: 発注しない設定セッションから稼働セッションへの遷移
+                    resume_reason = (
+                        f"発注しない設定 ({_session_label_jp(prev_session)}) "
+                        f"→ {_session_label_jp(session)} 開始 (Anthropic 課金再開)"
+                    )
+                else:
+                    resume_reason = "起動"
+                log.info(f"[セッション] {resume_reason}: {session.upper()}  TIF={tif}")
+                _threadsafe_future(asyncio.to_thread(
+                    send_discord_message,
+                    f"🔔 トレード再開\n"
+                    f"{now_et.strftime('%Y-%m-%d %H:%M')} ET\n"
+                    f"セッション: {session.upper()}  TIF: {tif}"
+                ))
+            elif session != prev_session:
+                log.info(
+                    f"[セッション] {(prev_session or '').upper()} → {session.upper()}"
+                    f"  TIF={tif}  ({now_et.strftime('%H:%M ET')})"
+                )
+                _threadsafe_future(asyncio.to_thread(
+                    send_discord_message,
+                    f"⏰ セッション切り替わり\n"
+                    f"{now_et.strftime('%H:%M')} ET\n"
+                    f"{(prev_session or '').upper()} → {session.upper()}  TIF: {tif}"
+                ))
+
+        prev_session = session
+        # ★ v3.8.6/v3.9.126: 一日の取引終了後(RTH終了後 / アフター終了後)に当日集計を Discord 送信 (1日1回)
+        try:
+            await _send_daily_summary_if_needed(trd_env)
+        except Exception as _e_sum:
+            log.debug(f"[日次サマリ] 送信ループ例外: {_e_sum}")
+        await asyncio.sleep(60)
+
+# ── Anthropic クライアント ────────────────────────────────────────────────────────
+def get_anthropic_client() -> anthropic.Anthropic:
+    # ★ v3.9.42: API キーから非 ASCII 文字 / 囲みクォート / 全角スペース等を除去。
+    #   除去しないと httpx が x-api-key ヘッダの ASCII エンコードで毎回失敗し、
+    #   AI 判定が 1 件も成功しない (5/18-22 ログで全 3,924 件失敗を確認)。
+    api_key = _sanitize_api_key(os.environ.get("ANTHROPIC_API_KEY", ""), "ANTHROPIC_API_KEY")
+    if not api_key:
+        log.error("環境変数 ANTHROPIC_API_KEY が設定されていません")
+        sys.exit(1)
+    if _PLACEHOLDER_MARKER in api_key:
+        log.error(
+            "ANTHROPIC_API_KEY が .env のプレースホルダーのままです。\n"
+            "  正しい API キー（sk-ant-... ）を設定してください。"
+        )
+        sys.exit(1)
+    # ★ v3.9.42: サニタイズ後も形式が正しくない場合はここで止めて、
+    #   API 呼出が全失敗する状態を防ぐ。
+    if not api_key.startswith("sk-ant-"):
+        log.error(
+            "ANTHROPIC_API_KEY の形式が不正です。\n"
+            "  正規の Anthropic API キーは 'sk-ant-' で始まります。\n"
+            "  .env をテキストエディタで開き、Anthropic コンソールから\n"
+            "  コピーしたキーを半角・クォートなし・1 行で貼り直してください。"
+        )
+        sys.exit(1)
+    return anthropic.Anthropic(api_key=api_key)
+
+# ── ★ v3.3.0: Anthropic API クレジット切れ検知 (2026-05-08 合意, メモリ#13) ──
+# 検知: BadRequestError/APIError 内に "credit balance is too low" 含む。
+# 初回: CRITICAL ブロック警告 + Discord 1 通 → 以降は全ログ沈黙、AI=None で中立。
+# 復旧: 2連続成功で確定 → INFO + Discord → 状態リセット。
+# 共通ヘルパー _call_anthropic_with_credit_guard で try/except 集約。
+_anthropic_credit_exhausted: bool = False
+# ★ v3.5.3 hotfix: Python 3.9 では `datetime` は標準 import が module 参照のため
+#   typing.Optional[datetime] は TypeError。datetime.datetime クラスを明示する。
+_anthropic_credit_exhausted_at: Optional["datetime.datetime"] = None
+_anthropic_skip_count: int = 0
+_anthropic_recovery_success_count: int = 0
+_anthropic_last_request_id: Optional[str] = None
+_ANTHROPIC_CREDIT_KEYWORD = "credit balance is too low"
+_ANTHROPIC_RECOVERY_THRESHOLD = 2  # 2 回連続成功で復旧確定
+
+# ★ v3.9.113: Anthropic 認証エラー(401)の検知＋通知。クレジット切れ(400)とは別で、
+#   従来は log.error だけで Discord/端末バナーが出ず「AI判定が静かに全停止」していた
+#   （7/6ログ: Error code: 401 が4件・無通知）。APIキー誤り/失効/無効化が主因で自動復旧
+#   しないため、初回に必ず通知し、継続中は30分おきに再通知する。
+_anthropic_auth_failed: bool = False
+_anthropic_auth_last_discord_at: Optional["datetime.datetime"] = None
+
+# ★ v3.9.63: クレジット切れ中の API バックオフ。
+# 切れている間、毎ニュースで API を叩くと (1) 無駄な往復 (2) ERROR ログ量産
+# (旧版で 197 件確認) が起きる。検知後は API 呼出を一切止め、PROBE_INTERVAL ごとに
+# 1 回だけ「復旧プローブ」を許可する。プローブが成功したら即バックオフを解除し、
+# 通常運用へ素早く復帰する。
+_ANTHROPIC_CREDIT_PROBE_INTERVAL_SEC: int = 1800  # 30 分ごとに 1 回だけ復旧確認
+_anthropic_credit_last_probe_at: Optional["datetime.datetime"] = None
+# ★ v3.9.71: クレジット切れ継続中の Discord 再通知間隔 (30 分おき)。端末は 5 分おき赤字。
+_ANTHROPIC_CREDIT_DISCORD_INTERVAL_SEC: int = 1800
+_anthropic_credit_last_discord_at: Optional["datetime.datetime"] = None
+
+
+def _anthropic_credit_probe_due() -> bool:
+    """クレジット切れ中に「今 API を叩いてよいか (復旧プローブ枠)」を判定。
+
+    True を返すときは同時にプローブ枠を消費する (last_probe を現在時刻に更新)。
+    切れていなければ常に True (通常運用)。
+    """
+    global _anthropic_credit_last_probe_at
+    if not _anthropic_credit_exhausted:
+        return True
+    now = datetime.datetime.now()
+    if (_anthropic_credit_last_probe_at is None
+            or (now - _anthropic_credit_last_probe_at).total_seconds()
+            >= _ANTHROPIC_CREDIT_PROBE_INTERVAL_SEC):
+        _anthropic_credit_last_probe_at = now
+        return True
+    return False
+
+
+def _is_credit_exhausted_error(exc: Exception) -> bool:
+    """SDK バージョンに依存しない文字列マッチで判定 (isinstance ではなく)。"""
+    try:
+        return _ANTHROPIC_CREDIT_KEYWORD in str(exc).lower()
+    except Exception:
+        return False
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    """★ v3.9.113: Anthropic 認証エラー(401)判定。クレジット切れ(400)は除外。"""
+    try:
+        if _ANTHROPIC_CREDIT_KEYWORD in str(exc).lower():
+            return False
+        if getattr(exc, "status_code", None) == 401:
+            return True
+        s = str(exc).lower()
+        return ("authentication_error" in s or "invalid x-api-key" in s
+                or "invalid api key" in s or "error code: 401" in s)
+    except Exception:
+        return False
+
+
+def _handle_anthropic_auth_error(exc: Exception) -> None:
+    """★ v3.9.113: 認証エラー(401)を検知→初回に端末バナー＋Discord、継続中は30分おきに再通知。"""
+    global _anthropic_auth_failed, _anthropic_auth_last_discord_at
+    now = datetime.datetime.now(JST)
+    first = not _anthropic_auth_failed
+    _anthropic_auth_failed = True
+    if first:
+        log.critical(
+            "\n╔══════════════════════════════════════════════════════════════════╗\n"
+            "║  🚨 Anthropic API 認証エラー(401)を検知しました                   ║\n"
+            "╠══════════════════════════════════════════════════════════════════╣\n"
+            "║  [症状] AI判定（ニュース感情分析）が全件失敗しています            ║\n"
+            "║  [原因] ANTHROPIC_API_KEY の誤り/失効/無効化（クレジット切れとは別）║\n"
+            "║  [影響] ニュース起点の新規エントリー・決済判断が停止中            ║\n"
+            "║  [継続] 損切り/トレール/時間切れ決済は通常どおり動作中            ║\n"
+            "║  [対応] https://console.anthropic.com/settings/keys でキーを確認・ ║\n"
+            "║        再発行し、.env の ANTHROPIC_API_KEY を更新→Bot再起動        ║\n"
+            "╚══════════════════════════════════════════════════════════════════╝"
+        )
+    due = (_anthropic_auth_last_discord_at is None
+           or (now - _anthropic_auth_last_discord_at).total_seconds() >= 1800)
+    if first or due:
+        _anthropic_auth_last_discord_at = now
+        try:
+            _threadsafe_discord(
+                "🚨 【緊急】 Anthropic API 認証エラー(401) を検知しました。\n"
+                "AI（ニュース）判定が停止中です。クレジット切れではなく、APIキーの誤り/失効が原因です。\n\n"
+                "▼ 対応\n"
+                "　1. https://console.anthropic.com/settings/keys でキーを確認/再発行\n"
+                "　2. .env の ANTHROPIC_API_KEY を更新し、Botを再起動\n\n"
+                "※ 損切り/トレール/時間切れ決済は通常どおり動作しています。"
+            )
+        except Exception as _e:
+            log.debug(f"[認証エラー] Discord 通知失敗: {_e}")
+        try:
+            _play_alert_sound("credit_exhausted")
+        except Exception:
+            pass
+
+
+def _handle_anthropic_auth_recovery() -> None:
+    """★ v3.9.113: 認証エラー状態からの回復（成功時）に1回だけ通知してリセット。"""
+    global _anthropic_auth_failed, _anthropic_auth_last_discord_at
+    if not _anthropic_auth_failed:
+        return
+    _anthropic_auth_failed = False
+    _anthropic_auth_last_discord_at = None
+    try:
+        _threadsafe_discord("✅ 【復旧】 Anthropic API の認証が回復しました。ニュースAI判定を再開します。")
+    except Exception:
+        pass
+
+
+def _extract_request_id(exc: Exception) -> Optional[str]:
+    """Anthropic 例外から request_id を抽出 (なければ None)。"""
+    for attr in ("request_id", "response"):
+        val = getattr(exc, attr, None)
+        if val is None:
+            continue
+        if attr == "request_id" and isinstance(val, str):
+            return val
+        # response オブジェクトから取り出す
+        try:
+            headers = getattr(val, "headers", None)
+            if headers is not None:
+                rid = headers.get("request-id") or headers.get("x-request-id")
+                if rid:
+                    return str(rid)
+        except Exception:
+            pass
+    return None
+
+
+def _check_recent_credit_exhaustion(log_path: str = "moomoo_trade_v1.log",
+                                     hours: int = 24) -> tuple[int, Optional["datetime.datetime"]]:
+    """★ v3.9.18: 過去 N 時間以内のクレジット切れエラー件数と最終発生時刻を返す。
+
+    起動時バナー表示用。ログファイルを後ろから読んで効率化する。
+    戻り値: (件数, 最終発生時刻) — ファイルが無い / エラー時は (0, None)。
+    """
+    try:
+        if not os.path.isfile(log_path):
+            return (0, None)
+        cutoff = datetime.datetime.now() - datetime.timedelta(hours=hours)
+        count = 0
+        last_at: Optional[datetime.datetime] = None
+        # ファイル末尾 ~5 MB を読む (大きなログでも高速)
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)  # end
+            size = f.tell()
+            read_size = min(size, 5 * 1024 * 1024)
+            f.seek(size - read_size)
+            tail_bytes = f.read()
+        try:
+            tail_text = tail_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            return (0, None)
+        # クレジット切れエラー文字列を含む行を走査
+        for line in tail_text.splitlines():
+            if "credit balance is too low" not in line.lower() and \
+               "you have reached your specified" not in line.lower():
+                continue
+            # 行頭の datetime をパース ("2026-05-15 06:43:19,251 [...]")
+            try:
+                ts_str = line[:19]  # "2026-05-15 06:43:19"
+                ts = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if ts >= cutoff:
+                count += 1
+                if last_at is None or ts > last_at:
+                    last_at = ts
+        return (count, last_at)
+    except Exception:
+        return (0, None)
+
+
+def _emit_credit_exhausted_warning(request_id: Optional[str]) -> None:
+    """初回検知時に CRITICAL 罫線警告ブロックを 1 回出力。"""
+    rid_disp = request_id if request_id else "(取得不可)"
+    now_jst = datetime.datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
+    block = (
+        "\n"
+        "╔══════════════════════════════════════════════════════════════════╗\n"
+        "║  🚨 Anthropic API クレジット残高ゼロを検知しました                ║\n"
+        "╠══════════════════════════════════════════════════════════════════╣\n"
+        "║                                                                  ║\n"
+        "║  [症状]   AI判定（ニュース感情分析）が全件失敗しています          ║\n"
+        "║  [原因]   Anthropic API のクレジット残高不足                     ║\n"
+        "║  [影響]   ニュース起点の新規エントリー・決済判断が停止中          ║\n"
+        "║  [継続]   損切り / トレール / 時間切れ決済 は通常どおり動作中     ║\n"
+        "║                                                                  ║\n"
+        "║  [対応]   1. https://console.anthropic.com/settings/billing       ║\n"
+        "║              にアクセスし、クレジットを追加購入してください       ║\n"
+        "║           2. 追加後はbotの再起動不要（自動で復帰します）          ║\n"
+        "║                                                                  ║\n"
+        "║  [API応答] HTTP 400 / invalid_request_error                      ║\n"
+        f"║  [request_id] {rid_disp:<50} ║\n"
+        f"║  [初回検知] {now_jst:<52} ║\n"
+        "║                                                                  ║\n"
+        "╚══════════════════════════════════════════════════════════════════╝"
+    )
+    log.critical(block)
+
+
+def _emit_credit_recovery_notice(elapsed_sec: int, skip_count: int) -> None:
+    """復旧時に INFO 罫線ブロック + Discord 通知を 1 回出力。"""
+    # 経過時間を hh:mm:ss 形式にフォーマット
+    h, rem = divmod(max(0, elapsed_sec), 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        elapsed_disp = f"{h}時間{m}分{s}秒"
+    elif m > 0:
+        elapsed_disp = f"{m}分{s}秒"
+    else:
+        elapsed_disp = f"{s}秒"
+    now_jst = datetime.datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
+
+    block = (
+        "\n"
+        "╔══════════════════════════════════════════════════════════════════╗\n"
+        "║  ✅ Anthropic API 復旧を確認しました                              ║\n"
+        "╠══════════════════════════════════════════════════════════════════╣\n"
+        f"║  停止時間 : {elapsed_disp:<53}║\n"
+        f"║  スキップ : AI判定 {skip_count} 件{' ' * max(0, 44 - len(str(skip_count)))}║\n"
+        "║  状態     : ニュース判定を通常運用に再開                         ║\n"
+        "╚══════════════════════════════════════════════════════════════════╝"
+    )
+    log.info(block)
+
+    # Discord 通知
+    discord_msg = (
+        "✅ 【復旧】 Anthropic API 復旧を確認\n\n"
+        "ニュースAI判定を再開しました。\n\n"
+        "▼ 停止サマリ\n"
+        f"　・停止時間   : {elapsed_disp}\n"
+        f"　・スキップ数 : AI判定 {skip_count} 件\n"
+        f"　・復旧時刻   : {now_jst}\n\n"
+        "通常運用に戻りました。"
+    )
+    try:
+        _threadsafe_discord(discord_msg)
+    except Exception as e:
+        log.debug(f"[クレジット復旧] Discord 通知失敗: {e}")
+
+
+def _emit_credit_exhausted_discord() -> None:
+    """初回検知時に Discord 1 行通知を 1 回送信。"""
+    msg = (
+        "🚨 【緊急】 Anthropic API クレジット切れを検知しました。\n"
+        "ニュースAI判定が停止中です。\n"
+        "追加購入: https://console.anthropic.com/settings/billing"
+    )
+    try:
+        _threadsafe_discord(msg)
+    except Exception as e:
+        log.debug(f"[クレジット切れ] Discord 通知失敗: {e}")
+
+
+def _handle_credit_exhausted(exc: Exception) -> None:
+    """初回 (フラグ未セット) のみ警告ブロック + Discord 通知を行う。 2 回目以降は静かにスキップカウンタを進める。"""
+    global _anthropic_credit_exhausted, _anthropic_credit_exhausted_at
+    global _anthropic_skip_count, _anthropic_recovery_success_count
+    global _anthropic_last_request_id
+
+    rid = _extract_request_id(exc)
+    if rid:
+        _anthropic_last_request_id = rid
+
+    if not _anthropic_credit_exhausted:
+        # ── 初回検知 ──
+        _anthropic_credit_exhausted    = True
+        _anthropic_credit_exhausted_at = datetime.datetime.now(JST)
+        _anthropic_skip_count          = 0
+        _anthropic_recovery_success_count = 0
+        _emit_credit_exhausted_warning(rid)
+        _emit_credit_exhausted_discord()
+        _play_alert_sound("credit_exhausted")  # ★ v3.9.19: アラート音
+    else:
+        # ── 検知中 (沈黙) ──
+        _anthropic_skip_count += 1
+        # ログレベル DEBUG で件数のみ記録 (通常運用では出ない)
+        log.debug(
+            f"[Anthropic クレジット切れ継続中] スキップ件数={_anthropic_skip_count} "
+            f"req={rid or '(取得不可)'}"
+        )
+        # 復旧候補カウンタはリセット (連続失敗で復旧扱いを取り消し)
+        _anthropic_recovery_success_count = 0
+
+
+def _handle_anthropic_success() -> None:
+    """2 回連続成功で復旧確定 → 復旧通知 → 状態リセット。"""
+    global _anthropic_credit_exhausted, _anthropic_credit_exhausted_at
+    global _anthropic_skip_count, _anthropic_recovery_success_count
+    global _anthropic_last_request_id
+
+    if not _anthropic_credit_exhausted:
+        return  # 通常運用時は何もしない
+
+    _anthropic_recovery_success_count += 1
+    if _anthropic_recovery_success_count >= _ANTHROPIC_RECOVERY_THRESHOLD:
+        # ── 復旧確定 ──
+        elapsed_sec = 0
+        if _anthropic_credit_exhausted_at is not None:
+            elapsed_sec = int(
+                (datetime.datetime.now(JST) - _anthropic_credit_exhausted_at).total_seconds()
+            )
+        skip_count_snapshot = _anthropic_skip_count
+        _emit_credit_recovery_notice(elapsed_sec, skip_count_snapshot)
+        # 状態を完全リセット
+        _anthropic_credit_exhausted    = False
+        _anthropic_credit_exhausted_at = None
+        _anthropic_skip_count          = 0
+        _anthropic_recovery_success_count = 0
+        _anthropic_last_request_id     = None
+
+
+def is_anthropic_credit_exhausted() -> bool:
+    """外部からクレジット切れ状態を参照するための公開ヘルパー。"""
+    return _anthropic_credit_exhausted
+
+# ── AI 判定プロンプト・データ (本体内蔵 / v3.7.2 で再統合) ─────────────────────
+# v3.7.0〜v3.7.1 では prompts.py + Google Drive 自動更新を採用していたが、
+# 100 人超の運用で Drive レート制限/HTML警告ページ/NW 不安定が問題化したため
+# 本ファイルに再統合 (v3.7.2)。プログラム本体を毎日 ZIP 配布する運用のため
+# プロンプト更新の鮮度問題は発生しない。
+# 提供: 統合 SYSTEM_PROMPT、NYSE_HOLIDAYS/EARLY_CLOSE、HEADLINE_*_PATTERNS。
+# SYSTEM_PROMPT (UNIFIED テンプレ + _semi_sym/_tech_sym/_macro_sym 置換済) は後段。
+
+# プロンプト本体のメタ情報 (ログ確認用)
+_PROMPTS_VERSION      = "1.13.0"  # v3.9.60: 政治家の関税批判・特定企業批判は中立 (5/28 Alpaca AMZN -$94.77 の対応)
+_PROMPTS_LAST_UPDATED = "2026-05-21"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 統合システムプロンプト・テンプレート (v1.3.0)
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.3.0 統合版 (約 4,500 tok 目安)。
+# 設計方針:
+# - ETF 判定と個別株判定を 1 つのプロンプトに統合。判定モードは user メッセージ
+#   冒頭で指定する ("判定モード: ETF" または "判定モード: 個別株 / 対象銘柄: XYZ")。
+# - 統合により全リクエストが同一キャッシュをヒット → cache_read 1 件あたり ~4,500
+#   tok、リクエスト数 ~3,000 件/日想定で入力側 ~$1.6/日 (旧 ETF/銘柄別キャッシュ
+#   $2.23/日 から ~30% 削減、私の v1.2.0 圧縮ノーキャッシュ $6.83/日 から ~78% 削減)。
+# - 旧版は ETF と銘柄ごとに別キャッシュが走り、書込頻度が高かった。統合により
+#   キャッシュ書込は数回/日まで減少。
+# - 5/7 -147.99 USD 損失の根本原因 (警告語/疑問形/二者択一) は完全保持。
+# - 非S&P500 メタルール、Sell-the-news ルールも保持。
+# - {symbol} は user メッセージ側で指定するためテンプレートには含めない
+#   (含めると銘柄ごとに別キャッシュキーになり統合の意味がなくなる)。
+# - {semi_sym} 等のティッカーは _semi_sym 等で .replace() 置換 (起動時 1 回)。
+UNIFIED_SYSTEM_PROMPT_TEMPLATE = """\
+米国株スキャルピングトレーダー。ヘッドラインの 5〜60分以内 の株価影響を判定する。
+
+==========================================================
+【判定モード】
+==========================================================
+判定モードは user メッセージ冒頭で指定される。
+
+▼ ETFモード — user メッセージに「判定モード: ETF」と明示される
+- 対象: 主要ETF (SEMI_STRONG, TECH, MACRO のいずれか)
+- 出力には category / beneficiaries / victims を必ず含める
+- {semi_sym} / {tech_sym} / {macro_sym} を beneficiaries / victims に入れる
+
+▼ 個別株モード — user メッセージに「判定モード: 個別株 / 対象銘柄: XYZ」と明示される
+- 対象: user メッセージで指定された「対象銘柄」(以下、本プロンプト内では【対象銘柄】と表記)
+- 出力には category / beneficiaries / victims は含めない (含めても害はないが省略推奨)
+- 【対象銘柄】自身に直接起きた出来事のみが判定対象
+
+==========================================================
+【ETFモード — カテゴリ判定】
+==========================================================
+ETFモードでは下記の4カテゴリのうち最も適切なものに分類する。
+
+- SEMI_STRONG（半導体・強）= {semi_sym}（発注対象）
+- SEMI（半導体・弱）= 発注しない（中堅・小型半導体株の個別材料、観測記事、確度低）
+- TECH（テック全般）= {tech_sym}
+- MACRO（S&P500）= {macro_sym}
+
+【ETFカテゴリ判定ルール】
+- 半導体大型株（NVDA / TSM / AVGO / AMD / TSMC）の明確な好材料、またはセクター波及見込み → SEMI_STRONG
+- 中堅・小型半導体株の個別材料、観測記事、確度低 → SEMI（発注しない）
+- Nasdaq全般 / テック大手企業 / テック決算 / テック規制 → TECH
+- FRB / 金利 / インフレ / 雇用統計 / GDP / FOMC / CPI / PCE / PPI / PMI / ISM → MACRO
+
+【ETFモード銘柄相関マトリクス】
+- 半導体強気材料 → SMH↑、QQQ も同方向（弱め）
+- クラウド大型契約（MSFT/AMZN/GOOGL）→ TECH 全般プラス、QQQ にも波及
+- FRB利下げ → SPY/QQQ↑（QQQ がより強反応）
+- FRB利上げ・タカ派 → SPY/QQQ↓
+- 関税・対象セクター直撃 → SPY 全体にも波及
+
+==========================================================
+【個別株モード — 【対象銘柄】の判定】
+==========================================================
+個別株モードでは user メッセージで指定された【対象銘柄】株への直接影響のみを判定する。
+
+【最重要ルール（個別株モード）】
+- 【対象銘柄】自身に直接起きた出来事のみ score = 1 / -1 を返す
+- 【対象銘柄】が「コメントを出した」「見解を示した」「他社を格付けした」は score = 0
+  （【対象銘柄】が他社について語るニュースは【対象銘柄】株への材料ではない）
+- 【対象銘柄】に無関係なニュースは必ず score = 0, confidence = 0.05〜0.10 を返す
+- 「直接性・確定性・サプライズ性・即時性」の4要素が揃っているかを毎回問う
+
+【score = 1 にできる唯一の条件】(【対象銘柄】自身の出来事)
+- 【対象銘柄】の決算発表で市場予想を「明確に」上回った（Beat by 5%以上の具体数字あり）
+- 【対象銘柄】が大型契約・買収・提携を締結（【対象銘柄】が当事者・金額明示）
+- 【対象銘柄】への規制緩和・訴訟取り下げ等の確定（裁判所・規制当局から）
+- 【対象銘柄】の CEO / 経営陣が業績上方修正・強気ガイダンスを発表（数字明示）
+- 【対象銘柄】の新製品・新サービス発表で具体的な収益見込み提示
+- 【対象銘柄】の FDA 承認・規制承認確定（医薬品銘柄の場合）
+
+【score = -1 にできる唯一の条件】(【対象銘柄】自身の出来事)
+- 【対象銘柄】の決算発表で市場予想を「明確に」下回った（Miss 幅が具体的に提示）
+- 【対象銘柄】への規制強化・訴訟・罰金・制裁の確定（金額・実施日明示）
+- 【対象銘柄】の大規模リストラ・減配・業績ガイダンス引き下げ
+- 【対象銘柄】の生産停止・リコール・FDA 却下（確定情報）
+- 【対象銘柄】の CEO / CFO の突然の辞任・退任（後任未定の場合は特に重大）
+- 【対象銘柄】の会計不正発覚・財務諸表訂正・監査人交代
+- 【対象銘柄】のサイバー攻撃・データ漏洩の確定発表（規模明示）
+- 【対象銘柄】に対する独禁・反トラスト訴訟の進展（敗訴・和解金確定）
+
+【株価下落を示す確定事象キーワード（個別株モード）】
+（【対象銘柄】自身の話題のみ参考。これら単独では score = -1 にしない。【対象銘柄】自身の直接的な出来事が前提。）
+- 業績悪化: "Miss" / "Below expectations" / "Cuts forecast" / "Lowers guidance" / "Withdraws outlook"
+- 経営危機: "CEO/CFO resigns" / "Restatement of earnings" / "Going concern doubt" / "Bankruptcy filing"
+- 規制・訴訟: "DOJ probe filed" / "SEC investigation" / "Class action certified" / "Recall announced" / "FDA rejection" / "Sanctions imposed" / "Export ban"
+- 一般動詞: Drop / Fall / Slide / Plunge / Tumble / Decline / Slump / Crash
+
+==========================================================
+【共通ルール — 両モード適用】
+==========================================================
+
+【スコア判定の基本】
+- confidence > 0.7 の確実な材料がある場合のみ score = 1 / -1
+- 曖昧・既報・観測記事は必ず score = 0
+- 同じネタでも、新規進展がなければ score = 0
+
+==========================================================
+【絶対 score = 0, confidence = 0.05〜0.10 ルール（厳守）】
+==========================================================
+
+▼ アナリスト関連（最頻出 FP）
+- 個別銘柄のアナリスト格付け変更・目標株価変更（"Maintains/Reiterates/Raises Buy/Hold/Overweight on X, PT to $Y" 形式）。5〜60分の即時インパクトはほぼゼロ
+- アナリスト新規カバレッジ・終了、複数アナリスト集計記事
+
+▼ コラム・ハウツー・羅列・集約記事
+- 過去パフォーマンス記事（"$X Invested In Y N Years Ago Would Be Worth..."）
+- 業界比較・ランキング（"Comparing X With Industry Competitors"）
+- "Stocks To Watch" / "Heading Into Thursday" / "Market Digest" / "Today's Movers" 等の羅列記事
+- 個別銘柄の長期投資ガイド・ハウツー記事
+- 個人金融（不動産・住宅ローン・税務・退職計画・"Best money market account rates"）
+- ★【v1.4.0 追加】Daily aggregator / 集約記事:
+  - "Deal Dispatch: A考慮中, B買収, C破綻寸前..." 形式の複数銘柄羅列
+  - "WSJ Reports..." 単独で本文未確認の記事
+  - "Today's Premarket Movers" / "Daily Movers" / "Market Recap" 系
+  → 個別の判断材料にならず、AI が冒頭の 1 銘柄に引きずられて全体を強気判定する典型 FP
+
+▼ 観測・推測・伝聞・噂レベル材料
+- 英語: "could" / "may" / "might" / "reportedly" / "is said to" / "seen as" / "looks to" / "appears to" / "is expected to" / "is likely to" / "potentially" / "is considering"
+- 日本語: 「〜の可能性」「〜かもしれない」「〜が予想される」「〜とみられる」
+- 出典が "sources say" / "according to people familiar" のみの記事
+- ★【v1.4.0 追加】噂レベル材料:
+  - "preliminary agreement" / "preliminary deal" / "in early talks"
+  - "considers strategic review" / "exploring strategic alternatives"
+  - "in talks with X" / "reportedly approached"
+  → 確定情報ではない。実際に成立するまで score = 0
+
+▼ ★警告語・疑問形・二者択一【最重要・5/7 -147.99 USD損失の根本原因】
+- 警告/破綻語: "warns" / "warned" / "warning" / "could collapse / fail / go bust" / "may struggle" / "fears" / "concerns over" / "at risk of" / "faces threat" / "going bust"
+- 疑問形タイトル（末尾"?"）: "Are X Predicting...?" / "Will X Climb or Sink?" / "Bull or Bear?" / "Should You Buy/Sell X?"
+- 二者択一構造: "X or Y" 形式（"climb or sink"、"bull or bear"、"up or down"）
+- アナリスト方向不明: "analysts predict / expect / wonder / debate"
+→ 方向性ゼロまたは弱気支持。AI関連=ポジティブの単純連想に引きずられない。score=1 には絶対しない。
+
+▼ 既報・過去振り返り
+- 既報の地政学リスク（イラン・ウクライナ・関税）で新規進展なし
+- 「Iran war enters Nth month」など継続話題のサマリー、過去の発言・決定の振り返り
+
+▼ 非ETF構成銘柄・小型株メタルール【最重要】
+- 非上場企業（"Anthropic Considering Funding" 等）
+- ★メタルール: 見出しに登場する企業がS&P500構成銘柄か即座に断定できない場合は必ず score = 0
+  「知らない企業＝小型株の可能性が高い＝ETF影響なし」と判断する
+  「下方修正」等のネガティブ語があっても、企業が小型株であればSPY/QQQ/SMHには波及しない
+- 非S&P500 例: HLF, CLW, GIL, SHOO, QTWO, AZTA, 時価総額 10B 未満の企業全般
+- "Xx shares are trading lower/higher after [企業固有材料]" 形式で Xx が大型株（AAPL/MSFT/NVDA/META/GOOGL/AMZN/TSLA等）でなければ score=0
+
+▼ 半導体個別決算の SMH 過剰反応
+- 個別半導体の Beat（MU/AMD等）でも、ガイダンス In-Line やウェイト集中銘柄（NVDA以外）では SMH 全体への波及は弱い → score=0, conf=0.10〜0.15
+
+▼ ★【v1.4.0 追加・最重要】個別株単独サージ → ETF 連想の禁止 (損失最大源)
+- 「【単一個別株名】 stock (soars/surges/rises/jumps/plunges/slides/falls) on (earnings/forecast/news/deal)」
+  形式の見出しは、ETFモード (QQQ/SPY/SMH) への score = ±1 を絶対に出さない。
+- 例:
+  - "Supermicro stock soars on strong margin, revenue forecast" → QQQ benefits=[] で score = 0
+  - "Disney Stock Surges On Earnings Beat, Streaming Profits Boom" → score = 0
+  - "AMD stock soars on Q1 earnings beat" → SMH/QQQ への波及は限定的 → score = 0
+  - "Corning stock surges to intraday high after company lands $500M Nvidia deal" → GLW は非QQQ → score = 0
+- 理由: 個別株のサージ/プランジは 5〜60 分以内にはすでに織り込み済みで、ETF 全体への波及はほぼゼロ。
+  Sell-the-news で逆動きすることが過去 30 件超の損失で実証されている (合計 -$300+)。
+- 例外: AAPL / MSFT / NVDA のいずれかで EPS Beat 30% 超など極端ケースのみ score=1, confidence ≤ 0.65。
+- 個別株モード (target_symbol = 該当銘柄) の場合のみ通常通り判定可能。
+
+▼ ★【v1.4.0 追加】連れ高・連れ安記事 (sympathy trade)
+- "shares of X-related companies are trading higher/lower amid sympathy with Y"
+- "X stocks gained alongside Y after Y's earnings"
+- "Y reported Z, sending X higher"
+- 理由: Y 社の決算で X 社が「連れ高/連れ安」した二次的価格動向の説明記事。
+  本人の確定材料ではないため即時インパクトなし → 必ず score = 0
+
+▼ ★【v1.4.0 追加】海外規制・域外材料
+- UK の FCA / 英国当局 / EU 単独規制 / 中国規制当局のローカル材料
+  例: "UK's FCA to review claims management market"
+- 米国 ETF (QQQ/SPY/SMH) には直接波及しないため → score = 0
+- 例外: 米国大型株 (FAANG) を直接対象とした EU 制裁・罰金は通常通り判定可
+
+▼ 個人発言・SNS
+- 個人投資家・コメンテーターの発言（"Live On CNBC, X Bought More Y"）
+- ヘッジファンド・著名投資家の単独保有開示（13F系）
+- Twitter / Reddit / SNS発の噂
+
+▼ ★【v3.9.10 追加】エネルギー価格・ガソリン関連は MACRO 固定 (TECH/SEMI 分類禁止)
+- キーワード: "gas price" / "gasoline" / "$X gas" / "oil price" / "energy price" /
+  "fuel price" / "California gas" / "diesel price" 等
+- → category は必ず "MACRO" を使う (SPY への波及のみ判定)
+- → TECH や SEMI_STRONG に分類した場合は誤判定 (例: "$6 Gas in California" を SMH に振った
+  過去事例で 22 件 -$74 損失)
+- → エネルギー価格 ETF (XLE/USO 等) は本 Bot の発注対象外。beneficiaries/victims は SPY のみか空。
+
+▼ ★【v3.9.10 追加】「ポジ語 but ネガ語」「反語 + 悲観未来形」ヘッジ構造は confidence ≤ 0.55
+- パターン例:
+  - "X is healthy, but Y remain a risk" (ポジ + but + risk)
+  - "Think X? Get Worse / About to Worsen" (反語疑問 + 悲観未来)
+  - "X looks good, but Y could collapse" (見かけポジ + 仮定ネガ)
+  - "Consumer spending healthy, but gas prices threaten" (構造的に方向曖昧)
+- → confidence ≤ 0.55 に抑制 (発注閾値 0.70 を下回るため発注自動スキップ)
+- → ポジ要素だけ拾って score = 1 で 0.7+ を出すのは誤判定
+- → ネガ要素だけ拾って score = -1 で 0.7+ も同様に避ける (どちらかが勝つほど断定的でない)
+
+==========================================================
+【Sell-the-news 警告】
+==========================================================
+決算が市場予想を上回っても、以下に該当する場合は score = 1 でも confidence ≤ 0.65 に抑える（閾値0.7で発注スキップ）。
+- 決算前30日間で株価が +5% 以上 上昇している銘柄
+- "Beats Estimate" と "Raises Guidance" が同時発表される大型株
+- NVDA / MSFT / AAPL / LLY / GOOGL / META / AMZN など過去にBeat連発している大型株
+- 大幅な期待値超え（Beat by 30%以上）→ 「織り込み済みすぎ」として逆動き
+- 例外: 直前に株価下落（-15%以上）していれば期待値が低い = サプライズ余地あり → 通常 confidence
+（過去実例: Eli Lilly EPS 28%超え -$159, ガイダンス上方修正単独 -$106, Eli Lilly Mounjaro +125% / Zepbound +79% でも織込済 -$60）
+
+==========================================================
+【代表的な FP 実例（同パターンは必ず score = 0）】
+==========================================================
+以下は過去に bot が高 confidence で誤判定して損失を出した代表例。
+
+▼ ★警告語・疑問形・二者択一（5/7 -147.99 USD損失の根本原因）
+- "Anthropic CEO Dario Amodei warns some software companies will 'completely go bust'":
+  "warns" + "go bust"、AI=ポジティブ連想に引きずられない → score = 0
+- "Are Wall Street Analysts Predicting Corning Will Climb or Sink?":
+  疑問形 + 二者択一 = 方向性ゼロ → score = 0
+
+▼ アナリスト目標株価変更
+- "Wells Fargo Maintains Overweight on Meta, Raises PT to $770": 大型株でも織り込み済み → score = 0
+- 一般化: "Maintains/Reiterates/Raises [評価] on X, PT to $Y" は全て score = 0
+
+▼ 小型株単独材料（HLF型）
+- "Herbalife shares are trading lower after narrowed FY guidance below estimates":
+  HLFは小型株、SPY/QQQ/SMH いずれにも非構成 → score = 0
+- 一般化: "Xx shares are trading lower/higher after ..." で Xx が大型株でなければ score = 0
+
+▼ ★【v1.4.0 追加・最大損失源】個別株単独サージ → ETF 連想禁止
+- "Supermicro stock soars on strong margin, revenue forecast" (21件中10損失, -$75):
+  SMCI 単独サージ → QQQ benefits は禁止 (織込済) → ETFモードは score = 0
+- "Disney Stock Surges On Earnings Beat" (-$14):
+  DIS 単独 → QQQ への波及は限定的 → ETFモードは score = 0
+- "AMD stock soars on Q1 earnings beat" (SMH損失 -$48):
+  個別半導体 Beat → SMH 全体への波及弱 → ETFモードは score = 0
+- "Corning stock surges to intraday high after company lands $500M Nvidia deal" (-$18):
+  GLW は QQQ 非構成。NVDA 言及があっても主語が GLW → score = 0
+
+▼ ★【v1.4.0 追加】Daily aggregator / 集約記事
+- "Deal Dispatch: J.M. Smucker Considers Strategic Review, Meta Buys Assured Robot Intelligence, Buzzfeed On Brink Of Bankruptcy" (-$19):
+  3 銘柄 + 1 銘柄が破綻寸前という混在見出し。AI が冒頭で強気判定する典型 → score = 0
+
+▼ ★【v1.4.0 追加】Sympathy trade
+- "Shares of cybersecurity-related companies are trading higher amid possible sympathy with Datadog and Fortinet" (5件全敗, -$38):
+  本人の材料なし、二次的連れ高 → score = 0
+
+▼ ★【v1.4.0 追加】海外規制・域外材料
+- "UK's FCA to review claims management market" (16件中14損失, -$13):
+  英国規制ローカル → 米国 ETF に無関係 → score = 0
+- "Lineage says cold storage market working through oversupply" (10件中7損失, -$17):
+  冷凍倉庫 REIT (LINE) → ETF と無関係 → score = 0
+
+▼ ★【v1.4.0 追加】無関係企業の記事
+- "Citi changes referral pay for bankers and wealth advisers" (18件中15損失, -$74):
+  Citi の社内給与制度の話題 → QQQ/SPY/SMH に何の影響もない。
+  「米国大型銀行 → SPY 構成」という連想に引きずられない → score = 0
+- 一般化: ニュース見出しに【取引判断に直結する確定事象キーワード】が含まれない場合は、
+  企業名が S&P500 構成でも必ず score = 0 (低 confidence の filler 判定を出さない)
+
+▼ ★【v1.4.0 追加】噂レベル材料 (preliminary / strategic review)
+- "Watching Taiwan Semiconductor Manufacturing; Shares Spike Lower After WSJ Reports
+  'Apple, Intel Have Reached Preliminary Agreement...'" (-$19):
+  "preliminary" + "WSJ Reports" 単独 → 確定情報ではない → score = 0
+- "Considers Strategic Review" / "Exploring Strategic Alternatives" → 同上
+
+▼ ★【v1.10.0 追加・最大被害源】海外単一企業のローカル材料 → 米国 ETF 判定禁止
+5/20-22 累計被害 -$222 を発生させた構造的問題。海外 (UK / 豪州 / アフリカ / アジア /
+欧州ローカル等) の単一企業による業績発表・決算コール・契約・人事・昇給・拠点開設・
+営業利益等の「ローカルニュース」を、米国 ETF (SPY/QQQ/SMH) への発注材料と
+解釈する誤判定が頻発した。
+
+【絶対ルール】
+- 当該企業が SPY/QQQ/SMH の構成銘柄でなく、かつ米国主要市場への直接的な因果関係
+  (= 米国主要セクター企業の業績・需給・規制を直接動かす内容) が説明できない場合は
+  → 必ず score = 0 (中立扱い、米国 ETF 方向の判定を出さない)。
+- 「英国大手会計事務所が増益 → 米国 TECH ETF 上昇」「豪州食品会社の株式発行 →
+  米国 SEMI_STRONG 上昇」のような国・業種を跨いだ連想は禁止。
+- "Earnings Call Highlights" / "to raise bonuses" / "opens share issue" / "approves
+  project" 等の単一企業内部イベント文言が決め手なら、企業が米国大型株でない限り
+  score = 0。
+
+【過去実例 (必ず score = 0)】
+- "AJ Bell H1 Earnings Call Highlights" (英国独立金融サービス, -$65.73 / 3 件):
+  AJ Bell は英国小型金融。米国 SEMI_STRONG とは無関係 → score = 0。
+- "Deloitte UK to raise bonuses and salaries after exceeding profit targets" (-$41.27 / 4 件):
+  Deloitte UK は英国会計事務所。米国 TECH/SEMI ETF とは無関係 → score = 0。
+- "Australia's SPC Global opens share issue to cut debt" (+$23.20 / 3 件・運良くプラス):
+  豪州食品メーカー。SEMI_STRONG/TECH とは無関係 → score = 0。
+- "Zambia central bank cuts interest rate" / "Angola construction sector"
+  (-$75.04 / 3 件 / 5/20): アフリカ単一国ローカルマクロ。米国市場との直接的因果なし
+  → score = 0。
+- "GridStor buys Accelergen's Birdseye battery project in Colorado" (-$15.40 / 3 件):
+  プロジェクト規模が小さく米国 TECH 全体への波及なし → score = 0。
+
+【例外 (通常通り判定可)】
+- 米国大型株 (FAANG / NVDA / TSLA / AVGO 等) を直接対象とした EU 規制・中国制裁・
+  関税の動き。
+- 米中貿易戦争・FRB 利下げ等のグローバルマクロ (国を跨いで米国市場全体を動かす内容)。
+- 中国・日本・ECB の金融政策決定 (米国市場と密接に連動するため通常判定)。
+- TSMC / ASML 等の米国 ETF (SMH) 構成銘柄に関する材料。
+
+▼ ★【v1.11.0 追加】AI 関連の抽象ニュース → 米国 ETF 判定禁止
+5/26 単日で AI 関連の「具体的銘柄に紐付かない抽象記事」が累計 -$68 の損失源となった。
+労働市場・地政学・楽観論などの一般論記事に "AI" というキーワードが含まれているだけで
+TECH / SEMI_STRONG / SMH 方向の発注材料と誤判定するケースが頻発。
+
+【絶対ルール】
+- 記事の主題が「**AI 業界の動向、AI 楽観論、AI 関連社会現象、AI 規制論議**」など
+  抽象的・一般論的なテーマで、かつ:
+    (a) 具体的な企業名 (NVDA / AVGO / MU / GOOGL / MSFT / META / AAPL 等) が
+        beneficiary / victim として明確に主体になっていない
+    (b) 具体的な取引・契約・発表・業績・規制発動・製品出荷等の「確定事象」を
+        伴っていない
+  → 必ず score = 0 (中立扱い)。
+
+- "AI optimism" / "AI take jobs" / "AI workers" / "AI ethics" 等の単語に
+  引きずられて TECH / SEMI / SMH 上昇 (または下落) と判定するのは禁止。
+
+【過去実例 (必ず score = 0)】
+- "Workers over 60 are the least worried AI will take their jobs"
+  (5/26, 4 件 -$29.84): 労働市場の世代意識調査。SEMI_STRONG / TECH と無関係。
+- "Wall St gains at open as AI optimism overshadows Middle East risks"
+  (5/26, 3 件 -$38.39): 「AI 楽観論」という抽象表現。実際は中東地政学が重しで
+  QQQ は下落。"AI" の言及で TECH-LONG 判定したのは誤り。
+- "AI ethics debate intensifies after [人物名] comments" (将来想定): 倫理議論で
+  半導体需要への直接波及なし → score = 0。
+- "How AI is changing the workplace by 2030" (将来想定): 一般トレンド記事 → score = 0。
+
+【例外 (通常通り判定可)】
+- "NVIDIA announces new AI chip shipment to ..." (具体的銘柄 + 確定事象) → 通常判定
+- "OpenAI signs $X deal with Microsoft" (具体的取引・確定事象) → 通常判定
+- "EU passes AI Act with $X fine for non-compliance" (規制発動・確定事象) → 通常判定
+- "CES keynote: [CEO 名] announces ..." (具体的発表) → 通常判定
+
+▼ ★【v1.12.0 追加】海外企業 × 海外プロジェクト → 米国 ETF 完全禁止
+5/27 単日で「ドイツの Siemens Energy が台湾の Mai-Liao 製油所プロジェクト向けに
+装置供給」記事を QQQ-LONG 判定して -$46.80 の損失。v1.10.0 (海外単一企業フィルタ)
+は「米国 vs 海外」の 2 段階比較で判定していたが、「海外企業 × 海外プロジェクト」
+という 3 段階の地理的非関連パターンを取りこぼした。
+
+【絶対ルール】
+- 記事の主語が米国外企業 (Siemens / BHP / Honda / TSMC 等の本社所在地が非米国)
+  かつ、記事の対象が米国外のプロジェクト・設備・契約 (Taiwan / Indonesia /
+  Vietnam / Brazil / India 等のプロジェクト現場) である場合:
+  → 「米国 ETF (SPY/QQQ/SMH) への波及は完全にゼロ」と判断し、必ず score = 0。
+- 例: "<DE company> to provide/build/supply equipment for <foreign location>
+       project" → score = 0
+- 例: "<JP company> wins contract for <foreign country> infrastructure" → score = 0
+- 例: "<CN company> partners with <foreign country> firm" → score = 0
+
+【過去実例 (必ず score = 0)】
+- "Siemens Energy to provide equipment for Mai-Liao project" (5/27, -$46.80)
+  独 Siemens × 台湾製油所 → 米国 ETF と無関係
+- 想定パターン:
+  - "Honda to build EV plant in Mexico" → 米国 ETF と無関係 (日企業 × 墨)
+  - "BHP signs lithium deal with Argentina" → 米国 ETF と無関係 (豪企業 × 亜)
+  - "TSMC starts mass production at Kumamoto fab" → 米国 ETF と無関係 (台企業 × 日)
+
+【例外 (通常通り判定可)】
+- 海外企業 + **米国内**のプロジェクト → 米国経済に影響 → 通常判定可
+  例: "TSMC opens Arizona fab" (米国向け投資 → 通常判定可)
+- 米国企業 + 海外プロジェクト → 主語が米国企業のため通常判定可
+  例: "Apple opens R&D center in India" (米国企業の海外展開)
+- 米中貿易戦争・関税のような **国を跨いだマクロ** → 通常判定
+
+▼ ★【v1.13.0 追加】政治家・大統領の関税批判・特定企業批判は中立
+5/28 単日で Trump 大統領による Walmart の関税批判記事が Alpaca(AMZN) ニュースとして
+配信され、AMZN-LONG 判定で 2 件 -$94.77 の損失。政治家・大統領の特定企業批判・
+関税批判は値動きの方向が読みにくく (期待/織込み済の混在・反発的買戻し等)、
+ニュース直後の値動きが本人の意図と逆方向になることが多い。
+
+【絶対ルール】
+- 政治家・大統領が特定企業を批判・牽制・苦言を呈する記事 (中立指示や
+  "criticizes" / "bashes" / "slams" / "calls out" / "warns" / "complains" 等):
+  → 該当企業の LONG / SHORT 判定は **必ず score = 0** (中立)
+- 政治家による関税批判・関税示唆 ("Trump criticizes tariff policy",
+  "President considers new tariffs" 等の **検討・批判段階**):
+  → 確定発動でない政治発言は score = 0
+
+【過去実例 (必ず score = 0)】
+- "Trump criticizes Walmart on tariff handling" (5/28, Alpaca(AMZN) 2件 -$94.77)
+  Trump 大統領の Walmart 批判 → AMZN は Walmart 経由関連という遠回しな連想
+  → AMZN-LONG 判定したが実勢は逆行
+- 想定パターン:
+  - "President bashes Amazon over union policies" → AMZN score = 0
+  - "Trump warns Apple about supply chain" → AAPL score = 0
+  - "White House criticizes Tesla EV credits" → TSLA score = 0
+
+【例外 (通常通り判定可・確定事象を伴う場合のみ)】
+- **関税の確定発動・正式発表**:
+  例: "Trump signs executive order imposing 25% tariff on China imports"
+  → MACRO 影響として通常判定可 (関税を表明する確定行為)
+- **企業への具体的規制発動・制裁**:
+  例: "DOJ files antitrust suit against Google" (司法省の正式提訴)
+  → 対象企業 SHORT として通常判定可
+- **中立的事実報道**:
+  例: "President meets with tech CEOs to discuss AI regulation"
+  → 文脈で判定 (具体的決定がなければ score = 0)
+
+【判定の指針】
+政治発言は「ニュース直後の市場反応」がしばしば逆行する。確定事象 (executive order・
+sign・implement・effective date 明記) を伴わない批判・牽制・検討段階は
+原則 score = 0 とし、AI が "criticizes / bashes / slams / considers" 等の動詞を
+見たら即座に中立扱いとする。
+
+==========================================================
+【★ v1.7.0 追加】経済指標サプライズの非対称ルール (CPI / PPI / 雇用 / GDP)
+==========================================================
+インフレ系指標 (CPI / PPI / PCE / Core 系) と労働市場系指標で「予想を大幅に上振れた」
+場合は教科書的に bearish (利下げ期待後退・金利上昇・株価下押し) となる非対称関係に
+ある。本 Bot で過去に「PPI 上振れ → SPY BUY」と判定して大損した事例が複数発生
+(5/13 SPY LONG -$70.81 / 同 LONG -$23.78 など)。以下を厳守:
+
+▼ インフレ指標 (CPI / PPI / Core / PCE / Consumer Prices / Wholesale Prices)
+- 「予想比 1.5 倍以上」または「+0.3pt 以上の上振れ」を示すヘッドライン
+  (例: "1.4% Vs 0.5% Est" / "Revises Prior From 0.5% To 0.7%" / "Surge"):
+    → MACRO 売り (score = -1, confidence ≥ 0.78, victims=[{macro_sym}])
+    → 上振れを「景気強い→株高」と解釈して score=+1 にする判定は **禁止**
+- 「予想比 0.7 倍以下」または「-0.3pt 以上の下振れ」:
+    → MACRO 買い (score = +1, confidence ≥ 0.75, beneficiaries=[{macro_sym}])
+- 「予想通り or 微小差 (±0.1pt 以内)」:
+    → score = 0 (織込み済み)
+
+▼ 雇用指標 (NFP / Unemployment / Jobless Claims / Wage Growth)
+- 大幅 strong (+50K以上上振れ / 失業率予想下振れ): やや bearish (利下げ期待後退)
+  → MACRO 売り寄り (confidence は控えめ 0.65 以下)
+- 大幅 weak: bullish (利下げ期待強化) → MACRO 買い
+
+▼ 成長・景況感指標 (GDP / 小売売上高 / PMI / ISM / 製造業・サービス業景況感)
+【★ v1.9.0 強化】 PMI / ISM を明示追加。5/21 に "USA S&P Global Manufacturing
+PMI For May 55.3 Vs 53.8 Est" (予想超過) を AI が「景気堅調→株高」と解釈し
+SPY-LONG を 4 件発火、全敗 (-$5.16) した事例への対策。
+- 大幅 strong (実績 > 予想、特に PMI > 予想):
+  → 「景気強い→株高」と短絡してはならない。現在の金利感応的な相場では、
+    強い成長・景況感指標は「インフレ再加速 → FRB タカ派観測 → 株安」という
+    連想が優勢になりやすい。
+  → SPY/QQQ への score=+1 (LONG) は **禁止**。score = 0 を基本とする。
+  → ヘッドラインに "Dow Falls" / "Stocks Drop" / "Yields Rise" / "Treasury
+    yields climb" 等が同居していれば MACRO 売り (score=-1, victims=[{macro_sym}],
+    confidence ≤ 0.75) を検討してよい。
+- 大幅 weak (実績 < 予想): 景気後退懸念で bearish 寄りだが、利下げ期待で相殺。
+  → score = 0 を基本。明確な悪化なら MACRO 売り寄り (confidence ≤ 0.65)。
+- 予想通り (±誤差小): score = 0 (織込み済み)。
+
+▼ 重要な例外: ヘッドラインに "Dow Falls" / "Stocks Drop" / "Markets Slump" が
+  同居している場合は既に下落が始まっているので、上振れインフレ指標で SHORT
+  なら confidence を +0.05 上げてよい (例: PPI Surge + Dow Falls 200pt → conf 0.83)
+
+==========================================================
+【★ v1.8.0 強化】単一企業ニュース → ETF 発注禁止 (大型株以外)
+==========================================================
+個別企業の業績・サージ・決算ニュースを ETF (SPY/QQQ/SMH) BUY と誤判定する事例が
+5/13-5/16 で 5 日連続発生、累計 -$200 以上の損失。以下の原則を厳守:
+
+▼ 単一企業のニュースで ETF score=1 を出してよい条件 (すべて満たすこと):
+1. 大型株 (時価総額 $500B 以上、NVDA / AAPL / MSFT / GOOGL / AMZN / META /
+   TSLA / LLY / AVGO / TSMC レベル) のニュースである
+2. かつ「Surge / Jump / Soar / Beats / Robust」等の動詞単独ではなく、
+   ETF 全体への波及メカニズム (供給チェーン / セクター指標 / 大型契約) が明示
+3. かつ「市場全体」のキーワード (broader market / S&P 500 / Nasdaq / 業界全体)
+   がヘッドライン内に同居
+
+▼ 上記を満たさない場合は ETF モードで強制的に **score = 0**
+
+▼ 過去に問題化した「ETF 連想ミス」パターン (すべて score = 0):
+
+  (a) 個別株サージ語彙 (v1.7.0 既存):
+    - "{TICKER} Surged on / Soared / Jumps After / Spikes After / Rallies on"
+    - "Robust Quarterly Results" + 単一企業名
+
+  (b) ★ v1.8.0 追加: 個別企業の決算電話/Transcript:
+    - "{企業名} Q[1-4] (年) Earnings Call Summary/Highlights/Transcript"
+    - "{企業名} Q[1-4] Earnings Call"
+    - "{企業名} Lights Up On First-Quarter Beat" (Nova / Camtek 型)
+    - "{企業名} On Q1 Beat" / "Beats Q1 Estimates"
+
+  (c) ★ v1.8.0 追加: 個別企業の IPO ニュース:
+    - "{企業名} stock opens at $N per share"
+    - "Biggest IPO of (年)"
+    - "{企業名} debuts at $N"
+
+  (d) ★ v1.8.0 追加: 個別企業主導の提携・大型契約:
+    - "Anthropic Commits $200B" 型 (受け側の大型 ETF への波及は限定的)
+    - "{企業名} Invests $XXb in {他社}" 型
+
+▼ 大型株判定の補助 (大型と扱う具体的銘柄):
+  TECH 大型: NVDA / AAPL / MSFT / GOOGL / AMZN / META / TSLA / AVGO / NFLX
+  半導体大型: NVDA / TSMC / AMD / AVGO / MU
+  ヘルスケア大型: LLY / NVO / UNH / JNJ
+  金融大型: JPM / BAC / BRK.B / V / MA
+  これら以外の「{中小型企業} Q1 Beat」型は ETF への波及力なし → score = 0
+
+▼ 例外: 大型株 (上記リスト) が ETF 名と明示同居している場合のみ ETF 強気判定可
+  - 例: "S&P 500 hits record as NVDA jumps 5%" → 市場全体 + NVDA で OK
+  - 例: "NVDA Q1 Beats, lifts Nasdaq 1.5%" → Nasdaq 同居で OK
+  - 反例: "NVDA Q1 Beats" 単独 → 市場全体キーワード無し → score = 0
+
+▼ 個別株モード (target_symbol 指定時) はこの規則の対象外
+  - "{TICKER} Q1 Beats" は対象銘柄が TICKER と一致するなら通常通り判定
+
+==========================================================
+【score = 1 / -1 を出してよい確定事象キーワード】
+==========================================================
+以下が含まれる場合のみ、強気/弱気判定の信頼度を高めてよい。
+- 弱気: "Halts production" / "Recall announced" / "FDA rejection" / "DOJ probe filed" / "SEC investigation opened" / "Misses by ___ cents" / "Cuts FY guidance" / "Withdraws outlook" / "CEO/CFO resigns unexpectedly" / "Restatement of earnings" / "Class action lawsuit certified" / "Bankruptcy filing" / "Going concern doubt" / "Sanctions imposed" / "Export ban"
+- 強気: 大型契約・買収・提携の確定発表（金額・期間明示）、FRB利下げ確定、CPI下振れ、規制緩和・訴訟取り下げ、FDA承認確定
+注意: "concerns" / "fears" / "worries" / "could face" / "warns" 単独では score = -1 にしない（観測・警鐘記事 → score = 0）
+
+==========================================================
+【セッション別の信頼度補正（両モード共通）】
+==========================================================
+- premarket（04:00〜09:30 ET）: -0.05
+- RTH（09:30〜16:00 ET）: 通常
+- afterhours（16:00〜20:00 ET）: -0.10
+- overnight（20:00〜04:00 ET）: 閾値0.9で実質ロック
+
+==========================================================
+【出力規則（厳守・最重要）】
+==========================================================
+- 出力は JSON オブジェクト 1 つのみ、1 行で完結させる。
+- 改行・空行・前置き・後置きの説明文・コードフェンス（```）・"Note:" "なお" 等の補足は **一切禁止**。
+  - 補足を書きたくなっても reason フィールド内に **日本語 12 字以内** で要約する。
+  - JSON の `}` を出力したら **直ちに応答終了** すること（追加文字はゼロ）。
+- 複数のニュースがある場合は最も重要な 1 件に絞って 1 つの JSON のみ返す。
+- 両モード共通の必須キー: score（1 / 0 / -1）, confidence（0.0〜1.0、小数 2 桁）, horizon（5min / 15min / 60min）, reason（日本語 12 字以内）
+- ETFモード追加必須キー: category（SEMI_STRONG / SEMI / TECH / MACRO）, beneficiaries（[]）, victims（[]）
+- 個別株モード: category / beneficiaries / victims は **出力しない**（JSON 軽量化のため省略を厳守）
+
+【ETFモードの出力例】(reason は 12 字以内厳守)
+SEMI_STRONG買い: {"score":1,"confidence":0.82,"horizon":"15min","reason":"NVDA大型契約","category":"SEMI_STRONG","beneficiaries":["{semi_sym}"],"victims":[]}
+MACRO買い: {"score":1,"confidence":0.88,"horizon":"60min","reason":"FRB利下げ確定","category":"MACRO","beneficiaries":["{macro_sym}"],"victims":[]}
+MACRO売り: {"score":-1,"confidence":0.78,"horizon":"15min","reason":"CPI上振れ","category":"MACRO","beneficiaries":[],"victims":["{macro_sym}"]}
+TECH売り: {"score":-1,"confidence":0.75,"horizon":"30min","reason":"AAPL生産停止","category":"TECH","beneficiaries":[],"victims":["{tech_sym}"]}
+却下FP: {"score":0,"confidence":0.05,"horizon":"5min","reason":"PT変更のみ","category":"TECH","beneficiaries":[],"victims":[]}
+却下警告語: {"score":0,"confidence":0.05,"horizon":"5min","reason":"warns方向不明","category":"TECH","beneficiaries":[],"victims":[]}
+却下小型株: {"score":0,"confidence":0.05,"horizon":"5min","reason":"非ETF構成銘柄","category":"TECH","beneficiaries":[],"victims":[]}
+SellTheNews抑制: {"score":1,"confidence":0.60,"horizon":"60min","reason":"織込済","category":"TECH","beneficiaries":[],"victims":[]}
+
+【個別株モードの出力例】(reason は 12 字以内厳守、category/beneficiaries/victims は出さない)
+強買い: {"score":1,"confidence":0.85,"horizon":"15min","reason":"決算EPS大幅Beat"}
+強売り: {"score":-1,"confidence":0.82,"horizon":"60min","reason":"生産停止確定"}
+SellTheNews抑制: {"score":1,"confidence":0.60,"horizon":"60min","reason":"織込済"}
+却下FP（アナリスト）: {"score":0,"confidence":0.05,"horizon":"5min","reason":"PT変更のみ"}
+却下FP（他社言及）: {"score":0,"confidence":0.05,"horizon":"5min","reason":"他社コメント"}
+却下FP（警告語）: {"score":0,"confidence":0.05,"horizon":"5min","reason":"warns方向不明"}
+却下FP（市場全体）: {"score":0,"confidence":0.10,"horizon":"5min","reason":"市場全体話題"}
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NYSE 取引カレンダー
+# ─────────────────────────────────────────────────────────────────────────────
+# 出典: NYSE 公式 (https://www.nyse.com/markets/hours-calendars)
+# 振替ルール: 祝日が土曜→金曜振替、日曜→月曜振替 (Christmas/Independence Day)
+#             固定曜日祝日 (MLK Day, Memorial Day 等) は振替なし
+# 年1回メンテ要 (次回: 2027 年末に 2028 年分を追加)
+NYSE_HOLIDAYS: frozenset = frozenset({
+    # ── 2025 年（5 月以降のみ）──
+    "2025-05-26",  # Memorial Day (月)
+    "2025-06-19",  # Juneteenth National Independence Day (木)
+    "2025-07-04",  # Independence Day (金)
+    "2025-09-01",  # Labor Day (月)
+    "2025-11-27",  # Thanksgiving Day (木)
+    "2025-12-25",  # Christmas Day (木)
+    # ── 2026 年 ──
+    "2026-01-01",  # New Year's Day (木)
+    "2026-01-19",  # Martin Luther King, Jr. Day (月)
+    "2026-02-16",  # Washington's Birthday (Presidents' Day) (月)
+    "2026-04-03",  # Good Friday (金)
+    "2026-05-25",  # Memorial Day (月)
+    "2026-06-19",  # Juneteenth National Independence Day (金)
+    "2026-07-03",  # Independence Day observed (金) — 7/4 が土曜のため振替
+    "2026-09-07",  # Labor Day (月)
+    "2026-11-26",  # Thanksgiving Day (木)
+    "2026-12-25",  # Christmas Day (金)
+    # ── 2027 年 ──
+    "2027-01-01",  # New Year's Day (金)
+    "2027-01-18",  # Martin Luther King, Jr. Day (月)
+    "2027-02-15",  # Washington's Birthday (Presidents' Day) (月)
+    "2027-03-26",  # Good Friday (金)
+    "2027-05-31",  # Memorial Day (月)
+    "2027-06-18",  # Juneteenth observed (金) — 6/19 が土曜のため振替
+    "2027-07-05",  # Independence Day observed (月) — 7/4 が日曜のため振替
+    "2027-09-06",  # Labor Day (月)
+    "2027-11-25",  # Thanksgiving Day (木)
+    "2027-12-24",  # Christmas Day observed (金) — 12/25 が土曜のため振替
+})
+
+# 早期クローズ日 (13:00 ET): (日付, (時, 分))
+NYSE_EARLY_CLOSE: dict = {
+    # ── 2025 年 ──
+    "2025-07-03": (13, 0),  # Independence Day 前日 (木)
+    "2025-11-28": (13, 0),  # Black Friday (金) — Thanksgiving 翌日
+    "2025-12-24": (13, 0),  # Christmas Eve (水)
+    # ── 2026 年 ──
+    # 注: 2026 年は 7/3 が完全休場（独立記念日振替）のため早期クローズなし
+    "2026-11-27": (13, 0),  # Black Friday (金)
+    "2026-12-24": (13, 0),  # Christmas Eve (木)
+    # ── 2027 年 ──
+    # 注: 2027 年は 12/24 が完全休場（Christmas 振替）のため Christmas Eve の早期クローズなし
+    #     2027 年の 7/2 (金) は早期クローズではない（NYSE 公式に記載なし）
+    "2027-11-26": (13, 0),  # Black Friday (金)
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ヘッドライン メタフィルタ (v3.4.0)
+# ─────────────────────────────────────────────────────────────────────────────
+# AI判定の誤検知を post-process で抑制する正規表現パターン。
+# Prompt Caching を維持するため AI 呼出はスキップせず、結果のみ補正。
+# 誤検知例が見つかったら該当パターンに追加。
+
+# ── ヘッジ/警告語 (confidence ペナルティ対象、score自体は維持) ──────────────
+# 設計: "if X" 単独は誤検知多 → "could/may/might/would" + ネガ動詞のセット限定
+#       "warns" は単独でも警戒値高 → 単独検出OK
+HEADLINE_HEDGE_PATTERNS: tuple = (
+    # ── 警告動詞 (単独検出) ──
+    r'\bwarn(?:s|ed|ing)\b',           # warns / warned / warning
+    r'\balert(?:s|ed|ing)?\b',
+    r'\bcaution(?:s|ed|ing)?\b',
+
+    # ── 仮定法 + ネガ動詞 (セット検出で誤検知抑制) ──
+    r'\b(?:could|may|might|would)\s+'
+    r'(?:collapse|fail|plunge|crash|tumble|sink|struggle|disappoint|miss|drop|fall)\b',
+    r'\b(?:could|may|might|would)\s+go\s+(?:bust|under|bankrupt)\b',
+    r'\b(?:could|may|might)\s+face\s+(?:collapse|bankruptcy|struggle|trouble|loss|risk)\b',
+
+    # ── 破綻/急落の直接表現 ──
+    r'\bgo(?:es|ing)?\s+bust\b',
+    r'\bgo(?:es|ing)?\s+under\b',
+    r'\bbankrupt(?:cy)?\b',
+    r'\bcollapse(?:s|d|ing)?\b',
+
+    # ── 懸念系 ──
+    r'\bfears?\b',
+    r'\bconcern(?:s|ed)?\s+(?:over|about|that|grow)\b',
+    r'\bat\s+risk\s+of\b',
+    r'\bfaces?\s+(?:threat|risk|pressure|headwind|crisis|backlash)\b',
+
+    # ── アナリスト方向不明 (方向断定なしの予測語) ──
+    # 注意: "analysts upgrade" / "analysts raise target" は別物 (実際の格付け)
+    #       なので "predict / expect / see / wonder / debate / question" に限定
+    # 語尾変化 (predict/predicts/predicted/predicting) を網羅
+    r'\banalysts?\s+(?:predict|expect|see|wonder|debate|question)(?:s|ed|ing)?\b',
+)
+
+# ── ★ v3.9.7: ネガティブ語幹 × LONG 倒錯ガード (score=±1 を score=0 強制) ──
+# 5/11 サポーター環境で発覚: Keel Infrastructure "$145M net loss in Q1 as
+# legacy mining business shrinks" を AI が QQQ ロングで判定し 11 件 -$201 の損失。
+# AI が「mining」→「AI mining (TECH)」連想に引きずられ、明確なネガ語幹を見落とした。
+# 対策: ヘッドラインに「業績悪化を断定的に示すキーワード」が含まれる場合は
+# AI が score=±1 を返しても score=0 に強制 (LONG 倒錯 / SHORT 単発悪材料 両方ブロック)。
+# 既存 HEDGE_PATTERNS (warns/could+ネガ動詞) はヘッジ語で「弱い対策 (conf 減点)」
+# だが、本パターンは「断定語 (posts net loss / misses / cuts forecast 等)」のため
+# 強い対策 (score=0 強制) を採用。誤検知時の機会損失は許容範囲 (元々 -$200 規模の損失源)。
+HEADLINE_NEGATIVE_TONE_PATTERNS: tuple = (
+    # ── 損失・赤字の断定 (Keel ケース対策) ────────────────────────────────
+    r'\bnet\s+loss\b',                                # net loss
+    r'\bposts?\s+(?:a\s+)?(?:\$?[\d.]+[bmk]?\s+)?loss\b',  # posts $145M loss / posts a loss
+    r'\bquarterly\s+loss\b',                          # quarterly loss
+    r'\bwiden(?:s|ed|ing)?\s+loss(?:es)?\b',          # widens losses
+    r'\bgoes?\s+bust\b',                              # goes bust (断定形)
+    r'\bbankruptcy\s+filing\b',                       # bankruptcy filing
+    r'\bchapter\s+11\b',                              # chapter 11
+    # ★ v3.9.22 追加: 損失系の拡張
+    r'\bloss(?:es)?\s+(?:widen|deepen|mount|balloon)(?:ed|ing|s)?\b',  # losses widen
+    r'\b(?:reports?|reported)\s+(?:a\s+)?(?:\$?[\d.]+[bmk]?\s+)?loss\b',  # reports loss
+    r'\bswings?\s+to\s+(?:a\s+)?loss\b',              # swings to loss
+    r'\bq[1-4]\s+loss\b',                             # Q1 loss
+    r'\bfiscal\s+(?:year\s+)?loss\b',                 # fiscal year loss
+    r'\boperating\s+loss\b',                          # operating loss
+
+    # ── 業績ミス・下方修正の断定 ──────────────────────────────────────
+    r'\bmiss(?:es|ed)\s+(?:estimates?|expectations?|consensus|forecast)\b',
+    r'\bdouble\s+miss\b',                             # EPS/売上ダブルミス
+    r'\bcuts?\s+(?:fy|full[- ]?year|annual|guidance|forecast|outlook)\b',
+    r'\blowers?\s+(?:fy|full[- ]?year|annual|guidance|forecast|outlook)\b',
+    r'\bguides?\s+down\b',                            # guides down
+    r'\bwithdraws?\s+(?:guidance|outlook|forecast)\b',
+    r'\bslash(?:es|ed)?\s+(?:guidance|forecast|outlook|target|estimates?)\b',
+    # ★ v3.9.22 追加: ミス系の拡張
+    r'\b(?:revenue|sales|earnings|eps)\s+miss(?:es|ed)?\b',  # revenue miss
+    r'\bmiss(?:es|ed)?\s+(?:on\s+)?(?:revenue|sales|earnings|eps|top[- ]?line|bottom[- ]?line)\b',
+    r'\bdisappoint(?:s|ed|ing)?\s+(?:investors|wall\s+street|market)\b',
+    r'\bguid(?:es?|ance)\s+(?:weaker|lower|softer|below)\b',
+    r'\b(?:weak|soft|poor)\s+(?:q[1-4]\s+)?(?:results?|outlook|guidance|demand|sales|earnings)\b',
+    r'\bdowngrade(?:s|d|ing)?\s+(?:to|by|from)\b',    # アナリスト downgrade
+
+    # ── 規模縮小・退潮の断定 ──────────────────────────────────────────
+    r'\bbusiness\s+shrinks?\b',                       # business shrinks (Keel ケース)
+    r'\bmassive\s+layoffs?\b',
+    r'\b(?:significant|major)\s+(?:layoffs?|job\s+cuts)\b',
+    r'\bproduction\s+halt(?:ed|s)?\b',
+    r'\brecall\s+announced\b',
+    r'\bfda\s+rejection\b',
+    # ★ v3.9.22 追加: 退潮系の拡張
+    r'\bheadwinds?\b',                                # headwinds (週次レポート提案)
+    r'\b(?:revenue|sales|earnings)\s+(?:fell|declined|decreased|dropped)\b',
+    r'\b(?:facing|faces)\s+(?:headwinds?|challenges?|pressure|slowdown)\b',
+    r'\brestructuring\s+plan\b',                      # restructuring plan
+    r'\bcost[- ]?cutting\s+measures?\b',
+
+    # ── 急落の断定動詞 (過去形・現在形のみ。仮定法は HEDGE 側でカバー) ──────
+    # AI が断定 LONG を出す前提で、これらの動詞が見出しにある = 致命的誤判定
+    r'\b(?:stock|shares?)\s+(?:plunges?|tumbles?|sinks?|crashes?|slumps?)\b',
+    r'\b(?:plunge|tumble|sink|crash|slump)(?:s|d|ed)?\s+(?:on|after)\b',
+    # ★ v3.9.22 追加: 急落系の拡張
+    r'\bfalls?\s+to\s+(?:multi[- ]?year|record|fresh|new)\s+low\b',
+    r'\bsink(?:s|ing)?\s+to\s+(?:multi[- ]?year|record|fresh|new)\s+low\b',
+)
+
+
+# ── 疑問形/方向不明 (score=0 強制対象) ──────────────────────────────────────
+# 14:46事象例: "Are Wall Street Analysts Predicting Corning Will Climb or Sink?"
+# 疑問詞始まり + 末尾? + 二者択一 は方向性ゼロ → AI断定スコアを破棄
+HEADLINE_QUESTION_PATTERNS: tuple = (
+    # ── 疑問詞始まり + 末尾 ? ──
+    # 5 文字以上の本文を要求して "?" 単独や極短ヘッドラインを除外
+    r'^\s*(?:will|should|can|are|is|does|do|could|might|why|how|what|when|where)\b'
+    r'[^?\n]{5,}\?\s*$',
+
+    # ── 二者択一 (X or Y) - 方向性ゼロ ──
+    r'\b(?:climb|rise|surge|jump|soar)\s+or\s+(?:sink|fall|drop|plunge|crash|tumble)\b',
+    r'\b(?:bull|bullish)\s+or\s+(?:bear|bearish)\b',
+    r'\b(?:buy|long)\s+or\s+(?:sell|short|hold)\b',
+    r'\bup\s+or\s+down\b',
+    r'\b(?:winner|winners)\s+or\s+(?:loser|losers)\b',
+
+    # ── アナリスト疑問形 (典型: "Are Analysts Predicting X Will Climb or Sink?") ──
+    r'\banalysts?\s+(?:predict|expect|see)\b[^?\n]{0,80}\?',
+
+    # ── ★ v3.9.10 追加: 反語 "Think X? Y" 形式 (悲観未来形を含むケースをカバー) ──
+    # 例: "Think $6 Gas Is Bad? It's About to Get Even Worse in California"
+    # 反語 (Think X?) + 後続節 (It's/That's/We're/You're 等) で方向性が逆転する
+    # パターン。AI がポジ要素 ($6 = 具体的金額) に引きずられて誤判定する典型例。
+    r'^\s*Think\s+[^?]{3,}\?\s+(?:It|That|This|We|You|Here|There)',
+
+    # ── ★ v3.9.10 追加: 悲観未来形 "about to get worse / harder" ──
+    # 反語疑問とセット出現する悲観表現。単独でもネガ方向だが、AI が見出しの
+    # 他の単語に引きずられてポジ判定するケースがあるため score=0 強制で確実化。
+    r'\babout\s+to\s+get\s+(?:worse|harder|tougher|tighter|uglier|messier)\b',
+
+    # ── ★ v3.9.10 追加: "Bad? ... Worse" 形式の比較ヘッジ ──
+    # 例: "Think $6 Gas Is Bad? ... Worse in California"
+    # Bad + ? + Worse は「現状が悪い + 未来は更に悪い」の構造で方向性は弱気だが、
+    # AI が「Bad ≠ 確定ネガ」と曖昧に解釈することがあるため score=0 強制。
+    r'\b(?:bad|tough|hard|painful)\?\s+(?:it|that|this|we|you|here|there)',
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ★ v3.8.3: 高信頼度ノイズパターン (AI 呼出前 pre-filter)
+# ─────────────────────────────────────────────────────────────────────────────
+# ログ分析 (4/30〜5/9, 28,000 件超の AI 判定) で「常に score=0 を返す」noise
+# パターンを抽出。対応するルールはすべて統合 SYSTEM_PROMPT に既存だが、
+# AI 呼出を 1 回節約できる (~$0.0018/呼出 = output 200tok + cache_read 7,500tok)。
+#
+# 5/4-9 期間統計:
+# - 全 AI 判定の ~48% が score=0 (= 確認のためだけに AI 呼出)
+# - 最頻パターン: アナリスト目標株価変更 (5/7 単日で 320 件超)
+# - 想定削減: 700-1,500 calls/日 = 月 $40-90 の API コスト削減
+#
+# 実装方針:
+# - 短文・キーワードフィルタの直後に regex マッチで早期 return
+# - 偽陽性 (= 真の取引機会を取り逃がす) リスクを避けるため、本パターン群は
+#   「明らかに score=0 確実」と歴代ログで実証済みのもののみに限定
+# - 環境変数 NOISE_FILTER_ENABLED=false で無効化可能 (回帰時の保険)
+# (パターン, 内部ラベル) のタプル。ラベルはログと統計で使用。
+HEADLINE_NOISE_PATTERNS: tuple = (
+    # ── 1. アナリスト目標株価変更系 (最頻 noise, 5/7 単日 320+ 件) ──────────
+    # "Maintains/Reiterates Buy on X, Raises Price Target to $Y" 形式
+    (r'\b(?:Maintains|Reiterates|Reaffirms)\s+'
+     r'(?:Buy|Hold|Sell|Overweight|Underweight|Equal-?Weight|Neutral|'
+     r'Outperform|Underperform|Market\s+Perform|Sector\s+Perform|'
+     r'Sector\s+Outperform|Sector\s+Underperform)\s+on\s+',
+     'analyst-rating-maintain'),
+    # "X Raises/Lowers/Cuts/Trims PT/Price Target to $Y"
+    (r'\b(?:Raises|Lowers|Cuts|Trims|Boosts)\s+'
+     r'(?:PT|Price\s+Target)\s+(?:to|on)\s+\$?[\d,.]+',
+     'analyst-pt-change'),
+    # "Maintains [銘柄]: Price Target $Y" / "Maintains... at $Y"
+    (r'\bMaintains\s+\w+.*\b(?:Price\s+Target|PT)\s+(?:at|to|of)\s+\$',
+     'analyst-pt-maintain'),
+    # "Bank Upgrades/Downgrades [銘柄] to/on/from" — 多語企業名対応
+    (r'\b(?:Upgrades?|Downgrades?|Initiates|Resumes\s+Coverage\s+(?:on|of))\s+'
+     r'[A-Z][\w&\.\(\)\s]{1,80}?\s+(?:to|on|from)\s+',
+     'analyst-upgrade-downgrade'),
+    # "<Firm> Upgrades/Downgrades [銘柄]" — 行頭のブローカー名検出
+    (r'^(?:[A-Z][\w&\.]*(?:\s+[A-Z][\w&\.]*){0,3})\s+'
+     r'(?:Upgrades?|Downgrades?|Initiates|Reiterates|Resumes\s+Coverage)\s+',
+     'analyst-upgrade-downgrade'),
+
+    # ── 2. 決算 transcript (常に過去事象、score=0) ─────────────────────────
+    (r'\bQ[1-4]\s+\d{4}\s+Earnings\s+Call\s+Transcript\b',
+     'earnings-transcript'),
+    (r'\bEarnings\s+Call\s+Transcript\s*$',
+     'earnings-transcript'),
+
+    # ── 3. 個人金融・ハウツー記事 (5/7 単日 100+ 件) ───────────────────────
+    (r'\bBest\s+(?:money\s+market\s+account|credit\s+cards?|savings\s+accounts?|'
+     r'CD\s+rates?|mortgage\s+rates?|HELOC\s+rates?|personal\s+loans?)\b',
+     'personal-finance-comparison'),
+    (r'^Ask\s+an\s+Advisor\b',
+     'personal-finance-qa'),
+    (r'^Should\s+I\s+(?:Use|Pay|Buy|Sell|Take|Cash|Roll|Convert)\b',
+     'personal-investment-advice'),
+    (r'\$[\d,]+\s+Invested\s+In\s+\w+.*\s+\d+\s+Years?\s+Ago',
+     'past-performance-article'),
+    (r'\bIf\s+You\s+(?:Had\s+)?Invested\s+\$[\d,]+',
+     'past-performance-article'),
+    (r'\bWould\s+(?:Be|Have\s+Been)\s+Worth\b.*\bToday\b',
+     'past-performance-article'),
+
+    # ── 4. 業界比較・ストックリスト・プロモ ────────────────────────────────
+    (r'\bComparing\s+[\w\.\(\) ]+\s+With\s+Industry\s+(?:Competitors|Peers|Rivals)',
+     'industry-comparison'),
+    (r'^\d+\s+Stocks?\s+To\s+(?:Watch|Buy|Hold|Consider|Avoid)\b',
+     'stock-list-article'),
+    (r'\bIBD\s+\d+\s+Stocks?\s+To\s+Watch\b',
+     'ibd-stock-list'),
+    (r'\bBest\s+Young\s+Stocks?\s+to\s+Buy\b',
+     'promotional-stock-pick'),
+    (r'\bStock\s+You\s+Can\s+Actually\s+Buy\b',
+     'promotional-stock-pick'),
+
+    # ── 5. 連れ高・連れ安記事 (sympathy trade, 5 件全敗の実損例) ───────────
+    (r'\btrading\s+(?:higher|lower)\s+amid\s+(?:possible\s+)?sympathy\s+with\b',
+     'sympathy-trade'),
+    (r'^Shares\s+of\s+[\w\-]+(?:-related\s+companies|\s+stocks)\s+are\s+'
+     r'(?:trading\s+)?(?:higher|lower)\b',
+     'sympathy-trade'),
+
+    # ── 6. 海外ローカル規制 (米国 ETF 無関係) ──────────────────────────────
+    (r"^UK['']?s?\s+(?:FCA|PRA|HMRC)\b",
+     'uk-domestic-regulation'),
+    (r"\b(?:UK['']?s?|British)\s+regulator\b",
+     'uk-domestic-regulation'),
+
+    # ── 6.5 海外単一企業のローカル材料 (v3.9.41 追加 / -$222 累計被害) ─────
+    # 5/20-22 のシャドー/実発注ログで「海外単一企業の業績・契約・人事系記事」が
+    # 米国 ETF (SPY/QQQ/SMH) 発注材料として誤判定される構造的問題を確認。
+    # プロンプト本文 (v1.10.0) に絶対ルールを追加した上で、特に再発リスクの
+    # 高い明確なパターンを AI 呼出前にも遮断する (API コスト削減も兼ねる)。
+    # 偽陽性回避のため、米国市場に波及する可能性のある中国/日本/ECB 等の
+    # 主要国・グローバルマクロは敢えて含めない (プロンプト側で判定させる)。
+
+    # パターン1: 英国法人の内部発表 ("Deloitte UK to raise/cut/expand ...")
+    # 実例: "Deloitte UK to raise bonuses and salaries after exceeding profit targets"
+    #       (5/22, 4 件 -$41.27)
+    (r"\b[A-Z][\w&\.\-]{2,30}\s+UK\s+to\s+"
+     r"(?:raise|cut|increase|reduce|expand|launch|open|hire|fire|invest|"
+     r"acquire|sell|buy|spin|merge|appoint|name|pay|fund)\b",
+     'foreign-co-uk-internal'),
+
+    # パターン2: AJ Bell 系 (英国小型金融サービス)
+    # 実例: "AJ Bell H1 Earnings Call Highlights" (5/22, 3 件 -$65.73)
+    (r"^AJ\s+Bell\b",
+     'foreign-co-uk-ajbell'),
+
+    # パターン3: 国の所有格付きローカル企業ニュース
+    # 例: "Australia's SPC Global opens share issue to cut debt" (5/22, 3 件)
+    #     "Brazil's [Company] reports ..."
+    # 限定: 国は新興国・小型先進国 (中国/日本/ECB/英国 BoE/カナダ等の主要国は除外)。
+    # 動詞も内部企業活動に限定 (規制・選挙等は除外)。
+    (r"^(?:Australia|Brazil|Argentina|Mexico|Chile|Colombia|Peru|"
+     r"Indonesia|Philippines|Vietnam|Thailand|Malaysia|Pakistan|Bangladesh|"
+     r"Zambia|Angola|Nigeria|Kenya|Tanzania|Ghana|Egypt|Morocco|Ethiopia|"
+     r"Uganda|Senegal|Ivory|Cameroon|Mozambique|Zimbabwe|"
+     r"Romania|Hungary|Poland|Czech|Bulgaria|Slovakia|Croatia|Serbia|"
+     r"Ireland|Portugal|Greece|Finland|Norway|Denmark|Sweden)['']?s\s+"
+     r"[A-Z][\w&\.\s\-]{2,60}?\s+"
+     r"(?:opens|expands|launches|reports|posts|announces|approves|completes|"
+     r"raises|cuts|to\s+(?:raise|cut|launch|open|expand|acquire|sell|buy|fund|spin|merge|hire|invest)|"
+     r"H[12]\s+(?:earnings|results|report)|quarterly|annual\s+report|"
+     r"share\s+issue|capital\s+raise|rights\s+issue)\b",
+     'foreign-co-local-news'),
+
+    # パターン4: アフリカ・新興国の単一国ローカルマクロ (中央銀行・財政等)
+    # 例: "Zambia central bank holds rate at 14.5%"
+    # 注意: 中国・日本・ECB・英国 BoE は米国市場連動のため除外
+    (r"^(?:Zambia|Angola|Nigeria|Kenya|Tanzania|Ghana|Egypt|Morocco|Ethiopia|"
+     r"Uganda|Senegal|Ivory|Cameroon|Mozambique|Zimbabwe|"
+     r"Indonesia|Philippines|Vietnam|Thailand|Malaysia|Pakistan|Bangladesh|"
+     r"Romania|Hungary|Poland|Czech|Bulgaria|Slovakia|Croatia|Serbia)\s+"
+     r"(?:central\s+bank|finance\s+ministry|government|cabinet|"
+     r"interest\s+rate|rate\s+(?:cut|hike|hold|decision)|"
+     r"construction\s+sector|mining\s+sector|inflation)\b",
+     'foreign-macro-emerging'),
+
+    # ── 6.7 AI 関連の抽象ニュース (v3.9.50 追加 / 5/26 単日 -$68 累積) ──────
+    # 「AI」というキーワードを含むが、具体的な企業の業績・契約・規制発動等の
+    # 確定事象を伴わない一般論・抽象記事。労働市場・楽観論・社会現象等で米国 ETF
+    # 方向への影響が説明不能。プロンプト v1.11.0 に絶対ルールを追加した上で、
+    # 特に再発リスクの高い明確なパターンを AI 呼出前にも遮断する。
+
+    # パターン1: AI が労働市場に与える影響系
+    # 実例: "Workers over 60 are the least worried AI will take their jobs"
+    #       (5/26, 4 件 -$29.84)
+    (r"\bAI\s+(?:will\s+)?(?:take|takes|replace|replacing|eliminate|"
+     r"displaces?|impact|affect|automate)\s+(?:their\s+)?(?:jobs?|work|"
+     r"workers?|employees?|workforce)\b",
+     'ai-labor-abstract'),
+    (r"\bworkers?\s+(?:over|under|aged?)\s+\d+\s+.*\bAI\b",
+     'ai-labor-demographics'),
+    (r"\b(?:least|most|more|less)\s+worried\s+(?:about\s+)?AI\b",
+     'ai-anxiety-abstract'),
+
+    # パターン2: AI 楽観論・抽象表現
+    # 実例: "Wall St gains at open as AI optimism overshadows Middle East risks"
+    #       (5/26, 3 件 -$38.39)
+    (r"\bAI\s+(?:optimism|enthusiasm|euphoria|hype|frenzy|excitement)\b",
+     'ai-optimism-abstract'),
+    (r"\b(?:overshadow|overshadows|overshadowing|overshadowed)\b.*\bAI\b",
+     'ai-overshadow-abstract'),
+    (r"\bAI\b.*\b(?:overshadow|overshadows|overshadowing|overshadowed)\b",
+     'ai-overshadow-abstract'),
+
+    # パターン3: AI 社会論・倫理・未来予測 (一般論)
+    # 動詞は ing/s/ed 等の活用形も許容。change/reshape は -ing 化で末尾 e が落ちる
+    # ため語幹で書く (chang/reshap)。
+    (r"\b(?:how|why|what)\s+AI\s+(?:is|will|could|might|may)\s+"
+     r"(?:chang\w*|transform\w*|reshap\w*|disrupt\w*|impact\w*|affect\w*)",
+     'ai-society-abstract'),
+    (r"\bAI\s+(?:ethics?|debate|controversy|concern|fears?)\s+(?:debate|"
+     r"intensifies|grows|spreads|emerges)",
+     'ai-ethics-abstract'),
+    (r"\b(?:future|impact|effect)\s+of\s+AI\s+(?:on|in|for)\b",
+     'ai-future-abstract'),
+
+    # ── 6.8 海外企業 × 海外プロジェクト (v3.9.54 追加 / 5/27 -$46.80 累積) ──
+    # ドイツの Siemens Energy が台湾の Mai-Liao 製油所プロジェクトに装置供給
+    # のような「3 段階の地理的非関連 (海外企業 × 海外現場 × 米国 ETF)」を
+    # AI 呼出前にも遮断する。v1.10.0 プロンプトの「海外単一企業」フィルタを
+    # 補完。
+    # パターン: <海外企業 + 動詞 + 海外プロジェクト/設備>
+    # 注意: 米国企業の海外展開 (Apple opens India lab) や、海外企業の米国投資
+    # (TSMC Arizona fab) は捕捉しない設計 (米国経済に影響するため)。
+    (r"^(?:Siemens(?:\s+Energy)?|Honda|Toyota|Nissan|Sony|Samsung|LG|Hyundai|"
+     r"BHP|Rio\s+Tinto|Vale|Petrobras|Sinopec|CNOOC|Aramco|Equinor|Shell|"
+     r"BP|TotalEnergies|Eni|Repsol|Volkswagen|Mercedes|BMW|Stellantis|"
+     r"Airbus|Rolls-Royce|Mitsubishi|Hitachi|Panasonic|Schneider|ABB|"
+     r"Foxconn|Hon\s+Hai|Pegatron|Wistron|Quanta)\s+"
+     r"(?:to\s+(?:provide|build|supply|construct|deliver|invest|acquire|"
+     r"open|expand|launch|develop|partner|sign)|"
+     r"(?:provides?|builds?|supplies|constructs?|delivers?|invests?|"
+     r"acquires?|opens?|expands?|launches?|develops?|partners?|signs?|"
+     r"wins?|enters?|announces?))\s+"
+     r"(?:[\w\s&\.\-]{1,80}?)\s+"
+     r"(?:for\s+|in\s+|with\s+|at\s+)?"
+     r"(?:Taiwan|Indonesia|Vietnam|Thailand|Malaysia|Philippines|India|"
+     r"Brazil|Mexico|Chile|Argentina|Colombia|Peru|"
+     r"Saudi\s+Arabia|UAE|Egypt|Morocco|Nigeria|Kenya|South\s+Africa|"
+     r"Australia|New\s+Zealand|Germany|France|Spain|Italy|UK|Ireland|"
+     r"Poland|Czech|Hungary|Romania|Norway|Sweden|Finland|Denmark|"
+     r"Japan|Korea|China|Hong\s+Kong|Singapore)\b",
+     'foreign-co-foreign-project'),
+
+    # サブパターン: "<海外企業> ... <海外現場名>" 具体名でも捕捉
+    # 実例: "Siemens Energy to provide equipment for Mai-Liao project"
+    (r"^Siemens(?:\s+Energy)?\s+to\s+(?:provide|build|supply|construct)\s+"
+     r"[\w\s&\.\-]{1,80}?\s+(?:for|at|in)\s+(?:Mai-Liao|"
+     r"[A-Z][\w\-]+)\s+(?:project|facility|plant|refinery|terminal)",
+     'foreign-co-foreign-project-specific'),
+
+    # ── 6.9 政治家・大統領による批判・牽制 (v3.9.60 追加 / 5/28 -$94.77) ────
+    # Trump 大統領の Walmart 関税批判が Alpaca(AMZN) で AMZN-LONG 判定 → -$94.77。
+    # 政治家による特定企業批判・関税批判・牽制は値動きの方向が読みにくいため、
+    # 確定事象 (executive order / sign / impose / file suit 等) を伴わない発言は
+    # AI 呼出前に遮断する。プロンプト v1.13.0 と二重防御。
+
+    # パターン1: 大統領・政治家が特定企業を批判 (criticizes / bashes / slams 等)
+    # 実例: "Trump criticizes Walmart on tariff handling"
+    (r"\b(?:Trump|Biden|Harris|Obama|President|White\s+House|"
+     r"Vice\s+President|Treasury\s+Secretary|Fed\s+Chair|Senator\s+\w+|"
+     r"Congressman\s+\w+|Democrats?|Republicans?)\s+"
+     r"(?:criticizes?|bashes?|slams?|attacks?|calls?\s+out|"
+     r"warns?|complains?|denounces?|condemns?|rebukes?|blasts?|"
+     r"hits\s+out\s+at|takes?\s+aim\s+at|targets?)\s+"
+     r"[A-Z][\w&\.\-]{1,30}\b",
+     'political-criticism-company'),
+
+    # パターン2: 大統領による関税の批判・検討 (確定発動でない・批判段階)
+    # 例: "Trump considers new tariffs on China" (検討段階)
+    # 例: "President criticizes Walmart's tariff handling" (批判段階)
+    (r"\b(?:Trump|Biden|Harris|President|White\s+House|"
+     r"Treasury\s+Secretary|Commerce\s+Secretary)\s+"
+     r"(?:considers?|weighs?|threatens?|mulls?|"
+     r"criticizes?|warns?\s+about|condemns?|opposes?)\s+"
+     r"(?:new\s+|higher\s+|increased\s+|additional\s+)?tariff",
+     'political-tariff-consideration'),
+
+    # ── 7. Daily aggregator / 集約記事 ─────────────────────────────────────
+    (r'^Deal\s+Dispatch\s*:',
+     'daily-aggregator'),
+    (r"^Today['']?s\s+(?:Premarket\s+)?Movers\b",
+     'daily-aggregator'),
+    (r'^Daily\s+Movers\b',
+     'daily-aggregator'),
+    (r'^Market\s+Digest\s*:',
+     'daily-aggregator'),
+
+    # ── 8. 暗号資産価格・動向記事 (v3.9.10 追加) ─────────────────────────────
+    # 5/12 ログ: "Bitcoin and ethereum prices today, Tuesday, May 12" のような
+    # 価格速報記事が AI に QQQ 上昇材料と誤判定された (偶然勝ったが構造的にノイズ)。
+    # BTC/ETH は QQQ/SPY/SMH の構成銘柄ではないため、これらの記事から ETF 判定は出ない。
+    (r'\b(?:bitcoin|ethereum|btc|eth)\s+(?:price|prices)\s+(?:today|move|moves|jump|rise|fall|tumble)',
+     'crypto-price-update'),
+    (r'\b(?:bitcoin|ethereum|btc|eth)\s+and\s+(?:bitcoin|ethereum|btc|eth)\s+price',
+     'crypto-price-pair'),
+    # アルトコイン銘柄記事
+    (r'\b(?:dogecoin|cardano|solana|polkadot|chainlink|polygon|matic|avax|near\s+protocol)\b',
+     'altcoin-specific'),
+    # "Where Will [Crypto] Be in [Year]" 系の予想記事
+    (r'\bwhere\s+will\s+(?:bitcoin|ethereum|cardano|solana|dogecoin)\b',
+     'crypto-future-prediction'),
+    # 暗号資産規制・SEC関連 (主要 ETF への影響限定的)
+    (r'\b(?:bitcoin|ethereum)\s+etf\b',
+     'crypto-etf-product'),
+
+    # ── 9. エネルギー価格 + リスク表現 (v3.9.10 追加) ────────────────────────
+    # 5/12 ログ: "Consumer spending is healthy, but gas prices remain a risk"
+    # が QQQ LONG で 22 件 -$74.27 損失。ガス/原油価格は MACRO トピックで
+    # QQQ/SMH には直接影響しない。リスク表現と組合せた時のみ確実なノイズと判断。
+    (r'\bgas\s+price.*\b(?:risk|worse|surge|spike|concern|threat|warning|bad)\b',
+     'macro-gas-risk-combo'),
+    (r'\$\d+\s+gas\b',  # "$6 Gas" 等の具体的金額付き (\b は $ の前で機能しないため省略)
+     'macro-dollar-gas'),
+    (r'\bconsumer\s+spending.*\b(?:risk|worse|concern|threat|headwind|warning)\b',
+     'macro-consumer-risk-combo'),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# プロンプト・データ自己検証 (旧 prompts.py 末尾の assert を移植)
+# ─────────────────────────────────────────────────────────────────────────────
+assert isinstance(UNIFIED_SYSTEM_PROMPT_TEMPLATE, str), "UNIFIED_SYSTEM_PROMPT_TEMPLATE must be str"
+# v1.3.0 統合版: キャッシュ閾値 4,096 tok を確実に超えるサイズが必要 (Haiku 4.5)。
+# 文字数は ~10,000 字 前後で 4,500 tok 程度 (日本語混じりで 2.2 字/tok 換算)。
+assert 8_000 < len(UNIFIED_SYSTEM_PROMPT_TEMPLATE) < 30_000, "Unified prompt size out of expected range"
+assert "{semi_sym}" in UNIFIED_SYSTEM_PROMPT_TEMPLATE, "Unified prompt missing {semi_sym}"
+assert "{tech_sym}" in UNIFIED_SYSTEM_PROMPT_TEMPLATE, "Unified prompt missing {tech_sym}"
+assert "{macro_sym}" in UNIFIED_SYSTEM_PROMPT_TEMPLATE, "Unified prompt missing {macro_sym}"
+# {symbol} は user メッセージで指定するためテンプレート内には存在しないこと
+assert "{symbol}" not in UNIFIED_SYSTEM_PROMPT_TEMPLATE, "{symbol} は user msg で指定するためテンプレート内に含めない"
+assert isinstance(NYSE_HOLIDAYS, frozenset) and len(NYSE_HOLIDAYS) >= 20, "NYSE_HOLIDAYS too small"
+assert isinstance(NYSE_EARLY_CLOSE, dict) and len(NYSE_EARLY_CLOSE) >= 3, "NYSE_EARLY_CLOSE too small"
+assert all(len(d) == 10 and d[4] == '-' for d in NYSE_HOLIDAYS), "NYSE_HOLIDAYS bad date format"
+assert isinstance(HEADLINE_HEDGE_PATTERNS, tuple) and len(HEADLINE_HEDGE_PATTERNS) >= 5, "HEDGE patterns too few"
+assert isinstance(HEADLINE_QUESTION_PATTERNS, tuple) and len(HEADLINE_QUESTION_PATTERNS) >= 3, "QUESTION patterns too few"
+# ★ v3.9.7: ネガ語幹パターンの検証 (Keel 倒錯ガード用)
+assert isinstance(HEADLINE_NEGATIVE_TONE_PATTERNS, tuple) and len(HEADLINE_NEGATIVE_TONE_PATTERNS) >= 10, "NEGATIVE_TONE patterns too few"
+for _p in HEADLINE_HEDGE_PATTERNS + HEADLINE_QUESTION_PATTERNS + HEADLINE_NEGATIVE_TONE_PATTERNS:
+    re.compile(_p)  # 各パターンが有効な正規表現か検証
+del _p
+
+# ★ v3.8.3: ノイズパターンの正規表現コンパイル + assert
+assert isinstance(HEADLINE_NOISE_PATTERNS, tuple) and len(HEADLINE_NOISE_PATTERNS) >= 10, "NOISE patterns too few"
+for _np, _label in HEADLINE_NOISE_PATTERNS:
+    re.compile(_np, re.IGNORECASE)
+    assert _label and isinstance(_label, str), f"label missing for {_np}"
+del _np, _label
+_NOISE_FILTER_REGEXES: tuple = tuple(
+    (re.compile(_p, re.IGNORECASE), _l) for _p, _l in HEADLINE_NOISE_PATTERNS
+)
+
+log.info(
+    f"[起動] プロンプト・データ読み込み完了 "
+    f"(version={_PROMPTS_VERSION}, updated={_PROMPTS_LAST_UPDATED}, 内蔵)"
+)
+
+
+# ティッカープレースホルダを実際の値で置換して SYSTEM_PROMPT を生成 (起動時 1 回のみ)。
+# 統合版は ETF / 個別株両モードを 1 つのプロンプトで扱うため、analyze_news() は
+# モードに依らず常に SYSTEM_PROMPT を使用する (モードは user メッセージで指定)。
+SYSTEM_PROMPT = (
+    UNIFIED_SYSTEM_PROMPT_TEMPLATE
+    .replace("{semi_sym}", _semi_sym)
+    .replace("{tech_sym}", _tech_sym)
+    .replace("{macro_sym}", _macro_sym)
+)
+
+# 置換漏れチェック (起動時 assert)
+# JSON 例の中の波括弧 (例: {"score":1,...}) は影響なし
+assert "{semi_sym}" not in SYSTEM_PROMPT, "統合プロンプトに {semi_sym} の置換漏れあり"
+assert "{tech_sym}" not in SYSTEM_PROMPT, "統合プロンプトに {tech_sym} の置換漏れあり"
+assert "{macro_sym}" not in SYSTEM_PROMPT, "統合プロンプトに {macro_sym} の置換漏れあり"
+
+
+# ── ★ v3.5.0: プロンプトキャッシュ閾値の起動時実測 (オプション) ─────────────
+# Haiku 4.5 の Prompt Caching 最低 4,096 tok を確実に上回ることを保証する。
+# VERIFY_PROMPT_CACHE_SIZE=true で有効化 (default: false / API消費なし)。
+# 有効時は count_tokens で ETF/STOCK 実測 → 閾値割れなら CRITICAL ログ。
+# 推奨: プロンプト編集直後の起動で1度 ON、通常運用は OFF。
+
+VERIFY_PROMPT_CACHE_SIZE: bool = (
+    os.getenv("VERIFY_PROMPT_CACHE_SIZE", "false").lower() == "true"
+)
+_PROMPT_CACHE_MIN_TOKENS = 4096  # Haiku 4.5 / Opus の Prompt Caching 最低 tok
+
+
+def _verify_prompt_cache_eligibility() -> None:
+    """起動時に統合 SYSTEM_PROMPT のトークン数を実測し、4,096 tok 閾値を満たすか確認する。
+
+    v1.3.0 統合版: ETF / 個別株モードとも同じ SYSTEM_PROMPT をキャッシュするため、
+    実測対象は 1 つだけ。Anthropic API の count_tokens エンドポイントを使用。
+    閾値割れ時は CRITICAL ログ + 警告を出力 (ただし起動は継続)。
+    API call 失敗時は WARNING で握りつぶす (本番運用に影響を与えない)。
+    """
+    if not VERIFY_PROMPT_CACHE_SIZE:
+        log.debug("[起動] プロンプトキャッシュサイズ実測: スキップ (VERIFY_PROMPT_CACHE_SIZE=false)")
+        return
+    try:
+        client = get_anthropic_client()
+        r = client.messages.count_tokens(
+            model=CLAUDE_MODEL,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        tok = r.input_tokens
+        if tok >= _PROMPT_CACHE_MIN_TOKENS:
+            log.info(
+                f"[起動] 統合プロンプト実測 input_tokens={tok} "
+                f"(閾値 {_PROMPT_CACHE_MIN_TOKENS} クリア、余裕 +{tok - _PROMPT_CACHE_MIN_TOKENS})"
+            )
+        else:
+            log.critical(
+                f"⚠️⚠️⚠️ 統合プロンプトが Prompt Caching 閾値 ({_PROMPT_CACHE_MIN_TOKENS} tok) 未満! "
+                f"現在 {tok} tok → キャッシュ無効化のリスク。"
+                f"プロンプトに {_PROMPT_CACHE_MIN_TOKENS - tok} tok 以上の追加が必要。"
+            )
+    except Exception as e:
+        # API call 失敗 (キー無効・レート制限・ネットワーク等) は本番運用に影響を出さない
+        log.warning(f"[起動] プロンプトトークン数の実測スキップ: {type(e).__name__}: {e}")
+
+
+# 起動時に実測実行 (オプション機能、デフォルトOFF)
+_verify_prompt_cache_eligibility()
+
+
+# ── ★ v3.5.1: Prompt Cache 利用統計の時間帯別収集 (運用可視化) ──────────────
+# 各 AI 呼出の cache_creation/read_input_tokens を ET セッション別に集計し、
+# 1 時間ごとに INFO ログでサマリ (ヒット率/書込発生率/推定コスト) を出力。
+# 24 時間ローテーション。CACHE_STATS_ENABLED で無効化可能 (default: true)。
+# 例: [Cache統計] RTH calls=42 read=39(92.9%) write=3 推定コスト=$0.0203
+# ─────────────────────────────────────────────────────────────────────────────
+
+CACHE_STATS_ENABLED: bool = (
+    os.getenv("CACHE_STATS_ENABLED", "true").lower() == "true"
+)
+CACHE_STATS_INTERVAL_SEC: int = int(os.getenv("CACHE_STATS_INTERVAL_SEC", "3600"))
+
+# ── キャッシュ統計バケット (時間帯別、1時間ごとの集計用) ──────────────────────
+# キー: ET時刻ベースの "YYYY-MM-DD HH:00" / セッション名 のタプル
+# 値: dict { calls, write_count, read_count, write_tok, read_tok, in_tok, out_tok }
+#
+# 24時間 = 24バケット x 4セッション = 最大96エントリ。それを超えたら古い順に削除。
+_cache_stats_buckets: dict = {}
+_CACHE_STATS_MAX_BUCKETS = 100
+
+# Haiku 4.5 の単価 (キャッシュコスト推計用)
+_HAIKU_INPUT_PRICE_PER_MTOK     = 1.00     # USD / 1M tokens
+_HAIKU_CACHE_WRITE_PRICE_PER_MTOK = 1.25   # USD / 1M tokens (5分TTL = 1.25x)
+_HAIKU_CACHE_READ_PRICE_PER_MTOK  = 0.10   # USD / 1M tokens (90% off)
+
+
+def _classify_et_session(now_et: datetime.datetime) -> str:
+    """既存の `Session` enum と概念は同じだが、統計バケット用に専用関数を持つ (循環参照と将来の API 変更に備えた疎結合設計)。"""
+    h = now_et.hour
+    m = now_et.minute
+    minutes = h * 60 + m
+    # PREMARKET: 04:00-09:30 ET
+    if 240 <= minutes < 570:
+        return "PREMARKET"
+    # RTH: 09:30-16:00 ET
+    if 570 <= minutes < 960:
+        return "RTH"
+    # AFTERHOURS: 16:00-20:00 ET
+    if 960 <= minutes < 1200:
+        return "AFTERHOURS"
+    # OVERNIGHT: 20:00-04:00 ET (またぎ)
+    return "OVERNIGHT"
+
+
+def _record_cache_usage(
+    cache_write_tok: int,
+    cache_read_tok: int,
+    input_tok: int,
+    output_tok: int,
+) -> None:
+    """analyze_news() の usage 取得直後に呼び出される (1 行追加で済む薄いラッパー)。 例外を握りつぶす (本番運用に影響を出さない設計)。"""
+    if not CACHE_STATS_ENABLED:
+        return
+    try:
+        now_et = datetime.datetime.now(_ET)
+        bucket_hour = now_et.strftime("%Y-%m-%d %H:00")
+        session    = _classify_et_session(now_et)
+        key        = (bucket_hour, session)
+
+        b = _cache_stats_buckets.setdefault(key, {
+            "calls":       0,
+            "write_count": 0,
+            "read_count":  0,
+            "write_tok":   0,
+            "read_tok":    0,
+            "in_tok":      0,
+            "out_tok":     0,
+        })
+        b["calls"]    += 1
+        b["in_tok"]   += int(input_tok)
+        b["out_tok"]  += int(output_tok)
+        if cache_write_tok > 0:
+            b["write_count"] += 1
+            b["write_tok"]   += int(cache_write_tok)
+        if cache_read_tok > 0:
+            b["read_count"] += 1
+            b["read_tok"]   += int(cache_read_tok)
+
+        # ── ローテーション: 古いバケット削除 (max _CACHE_STATS_MAX_BUCKETS 個まで圧縮) ──
+        # > 100 で1個削除だと一度に大量投入された場合に追いつかない。
+        # while ループで _CACHE_STATS_MAX_BUCKETS 以下になるまで古い順に削除する。
+        while len(_cache_stats_buckets) > _CACHE_STATS_MAX_BUCKETS:
+            oldest = sorted(_cache_stats_buckets.keys())[0]
+            _cache_stats_buckets.pop(oldest, None)
+    except Exception as e:
+        # 統計収集の失敗で本処理を止めない
+        log.debug(f"[Cache統計] 記録失敗 (無視): {type(e).__name__}: {e}")
+
+
+def _format_cache_stats_summary(window_hours: int = 1) -> str:
+    """直近 window_hours 時間のキャッシュ統計をフォーマットして返す。
+
+    出力例:
+      [Cache統計] 直近1h RTH calls=42 read=39(92.9%) write=3
+                  in=15.2K read_tok=180.1K
+                  推定コスト=$0.0203 (書込$0.0188+読取$0.0015)
+                  → 5分TTL適切 (書込率7.1%、keep-alive推奨せず)
+    """
+    if not _cache_stats_buckets:
+        return "[Cache統計] データなし"
+
+    # 直近 window_hours 時間のバケットを抽出
+    now_et = datetime.datetime.now(_ET)
+    cutoff = now_et - datetime.timedelta(hours=window_hours)
+
+    relevant = []
+    for (bucket_hour_str, session), b in _cache_stats_buckets.items():
+        try:
+            bh = datetime.datetime.strptime(bucket_hour_str, "%Y-%m-%d %H:00")
+            bh = bh.replace(tzinfo=_ET)
+            if bh >= cutoff:
+                relevant.append((session, b))
+        except Exception:
+            continue
+
+    if not relevant:
+        return f"[Cache統計] 直近{window_hours}h データなし"
+
+    # セッション別に集約
+    by_session: dict = {}
+    for session, b in relevant:
+        agg = by_session.setdefault(session, {
+            "calls": 0, "write_count": 0, "read_count": 0,
+            "write_tok": 0, "read_tok": 0, "in_tok": 0, "out_tok": 0,
+        })
+        for k in agg:
+            agg[k] += b[k]
+
+    lines = []
+    for session in ["PREMARKET", "RTH", "AFTERHOURS", "OVERNIGHT"]:
+        if session not in by_session:
+            continue
+        a = by_session[session]
+        if a["calls"] == 0:
+            continue
+        hit_rate    = (a["read_count"]  / a["calls"]) * 100
+        write_rate  = (a["write_count"] / a["calls"]) * 100
+        # コスト推計
+        cost_write = a["write_tok"] / 1_000_000 * _HAIKU_CACHE_WRITE_PRICE_PER_MTOK
+        cost_read  = a["read_tok"]  / 1_000_000 * _HAIKU_CACHE_READ_PRICE_PER_MTOK
+        cost_in    = a["in_tok"]    / 1_000_000 * _HAIKU_INPUT_PRICE_PER_MTOK
+        cost_total = cost_write + cost_read + cost_in
+
+        # keep-alive 価値判定:
+        # ・呼出 N < 5 → サンプル不足。書込率が高くても統計的意味なし
+        # ・書込率 > 30% → keep-alive 検討余地あり (頻繁にTTL失効中)
+        # ・それ以外 → 5分TTLで十分 (現状維持で OK)
+        if a["calls"] < 5:
+            advice = f"📉 呼出疎(N={a['calls']})→keep-alive価値低"
+        elif write_rate > 30:
+            advice = f"⚠️ TTL失効頻発(書込率{write_rate:.0f}%)→1h TTL検討"
+        else:
+            advice = f"✅ 5分TTL最適(書込率{write_rate:.0f}%)"
+
+        lines.append(
+            f"  [{session:10s}] calls={a['calls']:3d} "
+            f"hit={a['read_count']:3d}({hit_rate:5.1f}%) "
+            f"write={a['write_count']:2d}({write_rate:5.1f}%) "
+            f"in={a['in_tok']/1000:5.1f}K read={a['read_tok']/1000:6.1f}K "
+            f"$ ={cost_total:.4f} {advice}"
+        )
+
+    if not lines:
+        return f"[Cache統計] 直近{window_hours}h データなし"
+
+    header = f"[Cache統計サマリ] 直近{window_hours}h (ET基準セッション別)"
+    return header + "\n" + "\n".join(lines)
+
+
+async def cache_stats_loop() -> None:
+    """main() の _loop_guard でラップされる前提。例外時は3秒後に自動再起動。 / CACHE_STATS_ENABLED=false の場合は何もせず即時 return (ループ未起動扱い)。"""
+    if not CACHE_STATS_ENABLED:
+        log.info("[Cache統計] CACHE_STATS_ENABLED=false のためサマリ出力スキップ")
+        return
+
+    log.info(
+        f"[Cache統計] サマリ出力ループ開始 "
+        f"(間隔={CACHE_STATS_INTERVAL_SEC}秒, ローテーション={_CACHE_STATS_MAX_BUCKETS}バケット)"
+    )
+    # 起動直後はサマリ出力をスキップ (1サイクル待つ)
+    await asyncio.sleep(CACHE_STATS_INTERVAL_SEC)
+
+    while True:
+        summary = _format_cache_stats_summary(window_hours=1)
+        log.info(summary)
+        await asyncio.sleep(CACHE_STATS_INTERVAL_SEC)
+
+
+# ── ★ v3.4.0: ヘッドライン メタフィルタ (ヘッジ語/疑問形 検出) ────────────────
+# 14:46 事象 (2026-05-07 / 10名同期 LOSS) 対策。プロンプト改修と独立した最後の砦。
+# ① ヘッジ/警告語 (warns/could等) → confidence ペナルティ
+# ② 疑問形/方向不明 ("X or Y?")  → score=0 強制
+# AI 呼出は維持 (Prompt Caching 90%off 維持)、結果のみ post-process で補正。
+# .env で個別 ON/OFF 可能。
+
+# 統計カウンタ (運用監視用 - 既存 _anthropic_skip_count パターンに準拠)
+_meta_filter_hedge_count:    int = 0   # ヘッジ語検出により conf 減算した回数
+_meta_filter_question_count: int = 0   # 疑問形検出により score=0 強制した回数
+_meta_filter_negtone_count:  int = 0   # ★ v3.9.7: ネガ語幹×LONG倒錯で score=0 強制した回数
+_meta_filter_zeroed_count:   int = 0   # メタフィルタで実際に score を 0 に書き換えた回数
+
+# 環境変数からの設定読み込み (.env 未設定時は安全側 default で有効)
+HEADLINE_META_FILTER_ENABLED: bool = (
+    os.getenv("HEADLINE_META_FILTER_ENABLED", "true").lower() == "true"
+)
+HEADLINE_HEDGE_PENALTY: float = float(os.getenv("HEADLINE_HEDGE_PENALTY", "0.10"))
+HEADLINE_QUESTION_FORCE_ZERO: bool = (
+    os.getenv("HEADLINE_QUESTION_FORCE_ZERO", "true").lower() == "true"
+)
+
+# ── ★ v3.8.3: ノイズパターン pre-filter (AI 呼出前の早期 score=0 判定) ─────
+# 統合 SYSTEM_PROMPT が「常に score=0 を返す」パターンを正規表現で先回りブロック。
+# AI 呼出 1 回 = 約 $0.0018 (output 200tok + cache_read 7,500tok) を節約。
+# ログ分析 (4/30〜5/9) で全 AI 判定の 48% が score=0 と判明、削減余地が大きい。
+NOISE_FILTER_ENABLED: bool = (
+    os.getenv("NOISE_FILTER_ENABLED", "true").lower() == "true"
+)
+# 統計カウンタ (1日サマリログ用)
+_noise_filter_total_count: int = 0           # フィルタヒット総数
+_noise_filter_label_counts: dict = {}        # ラベル別件数
+_noise_filter_last_summary_date: Optional["datetime.date"] = None
+
+
+def _check_noise_pattern(headline: str) -> Optional[str]:
+    """ヘッドラインが既知の noise パターンに該当するか判定。
+
+    Returns:
+        該当時はラベル文字列 (例: 'analyst-pt-change')、該当なしは None。
+        NOISE_FILTER_ENABLED=false のときは常に None。
+    """
+    if not NOISE_FILTER_ENABLED or not headline:
+        return None
+    for regex, label in _NOISE_FILTER_REGEXES:
+        if regex.search(headline):
+            return label
+    return None
+
+
+def _record_noise_filter_hit(label: str) -> None:
+    """ノイズフィルタヒット時の統計記録 (1日サマリ用)。"""
+    global _noise_filter_total_count
+    _noise_filter_total_count += 1
+    _noise_filter_label_counts[label] = _noise_filter_label_counts.get(label, 0) + 1
+
+
+def _maybe_log_noise_filter_summary() -> None:
+    """日付が変わったら前日のノイズフィルタ統計を INFO ログに出力する。
+
+    process_headlines 等から低頻度で呼ばれることを想定。
+    """
+    global _noise_filter_last_summary_date, _noise_filter_total_count
+    if not NOISE_FILTER_ENABLED:
+        return
+    today_et = datetime.datetime.now(_ET).date()
+    if _noise_filter_last_summary_date is None:
+        _noise_filter_last_summary_date = today_et
+        return
+    if today_et == _noise_filter_last_summary_date:
+        return
+    # 日付が進んだので前日分をサマリ出力 → カウンタリセット
+    if _noise_filter_total_count > 0:
+        _top = sorted(_noise_filter_label_counts.items(), key=lambda kv: -kv[1])[:5]
+        _top_str = ", ".join(f"{l}={n}" for l, n in _top)
+        # 想定削減コスト: $0.0018/呼出 (cache_read 7,500tok + output 200tok 換算)
+        _saved_cost = _noise_filter_total_count * 0.0018
+        log.info(
+            f"[ノイズフィルタ統計] 前日 {_noise_filter_last_summary_date}: "
+            f"{_noise_filter_total_count}件ブロック (推定削減 ${_saved_cost:.2f}) "
+            f"内訳上位5: {_top_str}"
+        )
+    _noise_filter_last_summary_date = today_et
+    _noise_filter_total_count = 0
+    _noise_filter_label_counts.clear()
+
+# ── ヘッジ/疑問形パターン (本ファイル上部に内蔵 / v3.7.2 で再統合) ───────────
+# HEADLINE_HEDGE_PATTERNS:           confidence ペナルティ対象 (warns/could+ネガ動詞 等)
+# HEADLINE_QUESTION_PATTERNS:        score=0 強制対象 (疑問形/二者択一)
+# HEADLINE_NEGATIVE_TONE_PATTERNS:   score=0 強制対象 (v3.9.7 / 断定的ネガ語幹)
+# 誤検知発見時は本ファイル上部の定義に追加 → 翌日の ZIP 配布で全 Bot 反映。
+_HEDGE_REGEX         = re.compile('|'.join(HEADLINE_HEDGE_PATTERNS), re.IGNORECASE)
+_QUESTION_REGEX      = re.compile('|'.join(HEADLINE_QUESTION_PATTERNS), re.IGNORECASE)
+_NEGATIVE_TONE_REGEX = re.compile('|'.join(HEADLINE_NEGATIVE_TONE_PATTERNS), re.IGNORECASE)
+
+
+def _detect_hedge_signals(headlines: list[str]) -> list[tuple[int, str, str]]:
+    """ヘッドラインからヘッジ/警告語を検出。
+
+    Args:
+        headlines: ニュースヘッドラインのリスト (先頭 5 件のみ評価)
+
+    Returns:
+        [(idx, headline, matched_text), ...] 検出ペアのリスト。
+        idx は headlines 内の位置 (0-based)。検出なしなら空リスト。
+    """
+    detected: list[tuple[int, str, str]] = []
+    for i, h in enumerate(headlines[:5]):
+        if not h or not isinstance(h, str):
+            continue
+        m = _HEDGE_REGEX.search(h)
+        if m:
+            detected.append((i, h, m.group(0)))
+    return detected
+
+
+def _detect_question_signals(headlines: list[str]) -> list[tuple[int, str, str]]:
+    """ヘッドラインから方向性のない疑問形/二者択一を検出。
+
+    Args:
+        headlines: ニュースヘッドラインのリスト (先頭 5 件のみ評価)
+
+    Returns:
+        [(idx, headline, matched_text), ...] 検出ペアのリスト。
+    """
+    detected: list[tuple[int, str, str]] = []
+    for i, h in enumerate(headlines[:5]):
+        if not h or not isinstance(h, str):
+            continue
+        m = _QUESTION_REGEX.search(h.strip())
+        if m:
+            detected.append((i, h, m.group(0)))
+    return detected
+
+
+def _detect_negative_tone_signals(headlines: list[str]) -> list[tuple[int, str, str]]:
+    """★ v3.9.7: ヘッドラインから断定的ネガティブ語幹を検出 (Keel 倒錯ガード用)。
+
+    HEDGE_PATTERNS (warns / could+ネガ動詞 等の "弱い対策") とは別に、
+    "net loss" / "misses estimates" / "business shrinks" 等の **断定形** を検出する。
+    AI が score=±1 を返してもこれらが含まれていれば score=0 に強制する。
+
+    Args:
+        headlines: ニュースヘッドラインのリスト (先頭 5 件のみ評価)
+
+    Returns:
+        [(idx, headline, matched_text), ...] 検出ペアのリスト。
+    """
+    detected: list[tuple[int, str, str]] = []
+    for i, h in enumerate(headlines[:5]):
+        if not h or not isinstance(h, str):
+            continue
+        m = _NEGATIVE_TONE_REGEX.search(h)
+        if m:
+            detected.append((i, h, m.group(0)))
+    return detected
+
+
+def _apply_meta_filter_to_ai_result(
+    result: dict,
+    headlines: list[str],
+    trigger_symbol: str,
+) -> dict:
+    """AI 判定結果に対してヘッドライン メタフィルタを適用 (v3.4.0)。
+
+    破壊的変更: result dict を in-place で書き換え + 返却。
+
+    適用ルール (優先度順):
+        score=0                       → 何もしない (既に中立)
+        score=1  + ネガ語幹検出 (新)  → score=0 強制 (v3.9.7 / Keel 倒錯ガード)
+        score=±1 + 疑問形検出         → score=0 強制 (HEADLINE_QUESTION_FORCE_ZERO)
+        score=1  + ヘッジ検出のみ     → confidence -= HEADLINE_HEDGE_PENALTY
+        score=-1 + ヘッジ検出のみ     → そのまま (ヘッジ語は弱気判定を支持するため)
+        score=-1 + ネガ語幹検出      → そのまま (弱気判定を支持するため)
+
+    監査ログ:
+        INFO レベルで適用前後の score/confidence と検出パターンを記録。
+        result["reason"] に追記して Discord 通知/Sheet ログから追跡可能に。
+    """
+    global _meta_filter_hedge_count, _meta_filter_question_count, _meta_filter_zeroed_count
+    global _meta_filter_negtone_count
+
+    # ── 全体無効化 (.env で OFF) ─────────────────────────────────────────────
+    if not HEADLINE_META_FILTER_ENABLED:
+        return result
+
+    # ── 既に中立なら何もしない ───────────────────────────────────────────────
+    score      = int(result.get("score", 0))
+    confidence = float(result.get("confidence", 0.0))
+    if score == 0:
+        return result
+
+    hedge_hits    = _detect_hedge_signals(headlines)
+    question_hits = _detect_question_signals(headlines)
+    # ★ v3.9.7: 断定的ネガ語幹検出 (Keel 倒錯ガード用)
+    negtone_hits  = _detect_negative_tone_signals(headlines) if score == 1 else []
+
+    # 検出なし → そのまま返す
+    if not hedge_hits and not question_hits and not negtone_hits:
+        return result
+
+    note_parts: list[str] = []
+
+    # ── ★ v3.9.7 ⓪: ネガ語幹 × score=1 倒錯ガード (最強対策: score=0 強制) ──
+    # 5/11 Keel Infrastructure "$145M net loss... business shrinks" を AI が
+    # QQQ ロングで判定して -$201 損失を出した事案への根本対策。
+    # AI が「mining」→「AI mining (TECH)」表層連想で誤判定したケースを構造的に防ぐ。
+    # 疑問形ガードより優先 (より確実なシグナル)。score=-1 には適用しない。
+    if negtone_hits and score == 1:
+        for idx, h, pat in negtone_hits:
+            log.info(
+                f"[META] {trigger_symbol} ネガ語幹×LONG倒錯検出 → score=0 強制 "
+                f"(AI: score={score} conf={confidence:.2f}): "
+                f"pattern={pat!r} idx={idx} headline={h[:140]!r}"
+            )
+        _meta_filter_negtone_count += 1
+        _meta_filter_zeroed_count  += 1
+        note_parts.append(
+            f"METAネガ語幹 {len(negtone_hits)}件 ({negtone_hits[0][2]!r}) "
+            f"→ score 1→0 強制 (倒錯ガード)"
+        )
+        result["score"] = 0
+        # reason 欄に追記して下流の Sheet/Discord で追跡可能に
+        existing = (result.get("reason") or "").strip()
+        result["reason"] = (existing + " | " + " | ".join(note_parts)).strip(" |")
+        return result
+
+    # ── ① 疑問形検出 (強い対策: score=0 強制) ────────────────────────────────
+    # 疑問形ヘッドラインは方向性ゼロ → AI が断定したスコア自体を信頼しない
+    if question_hits and HEADLINE_QUESTION_FORCE_ZERO:
+        for idx, h, pat in question_hits:
+            log.info(
+                f"[META] {trigger_symbol} 疑問形検出 → score=0 強制 "
+                f"(AI: score={score} conf={confidence:.2f}): "
+                f"pattern={pat!r} idx={idx} headline={h[:140]!r}"
+            )
+        _meta_filter_question_count += 1
+        _meta_filter_zeroed_count   += 1
+        note_parts.append(
+            f"META疑問形 {len(question_hits)}件 ({question_hits[0][2]!r}) "
+            f"→ score {score}→0 強制"
+        )
+        result["score"] = 0
+        # 注: confidence は据え置き (誤検知時に AI の判断材料を残し reason 欄で追跡)
+
+    # ── ② ヘッジ語検出 (弱い対策: confidence ペナルティ) ─────────────────────
+    # 疑問形で既に score=0 化された場合は重複適用しない
+    elif hedge_hits and HEADLINE_HEDGE_PENALTY > 0:
+        # score=-1 (弱気) + ヘッジ語は元判定を支持するためペナルティしない
+        # score=1 (強気) + ヘッジ語は方向矛盾なので conf を下げる
+        if score == 1:
+            before_conf = confidence
+            confidence  = max(0.0, confidence - HEADLINE_HEDGE_PENALTY)
+            for idx, h, pat in hedge_hits:
+                log.info(
+                    f"[META] {trigger_symbol} ヘッジ語検出 → conf {before_conf:.2f}→{confidence:.2f}: "
+                    f"pattern={pat!r} idx={idx} headline={h[:140]!r}"
+                )
+            _meta_filter_hedge_count += 1
+            note_parts.append(
+                f"METAヘッジ {len(hedge_hits)}件 ({hedge_hits[0][2]!r}) "
+                f"→ conf {before_conf:.2f}→{confidence:.2f}"
+            )
+            result["confidence"] = confidence
+        else:
+            # score=-1 + ヘッジ語: 検出はログのみ (DEBUG)、判定には影響させない
+            log.debug(
+                f"[META] {trigger_symbol} ヘッジ語検出だが score=-1 のため skip: "
+                f"pattern={hedge_hits[0][2]!r}"
+            )
+
+    # ── ★ v3.9.10: ③ カテゴリ × キーワード整合性チェック ────────────────────
+    # AI が SEMI_STRONG カテゴリを返したのに、ヘッドラインに半導体関連キーワードが
+    # 全く含まれていない場合、それは構造的誤判定 (例: 5/12 "$6 Gas in California"
+    # を SMH に振った事案) → score=0 強制で確実に発注ブロック。
+    # TECH カテゴリも同様だが、TECH は範囲が広いため確実な検出が難しく、
+    # 半導体ほど明瞭ではない (Microsoft/Apple 等の文脈推定が必要) → SEMI_STRONG のみ厳格化。
+    final_score = int(result.get("score", 0))
+    final_category = (result.get("category") or "").upper()
+    if final_score != 0 and final_category == "SEMI_STRONG":
+        _semi_kw_match = _SEMI_KEYWORD_REGEX.search(" ".join(headlines[:5]) if headlines else "")
+        if not _semi_kw_match:
+            log.info(
+                f"[META] {trigger_symbol} カテゴリ矛盾検出 (SEMI_STRONG なのに半導体KW無) "
+                f"→ score={final_score}→0 強制  headline={(headlines[0] if headlines else '')[:140]!r}"
+            )
+            note_parts.append(
+                f"METAカテゴリ矛盾 SEMI_STRONG/半導体KW無 → score {final_score}→0 強制"
+            )
+            result["score"] = 0
+            _meta_filter_zeroed_count += 1
+
+    # ── ★ v3.9.17: ③.5 個別株サージ語彙 × ETF 強気判定 ガード (post-AI) ──────
+    # 5/13 MPWR "Surged on Robust Quarterly Results" を AI が SEMI_STRONG QQQ BUY と
+    # 判定 → 受講生 5 名同時被弾 (-$24.14 / -$21.87 / -$18.50)。
+    # ETF モード (target_symbol が None → category != "") かつ score=1 で個別株サージ
+    # 語彙 (Surged on / Soared / Jumps / Robust Quarterly) を含み、市場全体キーワード
+    # (SPY/QQQ/SMH/broader market 等) が無い場合は強制的に score=0。
+    final_score2 = int(result.get("score", 0))
+    final_category2 = (result.get("category") or "").upper()
+    is_etf_mode = final_category2 != ""  # 個別株モードは category 出力なし → ""
+    if final_score2 == 1 and is_etf_mode and headlines:
+        _hl_joined2 = " ".join(headlines[:5])
+        _surge_match = _STOCK_SURGE_REGEX.search(_hl_joined2)
+        _market_match = _MARKET_WIDE_REGEX.search(_hl_joined2)
+        if _surge_match and not _market_match:
+            log.info(
+                f"[META] {trigger_symbol} 個別株サージ × ETF 強気判定 検出 → score=1→0 強制 "
+                f"(surge={_surge_match.group(0)!r}): "
+                f"headline={(headlines[0] if headlines else '')[:140]!r}"
+            )
+            note_parts.append(
+                f"META個別株サージ ({_surge_match.group(0)!r}) → score 1→0 強制 (連想罠ガード)"
+            )
+            result["score"] = 0
+            _meta_filter_zeroed_count += 1
+
+    # ── ★ v3.9.10: ④ エネルギー価格 + ETF 整合性チェック (post-AI) ───────────
+    # ガス/原油等のエネルギー価格関連ヘッドラインで AI が QQQ/SMH を beneficiaries に
+    # 入れた場合、それは誤分類 (エネルギー価格 → MACRO → SPY のはず) → 該当銘柄を除外。
+    if int(result.get("score", 0)) != 0:
+        _hl_joined = " ".join(headlines[:5]) if headlines else ""
+        if _ENERGY_PRICE_REGEX.search(_hl_joined):
+            _bene = list(result.get("beneficiaries") or [])
+            _vict = list(result.get("victims") or [])
+            _removed = []
+            for tech_etf in ("QQQ", "SMH"):
+                if tech_etf in _bene:
+                    _bene.remove(tech_etf); _removed.append(f"bene-{tech_etf}")
+                if tech_etf in _vict:
+                    _vict.remove(tech_etf); _removed.append(f"vict-{tech_etf}")
+            if _removed:
+                log.info(
+                    f"[META] {trigger_symbol} エネルギー価格→TECH/SEMI 誤マッチ除外: "
+                    f"{','.join(_removed)} を除外  headline={(headlines[0] if headlines else '')[:140]!r}"
+                )
+                note_parts.append(f"METAエネルギー誤マッチ {','.join(_removed)} 除外")
+                result["beneficiaries"] = _bene
+                result["victims"] = _vict
+                # 全 ETF が空になった場合は score=0 強制 (発注対象なし)
+                if not _bene and not _vict:
+                    result["score"] = 0
+                    note_parts.append("→ ETF 全除外で score=0 強制")
+                    _meta_filter_zeroed_count += 1
+
+    # ── reason 欄に追記 (Discord 通知/Sheet ログ追跡用) ──────────────────────
+    if note_parts:
+        existing = (result.get("reason") or "").strip()
+        # 既存 reason の末尾に "|" 区切りで追記
+        result["reason"] = (existing + " | " + " | ".join(note_parts)).strip(" |")
+
+    return result
+
+
+# ── ★ v3.9.10: カテゴリ × キーワード整合性チェック用 regex ───────────────────
+# SEMI_STRONG カテゴリ判定時の妥当性検証 (post-AI 検証用)。
+# 半導体関連で頻出する銘柄名・専門用語を網羅。
+_SEMI_KEYWORD_REGEX = re.compile(
+    r'\b(?:chip|chips|semiconductor|semiconductors|wafer|fab|fabs|fabless|foundry|'
+    r'nvda|nvidia|tsm|tsmc|amd|avgo|broadcom|mu|micron|qcom|qualcomm|intc|intel|'
+    r'amat|applied\s+materials|asml|lrcx|lam\s+research|klac|nxpi|stmicro|stm|'
+    r'smh|soxx|soxl|gpu|cpu|h100|h200|blackwell|hopper|cuda|hbm|tsmc|samsung\s+foundry|'
+    r'memory\s+chip|dram|nand|flash\s+memory|silicon|microprocessor|cmos|asic)\b',
+    re.IGNORECASE
+)
+# エネルギー価格関連の検出用 regex (ETF 整合性チェック用)。
+# ガス/原油/エネルギー価格関連ヘッドラインで QQQ/SMH を巻き込むのを防ぐ。
+_ENERGY_PRICE_REGEX = re.compile(
+    r'\b(?:'
+    r'gas\s+price|gasoline\s+price|oil\s+price|fuel\s+price|energy\s+price|diesel\s+price|'
+    r'\$\d+\s+gas|\$\d+\s+oil|crude\s+oil|brent\s+crude|wti\s+crude|'
+    r'opec\s+production|gas\s+holiday|gas\s+tax|fuel\s+tax|'
+    r'california\s+gas'
+    r')\b',
+    re.IGNORECASE
+)
+
+# ★ v3.9.18: 観測記事プレフィルタ (AI 呼出前にハードブロック)。
+# 5/8-5/14 の 4 連続日次レポートで指摘されていた継続課題:
+#   - 5/14 "Stock market today: Dow retakes 50,000 level" 11件 -$130.13
+#   - 5/13 "Barbarians meet their new gatekeepers" 2件 -$12.60
+#   - 5/12 "Consumer spending… gas prices remain a risk" 22件 -$74.27
+#   - 累計推定 -$220 以上の機会損失
+# これらは「相場の様子を解説するだけの記事」で、価格に直接影響しない (= score=0 が正解)。
+# AI に判定させるとラッキー勝ち/負けで結果が運任せになるため、呼出前に regex で除外する。
+# Anthropic API コスト削減効果もある (1 件あたり ~$0.0005 削減)。
+_OBSERVATION_HEADLINE_REGEX = re.compile(
+    r'^(?:'
+    # 「Stock market today: ...」「Dow retakes ...」型のマーケットサマリ記事
+    r'stock\s+market\s+today\b|'
+    r'(?:dow|s&p\s*500?|nasdaq|wall\s+street|stocks?)\s+(?:retakes?|reclaims?|hits?|tops?|crosses?)|'
+    r'(?:dow|s&p\s*500?|nasdaq)\s+(?:jones\s+)?(?:closes?|finishes?|ends?|opens?)\s+(?:higher|lower|up|down|flat|mixed)|'
+    # 「today, [曜日], [月] [日], [年]」型の日次価格レポート
+    r'(?:bitcoin|ethereum|crypto|gold|oil|stocks?)\s+(?:and\s+\w+\s+)?prices?\s+today\b|'
+    r'(?:asian|european|us|global)\s+(?:stocks?|markets?|shares?)\s+(?:today|open|close|finish)|'
+    # 「Live updates / Market Digest / Market Wrap」型の集約記事
+    r'live\s+updates?\b|'
+    r'market\s+(?:digest|wrap|recap|roundup|update|brief)\b|'
+    r'(?:weekly|daily|monthly)\s+(?:market\s+)?(?:wrap|recap|roundup|preview|outlook)|'
+    # 「What is X? / Explained: X」型の解説記事
+    r'(?:explained|explainer)[:\s]|'
+    r'what\s+is\s+(?:a\s+)?(?:perpetual|defi|crypto|bitcoin|ethereum|nft|dao|dex)\b|'
+    # 「Barbarians meet... / wealthtech middlemen」型の論評記事
+    r'(?:barbarians|middlemen|gatekeepers|insiders)\s+(?:meet|face|battle|fight)|'
+    # ★ v3.9.24 追加: 「Tech stocks today: ...」プレフィックス
+    # 5/18 で 3 件 -$31.20、5/8/5/13/5/14 でも累計 -$80+ の損失源
+    r'tech\s+stocks?\s+today\b|'
+    # ★ v3.9.24 追加: 「Analyst Report: {企業名}」型 (アナリストレポート集約記事)
+    # 5/18 で +$22.97 のラッキー勝ち。長期的には方向性なしで運に依存
+    r'analyst\s+report\s*:\s*\w+|'
+    # ★ v3.9.24 追加: 訴訟・判決ニュース (株価への直接的影響は限定的)
+    # 5/18 利用者C -$28.22 "U.S. Jury Finds OpenAI, Sam Altman Not Liable" 型
+    r'(?:u\.?\s*s\.?\s+|federal\s+|state\s+|district\s+|supreme\s+)?(?:jury|court|judge)\s+'
+    r'(?:finds?|rules?|orders?|sides?\s+with|dismisses?|throws?\s+out|tosses?)|'
+    r'(?:found|ruled|deemed)\s+not\s+liable\b|'
+    r'verdict\s+in\s+(?:lawsuit|case|trial)|'
+    # ★ v3.9.27 追加: 新興国の金融政策ニュース (米国 ETF への波及は限定的)
+    # 5/20 利用者A 3 名 "Zambia and Angola announce rate cuts, boosting the construction industry"
+    # 3 件 -$75.04 (当日損失の 79%)。中国/日本/EU/UK/米国は US 連動性が高いため除外。
+    r'\b(?:zambia|angola|argentina|venezuela|nigeria|kenya|egypt|ghana|'
+    r'pakistan|bangladesh|sri\s+lanka|vietnam|indonesia|philippines|'
+    r'turkey|south\s+africa|chile|peru|colombia|brazil|mexico|'
+    r'thailand|malaysia|morocco|tunisia|kazakhstan|uzbekistan)\b'
+    r'(?:\s+and\s+\w+(?:\s+\w+)?)?'   # "Zambia and Angola" 連結対応 (最大 2 単語)
+    r'\s+(?:announces?|announced|cuts?|cutting|raises?|raising|'
+    r'hikes?|hiking|lowers?|lowering|holds?)\s+'
+    r'(?:interest\s+|policy\s+|key\s+)?(?:rates?|interest)|'
+    # ★ v3.9.27 追加: 自動車個別企業の生産地移管ニュース (TECH ETF への波及は限定的)
+    # 5/20 3 名 "GM to shift some production from Asia to Mexico from 2027" -$8.42
+    # 生産移管は単一企業の経営判断で、TECH/SEMI/MACRO のいずれにも該当しない。
+    r'\b(?:gm|general\s+motors|ford|stellantis|toyota|honda|nissan|hyundai|kia|'
+    r'volkswagen|vw|bmw|mercedes|audi|mazda|subaru|mitsubishi|chrysler|jeep|'
+    r'rivian|lucid|polestar|tesla|byd|nio|xpeng|li\s+auto)\s+'
+    r'(?:to\s+|plans?\s+to\s+|will\s+|is\s+)?'
+    r'(?:shifts?|moves?|relocates?|transfers?|migrates?|shifting|moving|'
+    r'relocating|transferring|migrating)\s+'
+    r'(?:some\s+|all\s+|partial\s+|its\s+|the\s+)?'
+    r'(?:production|manufacturing|assembly|operations|factory|plant)'
+    r')',
+    re.IGNORECASE
+)
+
+# ★ v3.9.31: 純粋な市場コメンタリー記事 (ETF・個別株 両モードでブロック)。
+# 5/21 "Sector Update: Tech Stocks Advance Thursday Afternoon" を Finnhub(NVDA)
+# 経由で AI が NVDA-STOCK 判定 (conf=0.66) → 強制損切り -$28.99。
+# これは「セクター全体の値動きを後追い解説する記事」で、特定銘柄の材料ではない。
+# _OBSERVATION_HEADLINE_REGEX は ETF モード専用だが、本 regex は個別株モードでも
+# 適用する (どの銘柄にとっても売買材料にならない純粋な市況サマリのため)。
+_MARKET_COMMENTARY_REGEX = re.compile(
+    r'^(?:'
+    # 「Sector Update: ...」型
+    r'sector\s+update\b|'
+    # 「Tech Stocks Advance Thursday Afternoon」型 (セクター名 + 値動き動詞)
+    r'(?:tech|chip|semiconductor|semi|energy|financial|bank|retail|'
+    r'health(?:care)?|industrial|utility|utilities|consumer|materials?|'
+    r'auto|airline)\s+stocks?\s+'
+    r'(?:advance|advances|climb|climbs|rise|rises|gain|gains|jump|jumps|'
+    r'slip|slips|fall|falls|drop|drops|retreat|retreats|rally|rallies|'
+    r'slide|slides|edge|edges|trade|trades|move|moves|mixed)\b|'
+    # 「Stocks Advance / Markets Edge Higher」型 (時間帯コメンタリ)
+    r'(?:stocks?|markets?|equities|shares?)\s+'
+    r'(?:advance|advances|climb|climbs|edge|edges|drift|drifts|'
+    r'mixed|wobble|wobbles|churn|churns|hover|hovers)\b'
+    r')',
+    re.IGNORECASE
+)
+
+# ★ v3.9.18: Bitcoin / Crypto 系ヘッドライン除外 (ETF モードでは無関係)。
+# 5/12 "Bitcoin and ethereum prices today" 13件 +$171 (ラッキー勝ち)
+# 5/14 "Explained: What is a perpetual DEX?" 13件 +$287.52 (大ラッキー勝ち)
+# 上昇相場では偶然勝てるが、下落相場では同じ仕組みで大損する → 長期勝率 50% 以下になる。
+# ETF モードでは AI 判定対象外 (score=0)。個別株モードで Coinbase 等の銘柄判定は影響なし。
+# 注意: 適切な企業ニュース ("Coinbase Q3 Beat" 等) を誤検知しないよう、
+#       「価格動向」「DeFi 解説」系のみマッチする厳格パターンに限定。
+_CRYPTO_HEADLINE_REGEX = re.compile(
+    r'(?:'
+    # 価格動向系
+    r'\bbitcoin\s+(?:and\s+\w+\s+)?prices?\b|'
+    r'\bethereum\s+prices?\b|'
+    r'\b(?:btc|eth)\s+(?:price|prices|surge|surges|jumps|drops|plunges)\b|'
+    r'\b(?:bitcoin|ethereum)\s+(?:surges?|jumps?|soars?|plunges?|crashes?)\s+(?:past|above|below|to)\b|'
+    # DeFi / 暗号資産インフラ解説系
+    r'\bperpetual\s+dex\b|'
+    r'\bdecentralized\s+(?:exchange|finance|defi)\b|'
+    r'\b(?:defi|crypto)\s+(?:primer|explained|explainer|guide|overview|deep\s+dive)\b|'
+    r'\bstablecoins?\s+(?:tokenization|driving|adoption|surge)\b|'
+    # 規制・ETF 系
+    r'\b(?:bitcoin|ethereum|crypto)\s+etf\b|'
+    r'\b(?:bitcoin|ethereum)\s+(?:halving|halvening)\b'
+    r')',
+    re.IGNORECASE
+)
+
+
+# ★ v3.9.17: 個別株サージ語彙ガード (ETF モード post-AI 検証)。
+# 5/13 MPWR (Monolithic Power Systems) "Surged on Robust Quarterly Results" を AI が
+# SEMI_STRONG/QQQ BUY と誤判定 → 受講生 5 名同時被弾 (-$24.14 / -$21.87 / -$18.50)。
+# 個別企業の単独サージ動詞 (Surged/Soared/Jumps/Spikes/Rallies) を含むヘッドラインは
+# ETF 強気判定に乗ってはいけない (織込済・連想罠)。ETF 名 (SPY/QQQ/SMH) や市場全体
+# キーワード (broader market / s&p 500 / nasdaq / market rally) が同居している場合は
+# 個別株ではなく市場全体の動きなので除外。
+#
+# ★ v3.9.21 拡張: 5/15-5/16 で「個別企業の決算電話/Transcript/IPO」型でも
+# 同様の被害が判明 (利用者Q SPY -$47.88 "Eos Energy Q1 2026 Earnings Call Summary",
+# 利用者F QQQ -$23.00 "Innovate (VATE) Q1 2026 Earnings Transcript",
+# Cerebras IPO で 3 名 -$37 等)。これらは「決算/IPO ニュース = 個別企業特有」で
+# ETF 全体への波及は限定的。語彙を拡張してハードガード。
+_STOCK_SURGE_REGEX = re.compile(
+    r'(?:'
+    # 単独サージ動詞 (v3.9.17 既存)
+    r'\bsurged?\s+(?:on|after|to|amid|following)\b|'
+    r'\bsoared?\s+(?:on|after|to|amid|following)\b|'
+    r'\bjumps?\s+(?:on|after|to|amid|following)\b|'
+    r'\bspikes?\s+(?:on|after|to|amid|following)\b|'
+    r'\brallies?\s+(?:on|after|to|amid|following)\b|'
+    r'\bclimbs?\s+(?:on|after|to|amid|following)\b|'
+    r'\brobust\s+quarterly\s+results?\b|'
+    r'\bshares?\s+(?:are\s+)?trading\s+higher\s+after\b|'
+    # ★ v3.9.21 追加: 個別企業の決算電話/Transcript 型
+    r'\bq[1-4]\s+\d{4}\s+earnings\s+(?:call\s+)?(?:summary|highlights|transcript|recap)\b|'
+    r'\bearnings\s+call\s+(?:summary|highlights|transcript|recap)\b|'
+    r'\bq[1-4]\s+earnings\s+call\b|'
+    # ★ v3.9.21 追加: 個別企業の IPO ニュース
+    r'\b(?:stock\s+)?opens?\s+at\s+\$\d+(?:\.\d+)?\s+per\s+share\b|'
+    r'\bbiggest\s+ipo\s+of\s+\d{4}\b|'
+    r'\b(?:debuts?|launched?)\s+(?:at|with)\s+\$\d+(?:\.\d+)?\b|'
+    # ★ v3.9.21 追加: 提携・大型契約 (個別企業主導)
+    r'\bcommits?\s+\$\d+(?:\.\d+)?\s*(?:b|billion)\b|'
+    r'\binvests?\s+\$\d+(?:\.\d+)?\s*(?:b|billion)\s+in\b|'
+    # ★ v3.9.21 追加: 個別企業の決算 Beat 型
+    r'\b(?:lights?\s+up|jumps?|leaps?)\s+on\s+(?:first|second|third|fourth|q[1-4])[\-\s]*quarter\s+beat\b|'
+    r'\bon\s+(?:first|second|third|fourth)[\-\s]*quarter\s+beat\b|'
+    # ★ v3.9.24 追加: 個別企業の上場/IPO/ADS 計画ニュース
+    # 5/18 利用者A -$71.00 "Kioxia plans U.S. ADS listing amid AI memory chip boom" 型
+    r'\bplans?\s+(?:u\.?\s*s\.?\s+|american\s+|nasdaq\s+|nyse\s+)?(?:ads|adr|ipo|listing|dual\s+listing|public\s+offering)\b|'
+    r'\b(?:ads|adr)\s+listing\b|'
+    r'\bto\s+list\s+(?:on|via)\s+(?:nasdaq|nyse|otc)\b|'
+    # ★ v3.9.24 追加: 個別企業の値動き解説型 (中小型企業のスリップ/ドロップ)
+    # 5/18 コバ -$1.14 "Mattel (MAT) Slipped Due to Unexpected Incremental Spending" 型
+    r'\bslip(?:s|ped|ping)?\s+(?:due\s+to|on|after|amid|because\s+of)\b|'
+    r'\b(?:dropped?|fell|tumbled|slid)\s+(?:due\s+to|on|after|amid|because\s+of)\s+(?:unexpected|disappointing|weak|lower)\b|'
+    # ★ v3.9.26 追加: JV (Joint Venture) / M&A 大型契約型 (市場全体キーワードなし)
+    # 5/19 "Blackstone Commits $5B Equity To Launch Joint Venture With Google" 6件 -$23.93
+    # → broader market / S&P 500 が同居していなければ単一企業の話で ETF 波及は限定的
+    r'\b(?:commits?|invests?|pledges?)\s+\$?\d+(?:\.\d+)?\s*(?:b|billion|bn|m|million|mm)?\s+'
+    r'(?:equity\s+)?(?:to\s+|in\s+|for\s+)?'
+    r'(?:launches?|forms?|creates?|establishes?|forges?|expands?|builds?)\s+'
+    r'(?:[\w\-]+\s+){0,3}(?:joint\s+venture|jv|partnership|alliance)\b|'
+    # 「JV with [Company]」/ 「Joint Venture with [Company]」短縮形
+    r'\b(?:joint\s+venture|jv|strategic\s+partnership)\s+with\s+[A-Z]\w'
+    r')',
+    re.IGNORECASE
+)
+# 市場全体キーワード (個別株サージガードの除外条件)。
+# これらが同居していれば「個別株単独」ではなく「市場全体の動き」と判定。
+_MARKET_WIDE_REGEX = re.compile(
+    r'\b(?:'
+    r'spy|qqq|smh|broader\s+market|s&p\s*500|s\s*&\s*p\s*500|sp\s*500|sp500|'
+    r'nasdaq|dow|dow\s+jones|stocks?\s+(?:rally|rallied|surge|surged|jump|jumped)|'
+    r'wall\s+street|market\s+(?:rally|rallied|surge|surged)'
+    r')\b',
+    re.IGNORECASE
+)
+
+
+async def analyze_news(
+    client: anthropic.Anthropic,
+    headlines: list[str],
+    trigger_symbol: str,       # ログ用
+    target_symbol: Optional[str] = None,  # v1.3.0: 個別株モード時の対象銘柄。None=ETFモード
+    market_context: str = "",  # ★ v2.92: マクロ環境（直近騰落率）の文脈を AI に追加
+) -> dict:
+    # ── ★ v3.9.6: 「発注しない」セッションは Anthropic API 呼出を完全スキップ ──
+    # setup_wizard で CONFIDENCE_PREMARKET=2.00 等の sentinel を設定したセッションは、
+    # AI が何を返しても発注に至らない (confidence の上限 1.0 < 閾値 2.0)。
+    # 旧設計では AI を呼んでから confidence < threshold で発注ブロックしていたため、
+    # 「発注は止まるが Anthropic API は消費される」状態だった。
+    # ここで先回りして API 呼出自体をスキップし、コストを実質ゼロにする。
+    _disabled, _sess_name = is_current_session_disabled()
+    if _disabled:
+        log.info(
+            f"[{trigger_symbol}] [AI判定スキップ] セッション {_sess_name} は発注しない設定 "
+            f"(CONFIDENCE_{_sess_name.upper()}≥2.0 sentinel) → Anthropic API 呼出回避"
+        )
+        return {
+            "score":         0,
+            "confidence":    0.0,
+            "horizon":       "skip",
+            "reason":        f"session-disabled ({_sess_name})",
+            "category":      "MACRO",
+            "beneficiaries": [],
+            "victims":       [],
+        }
+
+    # ── ★ v3.9.63: クレジット切れ中は API バックオフ (無駄打ち + ERROR スパム防止) ──
+    # 検知後は 30 分ごとの復旧プローブ枠以外は API を叩かず即中立スキップ。
+    if _anthropic_credit_exhausted and not _anthropic_credit_probe_due():
+        global _anthropic_skip_count
+        _anthropic_skip_count += 1
+        log.debug(
+            f"[{trigger_symbol}] [AI判定スキップ] Anthropic クレジット切れ中・"
+            f"バックオフ (累計スキップ {_anthropic_skip_count}) → 中立"
+        )
+        return {
+            "score": 0, "confidence": 0.0, "horizon": "unknown",
+            "reason": "Anthropic クレジット切れ（バックオフ中・中立スキップ）",
+            "category": "MACRO", "beneficiaries": [], "victims": [],
+        }
+
+    # ── ★ v3.9.31: 市場コメンタリー記事のプレフィルタ (ETF・個別株 両モード) ──
+    # 「Sector Update」「Tech Stocks Advance」型は、どの銘柄にとっても売買材料に
+    # ならない純粋な市況サマリ。ETF モード専用の観測記事フィルタとは別に、
+    # 個別株モードも含めて AI 呼出前にハードブロックする。
+    _first_hl_mc = (headlines[0] if headlines else "").strip()
+    _mc_match = _MARKET_COMMENTARY_REGEX.search(_first_hl_mc)
+    if _mc_match:
+        _pat_mc = _mc_match.group(0)
+        log.info(
+            f"[{trigger_symbol}] [AI判定スキップ] 市場コメンタリー記事検出 "
+            f"(pattern={_pat_mc!r}): {_first_hl_mc[:120]!r} → score=0 強制 (Anthropic API 呼出回避)"
+        )
+        try:
+            _log_observation(
+                symbol=(target_symbol or trigger_symbol),
+                side="BUY", confidence=0.0, score=0,
+                category="MACRO", headlines=headlines,
+                beneficiaries=[], victims=[],
+                outcome="blocked", block_stage="market_commentary",
+                block_reason=f"prefilter pattern={_pat_mc!r}",
+                price_at_decision=0.0,
+            )
+        except Exception:
+            pass
+        return {
+            "score":         0,
+            "confidence":    0.0,
+            "horizon":       "skip",
+            "reason":        f"市場コメンタリー記事プレフィルタ ({_pat_mc[:30]})",
+            "category":      "MACRO",
+            "beneficiaries": [],
+            "victims":       [],
+        }
+
+    # ── ★ v3.9.18: 観測記事 / Crypto 系ヘッドラインのプレフィルタ ──────────────
+    # AI 呼出前に regex でハードブロック。ETF モードのみ対象 (個別株モードは
+    # Coinbase 等の個別判定に影響しないよう除外)。
+    # 過去 4 連続日次レポートで指摘された累計 -$220+ の機会損失への対策。
+    if not target_symbol:  # ETF モードのみ
+        _first_hl = (headlines[0] if headlines else "").strip()
+        _obs_match    = _OBSERVATION_HEADLINE_REGEX.search(_first_hl)
+        _crypto_match = _CRYPTO_HEADLINE_REGEX.search(_first_hl)
+        if _obs_match or _crypto_match:
+            _stage  = "observation_headline" if _obs_match else "crypto_headline"
+            _kind   = "観測記事" if _obs_match else "Crypto系"
+            _pat    = (_obs_match or _crypto_match).group(0)
+            log.info(
+                f"[{trigger_symbol}] [AI判定スキップ] {_kind}ヘッドライン検出 "
+                f"(pattern={_pat!r}): {_first_hl[:120]!r} → score=0 強制 (Anthropic API 呼出回避)"
+            )
+            # 観察ログ記録 (集計用)。pnl60 バックフィルでフィルタの妥当性を後で検証可能。
+            try:
+                _log_observation(
+                    symbol=trigger_symbol, side="BUY", confidence=0.0, score=0,
+                    category="MACRO", headlines=headlines,
+                    beneficiaries=[], victims=[],
+                    outcome="blocked", block_stage=_stage,
+                    block_reason=f"prefilter pattern={_pat!r}",
+                    price_at_decision=0.0,
+                )
+            except Exception:
+                pass  # 観察ログ失敗は本判定に影響させない
+            return {
+                "score":         0,
+                "confidence":    0.0,
+                "horizon":       "skip",
+                "reason":        f"{_kind}プレフィルタ ({_pat[:30]})",
+                "category":      "MACRO",
+                "beneficiaries": [],
+                "victims":       [],
+            }
+
+    combined = "\n".join(f"- {h}" for h in headlines[:5])
+    # ★ v1.3.0 統合版: 判定モードを user メッセージ冒頭で指定する。
+    # システムプロンプト側に {symbol} を埋めずに済むため、全リクエストが同一の
+    # SYSTEM_PROMPT キャッシュをヒットする (ETF/個別株すべて共通キャッシュ)。
+    if target_symbol:
+        mode_line = f"判定モード: 個別株 / 対象銘柄: {target_symbol}"
+    else:
+        mode_line = "判定モード: ETF（SEMI_STRONG / SEMI / TECH / MACRO のカテゴリ分類）"
+    parts = [mode_line]
+    # ★ v2.92: market_context が指定されている場合は mode_line の直後に付加。
+    # 5/4 NY11時の急落事案で、相場全体の流れを AI が考慮できなかった問題への対策。
+    if market_context:
+        parts.append(market_context)
+    parts.append(f"以下のニュースヘッドラインを判定してください:\n{combined}")
+    user_msg = "\n\n".join(parts)
+    raw = ""
+    try:
+        # ★ v1.3.0: system は統合 SYSTEM_PROMPT のみ。cache_control で Prompt Caching 有効化。
+        # ETF / 個別株モード両方が 4,096 tok 超の同一キャッシュをヒット → 高ヒット率。
+        # user 側 (動的: モード行 + market_context + headlines) はキャッシュ対象外。
+        # ★ v3.8.4: max_tokens 1500→1000 に縮小 (ログ実測で max=1009 / avg=266、
+        # 99.98% は 1000 以下なので通常運用への影響なし)。万一切断されても result
+        # は中立判定にフォールバックするため安全。
+        # ★ v3.8.4 / v3.9.1: stop_sequences で JSON 後にコメント生成を停止 (output 削減)。
+        # ★ v3.9.1: Anthropic API 仕様変更により「空白のみの stop_sequence」が
+        # 400 invalid_request_error になったため、"\n\n" を削除し非空白文字を含む
+        # パターンに差し替え。エラー本文:
+        #   "stop_sequences: each stop sequence must contain non-whitespace"
+        #   - "\n```":  改行+コードフェンス (markdown 装飾の典型開始)
+        #   - "\nNote:": 英語の補足コメント開始
+        #   - "\nなお": 日本語の補足コメント開始
+        #   - "\n注:":  日本語の「注:」開始
+        # 共通: JSON 本体は 1 行記述 (改行禁止) を厳守させているため、これらの
+        # シーケンスが現れた = AI がコメント生成に入ったタイミング。
+        # ── ★ v3.9.13: 並列 API 呼出シリアライズ + 最小間隔ガード ──────────────
+        # 全 async ループ (external/alpaca/global/stock/earnings) が共通の
+        # _anthropic_api_lock (Semaphore(1)) を待つことで、サーバー側への
+        # 同時着弾を排除。さらに最小 ANTHROPIC_MIN_INTERVAL_SEC 秒の間隔を空ける。
+        # 5/13 04:44 観測の 529 連発 (異なるヘッドラインの並列発火) への根本対策。
+        # _anthropic_api_lock が未初期化 (テスト等) なら直列化なしで動作 (後方互換)。
+        if _anthropic_api_lock is not None:
+            async with _anthropic_api_lock:
+                global _last_anthropic_call_time
+                if _last_anthropic_call_time is not None and ANTHROPIC_MIN_INTERVAL_SEC > 0:
+                    elapsed = (datetime.datetime.now() - _last_anthropic_call_time).total_seconds()
+                    if elapsed < ANTHROPIC_MIN_INTERVAL_SEC:
+                        _wait = ANTHROPIC_MIN_INTERVAL_SEC - elapsed
+                        log.debug(
+                            f"[{trigger_symbol}] [API直列化] 前回呼出から {elapsed:.2f}秒 "
+                            f"→ {_wait:.2f}秒待機"
+                        )
+                        await asyncio.sleep(_wait)
+                _last_anthropic_call_time = datetime.datetime.now()
+                # ★ v3.9.60: 529/503/overloaded で指数バックオフ再試行
+                response = await asyncio.to_thread(
+                    _anthropic_create_with_retry,
+                    client,
+                    model=CLAUDE_MODEL,
+                    max_tokens=1000,
+                    stop_sequences=["\n```", "\nNote:", "\nなお", "\n注:"],
+                    system=[
+                        {
+                            "type": "text",
+                            "text": SYSTEM_PROMPT,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                    messages=[{"role": "user", "content": user_msg}],
+                )
+        else:
+            # フォールバック (semaphore 未初期化時): 従来通り直列化なし
+            # ★ v3.9.60: ここでもリトライ機能を適用
+            response = await asyncio.to_thread(
+                _anthropic_create_with_retry,
+                client,
+                model=CLAUDE_MODEL,
+                max_tokens=1000,
+                stop_sequences=["\n```", "\nNote:", "\nなお", "\n注:"],
+                system=[
+                    {
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[{"role": "user", "content": user_msg}],
+            )
+        # ★ v3.0.0: Prompt Cache 統計を DEBUG ログ出力
+        # cache_creation > 0 → 書込発生 / cache_read > 0 → ヒット (90% off)
+        # 両方0 → キャッシュ未到達 (4,096 tok 未満の可能性) / getattr で安全取得
+        _usage = getattr(response, "usage", None)
+        if _usage is not None:
+            _cw = getattr(_usage, "cache_creation_input_tokens", 0) or 0
+            _cr = getattr(_usage, "cache_read_input_tokens", 0) or 0
+            _in = getattr(_usage, "input_tokens", 0) or 0
+            _ot = getattr(_usage, "output_tokens", 0) or 0
+            log.debug(
+                f"[{trigger_symbol}] AI usage: "
+                f"in={_in} cache_write={_cw} cache_read={_cr} out={_ot}"
+            )
+            # ★ v3.5.1: 時間帯別バケットに記録 (1時間ごとサマリ用)
+            _record_cache_usage(_cw, _cr, _in, _ot)
+        raw     = response.content[0].text.strip()
+        # ── JSON パース戦略 (優先順位順) ──────────────────────────────────────
+        # ① コードフェンス除去 + json.loads 直接 (最も確実)
+        # ② regex で [...] 抽出 / ③ {...} 抽出 / ④ 複数JSONブロックを順次試行
+        # ★ v2.80: 旧版の "arr_match優先" は {"beneficiaries":["QQQ"]} のネスト配列を
+        # 誤マッチして "Extra data" 多発 → 上記順序に変更で根本解決。
+        cleaned = re.sub(r"```[a-zA-Z]*\s*", "", raw)  # 開始フェンス除去
+        cleaned = re.sub(r"\s*```", "", cleaned)         # 終了フェンス除去
+        cleaned = cleaned.strip()
+        result  = None
+
+        # ── ① json.loads 直接パース ──────────────────────────────────────────
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, list) and len(parsed) > 0:
+                # 配列: score != 0 のものを優先、なければ先頭
+                result = next(
+                    (x for x in parsed if isinstance(x, dict) and x.get("score", 0) != 0),
+                    parsed[0] if isinstance(parsed[0], dict) else None
+                )
+                if result:
+                    log.debug(f"[{trigger_symbol}] AI配列レスポンス(直接) → {len(parsed)}件中1件を選択")
+            elif isinstance(parsed, dict):
+                result = parsed
+        except json.JSONDecodeError:
+            pass  # フォールバックへ
+
+        # ── ② フォールバック: 正規表現で最外の [...] を抽出 ─────────────────
+        if result is None:
+            # 先頭の [ から対応する ] を探す（ネスト考慮のため re.DOTALL で最外のみ）
+            arr_m = re.search(r'^\s*\[', cleaned)  # 先頭付近の [
+            if not arr_m:
+                # 前置きテキスト後に配列がある場合 ("各ニュースを判定します。\n\n[...]")
+                arr_m = re.search(r'\n\s*\[', cleaned)
+            if arr_m:
+                # [ 以降を抽出して json.loads
+                sub = cleaned[arr_m.start():].strip()
+                try:
+                    parsed = json.loads(sub)
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        result = next(
+                            (x for x in parsed if isinstance(x, dict) and x.get("score", 0) != 0),
+                            parsed[0] if isinstance(parsed[0], dict) else None
+                        )
+                        if result:
+                            log.debug(f"[{trigger_symbol}] AI配列レスポンス(正規表現) → {len(parsed)}件中1件を選択")
+                except json.JSONDecodeError:
+                    pass
+
+        # ── ③ フォールバック: 正規表現で {...} を抽出 ────────────────────────
+        if result is None:
+            obj_m = re.search(r'\{.*?\}', cleaned, re.DOTALL)
+            if obj_m:
+                try:
+                    result = json.loads(obj_m.group(0))
+                except json.JSONDecodeError:
+                    pass
+
+        # ── ④ フォールバック: 複数JSONブロック（AIが件数分を個別ブロックで返す場合）─
+        # 例: ```json\n{...}\n```\n\n```json\n{...}\n```\n
+        if result is None:
+            _blocks = re.findall(r'\{[^{}]+\}', cleaned)
+            for _b in _blocks:
+                try:
+                    _parsed = json.loads(_b)
+                    if isinstance(_parsed, dict) and "score" in _parsed:
+                        if _parsed.get("score", 0) != 0 or result is None:
+                            result = _parsed
+                        if _parsed.get("score", 0) != 0:
+                            break  # score!=0が見つかれば確定
+                except json.JSONDecodeError:
+                    continue
+
+        # ── ⑤ ★ v3.9.60: AI 散文応答からの score 抽出 ────────────────────────────
+        # AI が「以下の4件を評価:\n1. ...→ score = 0\n2. ...→ score = 0」のような
+        # 散文形式で応答した場合、JSON ブロックが存在せず ①〜④ が全て失敗する。
+        # 散文中の "score = N" / "score: N" / '"score": N' パターンを抽出する。
+        # 全件 0 = 確定的に中立 / 1件でも非0 = 低 confidence(0.30) で抽出
+        # 発注閾値 (STRONG_BUY_CONFIDENCE) には届かないため誤発注リスクなし。
+        if result is None:
+            _score_matches = re.findall(
+                r'\bscore["\s\']*[:=][\s\']*(-?[01])\b',
+                cleaned,
+                re.IGNORECASE,
+            )
+            if _score_matches:
+                _scores = [int(s) for s in _score_matches]
+                _nonzero = next((s for s in _scores if s != 0), None)
+                if _nonzero is None:
+                    # 全件中立 → 確定的に score=0
+                    result = {
+                        "score": 0,
+                        "confidence": 0.0,
+                        "horizon": "unknown",
+                        "reason": f"AI散文応答 (全 {len(_scores)} 件が score=0)",
+                        "beneficiaries": [],
+                        "victims": [],
+                        "category": "MACRO",
+                    }
+                    log.info(
+                        f"[{trigger_symbol}] AI 散文応答を中立抽出: "
+                        f"全 {len(_scores)} 件 score=0 → 中立扱い"
+                    )
+                else:
+                    # 散文中に score=±1 を検出 → 低 confidence で扱う
+                    # confidence=0.30 は STRONG_BUY_CONFIDENCE 標準 0.70 未満で発注スキップ
+                    result = {
+                        "score": _nonzero,
+                        "confidence": 0.30,
+                        "horizon": "unknown",
+                        "reason": f"AI散文応答 (score={_nonzero} を抽出・低confidence)",
+                        "beneficiaries": [],
+                        "victims": [],
+                        "category": "MACRO",
+                    }
+                    log.info(
+                        f"[{trigger_symbol}] AI 散文応答を解析: score={_nonzero} 検出 → "
+                        f"confidence=0.30 (発注閾値未達) で扱う"
+                    )
+
+        if result is None:
+            raise json.JSONDecodeError("有効なJSONブロックが見つかりません", cleaned, 0)
+        assert result["score"] in (-1, 0, 1)
+        assert 0.0 <= result["confidence"] <= 1.0
+        result.setdefault("horizon", "unknown")
+        result.setdefault("beneficiaries", [])
+        result.setdefault("victims", [])
+        result.setdefault("category", "MACRO")   # SEMI / TECH / MACRO
+        exec_syms = {sym for syms in EXECUTION_MAP.values() for sym in syms}
+        result["beneficiaries"] = [s for s in result["beneficiaries"] if s in exec_syms]
+        result["victims"]       = [s for s in result["victims"]       if s in exec_syms]
+        # ★ v3.4.0: ヘッドライン メタフィルタ適用
+        # (ヘッジ/警告語: conf 減算 / 疑問形・二者択一: score=0 強制)
+        # 14:46 事象 (2026-05-07) のような誤判定の最後の砦。
+        # AI の判定材料は reason 欄に保持されるため、誤検知時もトレースバック可能。
+        result = _apply_meta_filter_to_ai_result(result, headlines, trigger_symbol)
+        # ★ v3.3.0: AI 呼出成功 → クレジット切れ検知中なら復旧候補カウンタを進める
+        # (2 連続成功で復旧確定し、状態リセット + 復旧通知が出る)
+        _handle_anthropic_success()
+        # ★ v3.9.63: 復旧確定前のプローブ成功時は次回を即プローブ可能にして
+        # 高速復帰させる (30 分待たずに 2 回目の成功 → 復旧確定)。
+        if _anthropic_credit_exhausted:
+            global _anthropic_credit_last_probe_at
+            _anthropic_credit_last_probe_at = None
+        _handle_anthropic_auth_recovery()   # ★ v3.9.113: 認証エラーからの回復を通知
+        return result
+    except (json.JSONDecodeError, KeyError, AssertionError) as e:
+        log.warning(f"[{trigger_symbol}] AI レスポンス解析エラー: {e}  raw={raw!r}")
+        return {"score": 0, "confidence": 0.0, "horizon": "unknown",
+                "reason": "解析エラー（中立扱い）", "beneficiaries": [], "victims": []}
+    except anthropic.APIError as e:
+        # ★ v3.3.0: クレジット切れを文字列マッチで検知 (BadRequestError も APIError 配下)
+        if _is_credit_exhausted_error(e):
+            _handle_credit_exhausted(e)
+            # 検知後は中立スキップ（ログは _handle_credit_exhausted 内で完結）
+            return {"score": 0, "confidence": 0.0, "horizon": "unknown",
+                    "reason": "Anthropic API クレジット切れ（中立スキップ）",
+                    "beneficiaries": [], "victims": []}
+        # ── ★ v3.9.17: 400 invalid_request_error の詳細ロギング ───────────────
+        # 5/13 認定サポーター環境で 49 件発生。原因特定のため status_code / body /
+        # リクエスト要素 (model, max_tokens, stop_sequences, user_msg 先頭) を出力。
+        _status = getattr(e, "status_code", None)
+        _err_type = type(e).__name__
+        if _status == 400 or "invalid_request_error" in str(e).lower():
+            try:
+                _body = getattr(e, "body", None) or getattr(e, "response", None)
+                _user_head = (user_msg[:300] + "...") if len(user_msg) > 300 else user_msg
+                _stop_seqs_repr = repr(["\n```", "\nNote:", "\nなお", "\n注:"])
+                log.error(
+                    f"[{trigger_symbol}] Anthropic 400 invalid_request 詳細: "
+                    f"err_type={_err_type} status={_status} "
+                    f"model={CLAUDE_MODEL} max_tokens=1000 "
+                    f"stop_sequences={_stop_seqs_repr} "
+                    f"prompt_ver={_PROMPTS_VERSION} prompt_len={len(SYSTEM_PROMPT)} "
+                    f"target_symbol={target_symbol or 'ETF'} headlines_cnt={len(headlines)} "
+                    f"user_msg_head={_user_head!r} "
+                    f"body={_body}"
+                )
+            except Exception as _le:
+                log.error(f"[{trigger_symbol}] Anthropic 400 詳細ロギング失敗: {_le} (元エラー: {e})")
+            return {"score": 0, "confidence": 0.0, "horizon": "unknown",
+                    "reason": f"400 invalid_request ({_err_type})",
+                    "beneficiaries": [], "victims": []}
+        # ★ v3.9.113: 認証エラー(401)は専用通知（Discord＋端末バナー・従来は無通知だった）
+        if _is_auth_error(e):
+            _handle_anthropic_auth_error(e)
+            return {"score": 0, "confidence": 0.0, "horizon": "unknown",
+                    "reason": "Anthropic API 認証エラー401（中立スキップ）",
+                    "beneficiaries": [], "victims": []}
+        # クレジット切れ・認証エラー以外の API エラーは従来通り
+        log.error(f"[{trigger_symbol}] Anthropic API エラー: {e}")
+        return {"score": 0, "confidence": 0.0, "horizon": "unknown",
+                "reason": f"APIエラー: {e}", "beneficiaries": [], "victims": []}
+
+# ── セクターキーワードによる実行銘柄の絞り込み ───────────────────────────────────────────────────
+def resolve_execution_symbols(
+    headlines: list[str],
+    trigger_symbol: str,
+    ai_candidates: list[str],
+) -> list[str]:
+    if ai_candidates:
+        return ai_candidates
+    combined_lower = " ".join(headlines).lower()
+    keyword_matched: list[str] = []
+    for kw, syms in SECTOR_KEYWORDS.items():
+        if kw in combined_lower:
+            for s in syms:
+                if s not in keyword_matched:
+                    keyword_matched.append(s)
+    if keyword_matched:
+        log.info(f"[セクター] キーワードマッチ: {keyword_matched}")
+        return keyword_matched
+    return EXECUTION_MAP.get(trigger_symbol, [])
+
+# ── moomoo API ヘルパー ─────────────────────────────────────────────────────────
+def _apply_ctx_timeout(ctx):
+    """★ v3.9.129: 接続READY待ちの無限待ちを有限化する（OpenD無応答ハング対策）。
+    SDKに set_sync_query_connect_timeout が無い旧版でも壊れないよう getattr で防御。"""
+    try:
+        _setter = getattr(ctx, "set_sync_query_connect_timeout", None)
+        if callable(_setter) and MOOMOO_CONNECT_TIMEOUT_SEC > 0:
+            _setter(MOOMOO_CONNECT_TIMEOUT_SEC)
+    except Exception:
+        pass
+    return ctx
+
+
+def _make_quote_ctx() -> OpenQuoteContext:
+    """OpenQuoteContext を生成して返す。 MOOMOO_RSA_KEY が空・None・存在しないファイルの場合は security_data_path を渡さず「暗号化なし」で接続する。"""
+    if MOOMOO_RSA_KEY and isinstance(MOOMOO_RSA_KEY, str) and os.path.isfile(MOOMOO_RSA_KEY):
+        return _apply_ctx_timeout(OpenQuoteContext(
+            host=MOOMOO_HOST, port=MOOMOO_PORT,
+            security_data_path=MOOMOO_RSA_KEY,
+        ))
+    return _apply_ctx_timeout(OpenQuoteContext(host=MOOMOO_HOST, port=MOOMOO_PORT))
+
+
+def _make_trade_ctx() -> OpenSecTradeContext:
+    """moomoo日本（FUTUJP）実口座用。OpenSecTradeContext + SecurityFirm.FUTUJP が必須。"""
+    base_kwargs = dict(host=MOOMOO_HOST, port=MOOMOO_PORT)
+    if MOOMOO_RSA_KEY and isinstance(MOOMOO_RSA_KEY, str) and os.path.isfile(MOOMOO_RSA_KEY):
+        base_kwargs["security_data_path"] = MOOMOO_RSA_KEY
+    return _apply_ctx_timeout(OpenSecTradeContext(
+        filter_trdmarket=TrdMarket.US,
+        security_firm=SecurityFirm.FUTUJP,
+        **base_kwargs,
+    ))
+
+
+# ★ v2.86: ctx リソースリーク対策の context manager
+# `_make_trade_ctx()` 直呼びは API 例外時に close() されず OpenD 接続が滞留する問題あり。
+# `with _trade_ctx() as ctx:` で例外時も確実に close される。
+import contextlib as _contextlib
+
+def _ensure_thread_event_loop() -> None:
+    """★ v3.9.71: 現スレッドに asyncio イベントループを保証する。
+
+    モメンタム実発注は `await asyncio.to_thread(place_short/place_buy, ...)` で
+    ワーカースレッド実行され、そのスレッドにはイベントループが無い。moomoo SDK
+    (OpenSecTradeContext / place_order) が内部で asyncio.get_event_loop() を呼ぶと
+    Python 3.10+ では「There is no current event loop in thread '...'」が発生する
+    (6/4 DRAM SHORT で 4 件確認)。running loop が無く current loop も無ければ
+    空ループを 1 つ用意して回避する。メインスレッド(running loop あり)では何もしない。
+    例外は握りつぶし、呼び出し元(発注)に伝播させない。
+    """
+    try:
+        asyncio.get_running_loop()
+        return  # 実行中ループあり (メインスレッド等) → 何もしない
+    except RuntimeError:
+        pass
+    try:
+        _ev = asyncio.get_event_loop_policy().get_event_loop()
+        if _ev is None or _ev.is_closed():
+            raise RuntimeError("no usable loop")
+    except Exception:
+        try:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        except Exception:
+            pass
+
+
+@_contextlib.contextmanager
+def _trade_ctx():
+    """使用例: / with _trade_ctx() as ctx: / ret, data = ctx.place_order(...) / # この時点で ctx は閉じられている（例外が出ても）"""
+    _ensure_thread_event_loop()  # ★ v3.9.71: ワーカースレッドの no-event-loop 例外を防止
+    ctx = _make_trade_ctx()
+    try:
+        yield ctx
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+
+@_contextlib.contextmanager
+def _quote_ctx():
+    """OpenQuoteContext を確実に close する context manager。
+    `_trade_ctx` と同様、API 呼び出しで例外が発生しても close を保証する。
+    """
+    ctx = _make_quote_ctx()
+    try:
+        yield ctx
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+
+def _tokutei_kwargs(trd_env: TrdEnv, is_short: bool = False) -> dict:
+    """
+    place_order に jp_acc_type を追加するための kwargs を返す。
+
+    moomoo証券サポート回答（2026-04-21）＋テスト結果（2026-05-01）に基づく実装:
+
+    【実口座】
+    - BUY / SELL(決済) : jp_acc_type = JP_TOKUTEI
+    - SELL_SHORT(空売り): jp_acc_type = JP_TOKUTEI_SHORT
+      ★ test_short_sell.py で確認済み: B-1(JP_TOKUTEI_SHORT)・B-2(JP_GENERAL_SHORT) ともに成功
+        → JP_TOKUTEI_SHORT（信用特定口座）を採用
+
+    【デモ口座】
+    - BUY / SELL(決済) : 空dict（指定不要）
+    - SELL_SHORT(空売り): デモはAPIで空売り非対応のため place_short 内でスキップ済み
+      ★ test_short_sell.py で確認済み: A-1〜A-3 全パターン失敗（moomooデモの仕様）
+    """
+    if trd_env != TrdEnv.REAL:
+        return {}  # デモ口座は空dict（空売りはplace_short内でスキップ済み）
+
+    # 実口座
+    if SubAccType is None:
+        val = "JP_TOKUTEI_SHORT" if is_short else "JP_TOKUTEI"
+        log.debug(f"[SubAccType] 旧SDK → jp_acc_type={val}（文字列指定）")
+        return {"jp_acc_type": val}
+    try:
+        val = SubAccType.JP_TOKUTEI_SHORT if is_short else SubAccType.JP_TOKUTEI
+        return {"jp_acc_type": val}
+    except AttributeError:
+        val = "JP_TOKUTEI_SHORT" if is_short else "JP_TOKUTEI"
+        log.debug(f"[SubAccType] enum属性なし → jp_acc_type={val}（文字列フォールバック）")
+        return {"jp_acc_type": val}
+
+
+def _cover_trd_side(trd_env: TrdEnv):
+    """★ v3.9.63: SHORT 建玉の決済 (買い戻し) に使う TrdSide を環境別に返す。
+
+    - 実口座 (TrdEnv.REAL / FUTUJP 信用): TrdSide.BUY_BACK
+        moomoo サポート (2026-05-08) 確認の正規仕様。
+    - デモ口座 (TrdEnv.SIMULATE): TrdSide.BUY
+        moomoo デモは BUY_BACK を受け付けず
+        「Order side must be BUY or SELL. A BUY order when short will close
+         the short position.」を返して決済が全失敗する (5/27-6/1 のログで
+        QQQ 56 回・AMZN 20 回等の決済失敗→ショート残留→entry_time 累積を確認)。
+        デモはネッティング口座のためプレーン BUY で建玉が相殺される。
+
+    旧 SDK で BUY_BACK 定数が無い場合は安全側で BUY にフォールバック。
+    """
+    if trd_env == TrdEnv.REAL:
+        return getattr(TrdSide, "BUY_BACK", TrdSide.BUY)
+    return TrdSide.BUY
+
+
+def _df_has_rows(data) -> bool:
+    """
+    moomoo API の戻り値が DataFrame でも dict でも「データが存在する」かを判定する。
+    DataFrame: not data.empty
+    dict/list: len(data) > 0
+    その他:    bool(data)
+    """
+    try:
+        # pandas DataFrame かどうかを isinstance で確認（importなしで属性チェック）
+        if hasattr(data, "empty"):
+            return not data.empty
+        if isinstance(data, dict):
+            return len(data) > 0
+        if isinstance(data, list):
+            return len(data) > 0
+        return bool(data)
+    except Exception:
+        return False
+
+
+def get_price_finnhub(symbol: str) -> float:
+    """
+    Finnhub Quote APIから現在値を取得する。
+    moomooが価格を更新しない時間帯（プリマーケット・アフターアワーズ等）の
+    フォールバックとして使用する。
+    戻り値: 現在値（float）。取得失敗時は 0.0。
+    APIキー未設定の場合は即座に 0.0 を返す。
+    """
+    if not FINNHUB_API_KEY:
+        return 0.0
+    try:
+        resp = requests.get(
+            _FINNHUB_QUOTE_URL,
+            params={"symbol": symbol, "token": FINNHUB_API_KEY},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            data  = resp.json()
+            price = float(data.get("c", 0) or 0)
+            return price if price > 0 else 0.0
+    except Exception as e:
+        log.debug(f"[Finnhub Quote] {symbol}: {_mask_secrets(e)}")
+    return 0.0
+
+
+def get_quote_alpaca(symbol: str) -> dict:
+    """
+    Alpaca Data API v2 から最新 ask/bid を取得する。
+    Alpaca の無料プランでもプリマーケット・アフターアワーズのリアルタイム
+    気配値が取得できるため、moomoo/Finnhub の stale price 対策として使用。
+
+    戻り値: {"ask": float, "bid": float}
+    取得失敗・APIキー未設定時は {"ask": 0.0, "bid": 0.0}
+    """
+    if not ALPACA_API_KEY_ID or not ALPACA_API_SECRET_KEY:
+        return {"ask": 0.0, "bid": 0.0}
+    _headers = {
+        "APCA-API-KEY-ID":     ALPACA_API_KEY_ID,
+        "APCA-API-SECRET-KEY": ALPACA_API_SECRET_KEY,
+    }
+    try:
+        resp = requests.get(
+            f"https://data.alpaca.markets/v2/stocks/{symbol}/quotes/latest",
+            headers=_headers,
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            data  = resp.json()
+            quote = data.get("quote", {})
+            ask   = float(quote.get("ap", 0) or 0)
+            bid   = float(quote.get("bp", 0) or 0)
+            if ask > 0 or bid > 0:
+                log.debug(f"[Alpaca Quote] {symbol}: ask=${ask:.2f} bid=${bid:.2f}")
+            return {"ask": ask, "bid": bid}
+    except Exception as e:
+        log.debug(f"[Alpaca Quote] {symbol}: {e}")
+    return {"ask": 0.0, "bid": 0.0}
+
+
+# ★ v3.9.77 (B-3): get_order_book がセッション内で失敗した銘柄を記憶し、以降は
+# ORDER_BOOK 購読/取得をスキップして get_stock_quote を直接使う (無駄な失敗呼出と
+# ログノイズの削減)。セッションが変わったらリセット。
+_orderbook_fail_symbols: set = set()
+_orderbook_fail_session: str = ""
+
+
+def get_quote(symbol: str) -> dict:
+    """
+    指定銘柄のリアルタイム気配値を取得して返す。
+
+    手順:
+      1. subscribe（QUOTE + ORDER_BOOK）を実行してリアルタイム配信を開始
+      2. LV1 板情報（get_order_book）から ask/bid を取得
+      3. get_stock_quote から last_price を取得
+      4. get_order_book が失敗した場合は get_stock_quote の cur_price/last_price で代替
+
+    戻り値: {"ask": float, "bid": float, "last": float}
+    取得失敗時は全て 0.0
+
+    ★ v2.90: ctx 管理を with _quote_ctx() コンテキストマネージャに統一。
+    旧コード（v2.89 まで）も `try/except + 例外時 ctx.close()` で保護されており
+    実害はなかったが、v2.86 で導入したコンテキストマネージャパターンと
+    整合させて可読性を向上。挙動は完全に同一。
+    """
+    code = to_moomoo_code(symbol)
+    try:
+        # ★ v2.90: with _quote_ctx() による自動 close。早期 return / 例外でも
+        # __exit__ が呼ばれて ctx.close() が確実に実行される。
+        # ★ v3.9.77 (B-3): セッション変化でフェイルキャッシュをリセット
+        global _orderbook_fail_session
+        try:
+            _cur_sess, _ = get_session_info()
+        except Exception:
+            _cur_sess = _orderbook_fail_session
+        if _cur_sess != _orderbook_fail_session:
+            _orderbook_fail_symbols.clear()
+            _orderbook_fail_session = _cur_sess
+        _skip_ob = symbol in _orderbook_fail_symbols
+
+        with _quote_ctx() as ctx:
+            # ── 購読処理（データ取得前に必須）──────────────────────────────────────
+            # QUOTE と ORDER_BOOK を個別に subscribe してどちらが失敗するか明確化する
+            _r_quote, _e_quote = ctx.subscribe([code], [SubType.QUOTE], subscribe_push=False)
+            if _r_quote != RET_OK:
+                log.debug(f"[subscribe] {symbol} QUOTE: {_e_quote}（取得は続行）")
+            # ★ v3.9.77 (B-3): 当セッションで get_order_book 失敗実績がある銘柄は
+            #   ORDER_BOOK 購読/取得をスキップし get_stock_quote に直行（無駄呼出削減）。
+            if not _skip_ob:
+                _r_ob, _e_ob = ctx.subscribe([code], [SubType.ORDER_BOOK], subscribe_push=False)
+                if _r_ob != RET_OK:
+                    log.debug(f"[subscribe] {symbol} ORDER_BOOK: {_e_ob}（取得は続行）")
+
+            # ── LV1 板情報（OrderBook）から ask/bid を取得 ─────────────────────────
+            ask  = 0.0
+            bid  = 0.0
+            last = 0.0
+
+            if _skip_ob:
+                ret_ob, data_ob = -1, None
+                log.debug(f"[get_quote] {symbol}: ORDER_BOOK は当セッション失敗済 → スキップ (get_stock_quote 直行)")
+            else:
+                ret_ob, data_ob = ctx.get_order_book(code, num=1)
+            if ret_ob == RET_OK and data_ob is not None:
+                try:
+                    # get_order_book は dict を返す: {"Ask": [(price, vol, cnt, detail), ...], "Bid": [...]}
+                    # DataFrame 形式の場合（レガシー互換）
+                    if hasattr(data_ob, "iloc"):
+                        ask_list = data_ob["Ask"].iloc[0] if "Ask" in data_ob.columns else []
+                        bid_list = data_ob["Bid"].iloc[0] if "Bid" in data_ob.columns else []
+                        ask = float(ask_list[0][0]) if ask_list else 0.0
+                        bid = float(bid_list[0][0]) if bid_list else 0.0
+                    # dict 形式（通常パス）: Ask/Bid は (price, volume, count, detail) のタプルリスト
+                    else:
+                        ask_list = data_ob.get("Ask", [])
+                        bid_list = data_ob.get("Bid", [])
+                        # タプルの最初の要素 [0] が価格
+                        ask = float(ask_list[0][0]) if ask_list else 0.0
+                        bid = float(bid_list[0][0]) if bid_list else 0.0
+                    log.debug(f"[get_quote] {symbol}: ORDER_BOOK ask=${ask:.2f} bid=${bid:.2f}")
+                except (IndexError, TypeError, KeyError, AttributeError) as ex:
+                    log.warning(f"[get_quote] {symbol}: OrderBook パース失敗（{ex}）→ get_stock_quote にフォールバック")
+            elif not _skip_ob:
+                # ★ v3.9.31: get_order_book ret=-1 は get_stock_quote フォールバックが
+                # 正常動作するため実害なし。受講生が誤ってエラーと認識する問い合わせが
+                # 多発したため WARNING → DEBUG に降格 (ファイルログには引き続き記録)。
+                # ★ v3.9.77 (B-3): この銘柄は当セッション中スキップ対象として記憶。
+                _orderbook_fail_symbols.add(symbol)
+                log.debug(f"[get_quote] {symbol}: get_order_book ret={ret_ob} 失敗 → 当セッションは以降スキップ (get_stock_quote 直行)")
+
+            # ── 基本株価（last / ask・bid の補完）─────────────────────────────────
+            ret_sq, data_sq = ctx.get_stock_quote([code])
+            if ret_sq == RET_OK and _df_has_rows(data_sq):
+                # ★ v2.75: moomoo が 'N/A' 文字列を返すフィールドを安全に変換するヘルパー
+                # float('N/A') は ValueError を出し、get_quote 全体がクラッシュしていた問題を修正。
+                def _sf(v, d=0.0):
+                    """'N/A'・None・非数値を安全に float へ変換"""
+                    try:
+                        return float(v) if v is not None and str(v).strip() not in ('N/A','nan','') else d
+                    except (ValueError, TypeError):
+                        return d
+
+                try:
+                    if hasattr(data_sq, "iloc"):
+                        row          = data_sq.iloc[0]
+                        last         = _sf(row.get("last_price"))
+                        cur          = _sf(row.get("cur_price"))
+                        pre_price    = _sf(row.get("pre_price"))
+                        after_price  = _sf(row.get("after_price"))
+                        ovn_price    = _sf(row.get("overnight_price"))
+                        ask_sq       = _sf(row.get("ask_price"))
+                        bid_sq       = _sf(row.get("bid_price"))
+                    else:
+                        last        = _sf((data_sq.get("last_price",     [None]) or [None])[0])
+                        cur         = _sf((data_sq.get("cur_price",      [None]) or [None])[0])
+                        pre_price   = _sf((data_sq.get("pre_price",      [None]) or [None])[0])
+                        after_price = _sf((data_sq.get("after_price",    [None]) or [None])[0])
+                        ovn_price   = _sf((data_sq.get("overnight_price",[None]) or [None])[0])
+                        ask_sq      = _sf((data_sq.get("ask_price",      [None]) or [None])[0])
+                        bid_sq      = _sf((data_sq.get("bid_price",      [None]) or [None])[0])
+
+                    # セッション別リアルタイム価格を優先する
+                    # pre_price / after_price / overnight_price はそれぞれのセッションの
+                    # リアルタイム価格を返す（moomooはLV2でプリ・アフター・24H取引対応）
+                    _session_now, _ = get_session_info()
+                    if _session_now == SESSION_PREMARKET and pre_price > 0:
+                        last = pre_price
+                        log.debug(f"[get_quote] {symbol}: プリマーケット価格 ${pre_price:.2f}（pre_price）")
+                    elif _session_now == SESSION_AFTERHOURS and after_price > 0:
+                        last = after_price
+                        log.debug(f"[get_quote] {symbol}: アフターアワーズ価格 ${after_price:.2f}（after_price）")
+                    elif _session_now == SESSION_OVERNIGHT and ovn_price > 0:
+                        last = ovn_price
+                        log.debug(f"[get_quote] {symbol}: オーバーナイト価格 ${ovn_price:.2f}（overnight_price）")
+                    elif cur > 0 and cur != last:
+                        last = cur
+
+                    # ask_price / bid_price が ORDER_BOOK より精度が高い場合は補完
+                    if ask <= 0 and ask_sq > 0:
+                        ask = ask_sq
+                    if bid <= 0 and bid_sq > 0:
+                        bid = bid_sq
+                except (KeyError, IndexError, TypeError, AttributeError, ValueError) as ex:
+                    # ValueError も明示的に捕捉（float('N/A') 対策）
+                    log.warning(f"[get_quote] {symbol}: get_stock_quote パース失敗 ({type(ex).__name__}: {ex})")
+                    last = 0.0
+                # OrderBook が空だった場合は last を ask/bid の代替に使う
+                if ask <= 0:
+                    ask = last
+                if bid <= 0:
+                    bid = last
+
+        # ★ v2.90: with ブロックを抜けた時点で ctx.close() 済み
+        # 以降の return は ctx を使わないため with の外に配置（フォールバック含む）
+
+        # ── OpenD ORDER_BOOK が有効なら即リターン（最優先）────────────────────
+        if ask > 0 and bid > 0:
+            last = (ask + bid) / 2.0
+            log.debug(f"[get_quote] {symbol}: OpenD ORDER_BOOK ask=${ask:.2f} bid=${bid:.2f} → ${last:.2f}")
+            return {"ask": ask, "bid": bid, "last": last}
+
+        # ── ORDER_BOOK が取れなかった場合: get_stock_quote の値 ──────────────
+        if last > 0:
+            if ask <= 0: ask = last
+            if bid <= 0: bid = last
+            return {"ask": ask, "bid": bid, "last": last}
+
+        # ── Alpaca にフォールバック ───────────────────────────────────────────
+        if ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY:
+            _alp = get_quote_alpaca(symbol)
+            if _alp["ask"] > 0 and _alp["bid"] > 0:
+                last = (_alp["ask"] + _alp["bid"]) / 2.0
+                log.debug(f"[get_quote] {symbol}: OpenD取得失敗 → Alpaca ${last:.2f}")
+                return {"ask": _alp["ask"], "bid": _alp["bid"], "last": last}
+
+        # ── 最終フォールバック: Finnhub ──────────────────────────────────────
+        if FINNHUB_API_KEY:
+            finn_price = get_price_finnhub(symbol)
+            if finn_price > 0:
+                log.debug(f"[get_quote] {symbol}: OpenD/Alpaca失敗 → Finnhub ${finn_price:.2f}")
+                return {"ask": finn_price, "bid": finn_price, "last": finn_price}
+
+        return {"ask": ask, "bid": bid, "last": last}
+
+    except Exception as e:
+        # ★ v2.90: with _quote_ctx() が __exit__ で ctx.close() を保証するため、
+        # 旧コードにあった「except 内での明示的な ctx.close()」は不要になった。
+        log.warning(f"[価格取得] {symbol}: {e}")
+        return {"ask": 0.0, "bid": 0.0, "last": 0.0}
+
+
+def unlock_trade_if_needed(trd_env: TrdEnv) -> bool:
+    """moomoo GUI版ではAPIからの取引ロック解除が無効化されました。 / 取引ロックが発生した場合は moomoo アプリで手動アンロックしてください。 / （OpenD → 設定 → トレードロック解除）"""
+    log.info("[ロック解除] moomoo GUI版のためAPIロック解除はスキップ（手動でアンロックしてください）")
+    return True
+
+
+# ★ v3.9.63: sync_positions 全パターン失敗ログの間引き用 (5分に1回)
+_sync_fail_last_warn_at: Optional["datetime.datetime"] = None
+
+# ★ v3.9.77 (B-4): sync_positions の健全性状態。連続失敗で health_warning_loop が
+# 端末赤字(5分)＋Discord(30分)で警告する。成功でリセット。
+_sync_health: dict = {
+    "consecutive_fail": 0,
+    "last_success_at":  None,
+    "last_error":       "",
+    "last_discord_at":  None,
+}
+
+
+def sync_positions(trd_env: TrdEnv) -> None:
+    """moomoo からポジションを取得して state に同期する。
+    ret=-1 が返ってきた場合、パラメータを変えながら最大4パターンを試みる。
+
+    ★ v2.98: moomoo サポート (2026-05-06) からの正式回答に基づき全面書き換え。
+       - qty < 0 は OpenD のキャッシュバグではなく、SHORT 建玉の正規表現
+         (position_side='SHORT', qty<0 が moomoo JP の仕様)。
+       - qty=0 のレコードは決済済み・クリア待ちの残骸 (settlement 後に消える)。
+       - 同一銘柄で LONG (qty>0) と SHORT (qty<0) のレコードが共存しうる
+         (JP 信用口座は建玉ごとに position_id で個別管理)。
+       - 決済は position_id 指定で行うため、ここで取得・state に保存する。
+
+       v2.94.1〜v2.96 の qty<0 異常判定 (_negative_qty_warned, accinfo.short_mv 検証)
+       はすべて削除。SHORT は正規ポジションとして扱う。
+    """
+    global _startup_position_unknown, _ghost_miss_count
+    # 冒頭ガード: 自前追跡コストが 0 の銘柄は state を一旦リセット (後で API 結果で上書き)
+    for sym in ALL_TICKERS:
+        ts = state.get(sym)
+        if _tracked_position_cost.get(sym, 0.0) <= 0:
+            ts.position_qty = 0
+            ts.avg_cost     = 0.0
+            # position_ids も併せてクリア (sync 後に再構築)
+            ts.position_ids = {"LONG": [], "SHORT": []}
+            # ★ v3.9.133: 建玉が無くなったら「実際に適用された損切り%」もクリアする。
+            #   残したままだと、同一銘柄の次の建玉が監視ループに評価される前に決済された
+            #   場合（戦略が モメンタム⇄ニュース で変わった等）、前の建玉の値が記録に紛れる。
+            #   None にしておけば記録側が設計値で補完する。
+            ts.enforced_stop_pct = None
+    try:
+        # ★ v2.86: with _trade_ctx() で例外時の ctx.close() を保証
+        with _trade_ctx() as ctx:
+            # ── 試行パターン（ret=-1 が続く場合に段階的にパラメータを変える）──
+            # ★ v3.9.125: 実口座では acc_id=0 のフォールバックを廃止（利用者B報告 2026-07-23）。
+            #   SDK の position_list_query(acc_id=0) は「全口座」ではなく
+            #   _get_acc_id_by_acc_index(acc_index=0) ＝「口座リストの先頭口座」を意味する。
+            #   さらに戻り DataFrame に acc_id 列が無い（col_list に非含有）ため、
+            #   取得後に「どの口座の建玉か」を判別・フィルタできない。
+            #   結果、設定口座(REAL_ACC_ID)が0件でも先頭口座の建玉を取り込み、
+            #   その position_id を設定口座で決済しようとして Invalid position ID が
+            #   無限リトライする事故が発生した。実口座は REAL_ACC_ID 固定のみとする。
+            _is_real = (trd_env == TrdEnv.REAL)
+            # ── 試行パターン: acc_id × refresh × asset_category の組み合わせ ──────
+            # jp_acc_type は place_order 専用パラメータ。
+            # position_list_query に渡すと SDK が TypeError を返すため使用不可。
+            # moomoo JP 信用口座でUS株建玉を取得するには asset_category=US が有効。
+            # (acc_id, refresh_cache, asset_category_val or None)
+            _asset_cat_us = getattr(AssetCategory, "US", "US") if AssetCategory else None
+            _patterns = []
+            if _is_real:
+                # ★ moomoo サポート回答 (2026-04-30): refresh_cache=True は30秒間に10回の
+                #    レート制限あり。頻繁に呼ぶとエラー（空返却）になるため、
+                #    refresh_cache=False を優先パターンに変更。
+                # ★ v3.9.29: 新 SDK は asset_category が必須化された (5/20 利用者K 29件失敗)
+                #    旧 SDK は asset_category キーワード不対応 → TypeError フォールバック
+                #    asset_category 付きを先に試行する順序に変更。
+                # ★ v3.9.125: acc_id は REAL_ACC_ID に固定（他口座の建玉混入を構造的に防止）。
+                #   ret=-1 のフォールバックは asset_category の有無のみで行う。
+                _patterns = [
+                    (REAL_ACC_ID, False, _asset_cat_us),  # ★ v3.9.29: 新 SDK 優先
+                    (REAL_ACC_ID, False, None),           # 旧 SDK / fallback
+                ]
+            else:
+                _patterns = [
+                    (0, False, _asset_cat_us),  # ★ v3.9.29: デモも asset_category 付きを優先
+                    (0, False, None),            # 旧 SDK / fallback
+                ]
+
+            ret, data = -1, None
+            _ok_empty_data = None   # ★ v3.9.118: RET_OK かつ空（＝建玉0件の正常応答）を保持
+            for _try_idx, (_acc, _refresh, _asset_cat) in enumerate(_patterns):
+                _kwargs = dict(
+                    trd_env      = trd_env,
+                    refresh_cache= _refresh,
+                    acc_id       = _acc,
+                )
+                if _asset_cat is not None:
+                    _kwargs["asset_category"] = _asset_cat
+                try:
+                    ret, data = ctx.position_list_query(**_kwargs)
+                except TypeError as _te:
+                    # ★ v3.9.29: 新 SDK で asset_category 必須 / 旧 SDK で TypeError の両対応
+                    # 旧 SDK が asset_category キーワードを受け付けない場合のフォールバック
+                    if "asset_category" in str(_te) and _asset_cat is not None:
+                        _kwargs.pop("asset_category", None)
+                        ret, data = ctx.position_list_query(**_kwargs)
+                    else:
+                        raise
+                if ret == RET_OK:
+                    if _df_has_rows(data):
+                        if _try_idx > 0:
+                            _cat_label = f" asset_cat={_asset_cat}" if _asset_cat else ""
+                            log.info(
+                                f"[sync_positions] パターン{_try_idx+1}で取得成功"
+                                f"（acc_id={_acc if _acc else '先頭口座(acc_index=0)'}"
+                                f" refresh={_refresh}{_cat_label}）"
+                            )
+                        break
+                    # ★ v3.9.118: ret=OK だが空＝「建玉0件の正常応答」。moomoo JP の
+                    #   position_list_query は不安定（建玉があっても空を返す事あり）なので
+                    #   行付き結果を探して試行は続けるが、この正常応答を保持し、後続パターンの
+                    #   ret=-1 に上書きされないようにする（建玉ゼロ口座の誤「取得失敗」を防止）。
+                    _ok_empty_data = data if data is not None else _ok_empty_data
+                    log.debug(f"[sync_positions] パターン{_try_idx+1}: データ空(ret=OK・0件正常) → 念のため次も試行")
+                else:
+                    # ret=-1 → 次のパターンへ。★ v3.9.63: 段階的フォールバックの
+                    # 途中経過は DEBUG に降格 (Network interruption 等で 1 日 555 件の
+                    # WARNING ログ膨張を確認・正常なリトライ動作のためノイズ)。
+                    log.debug(
+                        f"[sync_positions] パターン{_try_idx+1}: ret={ret} エラー={data}"
+                        f"（acc_id={_acc if _acc else '先頭口座(acc_index=0)'}"
+                        f" refresh={_refresh}）→ 次を試行"
+                    )
+        # with を抜けた時点で ctx は close 済み
+
+        # ★ v3.9.118: 行付き成功で break しなかったが、いずれかのパターンが RET_OK(空) を
+        #   返していれば「ポジションなし(正常)」。後続パターン（旧SDK向け asset_category なし
+        #   照会等）の ret=-1 が、先に取れた正常な0件応答を上書きして「取得失敗」に誤分類する
+        #   のを防ぐ。建玉ゼロ口座で sync_positions が連続失敗するバグ（受講生報告 2026-07）。
+        if ret != RET_OK and _ok_empty_data is not None:
+            ret, data = RET_OK, _ok_empty_data
+
+        if ret != RET_OK:
+            # ★ v3.9.77 (B-4): 連続失敗カウント＋直近エラーを記録 (health_warning_loop が使用)
+            _sync_health["consecutive_fail"] = int(_sync_health.get("consecutive_fail", 0)) + 1
+            _sync_health["last_error"] = str(data)[:60]
+            # ★ v3.9.63: 全パターン失敗の最終警告は 5 分に 1 回へ間引き (305 件→数件)。
+            global _sync_fail_last_warn_at
+            _now_sf = datetime.datetime.now()
+            if (_sync_fail_last_warn_at is None
+                    or (_now_sf - _sync_fail_last_warn_at).total_seconds() >= 300):
+                _sync_fail_last_warn_at = _now_sf
+                log.warning(
+                    f"[sync_positions] ポジション取得失敗: 全パターン試行後もret={ret} "
+                    f"(OpenD/ネットワーク不安定の可能性・5分ごとに間引き表示)"
+                )
+            else:
+                log.debug(f"[sync_positions] ポジション取得失敗 (間引き中): ret={ret}")
+            return
+        # ★ v3.9.77 (B-4): 取得成功 → 健全性をリセット
+        _sync_health["consecutive_fail"] = 0
+        _sync_health["last_success_at"] = datetime.datetime.now()
+        if not _df_has_rows(data):
+            # 空応答でも後段のゴースト判定と台帳更新まで進める。
+            # ここで return すると、実際に建玉が消えても externally_held と
+            # 台帳の残骸が永久に解除されない。
+            log.debug("[sync_positions] ポジションなし（正常）")
+
+
+        # ── ★ v2.98: LONG/SHORT 別の集約 (position_id 取得・保存) ────────────────
+        # moomoo サポート (2026-05-06) 確認: SHORT は qty<0 + position_side='SHORT'
+        # qty=0 は決済済み残骸 / 同銘柄 LONG/SHORT 共存可 / 部分約定で複数 pid に分割可
+        # _agg 構造: {sym: {"LONG":{qty,cost_sum,ids:[{pid,qty,cost},..]}, "SHORT":{同}}}
+        # ids は決済時に建玉ごとに個別 place_order で閉じるため (1注文1建玉)。
+        _agg: dict = {}
+        for _, row in (data.iterrows() if _df_has_rows(data) else []):
+            row_qty_raw = int(float(row.get("qty", 0) or 0))
+            if row_qty_raw == 0:
+                # qty=0 は決済済み残骸 (moomoo JP 仕様) → スキップ
+                continue
+            sym = from_moomoo_code(str(row["code"]))
+            if sym not in ALL_TICKERS:
+                continue
+            # position_side 判別 (大文字統一)。取得できない場合は qty 符号でフォールバック。
+            _ps_raw = str(row.get("position_side", row.get("positionSide", "")) or "").upper()
+            if "SHORT" in _ps_raw:
+                side = "SHORT"
+            elif "LONG" in _ps_raw:
+                side = "LONG"
+            else:
+                side = "SHORT" if row_qty_raw < 0 else "LONG"
+            eff_qty = abs(row_qty_raw)
+            cost    = float(row.get("cost_price", 0) or 0)
+            pid     = str(row.get("position_id", "") or "")
+            if sym not in _agg:
+                _agg[sym] = {
+                    "LONG":  {"qty": 0, "cost_sum": 0.0, "ids": []},
+                    "SHORT": {"qty": 0, "cost_sum": 0.0, "ids": []},
+                }
+            _agg[sym][side]["qty"]      += eff_qty
+            _agg[sym][side]["cost_sum"] += cost * eff_qty
+            if pid:
+                _agg[sym][side]["ids"].append({
+                    "pid":  pid,
+                    "qty":  eff_qty,   # 当該建玉の株数 (常に絶対値)
+                    "cost": cost,
+                })
+
+        # ── 各銘柄を state に反映 ─────────────────────────────────────────────────
+        for sym, sides in _agg.items():
+            if sym not in ALL_TICKERS:
+                continue
+            ts        = state.get(sym)
+            long_qty  = sides["LONG"]["qty"]
+            short_qty = sides["SHORT"]["qty"]
+            long_avg  = sides["LONG"]["cost_sum"]  / long_qty  if long_qty  > 0 else 0.0
+            short_avg = sides["SHORT"]["cost_sum"] / short_qty if short_qty > 0 else 0.0
+
+            # position_ids は両方向のリストをそのまま保存 (LONG/SHORT 共存時に
+            # 決済関数が誤った方向を閉じないようにするため、両方を保持する)。
+            ts.position_ids = {
+                "LONG":  list(sides["LONG"]["ids"]),
+                "SHORT": list(sides["SHORT"]["ids"]),
+            }
+
+            if long_qty > 0 and short_qty > 0:
+                # ── LONG/SHORT 共存 (両建状態) ──────────────────────────────────
+                # bot は同時両建を行わない設計 (place_short / place_buy が事前決済を
+                # 強制) のため、ここに来るのは過渡期 (片方が決済中) または手動取引・
+                # 外部要因による両建。bot の意図 (is_short フラグ) を優先して
+                # state.position_qty を決定する。両方の position_ids は維持。
+                log.warning(
+                    f"[sync_positions] {sym}: LONG/SHORT 共存検出 "
+                    f"(LONG={long_qty}株 avg=${long_avg:.2f} / SHORT={short_qty}株 avg=${short_avg:.2f})"
+                    f" → bot 意図 (is_short={ts.is_short}) を優先"
+                )
+                _coexist_key = f"_coexist_warned_{sym}"
+                if not getattr(sync_positions, _coexist_key, False):
+                    _threadsafe_future(asyncio.to_thread(
+                        send_discord_message,
+                        f"⚠️ 【{sym}】 LONG/SHORT 両建状態を検出\n"
+                        f"LONG: {long_qty}株 (avg=${long_avg:.2f})\n"
+                        f"SHORT: {short_qty}株 (avg=${short_avg:.2f})\n"
+                        f"bot は同時両建を想定していません。\n"
+                        f"moomoo アプリで建玉を確認し、想定外の方向は手動決済してください。"
+                    ))
+                    setattr(sync_positions, _coexist_key, True)
+                if ts.is_short:
+                    total_qty = -short_qty
+                    api_avg   = short_avg
+                else:
+                    total_qty = long_qty
+                    api_avg   = long_avg
+            elif long_qty > 0:
+                total_qty = long_qty
+                api_avg   = long_avg
+                ts.is_short = False
+                # 共存解消 → 警告フラグもリセット (LONG/SHORT 両方リセット可能)
+                setattr(sync_positions, f"_coexist_warned_{sym}", False)
+            elif short_qty > 0:
+                total_qty = -short_qty
+                api_avg   = short_avg
+                ts.is_short = True
+                setattr(sync_positions, f"_coexist_warned_{sym}", False)
+            else:
+                # 両方 0 → このシンボルは実質ポジションなし (qty=0 残骸ばかりだった)
+                continue
+
+            ts.position_qty = total_qty
+            _bot_qty = abs(_tracked_qty.get(sym, 0))
+            # ★ v3.9.101: 約定確認待ちフラグの解除は「実約定単価が確定したとき」に限定する。
+            #   発注直後 avg_cost は指値の仮設定で、これを建値として判定すると建玉トレール/
+            #   強制損切りが指値基準で誤発火する（5/13 SPY・6/29 SMH 事例）。
+            #     ・確定済み(_check_order_filledで実約定反映済): 従来どおりボット値を維持して解除
+            #       （demo の cost_price=昨日終値の上書き防止）。
+            #     ・未確定 + APIの実建玉単価あり: 指値の仮設定を捨て、APIの実建玉単価を建値に
+            #       採用して解除（外部/初回認識ポジションも同経路）。
+            #     ・未確定 + API単価なし: 解除せずロック維持（次サイクル/約定確認で確定するまで）。
+            if ts.avg_cost_confirmed and _bot_qty > 0 and ts.avg_cost > 0:
+                # 実約定確定済み → ボット追跡値を維持して解除
+                ts.entry_pending_fill = False
+                _api_diff = abs(api_avg - ts.avg_cost) / ts.avg_cost if ts.avg_cost > 0 else 0
+                if _api_diff > 0.005:  # 0.5%以上乖離している場合
+                    _warn_key = f"_cost_warn_{sym}"
+                    _already_warned = getattr(sync_positions, _warn_key, False)
+                    if not _already_warned:
+                        # ★ v3.8.5: 防御的維持動作 (実害なし) のため WARNING → INFO に降格
+                        log.info(
+                            f"[sync_positions] {sym}: APIのcost_price=${api_avg:.2f}"
+                            f" vs ボット追跡avg=${ts.avg_cost:.2f}（乖離{_api_diff*100:.1f}%）"
+                            f"→ ボット追跡値を維持（昨日終値上書き防止）"
+                        )
+                        setattr(sync_positions, _warn_key, True)
+                    else:
+                        log.debug(
+                            f"[sync_positions] {sym}: APIのcost_price=${api_avg:.2f}"
+                            f" vs ボット追跡avg=${ts.avg_cost:.2f}（乖離{_api_diff*100:.1f}%）→ 維持"
+                        )
+                else:
+                    log.debug(f"[sync_positions] {sym}: qty={total_qty} avg_cost維持=${ts.avg_cost:.2f}（ボット追跡済）")
+            elif api_avg and api_avg > 0:
+                # 未確定の bot 建玉（指値仮設定）または外部/初回認識 → APIの実建玉単価を採用
+                if ts.entry_pending_fill and not ts.avg_cost_confirmed and _bot_qty > 0:
+                    log.info(
+                        f"[sync_positions] {sym}: 実約定単価を反映 avg_cost=${api_avg:.2f}"
+                        f"（指値の仮設定=${ts.avg_cost:.2f} を破棄）→ 判定解放"
+                    )
+                ts.avg_cost = api_avg
+                ts.avg_cost_confirmed = True
+                ts.entry_pending_fill = False
+                _ids_long  = sides["LONG"]["ids"]
+                _ids_short = sides["SHORT"]["ids"]
+                log.debug(
+                    f"[sync_positions] {sym}: qty={total_qty} avg_cost={api_avg:.2f}"
+                    f" (LONG ids={len(_ids_long)} / SHORT ids={len(_ids_short)})"
+                )
+            else:
+                # 実約定単価が未確定で API も単価を返さない → 解除せずロック維持（誤発火防止）。
+                log.debug(
+                    f"[sync_positions] {sym}: qty={total_qty} 実約定単価が未確定 → "
+                    f"entry_pending_fill を維持（判定ロック継続・次サイクルで再評価）"
+                )
+            # ── 外部保有ポジション検出時の _tracked_position_cost 仮設定 ──────
+            # 前回セッション持越・手動発注で _tracked_cost=0 のまま → 次回 sync で
+            # 「<=0 → position_qty=0」リセットを誘発する問題への対策で仮設定。
+            # ★ v2.70: 決済注文 pending 中は仮設定スキップ (約定直後の API 遅延対応)
+            # ★ v2.98: SHORT も abs(total_qty) で評価。
+            _has_pending_close = any(
+                info.get("is_close") and info.get("symbol") == sym
+                for info in _pending_orders.values()
+            )
+            if total_qty != 0 and _tracked_position_cost.get(sym, 0.0) <= 0:
+                if _has_pending_close:
+                    log.debug(
+                        f"[sync_positions] 【{sym}】 外部ポジション検出だが"
+                        f" 決済注文pending中のためスキップ（API遅延対策）"
+                    )
+                else:
+                    _est_cost = abs(total_qty) * api_avg
+                    _tracked_position_cost[sym] = _est_cost
+                    _side_label = "SHORT" if total_qty < 0 else "LONG"
+                    log.info(
+                        f"[sync_positions] 【{sym}】 外部保有ポジション検出 ({_side_label})"
+                        f" → _tracked_position_cost=${_est_cost:,.0f} に仮設定"
+                        f"（qty={total_qty} avg=${api_avg:.2f}）"
+                    )
+
+        # ── 起動時ポジション不明フラグの自動解除 ──────────────────────────────
+        # 実際のポジション行 (qty != 0) が見つかった場合のみ解除する。
+        # _df_has_rows=True でも全行 qty=0（決済済み残骸のみ）の場合は解除しない。
+        # ★ v2.98: _agg は LONG/SHORT 両方を含むため、いずれかに qty>0 があれば OK。
+        _has_any_position = any(
+            (s["LONG"]["qty"] > 0 or s["SHORT"]["qty"] > 0) for s in _agg.values()
+        )
+        if _startup_position_unknown and _has_any_position:
+            _startup_position_unknown = False
+            log.info("[起動時復元] ✅ ポジション取得成功 → 発注ブロックを解除しました")
+
+        # ── ゴースト防止: 連続 N 回「不在」で初めてクリア ──────────────────────
+        # moomoo JP の position_list_query は返り値が不安定 (建玉返ったり返らなかったり)。
+        # 1回不在でクリアすると正規ポジションが消える → _GHOST_MISS_THRESHOLD 回連続で初解除。
+        # ★ v2.98: SHORT 含む実在判定 (qty!=0 のいずれか方向)。
+        global _ghost_miss_count
+        _absence_confirmed = set()
+        for _sym_chk in ALL_TICKERS:
+            _sides_chk = _agg.get(_sym_chk)
+            _has_any = (
+                _sides_chk is not None and
+                (_sides_chk["LONG"]["qty"] > 0 or _sides_chk["SHORT"]["qty"] > 0)
+            )
+            if _has_any:
+                _ghost_miss_count[_sym_chk] = 0
+            elif (_tracked_position_cost.get(_sym_chk, 0.0) > 0
+                  or _ledger_has(_sym_chk, trd_env)
+                  or getattr(state.get(_sym_chk), "externally_held", False)):
+                _ts_chk = state.get(_sym_chk)
+                _has_pending_order = any(
+                    info.get("symbol") == _sym_chk
+                    for info in _pending_orders.values()
+                )
+                # 新規発注～約定反映、決済発注～約定反映の間は API に建玉が
+                # 見えなくても不在回数に数えない。pending が無い状態でのみ、
+                # Bot建玉・外部建玉とも連続不在を確定させる。
+                if not _has_pending_order:
+                    _ghost_miss_count[_sym_chk] = _ghost_miss_count.get(_sym_chk, 0) + 1
+                    if _ghost_miss_count[_sym_chk] >= _GHOST_MISS_THRESHOLD:
+                        _ghost_miss_count[_sym_chk] = 0
+                        _absence_confirmed.add(_sym_chk)
+                        _tracked_position_cost[_sym_chk] = 0.0
+                        _ts_chk.position_qty = 0
+                        _ts_chk.avg_cost     = 0.0
+                        _ts_chk.position_ids = {"LONG": [], "SHORT": []}
+                        log.info(
+                            f"[sync_positions] 【{_sym_chk}】"
+                            f" {_GHOST_MISS_THRESHOLD}回連続でAPIにポジション不在"
+                            f" → tracked_cost をクリア（手動決済または外部決済の可能性）"
+                        )
+                # v3.9.20: ポジション解消で entry_count を 0 にリセット (新規エントリー判定用)。
+                # 【重要】_tracked_position_cost > 0 なら API 一時 qty=0 とみなし誤リセット回避。
+                if _ts_chk.position_qty == 0 and _ts_chk.entry_count > 0:
+                    tracked = _tracked_position_cost.get(_sym_chk, 0.0)
+                    if tracked <= 0:
+                        _ts_chk.entry_count = 0
+                        log.debug(f"【{_sym_chk}】 ポジション解消 → entry_count リセット")
+
+        # ── ★ v3.9.134: ゴースト判定後に台帳と突き合わせる ──────────────────
+        # API が1回だけ建玉を返さなくても externally_held を解除せず、既存の
+        # _GHOST_MISS_THRESHOLD 回連続不在を満たした場合だけ解除・台帳削除する。
+        for _sym_j in ALL_TICKERS:
+            _sides_j = _agg.get(_sym_j)
+            _held_j = (
+                _sides_j is not None and
+                (_sides_j["LONG"]["qty"] > 0 or _sides_j["SHORT"]["qty"] > 0)
+            )
+            if _held_j and not _ledger_has(_sym_j, trd_env):
+                _q = _sides_j["LONG"]["qty"] or _sides_j["SHORT"]["qty"]
+                _sd = "ロング" if _sides_j["LONG"]["qty"] > 0 else "ショート"
+                if _ledger_first_run:
+                    # ★ v3.9.134: 台帳を作る最初の起動。旧版は口座の建玉をすべて
+                    #   Bot のものとして扱っていたので、ここでも取り込む。
+                    #   これをしないと、起動時復元より先にこの sync が走ったときに
+                    #   「停止します」→「再開します」の紛らわしい通知が2通飛ぶ
+                    #   （実機で確認済み。全利用者の初回起動で毎回起きる）。
+                    _ledger_mark(_sym_j, trd_env, state.get(_sym_j).entry_time)
+                    log.info(
+                        f"[建玉台帳] 【{_sym_j}】 台帳の初回作成: 既存の建玉"
+                        f"（{_sd} {int(abs(_q))}株）を Bot の建玉として登録しました"
+                    )
+                else:
+                    _ext_set_held(_sym_j, True,
+                                  f"口座に {_sd} {int(abs(_q))}株 ありますが、Bot の記録にありません。")
+            elif _held_j:
+                # 初回移行や発注直後に台帳へ記録された場合、先行syncで立った
+                # externally_held を直ちに解除して Bot 建玉の管理を継続する。
+                _ext_set_held(_sym_j, False,
+                              resume_reason="Bot の建玉として確認できたため")
+            elif not _held_j:
+                _was_known = (
+                    _ledger_has(_sym_j, trd_env)
+                    or getattr(state.get(_sym_j), "externally_held", False)
+                )
+                if not _was_known or _sym_j in _absence_confirmed:
+                    _ext_set_held(_sym_j, False)
+                    if _sym_j in _absence_confirmed:
+                        _ledger_unmark(_sym_j, trd_env)
+        _ext_remind_if_due()
+    except Exception as e:
+        # ★ v3.9.130: 例外失敗も consecutive_fail に計上する。
+        #   従来はここで log.warning のみ＝失敗カウントを進めず、health_warning_loop の
+        #   発火条件 (consecutive_fail>=3) を満たせなかった。OpenDプロセス消滅時に
+        #   _trade_ctx()/照会が「ret=-1」ではなく「例外」を投げると、失敗がここで
+        #   握りつぶされ、数時間ポジション取得できなくてもDiscord通知ゼロになる不具合
+        #   (利用者報告: 約5時間の停止・通知ゼロの実測と一致)。グレースフル失敗と同列に扱う。
+        _sync_health["consecutive_fail"] = int(_sync_health.get("consecutive_fail", 0)) + 1
+        _sync_health["last_error"] = str(e)[:60]
+        log.warning(f"[ポジション同期] エラー: {e}")
+
+# ── 動的ロットサイズ計算 ──────────────────────────────────────────────────────────────
+def calc_order_size(confidence: float) -> float:
+    """confidence に基づいて注文目標金額を「山型」で算出する。
+
+    ★ v3.9.20: 過去 1,293 件のトレード分析で、勝率と利益効率は conf 0.80 を
+    ピークとした山型曲線になることが判明:
+      ・conf 0.78-0.82 (スイートスポット): 平均 +$11/件 (最高効率)
+      ・conf 0.83 以上 (超強気帯):           平均 -$10/件 (個別株サージ過反応)
+      ・conf 0.70 未満 (弱シグナル帯):       平均 -$23/件 (損失)
+    そこで一律サイズではなく、conf 帯に応じた「山型」のサイズ配分を採用。
+
+    配分:
+      0.60-0.69 :  BUDGET × 30%   (弱シグナル → ロット縮小)
+      0.70-0.77 :  BUDGET × 60%   (主力帯 → 控えめロット)
+      0.78-0.82 :  BUDGET × 100%  (スイートスポット → フルロット)
+      0.83+     :  BUDGET × 40%   (超強気 → 過剰反応リスク管理)
+
+    旧版の線形補間 (conf 連動) およびピラミッディング (PYRAMID_ALLIN_THRESHOLD)
+    は撤去 (実データで一度も発動していなかった + 設計と相反)。
+    """
+    if confidence < 0.70:
+        size_pct = 0.30
+    elif confidence < 0.78:
+        size_pct = 0.60
+    elif confidence < 0.83:
+        size_pct = 1.00   # スイートスポット
+    else:
+        size_pct = 0.40
+    size = _BUDGET_USD * size_pct
+    # 最低ロット (ORDER_SIZE_MIN_USD) を下回らないようクランプ
+    return max(ORDER_SIZE_MIN_USD, min(ORDER_SIZE_MAX_USD, size))
+
+
+def calc_limit_price(quote: dict, action: str, symbol: Optional[str] = None) -> float:
+    """
+    LV1 板情報（ask/bid）を基準に指値を算出する。
+
+    BUY  : ask（最良売気配）× (1 + buffer_pct)
+    SELL : bid（最良買気配）× (1 - buffer_pct)
+
+    価格取得優先順位:
+      BUY  : ask（正値） → last（正値） → 0.0（発注スキップ）
+      SELL : bid（正値） → last（正値） → 0.0（発注スキップ）
+
+    ★ v2.99.4: symbol を受け取り、ETF/個別株でバッファを自動切替。
+       symbol が None の場合は後方互換で LIMIT_BUFFER_PCT (旧値) を使用。
+    """
+    ask  = quote.get("ask",  0.0) or 0.0
+    bid  = quote.get("bid",  0.0) or 0.0
+    last = quote.get("last", 0.0) or 0.0
+
+    # ★ v2.99.4: シンボル種別に応じたバッファ選択
+    buf = get_limit_buffer_pct(symbol) if symbol else LIMIT_BUFFER_PCT
+
+    if action == "BUY":
+        base = ask if ask > 0 else (last if last > 0 else 0.0)
+        return round(base * (1 + buf), 2) if base > 0 else 0.0
+    else:
+        base = bid if bid > 0 else (last if last > 0 else 0.0)
+        return round(base * (1 - buf), 2) if base > 0 else 0.0
+
+# ── 注文ヘルパー ──────────────────────────────────────────────────────────────────
+async def _check_order_filled(
+    order_id: str,
+    symbol: str,
+    qty: int,
+    price: float,
+    trd_env: TrdEnv,
+    mode: str,
+    wait_sec: int = 5,
+) -> None:
+    """発注後 wait_sec 秒待ってから order_list_query で約定状態を確認し 結果を Discord に通知する。 デモ口座（SIMULATE）でも呼び出し可能。"""
+    tag = f"【{symbol}】"
+    await asyncio.sleep(wait_sec)
+    try:
+        # ★ v2.86: with _trade_ctx() で例外時の close を保証
+        with _trade_ctx() as ctx:
+            _acc_id_check = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
+            ret, data = ctx.order_list_query(
+                trd_env    = trd_env,
+                order_id   = order_id,
+                acc_id     = _acc_id_check,
+            )
+        if ret != RET_OK or not _df_has_rows(data):
+            log.warning(f"{tag} [約定確認] 取得失敗 orderId={order_id}")
+            return
+
+        # DataFrame / dict 両対応で列存在チェック
+        def _has_col(d, col: str) -> bool:
+            if hasattr(d, "columns"):
+                return col in d.columns
+            return col in d
+
+        def _get_val(d, col: str, default=None):
+            try:
+                if hasattr(d, "iloc"):
+                    return d[col].iloc[0]
+                return d[col][0]
+            except (KeyError, IndexError, TypeError):
+                return default
+
+        status    = str(_get_val(data, "order_status", "不明"))
+        filled    = str(_get_val(data, "dealt_qty", _get_val(data, "qty", str(qty))))
+        avg_price = ""
+        if _has_col(data, "dealt_avg_price"):
+            ap = _get_val(data, "dealt_avg_price")
+            try:
+                avg_price = f"  約定均価: ${float(ap):.2f}"
+            except (ValueError, TypeError):
+                avg_price = f"  約定均価: {ap}"
+        log.info(f"{tag} [約定確認] orderId={order_id}  status={status}  約定数={filled}{avg_price}")
+        # ★ v3.9.105 (C1計測・挙動不変): moomoo が実際に返す order_status の生値を収集する。
+        #   現行判定は部分文字列（"filled" は FILLED_PART にも一致）のため、enum厳密比較へ
+        #   移行する前に、実環境（実口座/デモ）でのステータス表記を確認する目的。
+        #   部分約定の疑い（dealt_qty < qty）も件数把握のため WARNING で記録（処理は従来どおり）。
+        try:
+            global _SEEN_ORDER_STATUSES
+            if status not in _SEEN_ORDER_STATUSES:
+                _SEEN_ORDER_STATUSES.add(status)
+                log.info(f"[C1計測] order_status 新規観測: {status!r}（判定移行の実地確認用）")
+            _dq_chk = float(_get_val(data, "dealt_qty", qty) or qty)
+            if "part" in status.lower() or (0 < _dq_chk < float(qty)):
+                log.warning(
+                    f"{tag} [C1計測] 部分約定の可能性: status={status!r} dealt={_dq_chk}/{qty}"
+                    f"（★ v3.9.120: 残量管理に対応済み — 下の部分約定処理で残量を保持）"
+                )
+        except Exception:
+            pass
+        # Filled / PartiallyFilled の場合は Discord に通知
+        status_lower = status.lower()
+        if "filled" in status_lower or "dealt" in status_lower:
+            # ★ v3.9.120: 部分約定の厳密化（C1計測で予告済み・外部AIレビュー指摘 High）。
+            #   旧実装は "filled" の部分文字列一致が FILLED_PART にも一致し、部分約定でも
+            #   全量約定として処理（決済系では残株があるのにポジション全クリア）していた。
+            #   部分約定時は注文を watchdog 管理に残し（残量はタイムアウトでキャンセル→
+            #   決済系なら既存機構が残量を再発注）、state は残量を反映する。
+            try:
+                _dealt_chk2 = float(_get_val(data, "dealt_qty", qty) or qty)
+            except (ValueError, TypeError):
+                _dealt_chk2 = float(qty)
+            _is_partial_fill = ("part" in status_lower) or (0 < _dealt_chk2 < float(qty))
+            if _is_partial_fill:
+                _rem_est = max(0, int(round(float(qty) - _dealt_chk2)))
+                if order_id in _pending_orders:
+                    _pending_orders[order_id]["qty"] = _rem_est  # 再発注は残量で行う
+                log.warning(
+                    f"{tag} [部分約定] status={status} 約定 {int(_dealt_chk2)}/{int(qty)}株"
+                    f" → 残 {_rem_est}株 は注文管理を継続（タイムアウト時に既存機構で再処理）"
+                )
+            else:
+                _unregister_pending_order(order_id)  # 全量約定 → 管理辞書から削除
+            # ★ v2.90: Discord PnL表示用の退避変数（SELL決済時のみ計算結果が入る）
+            # 旧コードでは pending_avg_cost をクリア(下記参照)した後、Discord 通知作成時に
+            # 再度 pending_avg_cost を参照していたため、SELL 決済時に PnL が表示されなくなっていた。
+            # 計算済みの値をローカル変数に退避し、Discord 通知時はこれを参照する。
+            _realized_for_disc: Optional[float] = None
+            _realized_pct_for_disc: float = 0.0
+            _realized_qty_for_disc: int = 0
+            # ── 約定価格・株数でstate/_tracked_position_costを正確に更新 ──────
+            # 発注時は指値で仮記録しているため、実際の約定価格で上書きする
+            try:
+                filled_qty   = float(_get_val(data, "dealt_qty", qty) or qty)
+                filled_price_raw = _get_val(data, "dealt_avg_price", None)
+                filled_price = float(filled_price_raw) if filled_price_raw else 0.0
+                if filled_qty > 0 and filled_price > 0:
+                    ts_upd = state.get(symbol)
+                    # ロング約定: position_qty と avg_cost を正確な値で上書き
+                    if "[空売り]" not in mode:
+                        # ★ v2.99.3: place_close_all は side_label="ロング決済" を渡すため、
+                        # 旧来の "[決済]" だけでは検出できず Discord PnL 表示が消えていた。
+                        # "ロング決済" / "[決済]" のいずれかを SELL 決済として扱う。
+                        if "[決済]" in mode or "ロング決済" in mode:
+                            # ── SELL（決済）約定: 確定損益 + TRADE_RESULT を記録 ──
+                            prev_avg = ts_upd.avg_cost
+                            # avg_costがsync_positionsに0クリアされた場合はpending_avg_costで補完
+                            # （place_close_all → track_position_clear → sync_positionsの競合対策）
+                            if prev_avg <= 0 and ts_upd.pending_avg_cost > 0:
+                                prev_avg = ts_upd.pending_avg_cost
+                                log.debug(f"{tag} [確定損益] avg_cost=0のためpending_avg_cost={prev_avg:.2f}を使用")
+                            if prev_avg > 0 and filled_price > 0:
+                                realized = (filled_price - prev_avg) * filled_qty
+                                # ★ v2.90: Discord PnL表示用に退避（pending_avg_cost クリア前に取得）
+                                _realized_for_disc = realized
+                                _realized_pct_for_disc = (realized / (prev_avg * filled_qty) * 100
+                                                          if prev_avg > 0 else 0.0)
+                                _realized_qty_for_disc = int(filled_qty)
+                                # ★ v3.9.9: 視認性向上 — 絵文字 + ANSI 色付き損益サマリ + フローを前置き。
+                                # 端末では緑 (利益) / 赤 (損失) で表示、ログファイルは _PlainFormatter が
+                                # ANSI コードを除去するためプレーンテキスト。両方の視認性を両立。
+                                # 構造化部分 (realized_pnl=... sell_avg=... buy_avg=... qty=...) は
+                                # report parser の regex (line 11912 付近) のため保持。
+                                if realized > 0:
+                                    _pnl_emoji, _pnl_label, _pnl_color = "📈", "LONG決済益", "\033[1;32m"  # 太字 緑
+                                elif realized < 0:
+                                    _pnl_emoji, _pnl_label, _pnl_color = "📉", "LONG決済損", "\033[1;31m"  # 太字 赤
+                                else:
+                                    _pnl_emoji, _pnl_label, _pnl_color = "➡️", "LONG決済 同値", ""  # デフォルト
+                                _pnl_reset = "\033[0m" if _pnl_color else ""
+                                log.info(
+                                    f"{tag} {_pnl_color}{_pnl_emoji} {_pnl_label} "
+                                    f"${realized:+.2f} ({_realized_pct_for_disc:+.2f}%){_pnl_reset}"
+                                    f"  │  {int(filled_qty)}株"
+                                    f"  │  買 ${prev_avg:.2f} → 売 ${filled_price:.2f}"
+                                    f"  │  [確定損益]"
+                                    f"  realized_pnl={realized:+.2f}"
+                                    f"  sell_avg={filled_price:.2f}"
+                                    f"  buy_avg={prev_avg:.2f}"
+                                    f"  qty={int(filled_qty)}"
+                                )
+                                # TRADE_RESULT: 1トレード全情報をログ出力
+                                hold_min = 0.0
+                                # まず pending_entry_time を優先（タイムアウト決済等で entry_time が
+                                # None にリセットされてもhold_minを正しく計算するため）
+                                entry_t = ts_upd.pending_entry_time or ts_upd.entry_time
+                                if entry_t:
+                                    hold_min = round(
+                                        (datetime.datetime.now() - entry_t).total_seconds() / 60,
+                                        1
+                                    )
+                                session_name, _ = get_session_info()
+                                log.info(
+                                    f"{tag} [TRADE_RESULT]"
+                                    f"  entry_price={prev_avg:.2f}"
+                                    f"  exit_price={filled_price:.2f}"
+                                    f"  qty={int(filled_qty)}"
+                                    f"  realized_pnl={realized:+.2f}"
+                                    f"  hold_min={hold_min}"
+                                    f"  session={session_name}"
+                                    f"  ai_score={ts_upd.entry_ai_score}"
+                                    f"  ai_conf={ts_upd.entry_ai_conf:.2f}"
+                                    f"  ai_category={ts_upd.entry_ai_category}"
+                                    f"  news_source={ts_upd.entry_news_source}"
+                                    f"  exit_reason={ts_upd.pending_close_reason}"
+                                    f"  settings={_get_settings_snapshot()}"
+                                )
+                                # リアルタイムWebhook送信（DATA_COLLECT=trueの場合）
+                                threading.Thread(
+                                    target=_send_trade_result,
+                                    args=(
+                                        symbol, prev_avg, filled_price,
+                                        int(filled_qty), realized,
+                                        hold_min, session_name,
+                                        ts_upd.entry_ai_score,
+                                        ts_upd.entry_ai_conf,
+                                        ts_upd.entry_ai_category,
+                                        ts_upd.entry_news_source,
+                                        ts_upd.pending_close_reason,
+                                    ),
+                                    kwargs={  # ★ v2.95: GAS連携用の追加フィールド
+                                        "headlines":     ts_upd.entry_headlines,
+                                        "beneficiaries": ts_upd.entry_beneficiaries,
+                                        "victims":       ts_upd.entry_victims,
+                                        "price_trend":   ts_upd.entry_price_trend,
+                                        "peak_pnl":      ts_upd.entry_peak_pnl,
+                                        # ★ v3.1.0: ロング決済として明示
+                                        "trade_type":    "LONG",
+                                        # ★ v3.9.133: 決済時点の「実際に適用された損切り%」をスナップショットして渡す
+                                        #   （別スレッドで state を読むと次の建玉の値に入れ替わりうるため）
+                                        "enforced_stop_pct": getattr(ts_upd, "enforced_stop_pct", None),
+                                    },
+                                    daemon=True,
+                                ).start()
+                                # TRADE_RESULT出力後、pending_entry_time / pending_avg_cost をクリア
+                                # ★ v3.9.120: 部分約定時は残量の決済PnL計算に必要なためクリアしない
+                                if not _is_partial_fill:
+                                    ts_upd.pending_entry_time = None
+                                    ts_upd.pending_avg_cost   = 0.0
+                            if _is_partial_fill:
+                                # ★ v3.9.120: 部分決済 → 残量をポジションとして保持
+                                #   （全クリアすると残株が監視外になる・外部AIレビュー指摘 High）
+                                _rem_long = max(0, int(round(float(qty) - filled_qty)))
+                                ts_upd.position_qty = _rem_long
+                                if prev_avg > 0:
+                                    ts_upd.avg_cost = prev_avg
+                                ts_upd.entry_pending_fill = False
+                                _tracked_position_cost[symbol] = (prev_avg if prev_avg > 0 else 0.0) * _rem_long
+                                _tracked_qty[symbol]           = _rem_long
+                                log.warning(
+                                    f"{tag} [約定反映] 部分決済: 残 {_rem_long}株 を保持"
+                                    f"（avg_cost=${ts_upd.avg_cost:.2f}）→ 残量は監視・再決済対象"
+                                )
+                            else:
+                                ts_upd.position_qty = 0
+                                ts_upd.avg_cost     = 0.0
+                                ts_upd.is_short     = False  # ショートカバー完了
+                                ts_upd.entry_pending_fill = False  # v3.9.17: クローズ完了 → フラグリセット
+                                _tracked_position_cost[symbol] = 0.0
+                                _tracked_qty[symbol]           = 0
+                                log.info(f"{tag} [約定反映] qty=0株  avg_cost=$0.00  tracked=$0.00")
+                        elif "[ショートカバー]" in mode:
+                            # ★ v2.91: SHORTカバー約定の確定損益 + TRADE_RESULT 記録。
+                            # ショート利益 = (エントリー価格 - 買戻価格) × 株数 (高売-安買)。
+                            # v2.90 までは BUY 分岐で position_qty 設定のみで PnL 計算漏れ。
+                            prev_avg_sc = ts_upd.avg_cost
+                            if prev_avg_sc <= 0 and ts_upd.pending_avg_cost > 0:
+                                prev_avg_sc = ts_upd.pending_avg_cost
+                                log.debug(f"{tag} [確定損益(SC)] avg_cost=0のためpending_avg_cost={prev_avg_sc:.2f}を使用")
+                            if prev_avg_sc > 0 and filled_price > 0:
+                                realized_sc = (prev_avg_sc - filled_price) * filled_qty
+                                # Discord PnL表示用に退避
+                                _realized_for_disc = realized_sc
+                                _realized_pct_for_disc = (realized_sc / (prev_avg_sc * filled_qty) * 100
+                                                          if prev_avg_sc > 0 else 0.0)
+                                _realized_qty_for_disc = int(filled_qty)
+                                # ★ v3.9.9: 視認性向上 — 絵文字 + ANSI 色付き損益サマリ + フローを前置き。
+                                # 端末では緑 (利益) / 赤 (損失) で表示、ログファイルは _PlainFormatter が
+                                # ANSI コードを除去するためプレーンテキスト。
+                                # 構造化部分 (realized_pnl=... cover_avg=... short_avg=... qty=...) は
+                                # 既存ログ集計・トラブル調査用に保持。
+                                if realized_sc > 0:
+                                    _pnl_emoji_sc, _pnl_label_sc, _pnl_color_sc = "📈", "SHORT決済益", "\033[1;32m"
+                                elif realized_sc < 0:
+                                    _pnl_emoji_sc, _pnl_label_sc, _pnl_color_sc = "📉", "SHORT決済損", "\033[1;31m"
+                                else:
+                                    _pnl_emoji_sc, _pnl_label_sc, _pnl_color_sc = "➡️", "SHORT決済 同値", ""
+                                _pnl_reset_sc = "\033[0m" if _pnl_color_sc else ""
+                                log.info(
+                                    f"{tag} {_pnl_color_sc}{_pnl_emoji_sc} {_pnl_label_sc} "
+                                    f"${realized_sc:+.2f} ({_realized_pct_for_disc:+.2f}%){_pnl_reset_sc}"
+                                    f"  │  {int(filled_qty)}株"
+                                    f"  │  売 ${prev_avg_sc:.2f} → 買 ${filled_price:.2f}"
+                                    f"  │  [確定損益(SC)]"
+                                    f"  realized_pnl={realized_sc:+.2f}"
+                                    f"  cover_avg={filled_price:.2f}"
+                                    f"  short_avg={prev_avg_sc:.2f}"
+                                    f"  qty={int(filled_qty)}"
+                                )
+                                # TRADE_RESULT: 1トレード全情報をログ出力（ロング決済と同形式）
+                                hold_min_sc = 0.0
+                                entry_t_sc = ts_upd.pending_entry_time or ts_upd.entry_time
+                                if entry_t_sc:
+                                    hold_min_sc = round(
+                                        (datetime.datetime.now() - entry_t_sc).total_seconds() / 60,
+                                        1
+                                    )
+                                session_name_sc, _ = get_session_info()
+                                log.info(
+                                    f"{tag} [TRADE_RESULT]"
+                                    f"  entry_price={prev_avg_sc:.2f}"
+                                    f"  exit_price={filled_price:.2f}"
+                                    f"  qty={int(filled_qty)}"
+                                    f"  realized_pnl={realized_sc:+.2f}"
+                                    f"  hold_min={hold_min_sc}"
+                                    f"  session={session_name_sc}"
+                                    f"  ai_score={ts_upd.entry_ai_score}"
+                                    f"  ai_conf={ts_upd.entry_ai_conf:.2f}"
+                                    f"  ai_category={ts_upd.entry_ai_category}"
+                                    f"  news_source={ts_upd.entry_news_source}"
+                                    f"  exit_reason={ts_upd.pending_close_reason}"
+                                    f"  trade_type=SHORT"
+                                    f"  settings={_get_settings_snapshot()}"
+                                )
+                                # リアルタイムWebhook送信（DATA_COLLECT=trueの場合）
+                                threading.Thread(
+                                    target=_send_trade_result,
+                                    args=(
+                                        symbol, prev_avg_sc, filled_price,
+                                        int(filled_qty), realized_sc,
+                                        hold_min_sc, session_name_sc,
+                                        ts_upd.entry_ai_score,
+                                        ts_upd.entry_ai_conf,
+                                        ts_upd.entry_ai_category,
+                                        ts_upd.entry_news_source,
+                                        ts_upd.pending_close_reason,
+                                    ),
+                                    kwargs={  # ★ v2.95: GAS連携用の追加フィールド
+                                        "headlines":     ts_upd.entry_headlines,
+                                        "beneficiaries": ts_upd.entry_beneficiaries,
+                                        "victims":       ts_upd.entry_victims,
+                                        "price_trend":   ts_upd.entry_price_trend,
+                                        "peak_pnl":      ts_upd.entry_peak_pnl,
+                                        # ★ v3.1.0: ショートカバーとして明示
+                                        "trade_type":    "SHORT",
+                                        # ★ v3.9.133: 決済時点の「実際に適用された損切り%」をスナップショットして渡す
+                                        #   （別スレッドで state を読むと次の建玉の値に入れ替わりうるため）
+                                        "enforced_stop_pct": getattr(ts_upd, "enforced_stop_pct", None),
+                                    },
+                                    daemon=True,
+                                ).start()
+                                # クリア
+                                # ★ v3.9.120: 部分約定時は残量の決済PnL計算に必要なためクリアしない
+                                if not _is_partial_fill:
+                                    ts_upd.pending_entry_time = None
+                                    ts_upd.pending_avg_cost   = 0.0
+                            if _is_partial_fill:
+                                # ★ v3.9.120: 部分カバー → 残りのショートを復元して保持
+                                #   （place_close_all が発注時に is_short を下ろしているため、
+                                #    ここで復元しないと残ショートが監視外になる）
+                                _rem_sc = max(0, int(round(float(qty) - filled_qty)))
+                                ts_upd.position_qty = -_rem_sc
+                                if prev_avg_sc > 0:
+                                    ts_upd.avg_cost = prev_avg_sc
+                                ts_upd.is_short = (_rem_sc > 0)
+                                ts_upd.entry_pending_fill = False
+                                log.warning(
+                                    f"{tag} [約定反映(SC)] 部分カバー: 残 {_rem_sc}株 のショートを保持"
+                                    f"（avg_cost=${ts_upd.avg_cost:.2f}）→ 残量は監視・再決済対象"
+                                )
+                            else:
+                                # ショートカバー完了 → ポジション状態を 0 にクリーン化
+                                ts_upd.position_qty = 0
+                                ts_upd.avg_cost     = 0.0
+                                ts_upd.is_short     = False
+                                ts_upd.entry_pending_fill = False  # v3.9.17: クローズ完了 → フラグリセット
+                                _tracked_position_cost[symbol] = 0.0
+                                _tracked_qty[symbol]           = 0
+                                log.info(f"{tag} [約定反映(SC)] qty=0株  avg_cost=$0.00  tracked=$0.00")
+                        else:
+                            # ── BUY約定: ポジション・コストを更新 ─────────────────
+                            ts_upd.position_qty = int(filled_qty)
+                            ts_upd.avg_cost     = filled_price
+                            ts_upd.avg_cost_confirmed = True   # v3.9.101: 実約定単価で確定
+                            ts_upd.entry_pending_fill = False  # v3.9.17: 約定確認 → リスク監視解放
+                            _tracked_position_cost[symbol] = filled_qty * filled_price
+                            _tracked_qty[symbol]           = int(filled_qty)
+                            log.info(
+                                f"{tag} [約定反映] qty={int(filled_qty)}株"
+                                f"  avg_cost=${filled_price:.2f}"
+                                f"  tracked=${filled_qty * filled_price:,.2f}"
+                            )
+                    else:
+                        # ショート約定: position_qty をマイナスで記録
+                        ts_upd.position_qty = -int(filled_qty)
+                        ts_upd.avg_cost     = filled_price
+                        ts_upd.avg_cost_confirmed = True   # v3.9.101: 実約定単価で確定
+                        ts_upd.entry_pending_fill = False  # v3.9.17: 約定確認 → リスク監視解放
+            except Exception as _ue:
+                log.debug(f"{tag} [約定反映] 更新スキップ: {_ue}")
+            # ── 約定確認Discord送信 ─────────────────────────────────────────
+            # SELL確定時は実測PnL・判定理由・ニュースを追記
+            # ★ v2.90: 退避した _realized_for_disc を参照することで、
+            # 上で pending_avg_cost = 0.0 にクリア済みでも PnL を表示できる。
+            _fill_extra = ""
+            try:
+                if _realized_for_disc is not None:
+                    _fill_extra += f"\n{discord_pnl(_realized_for_disc, _realized_pct_for_disc, _realized_qty_for_disc)}"
+                # 判定理由の追記（SELL/COVER 時のみ）
+                # ★ v2.99.3: mode 文字列 ("ロング決済"/"ショートカバー") も判定対象に追加
+                _is_close_event = (
+                    "sell" in status_lower
+                    or "ロング決済" in mode
+                    or "ショートカバー" in mode
+                    or "[決済]" in mode
+                    or "[ショートカバー]" in mode
+                    or (ts_upd.avg_cost == 0.0 and ts_upd.position_qty == 0)
+                )
+                if _is_close_event:
+                    _ts_for_disc = state.get(symbol)
+                    if _ts_for_disc.entry_reason:
+                        _fill_extra += f"\n📋 判定理由: {_ts_for_disc.entry_reason}"
+            except Exception:
+                pass
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                f"[Bot] {tag} ✅ 約定確認 {mode}\n"
+                f"ステータス: {status}  約定株数: {filled}{avg_price}"
+                f"{_fill_extra}"
+            ))
+        elif "cancelled" in status_lower or "failed" in status_lower or "rejected" in status_lower:
+            _unregister_pending_order(order_id)  # キャンセル/失敗 → 管理辞書から削除
+            # ── キャンセル/失敗時は state と _tracked_position_cost をリセット ──────
+            # BUY注文がキャンセルされた場合、_tracked_position_cost が残ったままだと
+            # リスク監視ループが「ポジションあり」と誤判断し、[ポジション]📋注文中 を
+            # 永続表示してしまう（受講生が含み損と誤認するリスク）。
+            # position_qty > 0 か avg_cost > 0 の場合は部分約定済みなのでリセットしない。
+            try:
+                ts_cancel = state.get(symbol)
+                if not (ts_cancel.position_qty > 0 or ts_cancel.avg_cost > 0):
+                    # 未約定のまま取消 → コスト・エントリー情報をクリア
+                    prev_tracked = _tracked_position_cost.get(symbol, 0.0)
+                    _tracked_position_cost[symbol] = 0.0
+                    ts_cancel.entry_count = 0
+                    ts_cancel.entry_time  = None
+                    log.warning(
+                        f"{tag} [取消確認] ❌ 未約定取消 → state/tracked をリセット"
+                        f"  解放額:${prev_tracked:,.0f}  status={status}"
+                    )
+            except Exception as _ce:
+                log.debug(f"{tag} [取消確認] リセット処理例外: {_ce}")
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                f"[Bot] {tag} ❌ 注文キャンセル/失敗 {mode}\n"
+                f"orderId: {order_id}\n"
+                f"ステータス: {status}"
+            ))
+        else:
+            # ── SUBMITTED（未約定）: リトライして遅延約定を拾う ──────────────────
+            # moomoo API は約定直後もSUBMITTEDを返すことがある（反映遅延: 数秒〜10秒）。
+            # 最大3回・3秒間隔でリトライし、それでも未約定なら通常の指値待ちとして扱う。
+            _retried = False
+            for _retry in range(3):
+                await asyncio.sleep(3)
+                try:
+                    # ★ v2.86: with _trade_ctx() で例外時の close を保証
+                    with _trade_ctx() as ctx2:
+                        _acc2 = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
+                        ret2, data2 = ctx2.order_list_query(
+                            trd_env=trd_env, order_id=order_id, acc_id=_acc2,
+                        )
+                    if ret2 != RET_OK or not _df_has_rows(data2):
+                        continue
+                    status2 = str(_get_val(data2, "order_status", "")).lower()
+                    log.info(
+                        f"{tag} [約定確認リトライ {_retry+1}/3]"
+                        f" orderId={order_id}  status={status2}"
+                    )
+                    if "filled" in status2 or "dealt" in status2:
+                        # リトライで約定を確認 → 通常の約定処理に合流
+                        _unregister_pending_order(order_id)
+                        # ★ v2.90: Discord PnL表示用の退避変数（リトライ用）
+                        _realized_for_disc2: Optional[float] = None
+                        _realized_pct_for_disc2: float = 0.0
+                        _realized_qty_for_disc2: int = 0
+                        try:
+                            filled_qty2   = float(_get_val(data2, "dealt_qty", qty) or qty)
+                            filled_price2_raw = _get_val(data2, "dealt_avg_price", None)
+                            filled_price2 = float(filled_price2_raw) if filled_price2_raw else 0.0
+                            if filled_qty2 > 0 and filled_price2 > 0:
+                                ts_upd2 = state.get(symbol)
+                                if "[空売り]" not in mode:
+                                    # ★ v2.99.3: "ロング決済" も検出対象に追加 (上記と同じ理由)
+                                    if "[決済]" in mode or "ロング決済" in mode:
+                                        prev_avg2 = ts_upd2.avg_cost
+                                        if prev_avg2 <= 0 and ts_upd2.pending_avg_cost > 0:
+                                            prev_avg2 = ts_upd2.pending_avg_cost
+                                        if prev_avg2 > 0 and filled_price2 > 0:
+                                            realized2 = (filled_price2 - prev_avg2) * filled_qty2
+                                            # ★ v2.90: Discord PnL表示用に退避
+                                            _realized_for_disc2 = realized2
+                                            _realized_pct_for_disc2 = (realized2 / (prev_avg2 * filled_qty2) * 100
+                                                                       if prev_avg2 > 0 else 0.0)
+                                            _realized_qty_for_disc2 = int(filled_qty2)
+                                            log.info(
+                                                f"{tag} [確定損益(リトライ)]"
+                                                f"  realized_pnl={realized2:+.2f}"
+                                                f"  sell_avg={filled_price2:.2f}"
+                                                f"  buy_avg={prev_avg2:.2f}"
+                                                f"  qty={int(filled_qty2)}"
+                                            )
+                                            hold_min2 = 0.0
+                                            entry_t2 = ts_upd2.pending_entry_time or ts_upd2.entry_time
+                                            if entry_t2:
+                                                hold_min2 = round(
+                                                    (datetime.datetime.now() - entry_t2).total_seconds() / 60, 1
+                                                )
+                                            session_name2, _ = get_session_info()
+                                            log.info(
+                                                f"{tag} [TRADE_RESULT]"
+                                                f"  entry_price={prev_avg2:.2f}"
+                                                f"  exit_price={filled_price2:.2f}"
+                                                f"  qty={int(filled_qty2)}"
+                                                f"  realized_pnl={realized2:+.2f}"
+                                                f"  hold_min={hold_min2}"
+                                                f"  session={session_name2}"
+                                                f"  ai_score={ts_upd2.entry_ai_score}"
+                                                f"  ai_conf={ts_upd2.entry_ai_conf:.2f}"
+                                                f"  ai_category={ts_upd2.entry_ai_category}"
+                                                f"  news_source={ts_upd2.entry_news_source}"
+                                                f"  exit_reason={ts_upd2.pending_close_reason}"
+                                                f"  settings={_get_settings_snapshot()}"
+                                            )
+                                            threading.Thread(
+                                                target=_send_trade_result,
+                                                args=(
+                                                    symbol, prev_avg2, filled_price2,
+                                                    int(filled_qty2), realized2,
+                                                    hold_min2, session_name2,
+                                                    ts_upd2.entry_ai_score,
+                                                    ts_upd2.entry_ai_conf,
+                                                    ts_upd2.entry_ai_category,
+                                                    ts_upd2.entry_news_source,
+                                                    ts_upd2.pending_close_reason,
+                                                ),
+                                                kwargs={  # ★ v2.95: GAS連携用の追加フィールド
+                                                    "headlines":     ts_upd2.entry_headlines,
+                                                    "beneficiaries": ts_upd2.entry_beneficiaries,
+                                                    "victims":       ts_upd2.entry_victims,
+                                                    "price_trend":   ts_upd2.entry_price_trend,
+                                                    "peak_pnl":      ts_upd2.entry_peak_pnl,
+                                                    # ★ v3.1.0: ロング決済（リトライ）として明示
+                                                    "trade_type":    "LONG",
+                                                    # ★ v3.9.133: 決済時点の「実際に適用された損切り%」をスナップショットして渡す
+                                                    #   （別スレッドで state を読むと次の建玉の値に入れ替わりうるため）
+                                                    "enforced_stop_pct": getattr(ts_upd2, "enforced_stop_pct", None),
+                                                },
+                                                daemon=True,
+                                            ).start()
+                                            ts_upd2.pending_entry_time = None
+                                            ts_upd2.pending_avg_cost   = 0.0
+                                        ts_upd2.position_qty = 0
+                                        ts_upd2.avg_cost     = 0.0
+                                        ts_upd2.is_short     = False
+                                        _tracked_position_cost[symbol] = 0.0
+                                        _tracked_qty[symbol]           = 0
+                                        log.info(f"{tag} [約定反映(リトライ)] qty=0株  avg_cost=$0.00")
+                                    elif "[ショートカバー]" in mode:
+                                        # ── ★ v2.91: ショートカバー約定（リトライ）: PnL + TRADE_RESULT を記録 ──
+                                        prev_avg_sc2 = ts_upd2.avg_cost
+                                        if prev_avg_sc2 <= 0 and ts_upd2.pending_avg_cost > 0:
+                                            prev_avg_sc2 = ts_upd2.pending_avg_cost
+                                        if prev_avg_sc2 > 0 and filled_price2 > 0:
+                                            realized_sc2 = (prev_avg_sc2 - filled_price2) * filled_qty2
+                                            _realized_for_disc2 = realized_sc2
+                                            _realized_pct_for_disc2 = (realized_sc2 / (prev_avg_sc2 * filled_qty2) * 100
+                                                                       if prev_avg_sc2 > 0 else 0.0)
+                                            _realized_qty_for_disc2 = int(filled_qty2)
+                                            log.info(
+                                                f"{tag} [確定損益(SC・リトライ)]"
+                                                f"  realized_pnl={realized_sc2:+.2f}"
+                                                f"  cover_avg={filled_price2:.2f}"
+                                                f"  short_avg={prev_avg_sc2:.2f}"
+                                                f"  qty={int(filled_qty2)}"
+                                            )
+                                            hold_min_sc2 = 0.0
+                                            entry_t_sc2 = ts_upd2.pending_entry_time or ts_upd2.entry_time
+                                            if entry_t_sc2:
+                                                hold_min_sc2 = round(
+                                                    (datetime.datetime.now() - entry_t_sc2).total_seconds() / 60, 1
+                                                )
+                                            session_name_sc2, _ = get_session_info()
+                                            log.info(
+                                                f"{tag} [TRADE_RESULT]"
+                                                f"  entry_price={prev_avg_sc2:.2f}"
+                                                f"  exit_price={filled_price2:.2f}"
+                                                f"  qty={int(filled_qty2)}"
+                                                f"  realized_pnl={realized_sc2:+.2f}"
+                                                f"  hold_min={hold_min_sc2}"
+                                                f"  session={session_name_sc2}"
+                                                f"  ai_score={ts_upd2.entry_ai_score}"
+                                                f"  ai_conf={ts_upd2.entry_ai_conf:.2f}"
+                                                f"  ai_category={ts_upd2.entry_ai_category}"
+                                                f"  news_source={ts_upd2.entry_news_source}"
+                                                f"  exit_reason={ts_upd2.pending_close_reason}"
+                                                f"  trade_type=SHORT"
+                                                f"  settings={_get_settings_snapshot()}"
+                                            )
+                                            threading.Thread(
+                                                target=_send_trade_result,
+                                                args=(
+                                                    symbol, prev_avg_sc2, filled_price2,
+                                                    int(filled_qty2), realized_sc2,
+                                                    hold_min_sc2, session_name_sc2,
+                                                    ts_upd2.entry_ai_score,
+                                                    ts_upd2.entry_ai_conf,
+                                                    ts_upd2.entry_ai_category,
+                                                    ts_upd2.entry_news_source,
+                                                    ts_upd2.pending_close_reason,
+                                                ),
+                                                kwargs={  # ★ v2.95: GAS連携用の追加フィールド
+                                                    "headlines":     ts_upd2.entry_headlines,
+                                                    "beneficiaries": ts_upd2.entry_beneficiaries,
+                                                    "victims":       ts_upd2.entry_victims,
+                                                    "price_trend":   ts_upd2.entry_price_trend,
+                                                    "peak_pnl":      ts_upd2.entry_peak_pnl,
+                                                    # ★ v3.1.0: ショートカバー（リトライ）として明示
+                                                    "trade_type":    "SHORT",
+                                                    # ★ v3.9.133: 決済時点の「実際に適用された損切り%」をスナップショットして渡す
+                                                    #   （別スレッドで state を読むと次の建玉の値に入れ替わりうるため）
+                                                    "enforced_stop_pct": getattr(ts_upd2, "enforced_stop_pct", None),
+                                                },
+                                                daemon=True,
+                                            ).start()
+                                            ts_upd2.pending_entry_time = None
+                                            ts_upd2.pending_avg_cost   = 0.0
+                                        ts_upd2.position_qty = 0
+                                        ts_upd2.avg_cost     = 0.0
+                                        ts_upd2.is_short     = False
+                                        _tracked_position_cost[symbol] = 0.0
+                                        _tracked_qty[symbol]           = 0
+                                        log.info(f"{tag} [約定反映(SC・リトライ)] qty=0株  avg_cost=$0.00")
+                                    else:
+                                        ts_upd2.position_qty = int(filled_qty2)
+                                        ts_upd2.avg_cost     = filled_price2
+                                        ts_upd2.avg_cost_confirmed = True   # v3.9.101
+                                        _tracked_position_cost[symbol] = filled_qty2 * filled_price2
+                                        _tracked_qty[symbol]           = int(filled_qty2)
+                                        log.info(
+                                            f"{tag} [約定反映(リトライ)] qty={int(filled_qty2)}株"
+                                            f"  avg_cost=${filled_price2:.2f}"
+                                        )
+                                else:
+                                    ts_upd2.position_qty = -int(filled_qty2)
+                                    ts_upd2.avg_cost     = filled_price2
+                                    ts_upd2.avg_cost_confirmed = True   # v3.9.101
+                        except Exception as _re:
+                            log.debug(f"{tag} [約定確認リトライ] 反映処理例外: {_re}")
+                        # ★ v2.90: リトライ約定確認でもPnL表示を統一
+                        _fill_extra2 = ""
+                        try:
+                            if _realized_for_disc2 is not None:
+                                _fill_extra2 += f"\n{discord_pnl(_realized_for_disc2, _realized_pct_for_disc2, _realized_qty_for_disc2)}"
+                            # ★ v2.91: ショートカバーも判定理由を表示するよう判定条件を拡張
+                            # ★ v2.99.3: "ロング決済" / "ショートカバー" の文字列も検出対象に追加
+                            if (
+                                "[決済]" in mode or "ロング決済" in mode
+                                or "[ショートカバー]" in mode or "ショートカバー" in mode
+                            ):
+                                _ts_for_disc2 = state.get(symbol)
+                                if _ts_for_disc2.entry_reason:
+                                    _fill_extra2 += f"\n📋 判定理由: {_ts_for_disc2.entry_reason}"
+                        except Exception:
+                            pass
+                        _threadsafe_future(asyncio.to_thread(
+                            send_discord_message,
+                            f"[Bot] {tag} ✅ 約定確認(リトライ{_retry+1}回目) {mode}\n"
+                            f"ステータス: {status2}  約定株数: {int(filled_qty2)}"
+                            f"{_fill_extra2}"
+                        ))
+                        _retried = True
+                        break
+                    elif "cancelled" in status2 or "failed" in status2 or "rejected" in status2:
+                        # リトライ中にキャンセル判明 → stateリセット + Discord通知
+                        _unregister_pending_order(order_id)
+                        log.warning(f"{tag} [約定確認リトライ] キャンセル/失敗確認: status={status2}")
+                        # BUY注文キャンセル: ポジションが実際にない場合はtrackedをリセット
+                        try:
+                            ts_ret_cancel = state.get(symbol)
+                            if not (ts_ret_cancel.position_qty > 0 or ts_ret_cancel.avg_cost > 0):
+                                prev_tracked_r = _tracked_position_cost.get(symbol, 0.0)
+                                _tracked_position_cost[symbol] = 0.0
+                                ts_ret_cancel.entry_count = 0
+                                ts_ret_cancel.entry_time  = None
+                                if prev_tracked_r > 0:
+                                    log.warning(
+                                        f"{tag} [約定確認リトライ] BUY取消確定"
+                                        f" → state/tracked リセット  解放額:${prev_tracked_r:,.0f}"
+                                    )
+                        except Exception as _rce:
+                            log.debug(f"{tag} [約定確認リトライ] キャンセルリセット例外: {_rce}")
+                        _threadsafe_future(asyncio.to_thread(
+                            send_discord_message,
+                            f"[Bot] {tag} ❌ 注文キャンセル/失敗(リトライ中検出) {mode}\n"
+                            f"orderId: {order_id}\nステータス: {status2}"
+                        ))
+                        _retried = True
+                        break
+                except Exception as _re2:
+                    log.debug(f"{tag} [約定確認リトライ {_retry+1}] 例外: {_re2}")
+
+            if not _retried:
+                # 3回リトライしても未約定 → 指値待ちとして扱う + Discord通知
+                log.info(f"{tag} [約定確認] 未約定: status={status} （指値待ち・リトライ3回とも未約定）")
+                _threadsafe_future(asyncio.to_thread(
+                    send_discord_message,
+                    f"[Bot] {tag} ⚠️ 約定確認 SUBMITTED のまま {mode}\n"
+                    f"orderId: {order_id}\n"
+                    f"API遅延の可能性。watchdogが継続監視します。"
+                ))
+    except Exception as e:
+        log.warning(f"{tag} [約定確認] 例外: {e}")
+
+def place_buy(
+    symbol: str,
+    trd_env: TrdEnv,
+    confidence: float = 0.7,
+    trigger: str      = "",
+    reason: str       = "",
+    qty: Optional[int] = None,
+    category: str     = "MACRO",
+    news_source: str  = "",
+    headlines: Optional[List[str]] = None,
+    beneficiaries: Optional[List[str]] = None,  # ★ v2.95: AI beneficiaries (GAS送信用)
+    victims: Optional[List[str]]       = None,  # ★ v2.95: AI victims (GAS送信用)
+) -> bool:
+    """
+    指値買い注文を moomoo に発行する。
+    時間外取引（プリ・アフター・オーバーナイト）は outside_rth=True で対応。
+    confidence に応じた動的注文金額と BUDGET_USD ベースの上限管理を適用する。
+    qty を指定した場合はその株数で発注（ショートクリーンアップ用）。
+    """
+    global _trade_locked, _trade_lock_last_warned  # 取引ロック状態管理
+    tag     = f"【{symbol}】"
+    mode    = "【デモ】" if trd_env == TrdEnv.SIMULATE else "【実注文】"
+    session, _ = get_session_info()
+
+    # ★ v3.9.134: Bot 以外の建玉がある銘柄には新規エントリーしない。
+    #   決済は銘柄単位の全決済なので、混ぜると自分の分だけ決済できなくなる。
+    if _skip_if_externally_held(symbol, "新規ロング"):
+        return False
+
+    if session == SESSION_WEEKEND:
+        log.info(f"{tag} 週末セッション: BUY をスキップ")
+        return False
+
+    # ★ v2.87: 休日も発注スキップ（防御的ガード — 通常は market_open_event で停止済）
+    if session == SESSION_HOLIDAY:
+        log.info(f"{tag} 休場日セッション: BUY をスキップ")
+        return False
+
+    if session == SESSION_OVERNIGHT and trd_env == TrdEnv.SIMULATE:
+        log.info(f"{tag} オーバーナイトセッション: BUY をスキップ（デモ口座・ポジション管理不可）")
+        return False
+
+    # ── 起動時ポジション不明フラグチェック ────────────────────────────────────
+    if _startup_position_unknown and trd_env == TrdEnv.REAL:
+        log.warning(
+            f"{tag} 🚫 発注ブロック: 起動時のポジション確認が取れていません。"
+            f" moomooアプリでポジションを確認してからbotを再起動してください。"
+        )
+        return False
+
+    # ★ v2.98: SHORT 残存チェック (place_short 側の対称ロジック)。
+    # SHORT 保有中の新規 BUY は moomoo が買戻と区別できず両建てになる可能性。
+    # 先に買戻 → return → 次のシグナルでロング試行 (非対称解消順)。
+    sync_positions(trd_env)
+    ts_pre_buy = state.get(symbol)
+    if ts_pre_buy.position_qty < 0:
+        _abs_short = abs(ts_pre_buy.position_qty)
+        # ★ v3.9.89: L/S転換の抑制（MOMENTUM_REVERSE_EXIT=false）。
+        #   反対(SHORT)保有中は強制決済せず新規LONGを"見送る"だけにする。既存SHORTは
+        #   自身の損切り/トレール/時間切れ/建玉トレールに委ねる。反対シグナルは相場が
+        #   逆行した時に出るため、転換決済はほぼ必ず含み損確定(実データ WR0%・-$750/日規模)。
+        #   その純出血を回避する。既定(true)は従来どおり買い戻して向きを変える。
+        if not MOMENTUM_REVERSE_EXIT:
+            log.info(
+                f"{tag} [BUY前チェック] ショート {_abs_short}株 保有中 → "
+                f"転換せず新規LONGを見送り（MOMENTUM_REVERSE_EXIT=false・既存SHORTは損切り/トレールに委ねる）"
+            )
+            return False
+        # ★ v3.8.5: 正常なフロー (ショート→ロング切替) のため WARNING → INFO に降格
+        log.info(
+            f"{tag} [BUY前チェック] ショートポジション {_abs_short}株 が残存 "
+            f"→ 先に買い戻してからロングを試みます（今回はスキップ）"
+        )
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"[Bot] {tag} ⚠ ロング前にショート決済\n"
+            f"ショート {_abs_short}株 を保有中のためロングをスキップ。\n"
+            f"先にショートを買い戻します。次のシグナルでロングを試みます。"
+        ))
+        place_close_all(symbol, trd_env, "ロング前ショート強制決済")
+        return False
+
+    # ── ★ v2.99.4: 決済 FAILED 中の同銘柄新規 BUY ブロック (最優先) ───────────
+    # 直前の place_close_all が全 position_id 失敗で True を返さなかった銘柄は、
+    # 既存ポジションの解消が完了するまで新規 BUY をブロックする。
+    # サポーター v2.97 実口座運用フィードバックへの対応。
+    _is_fc_locked, _fc_elapsed = _is_failed_close_locked(symbol)
+    if _is_fc_locked:
+        log.warning(
+            f"{tag} 🚫 [決済FAILED中] 既存ポジションの決済が失敗中 ({_fc_elapsed:.1f}分前) "
+            f"→ 新規BUYをスキップ (既存ポジション解消を優先)"
+        )
+        return False
+
+    # ── ★ v3.9.10: 終盤エントリーブロック (強制決済の N 分前以内なら新規禁止) ──
+    # 5/12 ログ分析でデモ日次決済 (15:45 ET) 直前 1 分間に 22 件の新規 BUY が
+    # 集中し、買って数秒後の強制決済で全件損切り (-$74.27 / 勝率 4.5%) という
+    # 構造的バグを修正。close_trigger_time の 15 分前以降は新規エントリー禁止。
+    _late_block, _mins_to_close = _is_late_session_entry_blocked()
+    if _late_block:
+        log.info(
+            f"{tag} 🚫 [終盤エントリーブロック] 強制決済まで残り {_mins_to_close:.1f}分 "
+            f"(≤ {ENTRY_BLOCK_BEFORE_CLOSE_MIN}分) → BUY をスキップ"
+        )
+        _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                         category=category, headlines=headlines,
+                         beneficiaries=beneficiaries, victims=victims,
+                         outcome="blocked", block_stage="late_session",
+                         block_reason=f"強制決済まで残り {_mins_to_close:.1f}分")
+        return False
+
+    # ── ★ v2.93: 下落トレンド検知時の新規ロング一時停止 ──────────────────────
+    # 構成 A: 急落直後の同一銘柄ブロック (直近 NEW_LONG_BLOCK_SEC 秒)
+    # 5/4 (NY11時 Oracle事案) や 5/5 (SMH 終日下落で Alpaca 59件ロング) の
+    # 「損切り直後にまた同じ銘柄でロングを撃ち続ける」問題への対策。
+    _is_blocked_a, _elapsed_a = is_recent_risk_event(symbol)
+    if _is_blocked_a:
+        _remain = NEW_LONG_BLOCK_SEC - int(_elapsed_a)
+        log.info(
+            f"{tag} 🚫 [新規ロングブロック A] 直近 {int(_elapsed_a)}秒前にリスクイベント発動 "
+            f"→ あと {_remain}秒 ({_remain // 60}分{_remain % 60}秒) は新規ロックをスキップ"
+        )
+        _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                         category=category, headlines=headlines,
+                         beneficiaries=beneficiaries, victims=victims,
+                         outcome="blocked", block_stage="risk_event_a",
+                         block_reason=f"直近 {int(_elapsed_a)}秒前にリスクイベント発動")
+        return False
+    # 構成 B: マクロ下落トレンド検知 (全銘柄) — QQQ の直近騰落率から判定
+    # v2.92 で導入した _INDEX_PRICE_HISTORY を活用し、相場全体が下落中の
+    # ポジティブ単発ニュースに反応してロングを撃ち損ねるパターンを抑制する。
+    _is_downtrend, _dt_reason = is_macro_downtrend()
+    if _is_downtrend:
+        log.info(
+            f"{tag} 🚫 [新規ロングブロック B] マクロ下落トレンド検知 ({_dt_reason}) "
+            f"→ QQQ が反発するまで新規ロングをスキップ"
+        )
+        _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                         category=category, headlines=headlines,
+                         beneficiaries=beneficiaries, victims=victims,
+                         outcome="blocked", block_stage="macro_downtrend",
+                         block_reason=_dt_reason)
+        return False
+
+    # ── ★ v2.94: SMH 固有の追加チェック ──────────────────────────────────────
+    # 5/5 SMH 終日下落事案で、QQQ は横ばい (構成 B が発火しない) でも SMH だけが
+    # 下落するケースがあった。SMH 固有のセクター下落を別途検知する。
+    if symbol == "SMH":
+        # 修正項目 2: SMH 専用 Confidence しきい値 (0.80)
+        # SMH のみハードコードで confidence ≥ 0.80 を要求 (他銘柄は既存設定維持)
+        # 730 件分析で SMH 0.75 帯の損失が -$212 と最大だったことへの対策。
+        if confidence < SMH_CONFIDENCE_THRESHOLD:
+            log.info(
+                f"{tag} 🚫 [SMH 専用厳格化] confidence={confidence:.2f} "
+                f"< {SMH_CONFIDENCE_THRESHOLD} → SMH 発注をスキップ"
+            )
+            _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                             category=category, headlines=headlines,
+                             beneficiaries=beneficiaries, victims=victims,
+                             outcome="blocked", block_stage="smh_strict",
+                             block_reason=f"SMH conf={confidence:.2f} < {SMH_CONFIDENCE_THRESHOLD}")
+            return False
+        # 修正項目 4: SMH 下落トレンド検知ブロック
+        # SMH 自体の直近騰落率で下落トレンドを判定（QQQ ベースの構成 B とは独立）。
+        _is_smh_down, _smh_dt_reason = is_smh_downtrend()
+        if _is_smh_down:
+            log.info(
+                f"{tag} 🚫 [SMH 下落トレンドブロック] {_smh_dt_reason} "
+                f"→ SMH が反発するまで新規ロングをスキップ"
+            )
+            _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                             category=category, headlines=headlines,
+                             beneficiaries=beneficiaries, victims=victims,
+                             outcome="blocked", block_stage="smh_downtrend",
+                             block_reason=_smh_dt_reason)
+            return False
+
+    # ── ★ v3.9.5: SPY 固有の追加チェック ──────────────────────────────────────
+    # SPY は QQQ より約 40% 低ボラのため、QQQ ベースの構成 B (-0.30%/-0.70%) では
+    # SPY 単独下落の検知精度が低い。SPY 専用の閾値 (-0.20%/-0.45%) で補完する。
+    if symbol == "SPY":
+        _is_spy_down, _spy_dt_reason = is_spy_downtrend()
+        if _is_spy_down:
+            log.info(
+                f"{tag} 🚫 [SPY 下落トレンドブロック] {_spy_dt_reason} "
+                f"→ SPY が反発するまで新規ロングをスキップ"
+            )
+            _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                             category=category, headlines=headlines,
+                             beneficiaries=beneficiaries, victims=victims,
+                             outcome="blocked", block_stage="spy_downtrend",
+                             block_reason=_spy_dt_reason)
+            return False
+
+    # ── ★ v2.99.4: 構成 D - 個別株固有の下落トレンド検知 ────────────────────
+    # STOCK_TICKERS に含まれる銘柄のみ判定対象。QQQ/SMH 系の構成 B/C では
+    # 拾えない「個別株の単独急落」を検知する。
+    if symbol in STOCK_TICKERS:
+        _is_stock_down, _stock_dt_reason = is_stock_downtrend(symbol)
+        if _is_stock_down:
+            log.info(
+                f"{tag} 🚫 [個別株下落トレンドブロック D] {_stock_dt_reason} "
+                f"→ {symbol} が反発するまで新規ロングをスキップ"
+            )
+            _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                             category=category, headlines=headlines,
+                             beneficiaries=beneficiaries, victims=victims,
+                             outcome="blocked", block_stage="stock_downtrend",
+                             block_reason=_stock_dt_reason)
+            return False
+
+    # ── リアルタイム価格の取得（Quote Right 対応・推定値は使わない）──────────────
+    quote       = get_quote(symbol)
+    # ★ v3.9.78 (#2): 異常クォートガード（板薄/異常値での発注を遮断）
+    _qok, _qreason = _quote_sanity_ok(symbol, quote)
+    if not _qok:
+        log.warning(f"{tag} 🚫 発注見送り（異常クォートガード）: {_qreason}")
+        _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                         category=category, headlines=headlines,
+                         beneficiaries=beneficiaries, victims=victims,
+                         outcome="blocked", block_stage="quote_sanity",
+                         block_reason=_qreason, quote_sanity=0)
+        return False
+    limit_price = calc_limit_price(quote, "BUY", symbol)  # ★ v2.99.4: シンボル別バッファ
+    if limit_price <= 0:
+        log.warning(f"{tag} リアルタイム価格取得失敗: BUY をスキップ（ask={quote['ask']}, last={quote['last']}）")
+        return False
+
+    # ── ★ v3.9.20: ピラミッディング撤去・既存ポジションあれば新規追加スキップ ──
+    # 旧 v3.9.19 までは「同方向に複数回追加 (PYRAMID_MAX_ENTRIES)」を許可していたが、
+    # 1) 実データで一度も発動していなかった (タイムアウト 10分 / 再エントリー禁止 30分 と衝突)
+    # 2) スキャル戦略 (短時間決済) と「上昇継続中に増し玉」の思想が根本的に合わない
+    # 3) PYRAMID_ALLIN_THRESHOLD (一気全額) も新しい山型サイズ配分と競合する
+    # ため撤去。既存ポジション保有中の同シグナル再送はシンプルにスキップ。
+    ts_check = state.get(symbol)
+
+    # ★ v3.9.121: 既存 LONG 保有中の新規追加スキップを qty 指定経路にも適用（利用者H指摘②-2）。
+    #   旧実装は if qty is None: の内側のみ＝ショートカバー等を想定した抜け道だったが、
+    #   qty 明示のモメンタムBUY・動的個別株BUYが意図せずバイパスし、ニュースLONG保有中の
+    #   同銘柄に追い玉が入り得た（entry_time 上書きでタイムアウト起点・成績帰属もズレる）。
+    #   ショートカバーは position_qty < 0 のため本チェックには掛からず、従来どおり通過する。
+    if ts_check.position_qty > 0:
+        log.info(
+            f"{tag} 既存 LONG ポジション保有中 (qty={ts_check.position_qty}株) → 新規発注スキップ"
+        )
+        return False
+
+    if qty is None:
+        # 発注金額：confidence の「山型」配分で計算 (calc_order_size 内部)
+        order_size = calc_order_size(confidence)
+        # サイズ配分のログ表示 (実況用)
+        if confidence < 0.70:
+            _size_label = "弱シグナル帯 30%"
+        elif confidence < 0.78:
+            _size_label = "主力帯 60%"
+        elif confidence < 0.83:
+            _size_label = "★スイートスポット 100%"
+        else:
+            _size_label = "超強気帯 40%"
+        # ★ v3.9.32: 高ボラ銘柄はサイズを ÷ 倍率 で縮小 (損切り幅拡大とセット)
+        # 損切り幅を N 倍に拡げる代わりにサイズを 1/N に縮小し、1 トレードの
+        # 想定最大損失額 (ドル) を ETF と同水準に保つ (リスクパリティ)。
+        _hv_mult = _symbol_loss_mult(symbol)
+        if _hv_mult > 1.0:
+            _order_size_before = order_size
+            order_size = max(ORDER_SIZE_MIN_USD, order_size / _hv_mult)
+            log.info(
+                f"{tag} 発注額計算: confidence={confidence:.2f}  [{_size_label}]"
+                f"  → 高ボラ銘柄サイズ調整 ${_order_size_before:,.0f} ÷ {_hv_mult:.1f}"
+                f" = ${order_size:,.0f}"
+                f"  (損切り幅 {MAX_LOSS_PCT*100:.2f}%→{MAX_LOSS_PCT*_hv_mult*100:.2f}% / "
+                f"想定最大損失額は ETF と同水準)"
+            )
+        else:
+            log.info(
+                f"{tag} 発注額計算: confidence={confidence:.2f}  [{_size_label}]"
+                f"  → ${order_size:,.0f}"
+                f"  （min=${ORDER_SIZE_MIN_USD:,.0f} max=${ORDER_SIZE_MAX_USD:,.0f}）"
+            )
+    else:
+        order_size = qty * limit_price  # qty直接指定の場合は金額を後で計算
+
+    # ── ① ポートフォリオ合計上限チェック（自前管理・API非依存）────────────
+    portfolio_total = get_tracked_portfolio_total()
+    log.info(f"{tag} [上限チェック] ポートフォリオ合計=${portfolio_total:,.0f} / 上限=${_BUDGET_USD:,.0f}")
+    if portfolio_total >= _BUDGET_USD:
+        log.info(
+            f"{tag} ポートフォリオ上限到達: 現在合計=${portfolio_total:,.0f}"
+            f" ≥ BUDGET_USD=${_BUDGET_USD:,.0f} → 新規発注ブロック"
+        )
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"[Bot] {tag} 🚫 ポートフォリオ上限到達\n"
+            f"現在合計: ${portfolio_total:,.0f} / 上限: ${_BUDGET_USD:,.0f}\n"
+            f"→ 新規発注をブロックしました"
+        ))
+        return False
+
+    # ② 残余力を計算（BUDGET_USD - 自前管理の合計コスト）
+    remaining_budget = _BUDGET_USD - portfolio_total
+
+    # ── ③ 発注額を残余力に合わせて調整（100%まで使用）──────────────────────
+    if order_size > remaining_budget:
+        if remaining_budget < limit_price:
+            log.info(
+                f"{tag} 残余力不足: ${remaining_budget:,.0f} < 1株${limit_price:.2f}"
+                f" → 発注スキップ"
+            )
+            return False
+        log.info(
+            f"{tag} 余力調整: ${order_size:,.0f}"
+            f" → 残余力=${remaining_budget:,.0f} に引き下げ"
+            f"（現在合計=${portfolio_total:,.0f}）"
+        )
+        order_size = remaining_budget
+
+    # ── ④ 個別株・決算銘柄の1銘柄上限チェック（STOCK_MAX_PCT, v2.40）────────
+    _is_stock_sym = symbol in STOCK_TICKERS or symbol in EARNINGS_PRE_TICKERS or symbol in EARNINGS_AFTER_TICKERS
+    if _is_stock_sym and STOCK_MAX_USD > 0:
+        # ★ v2.90: 旧コードにあった `_cur_stock_cost` 計算は死コード（後続で未使用）
+        # のため削除。実際の上限判定は下記 `_sym_cost`（銘柄単体のtracked cost）で行う。
+        # ★ v3.9.105 (H2): getattr(TradeState, '_tracked_position_cost') は存在しない
+        #   属性の参照で常に 0 を返し、個別株の1銘柄上限チェックが事実上無効だった。
+        #   モジュールレベルの辞書 _tracked_position_cost が正しい参照先。
+        _sym_cost = _tracked_position_cost.get(symbol, 0.0) or 0
+        if _sym_cost >= STOCK_MAX_USD:
+            log.info(
+                f"{tag} 個別株上限到達: {symbol}=${_sym_cost:,.0f}"
+                f" ≥ STOCK_MAX=${STOCK_MAX_USD:,.0f} → 発注スキップ"
+            )
+            return False
+        _stock_remaining = STOCK_MAX_USD - _sym_cost
+        if order_size > _stock_remaining:
+            log.info(
+                f"{tag} 個別株上限調整: ${order_size:,.0f}"
+                f" → ${_stock_remaining:,.0f}（残余=${_stock_remaining:,.0f} / 上限=${STOCK_MAX_USD:,.0f}）"
+            )
+            order_size = _stock_remaining
+            if order_size < limit_price:
+                log.info(f"{tag} 個別株上限後に残余力不足 → 発注スキップ")
+                return False
+
+    if qty is None:
+        qty = max(1, math.floor(order_size / limit_price))
+    else:
+        # ★ v3.9.108 (レビューH1): qty明示の「新規買い」（モメンタムLONG・動的個別株）にも
+        #   残余力（BUDGET_USD − 既存建玉合計）を適用する。従来は無チェックで送信され
+        #   BUDGET_USD を超過し得た。ショートカバー（既存SHORTの買い戻し＝露出減）は
+        #   決済を止めないためキャップしない。
+        _ts_bq = state.get(symbol)
+        if _ts_bq is None or _ts_bq.position_qty >= 0:
+            _rb_buy = _BUDGET_USD - get_tracked_portfolio_total()
+            _max_qty_budget = math.floor(_rb_buy / limit_price)
+            if _max_qty_budget < 1:
+                log.info(
+                    f"{tag} 残余力不足（既存建玉込み）→ 発注スキップ"
+                    f"（残余力 ${_rb_buy:,.0f} < 1株 ${limit_price:.2f}）"
+                )
+                return False
+            if qty > _max_qty_budget:
+                log.info(
+                    f"{tag} 余力調整(qty): {qty}株 → {_max_qty_budget}株"
+                    f"（残余力 ${_rb_buy:,.0f} / BUDGET_USD ${_BUDGET_USD:,.0f}）"
+                )
+                qty = _max_qty_budget
+    order_cost = qty * limit_price
+
+    # 時間外取引フラグ（RTH 以外は outside_rth=True）
+    outside_rth = session != SESSION_RTH
+
+    log.info(_fmt_order_log(
+        symbol, "BUY", qty, limit_price, session,
+        trd_env=trd_env, confidence=confidence, amount=order_cost,
+    ))
+
+    # ── 発注（デモ口座・実口座ともに place_order を実行）──────────────────────
+    # ★ v3.9.52: 例外ハンドリングを 2 段階に分離
+    #   ① API 送信 (place_order) の例外 → ERROR + return False (注文未送信)
+    #   ② API 送信成功後の後処理例外 → WARNING + 処理継続 (注文は moomoo サーバへ到達済み)
+    # 旧版は両方とも同じ try で包まれており、後処理 (非同期約定確認スケジュール等) で
+    # 例外が出ると "注文は成功しているのに ERROR + return False" になり、ts_state の
+    # entry_time/peak_price が設定されず risk_monitor が追跡できないことがあった
+    # (5/26 22:50 QQQ ケース: order_id 取得済み + watchdog 登録済みなのに ERROR で
+    # 返却され、結局 watchdog の 2 分後タイムアウト確認まで放置されていた事象)。
+    order_id = None
+    try:
+        # ★ v2.86: with _trade_ctx() で例外時の close を保証
+        with _trade_ctx() as ctx:
+            _acc_id_buy = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
+            ret, data = ctx.place_order(
+                price        = limit_price,
+                qty          = qty,
+                code         = to_moomoo_code(symbol),
+                trd_side     = TrdSide.BUY,
+                order_type   = OrderType.NORMAL,
+                trd_env      = trd_env,
+                time_in_force= TimeInForce.DAY,
+                fill_outside_rth = True,
+                acc_id       = _acc_id_buy,
+                **_tokutei_kwargs(trd_env),  # 特定口座(JP_TOKUTEI)指定
+            )
+        if ret != RET_OK:
+            log.error(f"{tag} [ORDER] BUY 失敗: {data}")
+            # 取引ロックエラーを検出 → 赤い警告を表示
+            if "unlock" in str(data).lower():
+                _trade_locked = True
+                _trade_lock_last_warned = None  # 即時表示させる
+                _warn_trade_locked()
+            return False
+        order_id = str(data["order_id"][0])
+        log.info(f"{tag} [ORDER] BUY  orderId={order_id}  qty={qty}  price={limit_price}")
+    except Exception as e:
+        log.error(f"{tag} [ORDER] BUY API例外: {e}", exc_info=True)
+        return False
+
+    # ── ここから API 送信成功確定 ─────────────────────────────────────────────
+    # 注文は moomoo サーバへ到達済み。以降の例外は WARNING に降格し、
+    # ポジション追跡 (ts_state) や risk_monitor 引継ぎを止めないようにする。
+    try:
+        _register_pending_order(order_id, symbol, trd_env)
+        # 発注成功 → 取引ロックフラグをクリア
+        if _trade_locked:
+            _trade_locked = False
+            log.info("[ロック解除] ✅ 発注成功 → 取引ロック解消を確認")
+        # 約定確認を非同期で実行（5秒後）
+        _threadsafe_future(
+            _check_order_filled(order_id, symbol, qty, limit_price, trd_env, mode)
+        )
+    except Exception as e:
+        log.warning(
+            f"{tag} [ORDER] BUY 後処理例外 (注文 {order_id} は送信済み・"
+            f"watchdog/risk_monitor が引継ぎます): {_mask_secrets(e)}"
+        )
+
+    ts_state = state.get(symbol)
+    ts_state.total_orders += 1
+    # ── ★ v2.95: GAS連携用フィールドの設定 ─────────────────────────────
+    # v3.9.20: ピラミッディング撤去により常に新規エントリー (上書き)。
+    ts_state.entry_headlines     = (headlines or [])[:3]
+    ts_state.entry_beneficiaries = beneficiaries or []
+    ts_state.entry_victims       = victims or []
+    # entry_price_trend: SPY/QQQ/SMH のみ取得可能、それ以外は 0.0
+    ts_state.entry_price_trend   = get_index_pct_change(symbol, 5) or 0.0
+    ts_state.entry_peak_pnl      = 0.0           # エントリー時は 0.0 で初期化
+    ts_state.entry_count         = 1             # v3.9.20: 常に 1 (ピラミッド撤去)
+    ts_state.entry_time   = datetime.datetime.now()   # 時間切れ決済の起点
+    # v3.9.17: 約定確認待ち中はリスク判定スキップ (avg_cost が指値価格仮設定の間の誤発動防止)
+    ts_state.entry_pending_fill = True
+    ts_state.avg_cost_confirmed = False  # v3.9.101: 実約定単価が入るまで未確定
+    ts_state.entry_ai_score    = 1  # BUYはブル
+    ts_state.entry_ai_conf     = confidence
+    ts_state.entry_ai_category = category
+    ts_state.entry_news_source = news_source
+    ts_state.entry_reason      = reason
+    # 自前ポジション管理に発注コストと株数を記録
+    track_position_add(symbol, order_cost, qty=qty)
+    _headlines_str = (
+        "\n─── トリガーニュース ───\n" + "\n".join(f"・{h}" for h in headlines[:3])
+        if headlines else ""
+    )
+    _reason_str = f"\n📋 判定理由: {reason}" if reason else ""
+    # v3.9.20: 山型サイズ配分ラベル
+    if confidence < 0.70:
+        _conf_label = "弱シグナル帯 30%"
+    elif confidence < 0.78:
+        _conf_label = "主力帯 60%"
+    elif confidence < 0.83:
+        _conf_label = "★スイートスポット 100%"
+    else:
+        _conf_label = "超強気帯 40%"
+    _threadsafe_future(asyncio.to_thread(
+        send_discord_message,
+        f"[Bot] {tag} ▲ BUY 指値発注 {mode}\n"
+        f"サイズ配分: {_conf_label} (conf={confidence:.2f})\n"
+        f"株数: {qty}株  指値: ${limit_price:.2f}\n"
+        f"判定自信度: {confidence:.2f}  発注額: ${order_cost:,.0f}（confidence連動）\n"
+        f"ポートフォリオ合計: ${get_tracked_portfolio_total():,.0f} / 上限: ${_BUDGET_USD:,.0f}\n"
+        f"セッション: {session.upper()}  時間外: {outside_rth}"
+        f"{_reason_str}"
+        f"{_headlines_str}"
+    ))
+    # ★ v3.9.7: 観察ログ — 発注成功パス
+    _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                     category=category, headlines=headlines,
+                     beneficiaries=beneficiaries, victims=victims,
+                     outcome="ordered", block_stage="",
+                     block_reason="", price_at_decision=limit_price)
+    return True
+
+
+def place_short(
+    symbol: str,
+    trd_env: TrdEnv,
+    confidence: float = 0.7,
+    trigger: str      = "",
+    reason: str       = "",
+    qty: Optional[int] = None,
+    category: str     = "MACRO",
+    news_source: str  = "",
+    headlines: Optional[List[str]] = None,
+    beneficiaries: Optional[List[str]] = None,  # ★ v2.95: AI beneficiaries (GAS送信用)
+    victims: Optional[List[str]]       = None,  # ★ v2.95: AI victims (GAS送信用)
+) -> bool:
+    """空売り（新規SELL）注文を moomoo に発行する。 信用口座でベア局面時に SPY/QQQ を空売りする。 決済は place_cover（買い戻し）で行う。"""
+    global _trade_locked, _trade_lock_last_warned  # 取引ロック状態管理
+    tag  = f"【{symbol}】"
+    mode = "【デモ】" if trd_env == TrdEnv.SIMULATE else "【実注文】"
+    session, _ = get_session_info()
+
+    # ★ v3.9.134: Bot 以外の建玉がある銘柄には新規エントリーしない（place_buy と同様）
+    if _skip_if_externally_held(symbol, "新規ショート"):
+        return False
+
+    if session == SESSION_WEEKEND:
+        log.info(f"{tag} 週末セッション: SHORT をスキップ")
+        return False
+
+    # ★ v2.87: 休日も発注スキップ（防御的ガード — 通常は market_open_event で停止済）
+    if session == SESSION_HOLIDAY:
+        log.info(f"{tag} 休場日セッション: SHORT をスキップ")
+        return False
+
+    # ★ テスト結果確認済み（2026-05-01）: デモ口座は SELL_SHORT（信用空売り）非対応
+    #   全jp_acc_typeパターン（未指定/JP_TOKUTEI_SHORT/JP_GENERAL_SHORT）で
+    #   "Order side must be BUY or SELL..." エラー。
+    # ★ v3.9.28: デモでもシャドー SHORT (仮想 PnL シミュレート) を記録。
+    # ★ v3.9.65: DEMO_SHORT_ENABLED=true なら、デモをネッティング口座として扱い
+    #   「プレーン SELL で新規ショート（保有0株からの売り）」を実発注する。
+    #   この場合はスキップせず通常フローへ進む（後段でロング残存・既存SHORTを確認し、
+    #   発注時の trd_side をプレーン SELL に切替）。決済は _cover_trd_side()=BUY。
+    # ── ★ v3.9.69: 実口座の買い専用オプション (REAL_SHORT_ENABLED=false) ──────
+    # 実口座でショートを一括停止する共通ゲート (ニュース駆動・モメンタム両方を遮断)。
+    # SHORT 判定はシャドー記録のみに転送し、買いだけを実発注する運用を可能にする。
+    if trd_env == TrdEnv.REAL and not REAL_SHORT_ENABLED:
+        _shadow_msg = " / シャドー SHORT 記録" if SHADOW_SHORT_ENABLED else ""
+        log.info(f"{tag} 実口座: SHORT をスキップ（REAL_SHORT_ENABLED=false・買い専用運用）{_shadow_msg}")
+        try:
+            _shadow_short_open(
+                symbol=symbol, confidence=confidence, category=category,
+                news_source=news_source, headlines=headlines,
+                beneficiaries=beneficiaries, victims=victims,
+            )
+        except Exception as _e:
+            log.debug(f"{tag} [シャドーSHORT] open エラー (黙殺): {_mask_secrets(_e)}")
+        return False
+
+    if trd_env == TrdEnv.SIMULATE and not DEMO_SHORT_ENABLED:
+        _shadow_msg = " / シャドー SHORT 記録" if SHADOW_SHORT_ENABLED else ""
+        log.info(f"{tag} デモ口座: SHORT をスキップ（SELL_SHORT 非対応・DEMO_SHORT_ENABLED=false）{_shadow_msg}")
+        # シャドー SHORT エントリー記録 (DATA_COLLECT=true 環境でのみ実体動作)
+        try:
+            _shadow_short_open(
+                symbol=symbol,
+                confidence=confidence,
+                category=category,
+                news_source=news_source,
+                headlines=headlines,
+                beneficiaries=beneficiaries,
+                victims=victims,
+            )
+        except Exception as _e:
+            log.debug(f"{tag} [シャドーSHORT] open エラー (黙殺): {_mask_secrets(_e)}")
+        return False
+
+    # ── 起動時ポジション不明フラグチェック ────────────────────────────────────
+    if _startup_position_unknown and trd_env == TrdEnv.REAL:
+        log.warning(
+            f"{tag} 🚫 発注ブロック（SHORT）: 起動時のポジション確認が取れていません。"
+            f" moomooアプリでポジションを確認してからbotを再起動してください。"
+        )
+        return False
+
+    # ── ★ v3.9.10: 終盤エントリーブロック (強制決済の N 分前以内なら新規禁止) ──
+    # SHORT 側にも対称ガードを適用 (LONG と同じく終盤の新規エントリーは即決済リスク)。
+    _late_block_s, _mins_to_close_s = _is_late_session_entry_blocked()
+    if _late_block_s:
+        log.info(
+            f"{tag} 🚫 [終盤エントリーブロック] 強制決済まで残り {_mins_to_close_s:.1f}分 "
+            f"(≤ {ENTRY_BLOCK_BEFORE_CLOSE_MIN}分) → SHORT をスキップ"
+        )
+        _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
+                         category=category, headlines=headlines,
+                         beneficiaries=beneficiaries, victims=victims,
+                         outcome="blocked", block_stage="late_session",
+                         block_reason=f"強制決済まで残り {_mins_to_close_s:.1f}分")
+        return False
+
+    # ── ★ v3.8.1: マクロ上昇トレンド検知時の SHORT 一時停止 (構成 B' / 対称版) ──
+    # place_buy の is_macro_downtrend() に対応する SHORT 側の対称ガード。
+    # 旧 v3.1.3 はフォールバック経路のみ上昇トレンドを検査していたため、AI が
+    # 明示的に victims=['QQQ'] を返したケースでは無防備だった。
+    # 2026-05-08 TTD ネガニュース → AI が victims=['QQQ'] を明示 → ETFガード強化
+    # を通過 → place_short('QQQ') が走り、QQQ アップトレンド中の SHORT で含み損
+    # 拡大した事案への対称ガード。
+    if symbol in ("QQQ", "SPY"):
+        _is_up, _ut_reason = is_macro_uptrend()
+        if _is_up:
+            log.info(
+                f"{tag} 🚫 [新規SHORTブロック B'] マクロ上昇トレンド検知 ({_ut_reason}) "
+                f"→ {symbol} が反落するまで新規SHORTをスキップ"
+            )
+            _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
+                             category=category, headlines=headlines,
+                             beneficiaries=beneficiaries, victims=victims,
+                             outcome="blocked", block_stage="macro_uptrend",
+                             block_reason=_ut_reason)
+            return False
+        # ── ★ v3.9.5: SPY 固有の追加チェック ─────────────────────────────────
+        # SPY は QQQ より約 40% 低ボラのため、QQQ ベース (+0.10%/+0.25%) では
+        # SPY 単独上昇の検知精度が低い。SPY 専用閾値 (+0.07%/+0.15%) で補完。
+        if symbol == "SPY":
+            _is_spy_up, _spy_ut_reason = is_spy_uptrend()
+            if _is_spy_up:
+                log.info(
+                    f"{tag} 🚫 [SPY 上昇トレンドブロック] {_spy_ut_reason} "
+                    f"→ SPY が反落するまで新規SHORTをスキップ"
+                )
+                _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
+                                 category=category, headlines=headlines,
+                                 beneficiaries=beneficiaries, victims=victims,
+                                 outcome="blocked", block_stage="spy_uptrend",
+                                 block_reason=_spy_ut_reason)
+                return False
+    elif symbol == "SMH":
+        _is_up, _ut_reason = is_smh_uptrend()
+        if _is_up:
+            log.info(
+                f"{tag} 🚫 [新規SHORTブロック C'] SMH 上昇トレンド検知 ({_ut_reason}) "
+                f"→ SMH が反落するまで新規SHORTをスキップ"
+            )
+            _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
+                             category=category, headlines=headlines,
+                             beneficiaries=beneficiaries, victims=victims,
+                             outcome="blocked", block_stage="smh_uptrend",
+                             block_reason=_ut_reason)
+            return False
+
+    # ── ★ v3.8.2: 構成 D' - 個別株上昇トレンド検知時の SHORT 一時停止 ──
+    # place_buy の is_stock_downtrend() に対応する SHORT 側の対称ガード。
+    # STOCK_TICKERS に含まれる銘柄のみ判定対象 (env で監視対象に設定した銘柄)。
+    # 急騰中の個別株に悪材料ニュースで飛びついた SHORT が逆行する事案への対策。
+    # 5/4-8 週間レポートで個別株 (AMD/MU/Finnhub-NVDA/META) が構造的損失を出した
+    # ことに対する根本対策の一部。閾値は env で銘柄/受講生ごとに調整可能。
+    if symbol in STOCK_TICKERS:
+        _is_stock_up, _stock_ut_reason = is_stock_uptrend(symbol)
+        if _is_stock_up:
+            log.info(
+                f"{tag} 🚫 [個別株上昇トレンドブロック D'] {_stock_ut_reason} "
+                f"→ {symbol} が反落するまで新規SHORTをスキップ"
+            )
+            _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
+                             category=category, headlines=headlines,
+                             beneficiaries=beneficiaries, victims=victims,
+                             outcome="blocked", block_stage="stock_uptrend",
+                             block_reason=_stock_ut_reason)
+            return False
+
+    # ── ロングポジション残存チェック ─────────────────────────────────────────
+    # ロングを保有したまま TrdSide.SELL_SHORT を送っても moomoo は返済売と区別する。
+    # FUTUJP実口座では TrdSide.SELL は返済売、TrdSide.SELL_SHORT が空売り。ロングが残っている場合は先に決済してリターン。
+    # 次のネガティブシグナルで改めてショートを試みる。
+    sync_positions(trd_env)
+    ts_pre = state.get(symbol)
+    if ts_pre.position_qty > 0:
+        # ★ v3.9.89: L/S転換の抑制（MOMENTUM_REVERSE_EXIT=false）。反対(LONG)保有中は
+        #   強制決済せず新規SHORTを見送る。既存LONGは自身の損切り/トレール/時間切れに委ねる。
+        if not MOMENTUM_REVERSE_EXIT:
+            log.info(
+                f"{tag} [SHORT前チェック] ロング {ts_pre.position_qty}株 保有中 → "
+                f"転換せず新規SHORTを見送り（MOMENTUM_REVERSE_EXIT=false・既存LONGは損切り/トレールに委ねる）"
+            )
+            return False
+        # ★ v3.8.5: 正常なフロー (ロング→ショート切替) のため WARNING → INFO に降格
+        log.info(
+            f"{tag} [SHORT前チェック] ロングポジション {ts_pre.position_qty}株 が残存 "
+            f"→ 先に決済してからショートを試みます（今回はスキップ）"
+        )
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"[Bot] {tag} ⚠ ショート前にロング決済\n"
+            f"ロング {ts_pre.position_qty}株 を保有中のためショートをスキップ。\n"
+            f"先にロングを決済します。次のシグナルでショートを試みます。"
+        ))
+        place_close_all(symbol, trd_env, "ショート前ロング強制決済")
+        return False
+
+    # ※ 貸株在庫の事前確認はmoomoo APIに専用エンドポイントが存在しないため行わない。
+    #    発注後のエラーレスポンスで在庫なしを判定する（下記のエラーハンドリングを参照）。
+
+    quote       = get_quote(symbol)
+    # ★ v3.9.78 (#2): 異常クォートガード（板薄/異常値での発注を遮断）
+    _qok, _qreason = _quote_sanity_ok(symbol, quote)
+    if not _qok:
+        log.warning(f"{tag} 🚫 空売り見送り（異常クォートガード）: {_qreason}")
+        _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
+                         category=category, headlines=headlines,
+                         beneficiaries=beneficiaries, victims=victims,
+                         outcome="blocked", block_stage="quote_sanity",
+                         block_reason=_qreason, quote_sanity=0)
+        return False
+    limit_price = calc_limit_price(quote, "SELL", symbol)   # ★ v2.99.4: シンボル別バッファ
+    if limit_price <= 0:
+        log.warning(f"{tag} 価格取得失敗: SHORT をスキップ")
+        return False
+
+    # ── ★ v3.9.20: ピラミッディング撤去・既存 SHORT 保有中はスキップ ──────
+    ts_check = state.get(symbol)
+    if ts_check.position_qty < 0:
+        log.info(
+            f"{tag} 既存 SHORT ポジション保有中 (qty={ts_check.position_qty}株) → 新規空売りスキップ"
+        )
+        return False
+
+    # ── ポートフォリオ上限チェック ────────────────────────────────────────────
+    portfolio_total = get_tracked_portfolio_total()
+    log.info(f"{tag} [空売り上限チェック] ポートフォリオ合計=${portfolio_total:,.0f} / 上限=${_BUDGET_USD:,.0f}")
+    if portfolio_total >= _BUDGET_USD:
+        log.info(f"{tag} ポートフォリオ上限到達 → 空売りブロック")
+        return False
+
+    remaining_budget = _BUDGET_USD - portfolio_total
+
+    if qty is None:
+        # ★ v3.9.122 (利用者B報告 7/20): $ベースの発注額計算（confidence山型・高ボラ÷倍率）を
+        #   qty is None 経路の内側へ移動（place_buy と対称化）。従来はこのブロックが
+        #   qty 明示発注でも無条件に実行され、「高ボラ銘柄サイズ調整 ÷3.0 = $3,000」の
+        #   ログが出るのに実発注には使われない＝実態と異なる表示になっていた。
+        #   モメンタム実発注はサイズ縮小を行わない方針（v3.9.123・PAN決定）のため、
+        #   渡された qty＝モメンタム側の設計サイズをそのまま尊重する（残余力キャップのみ適用）。
+        # 発注金額：confidence の「山型」配分で計算
+        order_size = calc_order_size(confidence)
+        if confidence < 0.70:
+            _size_label = "弱シグナル帯 30%"
+        elif confidence < 0.78:
+            _size_label = "主力帯 60%"
+        elif confidence < 0.83:
+            _size_label = "★スイートスポット 100%"
+        else:
+            _size_label = "超強気帯 40%"
+        # ★ v3.9.32: 高ボラ銘柄はサイズを ÷ 倍率 で縮小 (損切り幅拡大とセット)
+        _hv_mult = _symbol_loss_mult(symbol)
+        if _hv_mult > 1.0:
+            _order_size_before = order_size
+            order_size = max(ORDER_SIZE_MIN_USD, order_size / _hv_mult)
+            log.info(
+                f"{tag} [空売り発注額] confidence={confidence:.2f} [{_size_label}]"
+                f" → 高ボラ銘柄サイズ調整 ${_order_size_before:,.0f} ÷ {_hv_mult:.1f}"
+                f" = ${order_size:,.0f}"
+                f" (損切り幅 {MAX_LOSS_PCT*100:.2f}%→{MAX_LOSS_PCT*_hv_mult*100:.2f}%)"
+            )
+        else:
+            log.info(
+                f"{tag} [空売り発注額] confidence={confidence:.2f} [{_size_label}]"
+                f" → ${order_size:,.0f}"
+            )
+        if order_size > remaining_budget:
+            if remaining_budget < limit_price:
+                log.info(f"{tag} 残余力不足 → 空売りスキップ")
+                return False
+            order_size = remaining_budget
+        qty = max(1, math.floor(order_size / limit_price))
+    else:
+        # ★ v3.9.108 (レビューH1・利用者B報告 7/2 実害確認): qty明示指定（モメンタム実発注等）
+        #   でも残余力（BUDGET_USD − 既存建玉合計）を必ず適用する。従来は $ベースの調整
+        #   （confidence配分・高ボラ縮小・残余力キャップ）が qty に一切反映されず、
+        #   QQQ $7.9k 保有中に SMH 13株 $7.8k がそのまま送られて BUDGET_USD 超過
+        #   →「Insufficient buying power」拒否が発生していた。
+        _max_qty_budget = math.floor(remaining_budget / limit_price)
+        if _max_qty_budget < 1:
+            log.info(
+                f"{tag} 残余力不足（既存建玉込み）→ 空売りスキップ"
+                f"（残余力 ${remaining_budget:,.0f} < 1株 ${limit_price:.2f}）"
+            )
+            return False
+        if qty > _max_qty_budget:
+            log.info(
+                f"{tag} 余力調整(qty): {qty}株 → {_max_qty_budget}株"
+                f"（残余力 ${remaining_budget:,.0f} / BUDGET_USD ${_BUDGET_USD:,.0f}）"
+            )
+            qty = _max_qty_budget
+    order_cost = qty * limit_price
+
+    # RTH 以外は空売り注文が通らないケースがあるため確認
+    outside_rth = session != SESSION_RTH
+
+    log.info(_fmt_order_log(
+        symbol, "SHORT", qty, limit_price, session,
+        trd_env=trd_env, confidence=confidence, amount=order_cost,
+    ))
+
+    # ★ v3.9.52: place_buy と同じ 2 段階例外ハンドリング (API送信 vs 後処理)
+    order_id = None
+    try:
+        # ★ v2.86: with _trade_ctx() で例外時の close を保証
+        with _trade_ctx() as ctx:
+            _acc_id_short = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
+            # ★ v3.9.65: 新規ショートのサイドを環境別に切替。
+            #   実口座 (FUTUJP 信用): TrdSide.SELL_SHORT + jp_acc_type=JP_TOKUTEI_SHORT
+            #   デモ (ネッティング): プレーン TrdSide.SELL (保有0株からの売り=ショート新規)。
+            #     ※ ここに到達する時点でロング残存チェック(9851)・既存SHORTチェック(9877)を
+            #       通過済み = position_qty==0 (flat) のため、SELL は確実にショート新規になる。
+            if trd_env == TrdEnv.REAL:
+                _open_side = TrdSide.SELL_SHORT
+                _open_kwargs = _tokutei_kwargs(trd_env, is_short=True)
+            else:
+                _open_side = TrdSide.SELL          # デモ・ネッティング空売り
+                _open_kwargs = {}                  # デモは jp_acc_type 不要
+            log.info(f"{tag} [SHORT発注サイド] {'SELL_SHORT(信用)' if trd_env==TrdEnv.REAL else 'SELL(デモ・ネッティング)'}")
+            ret, data = ctx.place_order(
+                price            = limit_price,
+                qty              = qty,
+                code             = to_moomoo_code(symbol),
+                trd_side         = _open_side,
+                order_type       = OrderType.NORMAL,
+                trd_env          = trd_env,
+                time_in_force    = TimeInForce.DAY,
+                fill_outside_rth = True,
+                acc_id           = _acc_id_short,
+                **_open_kwargs,
+            )
+        if ret != RET_OK:
+            # ── 貸株在庫なし判定 ──────────────────────────────────────────
+            # moomooが返すエラー文字列で在庫不足を判定する。
+            # 「insufficient positions」「cannot borrow」「short sell」等が含まれる場合は
+            # 貸株在庫なしと判断してDiscordに通知する。
+            err_str = str(data).lower()
+            # ★ v3.9.106: 「Insufficient buying power（信用余力不足）」を貸株在庫なしと
+            #   誤表示していた問題の修正。裸の "insufficient" が貸株キーワードに含まれて
+            #   いたため、余力不足も貸株判定に一致していた。余力系を先に判定する。
+            if "buying power" in err_str or "purchasing power" in err_str or "余力" in err_str:
+                log.warning(
+                    f"{tag} 🚫 ショートスキップ: 信用余力不足\n"
+                    f"   moomooエラー: {data}\n"
+                    f"   既存建玉との合計が口座の信用余力を超えています。"
+                    f" BUDGET_USD（現在 ${_BUDGET_USD:,.0f}）を実際の余力の範囲内に設定してください。"
+                )
+                _threadsafe_future(asyncio.to_thread(
+                    send_discord_message,
+                    f"[Bot] {tag} 🚫 ショートスキップ: 信用余力不足\n"
+                    f"既存建玉との合計が口座の信用余力を超えたため、moomooが発注を拒否しました。\n"
+                    f"BUDGET_USD を実際の信用余力の範囲内に設定してください（複数銘柄の同時保有を考慮）。"
+                ))
+                return False
+            _borrow_keywords = (
+                "insufficient", "borrow", "short sell", "short position",
+                "no inventory", "locate", "貸株", "在庫",
+            )
+            if any(kw in err_str for kw in _borrow_keywords):
+                log.warning(
+                    f"{tag} 🚫 ショートスキップ: 貸株在庫なし\n"
+                    f"   moomooエラー: {data}"
+                )
+                _threadsafe_future(asyncio.to_thread(
+                    send_discord_message,
+                    f"[Bot] {tag} 🚫 ショートスキップ: 貸株在庫なし\n"
+                    f"moomooが貸株在庫なしと判定しました。\n"
+                    f"moomooアプリで {symbol} の空売り可否を確認してください。"
+                ))
+            elif "unlock" in err_str:
+                # 取引ロックエラー → 赤い警告を表示
+                _trade_locked = True
+                _trade_lock_last_warned = None
+                _warn_trade_locked()
+            else:
+                log.error(f"{tag} [ORDER] SHORT 失敗: {data}")
+            return False
+        order_id = str(data["order_id"][0])
+        log.info(f"{tag} [ORDER] SHORT orderId={order_id}  qty={qty}  price={limit_price}")
+    except Exception as e:
+        log.error(f"{tag} [ORDER] SHORT API例外: {e}", exc_info=True)
+        return False
+
+    # ── ここから API 送信成功確定 ─────────────────────────────────────────────
+    # 注文は moomoo サーバへ到達済み。以降の例外は WARNING に降格し、
+    # ポジション追跡 (ts_state) や risk_monitor 引継ぎを止めないようにする。
+    try:
+        _register_pending_order(order_id, symbol, trd_env)
+        _threadsafe_future(
+            _check_order_filled(order_id, symbol, qty, limit_price, trd_env, f"{mode}[空売り]")
+        )
+    except Exception as e:
+        log.warning(
+            f"{tag} [ORDER] SHORT 後処理例外 (注文 {order_id} は送信済み・"
+            f"watchdog/risk_monitor が引継ぎます): {_mask_secrets(e)}"
+        )
+
+    ts_state = state.get(symbol)
+    ts_state.total_orders += 1
+    # ── ★ v2.95: GAS連携用フィールドの設定 ─────────────────────────────
+    # v3.9.20: ピラミッディング撤去により常に新規エントリー (上書き)。
+    ts_state.entry_headlines     = (headlines or [])[:3]
+    ts_state.entry_beneficiaries = beneficiaries or []
+    ts_state.entry_victims       = victims or []
+    # entry_price_trend: SPY/QQQ/SMH のみ取得可能、それ以外は 0.0
+    ts_state.entry_price_trend   = get_index_pct_change(symbol, 5) or 0.0
+    ts_state.entry_peak_pnl      = 0.0           # エントリー時は 0.0 で初期化
+    ts_state.entry_count         = 1             # v3.9.20: 常に 1 (ピラミッド撤去)
+    ts_state.entry_time    = datetime.datetime.now()
+    ts_state.position_qty -= qty   # 空売りはマイナスで管理（発注成功後のみここに到達）
+    # ★ v3.1.3: avg_cost を limit_price で仮設定 (約定確認/sync で実価格に上書き)。
+    # _check_order_filled が走る前にリスク監視が PnL=(0-price)*qty で誤検知する
+    # race condition への対策。
+    if ts_state.avg_cost <= 0:
+        ts_state.avg_cost = limit_price
+    # v3.9.17: 約定確認待ち中はリスク判定スキップ (limit_price 仮設定の間の誤発動防止)
+    # 5/13 22:49 SPY 事例で limit=$732.32 vs 現値$736.05 で -0.51% 誤算出 → 強制損切り
+    # 誤発動 → 即 BUY_BACK で自己決済の race condition への根本対策。
+    ts_state.entry_pending_fill = True
+    ts_state.avg_cost_confirmed = False  # v3.9.101: 実約定単価が入るまで未確定（指値仮設定）
+    ts_state.is_short          = True  # 意図的なショート中フラグ（リスク監視の誤検知防止）
+    ts_state.entry_ai_score    = -1  # SHORTはベア
+    ts_state.entry_ai_conf     = confidence
+    ts_state.entry_ai_category = category
+    ts_state.entry_news_source = news_source
+    track_position_add(symbol, order_cost, qty=qty)
+    _headlines_str = (
+        "\n─── トリガーニュース ───\n" + "\n".join(f"・{h}" for h in headlines[:3])
+        if headlines else ""
+    )
+    # v3.9.20: 山型サイズ配分ラベル (Discord 用)
+    if confidence < 0.70:
+        _conf_label_short = "弱シグナル帯 30%"
+    elif confidence < 0.78:
+        _conf_label_short = "主力帯 60%"
+    elif confidence < 0.83:
+        _conf_label_short = "★スイートスポット 100%"
+    else:
+        _conf_label_short = "超強気帯 40%"
+    _threadsafe_future(asyncio.to_thread(
+        send_discord_message,
+        f"[Bot] {tag} ▼ ショートエントリー（空売り）指値発注 {mode}\n"
+        f"サイズ配分: {_conf_label_short} (conf={confidence:.2f})\n"
+        f"株数: {qty}株  指値: ${limit_price:.2f}\n"
+        f"判定自信度: {confidence:.2f}  発注額: ${order_cost:,.0f}\n"
+        f"理由: {reason}\n"
+        f"セッション: {session.upper()}  時間外: {outside_rth}"
+        f"{_headlines_str}"
+    ))
+    # ★ v3.9.7: 観察ログ — 発注成功パス (SHORT)
+    _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
+                     category=category, headlines=headlines,
+                     beneficiaries=beneficiaries, victims=victims,
+                     outcome="ordered", block_stage="",
+                     block_reason="", price_at_decision=limit_price)
+    return True
+
+# 起動時ポジション不明フラグ
+_startup_position_unknown: bool = False
+
+# 起動時ニュース無視期間（秒）
+STARTUP_NEWS_IGNORE_SEC: int = int(os.environ.get("STARTUP_NEWS_IGNORE_SEC", "60"))
+_BOT_START_TIME: datetime.datetime = datetime.datetime.now()
+
+# ── ★ v3.9.56: セッション切替直後の古いニュース対策 ───────────────────────────
+# OVERNIGHT / WEEKEND / 取引不可セッション中も Alpaca News WebSocket や
+# Yahoo Finance / Finnhub の RSS は受信を続ける (蓄積される)。
+# セッションが PREMARKET 等に切り替わった瞬間、これら蓄積ニュースが一斉に
+# AI 判定に流れ、「数時間〜数日前の既に織込済ニュース」で発注してしまう。
+# (5/28 17:00:35 GOOGL Insider Trading 記事 → SHORT 25株 → PnL -$17 推移)
+# セッション切替後 SESSION_CHANGE_QUIET_SEC (デフォルト 60 秒) は新規ニュース
+# 処理を完全スキップし、ヘッドラインだけ既読登録する (重複排除のため)。
+# 0 で機能無効化 (旧挙動)。
+SESSION_CHANGE_QUIET_SEC: int = int(os.environ.get("SESSION_CHANGE_QUIET_SEC", "60"))
+_last_session_change_at: Optional[datetime.datetime] = None
+
+# ゴースト防止: position_list_query がデータを返したが銘柄が不在だった連続回数
+# JP口座では API の返り値が不安定なため、単発の「不在」では誤クリアしない
+_ghost_miss_count: dict[str, int] = {sym: 0 for sym in ALL_TICKERS}
+_GHOST_MISS_THRESHOLD = 3  # 連続N回「不在」で初めてクリア
+
+# ── ★ v2.97: RSS フィード健全性管理 ──────────────────────────────────────────
+# 受講生 5日間 DEBUG ログ8万行汚染 (Reuters/AP DNS失敗 5秒毎継続) への恒久対策。
+# _rss_fail_count: 連続失敗回数 / _rss_excluded: 動的除外セット (閾値超で追加)
+# _rss_warn_emitted: 初回 WARNING 出力済みフラグ
+_RSS_FAIL_THRESHOLD: int = 5
+_rss_fail_count:    dict[str, int] = {}
+_rss_excluded:      set[str]       = set()
+_rss_warn_emitted:  set[str]       = set()
+
+# 自前ポジション管理（moomooのAPI依存なし）
+# デモ口座ではposition_list_queryが正しく返らないため自前で管理
+# {symbol: 保有コスト（発注額）}
+_tracked_position_cost: dict[str, float] = {sym: 0.0 for sym in ALL_TICKERS}
+
+# ★ v3.9.105 (C1計測): 実環境で観測した order_status の生値集合（初回のみログ出力）。
+_SEEN_ORDER_STATUSES: set = set()
+# BUY約定時の正確な株数を保持。sync_positionsのAPI瞬間値が変動しても
+# place_close_all がこちらを優先参照することで売り株数の食い違いを防ぐ。
+_tracked_qty: dict[str, int] = {sym: 0 for sym in ALL_TICKERS}
+
+# ── ダイナミック個別株: 日次カウンター ────────────────────────────────────────
+_dynamic_calls_today: int = 0
+_dynamic_calls_date:  Optional[str] = None  # "2026-04-27" 形式（ET）で日付管理
+_DYNAMIC_EXCLUDE: set = set(ALL_TICKERS)    # 通常・決算銘柄は除外（重複防止）
+
+# ── ★ v2.92: マクロ環境（QQQ/SPY 直近騰落率）の文脈を AI に渡すための価格履歴 ──
+# 5/4 Oracle事案 (相場下落中の単発好材料への過剰反応) への対策。
+# AI 判定時に直近 5/15/60 分の QQQ/SPY/SMH 騰落率を添えて confidence を調整。
+# データ構造: {"QQQ": [(datetime, price), ...], ...} 60 分以内のみ保持。
+# 既存 get_quote 結果を流用するため追加 API コールなし。
+# v2.94: SMH 独立追跡 (QQQ 横ばいでも SMH 単独下落を検知)
+# v2.99.4: STOCK_TICKERS も追跡 (is_stock_downtrend / 5分ごと市場ログで使用)
+# ★ v3.9.33: IWM (Russell 2000 小型株 ETF) を価格履歴トラッキング対象に追加。
+# シャドーモメンタム観察専用。MOMENTUM_SYMBOLS と整合させる。
+_INDEX_PRICE_HISTORY: dict[str, list] = {
+    sym: [] for sym in (set(["QQQ", "SPY", "SMH", "IWM"]) | set(STOCK_TICKERS) | set(MOMENTUM_SYMBOLS))
+}
+_INDEX_PRICE_HISTORY_MAX_SEC: int = 4500  # 75分 (v3.9.5: 60分ルックアップに 15分のバッファ)
+# v3.9.5: 旧設定 3600 (60分) では cutoff と 60分ルックアップ target が完全一致し、
+# 「t ≤ target」を満たす candidate が見つからず「60分 データ不足」となる境界バグが発生。
+# 保持期間を 75分に広げ、60分ルックアップが常に安定して候補を見つけられるよう余裕を持たせる。
+
+# ── ★ v3.9.78 (#2): 異常クォートガード ───────────────────────────────────────
+# 板薄プリマーケット等で取得した異常クォート（直近価格から大きく乖離）での発注を
+# 構造的に遮断する。6/9 の CRM entry$868→exit$174(0分・premarket・-$8,332)、
+# TSLA(-$2,900) のようなテール事故を防ぐ。正常な取引は一切制限しない（fail-open設計）。
+try:
+    QUOTE_SANITY_DEVIATION_PCT = float(os.environ.get("QUOTE_SANITY_DEVIATION_PCT", "").strip() or 15.0)
+except (ValueError, TypeError):
+    QUOTE_SANITY_DEVIATION_PCT = 15.0
+try:
+    QUOTE_SANITY_SPREAD_PCT = float(os.environ.get("QUOTE_SANITY_SPREAD_PCT", "").strip() or 0.0)
+except (ValueError, TypeError):
+    QUOTE_SANITY_SPREAD_PCT = 0.0   # 0 = スプレッドガード無効（既定・プリマーケットの広めスプレッドで誤遮断しないため）
+
+
+def _quote_reference_price(symbol: str):
+    """_INDEX_PRICE_HISTORY から直近の参照価格(中央値)を返す。履歴不足なら None。
+    単一の異常ティックに引っ張られないよう中央値を用いる。"""
+    hist = _INDEX_PRICE_HISTORY.get(symbol)
+    if not hist or len(hist) < 3:
+        return None
+    prices = sorted(p for (_ts, p) in hist[-20:] if p and p > 0)
+    if len(prices) < 3:
+        return None
+    n = len(prices)
+    return prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2.0
+
+
+def _quote_sanity_ok(symbol: str, quote: dict):
+    """発注前クォート健全性チェック。(ok: bool, reason: str)。参照価格が無ければ fail-open。"""
+    try:
+        ask  = float(quote.get("ask", 0) or 0)
+        bid  = float(quote.get("bid", 0) or 0)
+        last = float(quote.get("last", 0) or 0)
+        price = last or ((ask + bid) / 2.0 if ask > 0 and bid > 0 else (ask or bid))
+        if price <= 0:
+            return True, ""   # 価格取得失敗は既存の limit_price<=0 ガードに委ねる
+        ref = _quote_reference_price(symbol)
+        if ref and ref > 0:
+            dev = abs(price - ref) / ref * 100.0
+            if dev > QUOTE_SANITY_DEVIATION_PCT:
+                return False, (f"現値 ${price:.2f} が直近基準 ${ref:.2f} から "
+                               f"{dev:.1f}% 乖離 (上限 {QUOTE_SANITY_DEVIATION_PCT:.0f}%)")
+        if QUOTE_SANITY_SPREAD_PCT > 0 and ask > 0 and bid > 0:
+            mid = (ask + bid) / 2.0
+            spread = (ask - bid) / mid * 100.0 if mid > 0 else 0.0
+            if spread > QUOTE_SANITY_SPREAD_PCT:
+                return False, (f"スプレッド過大 {spread:.2f}% > {QUOTE_SANITY_SPREAD_PCT:.2f}% "
+                               f"(板薄の可能性 bid ${bid:.2f}/ask ${ask:.2f})")
+        return True, ""
+    except Exception:
+        return True, ""   # ガード自体の例外で発注を止めない（fail-open）
+
+
+def record_index_price(symbol: str, price: float) -> None:
+    """指数銘柄 (QQQ/SPY/SMH) および STOCK_TICKERS の価格スナップショットを記録する。
+
+    risk_monitor_loop から呼ばれる前提。get_quote の追加コールは不要で、
+    既存の get_quote 結果を引数として受け取る。
+    記録時に 60 分より古いエントリーは自動削除する。
+    ★ v2.99.4: STOCK_TICKERS にも対応。_INDEX_PRICE_HISTORY を動的に拡張済み。
+    """
+    if symbol not in _INDEX_PRICE_HISTORY or price <= 0:
+        return
+    now = datetime.datetime.now()
+    cutoff = now - datetime.timedelta(seconds=_INDEX_PRICE_HISTORY_MAX_SEC)
+    _hist = _INDEX_PRICE_HISTORY[symbol]
+    _hist.append((now, price))
+    # 古いエントリーを削除（先頭から削除、リストは時系列順）
+    while _hist and _hist[0][0] < cutoff:
+        _hist.pop(0)
+
+
+# ★ v3.9.3: 起動時バックフィル ─────────────────────────────────────────────
+# Bot 再起動のたびに _INDEX_PRICE_HISTORY が空になり、起動から最大 60 分間
+# トレンドフィルタ (構成 B/B'/C/C'/D/D') が「データ不足」で無効化される問題への対策。
+# moomoo OpenD の request_history_kline で直近 60 分の 1 分足を取得し、メモリ上の
+# 履歴を即座に埋める。追加 API キー・追加ライブラリ不要 (既存接続流用)。
+def _backfill_index_price_history() -> None:
+    """起動時 / セッション切替時に過去の 1 分足 K 線を取得して
+    _INDEX_PRICE_HISTORY を埋める。
+
+    v3.9.4 修正点:
+      ① start/end を ET (米国東部時間) で指定。moomoo OpenD は US 株の K 線時刻を
+         ET で扱うため、JST で指定すると 12〜13 時間先の未来を要求してしまい
+         常に「取得 0 件」になる問題があった。
+      ② extended_time=True を指定して PREMARKET/AFTERHOURS のデータも取得。
+         デフォルト False だと RTH (09:30〜16:00 ET) 以外は除外される。
+      ③ time_key (ET) をローカル時刻 (JST 想定) に変換してから保存。
+         _INDEX_PRICE_HISTORY 内の比較は datetime.now() (ローカル) と整合させる。
+    v3.9.5: 取得 range を 70 分 → 80 分に拡張 (cutoff 75 分に対して 5 分のマージン)。
+            起動直後の 60 分ルックアップが「データ不足」になるのを防ぐ。
+    v3.9.57: 取得 range を 80 分 → 20 時間に拡張。
+            PREMARKET 開始 (ET 04:00) 直後に起動した場合、80 分前は OVERNIGHT
+            (ET 02:40〜04:00) で K 線データが存在せず、bootstrap が 0 件になる
+            事象が発生していた。20 時間遡ることで前営業日の AFTERHOURS (ET 16:00-
+            20:00) を必ず含むようにし、PREMARKET 開始直後の起動でも 60 分判定が
+            「データ不足」にならないようにする。
+            cutoff 75 分は維持 (古いデータは API 取得後に削除)。
+
+    取得失敗時 (NYSE 休場・OpenD 接続トラブル等) は静かにスキップ。
+    """
+    # ── 時刻パラメータ: moomoo は US 株を ET で扱う ──────────────────
+    # 1) ET の "今" を計算 (システム locale 非依存)
+    now_local = datetime.datetime.now()
+    now_et = datetime.datetime.now(_ET).replace(tzinfo=None)
+    # 2) ★ v3.9.57: ET 基準で 20 時間前から現在まで
+    # 前営業日の AFTERHOURS (ET 16:00-20:00) を必ずカバー。OVN 中の起動でも
+    # データを取得できる。cutoff 75 分で古いデータは結局削除されるため、
+    # メモリ使用量は変わらない (PRE/RTH/AFTER の活性バーのみが残る)。
+    start = (now_et - datetime.timedelta(hours=20)).strftime("%Y-%m-%d %H:%M:%S")
+    end = now_et.strftime("%Y-%m-%d %H:%M:%S")
+    # 3) ET → ローカルへの変換オフセット (ET 時刻 + offset = ローカル時刻)
+    et_to_local_offset = now_local - now_et
+
+    log.info(
+        f"[起動時バックフィル] 開始: ET {start} 〜 ET {end} "
+        f"(extended_time=True で PREMARKET/AFTERHOURS 含む)"
+    )
+
+    success_total = 0
+    fail_count = 0
+    target_symbols = list(_INDEX_PRICE_HISTORY.keys())
+
+    try:
+        with _quote_ctx() as ctx:
+            for sym in target_symbols:
+                try:
+                    ret, klines, _page = ctx.request_history_kline(
+                        code=f"US.{sym}",
+                        start=start,
+                        end=end,
+                        ktype=KLType.K_1M,
+                        max_count=1000,           # ★ v3.9.57: 200 → 1000 (20時間カバーのため)
+                        extended_time=True,   # ★ PREMARKET/AFTERHOURS も含む
+                    )
+                    if ret != RET_OK or klines is None:
+                        log.debug(f"[起動時バックフィル] {sym}: 取得不可 ret={ret} msg={klines}")
+                        fail_count += 1
+                        continue
+                    # DataFrame は空判定 (.empty) で判定
+                    try:
+                        if klines.empty:
+                            log.debug(f"[起動時バックフィル] {sym}: 0 件 (休場 or データなし)")
+                            fail_count += 1
+                            continue
+                    except AttributeError:
+                        if not klines:
+                            fail_count += 1
+                            continue
+
+                    cnt = 0
+                    for _, row in klines.iterrows():
+                        try:
+                            ts_et = datetime.datetime.strptime(
+                                str(row["time_key"]), "%Y-%m-%d %H:%M:%S"
+                            )
+                            # ★ ET → ローカル時刻に変換 (record_index_price と整合)
+                            ts_local = ts_et + et_to_local_offset
+                            price = float(row["close"])
+                        except (KeyError, ValueError, TypeError):
+                            continue
+                        if price > 0:
+                            _INDEX_PRICE_HISTORY[sym].append((ts_local, price))
+                            cnt += 1
+                    # 念のため時刻順にソート
+                    _INDEX_PRICE_HISTORY[sym].sort(key=lambda x: x[0])
+                    # 60 分より古いエントリーは削除 (record_index_price と同じ cutoff)
+                    cutoff = now_local - datetime.timedelta(seconds=_INDEX_PRICE_HISTORY_MAX_SEC)
+                    while _INDEX_PRICE_HISTORY[sym] and _INDEX_PRICE_HISTORY[sym][0][0] < cutoff:
+                        _INDEX_PRICE_HISTORY[sym].pop(0)
+                    if _INDEX_PRICE_HISTORY[sym]:
+                        oldest = _INDEX_PRICE_HISTORY[sym][0][0]
+                        latest = _INDEX_PRICE_HISTORY[sym][-1][0]
+                        log.info(
+                            f"[起動時バックフィル] {sym}: {cnt} 件追加 / "
+                            f"履歴 {len(_INDEX_PRICE_HISTORY[sym])} 件 "
+                            f"({oldest.strftime('%H:%M')}〜{latest.strftime('%H:%M')} ローカル)"
+                        )
+                        success_total += 1
+                    else:
+                        log.debug(f"[起動時バックフィル] {sym}: 取得後 cutoff で全削除")
+                        fail_count += 1
+                except Exception as _e_sym:
+                    log.debug(f"[起動時バックフィル] {sym}: 例外 {type(_e_sym).__name__}: {_e_sym}")
+                    fail_count += 1
+    except Exception as _e:
+        log.warning(f"[起動時バックフィル] OpenD 接続エラー: {_e} → スキップ (60分かけて蓄積)")
+        return
+
+    if success_total > 0:
+        log.info(
+            f"[起動時バックフィル] {success_total}/{len(target_symbols)} 銘柄完了 "
+            f"(失敗 {fail_count}) → トレンドフィルタ即時稼働可能"
+        )
+    else:
+        log.info(
+            f"[起動時バックフィル] 取得 0 件 (NYSE 休場時 / 全銘柄失敗={fail_count}) "
+            f"→ 従来通り 60 分かけて蓄積"
+        )
+
+
+def get_index_pct_change(symbol: str, minutes: int) -> Optional[float]:
+    """戻り値: 騰落率（例: -0.45 = -0.45%）/ データ不足時は None minutes 分前の最も近いスナップショットを使う（厳密に minutes 前である必要はない）。"""
+    if symbol not in _INDEX_PRICE_HISTORY:
+        return None
+    _hist = _INDEX_PRICE_HISTORY[symbol]
+    if len(_hist) < 2:
+        return None
+    now = datetime.datetime.now()
+    target = now - datetime.timedelta(minutes=minutes)
+    # target に最も近い（≤ target の中で最新）スナップショットを探す
+    _candidate = None
+    for t, p in _hist:
+        if t <= target:
+            _candidate = (t, p)
+        else:
+            break
+    if _candidate is None:
+        # minutes 分前のデータがない（履歴が浅い）
+        return None
+    _then_price = _candidate[1]
+    _now_price = _hist[-1][1]
+    if _then_price <= 0:
+        return None
+    return (_now_price - _then_price) / _then_price * 100.0
+
+
+def _market_trend_pct() -> Optional[float]:
+    """★ v3.9.103: 当日トレンドの代理指標。SPY（無ければQQQ）の
+    MOMENTUM_TREND_LOOKBACK_MIN 分騰落率(%)。履歴不足時は None。"""
+    for _sym in ("SPY", "QQQ"):
+        _v = get_index_pct_change(_sym, MOMENTUM_TREND_LOOKBACK_MIN)
+        if _v is not None:
+            return _v
+    return None
+
+def build_market_context() -> str:
+    """AI 判定時に user_msg に添付するマーケット文脈文字列を生成する。
+
+    例:
+      "【市場文脈】直近の指数騰落率 — QQQ: 5分 -0.07% / 15分 -0.15% / 60分 -0.45%, "
+      "SPY: 5分 -0.05% / 15分 -0.10% / 60分 -0.30%"
+
+    データが不足している場合は空文字列を返す（AI への文脈付与をスキップ）。
+    """
+    _parts = []
+    for sym in ("QQQ", "SPY"):
+        _seg = []
+        for m in (5, 15, 60):
+            _pct = get_index_pct_change(sym, m)
+            if _pct is not None:
+                _seg.append(f"{m}分 {_pct:+.2f}%")
+        if _seg:
+            _parts.append(f"{sym}: " + " / ".join(_seg))
+    if not _parts:
+        return ""
+    return (
+        "【市場文脈】直近の指数騰落率 — " + ", ".join(_parts) + "。"
+        " 全体の流れが下方向ならポジティブ材料の confidence を保守的に下げ、"
+        "上方向ならネガティブ材料の confidence を保守的に下げて判定すること。"
+    )
+
+
+# ── ★ v2.93: 下落トレンド検知時の新規ロング一時停止 ────────────────────────
+# 5/4 Oracle・5/5 SMH 下落トレンド中の新規ロング損失事案への対策。
+# 構成A: 急落直後の銘柄別ブロック (損切り/パニック/トレイル発動から NEW_LONG_BLOCK_SEC 秒)
+# 構成B: QQQ 15/60分の下落幅が閾値超で全銘柄ブロック (反発で自動解除)
+# 対象は place_buy のみ。決済 (place_close_all) と place_short は阻害しない。
+
+# 構成 A 用: 銘柄別の直近リスクイベント時刻
+_RECENT_RISK_EVENT: dict[str, datetime.datetime] = {}
+NEW_LONG_BLOCK_SEC: int = 900  # 15 分 (固定値、敏感設定)
+
+# 構成 B 用: マクロ下落トレンド判定の閾値 (敏感設定 / 固定値)
+MACRO_DOWNTREND_15M_PCT: float = -0.3  # 直近 15 分の QQQ 騰落率 ≤ -0.3% でトレンド検知
+MACRO_DOWNTREND_60M_PCT: float = -0.7  # 直近 60 分の QQQ 騰落率 ≤ -0.7% でトレンド検知
+
+# ★ v3.1.3: 上昇トレンド判定 (SHORT fallback ブロック用)
+# AI が victims を明示しなかった単発の個別株悪材料で bear ETF を空売りする前に、
+# QQQ/SMH が上昇傾向にあるかを確認する。下落判定 (構成 B/C) より敏感に設定:
+# 個別株悪材料 → ETF fallback ショートは元々エッジが薄いため、軽微な上昇でも
+# 中立化したい。誤検知 (= ショートを見送る) のコストは「機会損失」のみで小さい。
+MACRO_UPTREND_15M_PCT: float = 0.10  # 直近 15 分の QQQ 騰落率 ≥ +0.10% で上昇判定
+MACRO_UPTREND_60M_PCT: float = 0.25  # 直近 60 分の QQQ 騰落率 ≥ +0.25% で上昇判定
+SMH_UPTREND_15M_PCT:   float = 0.15  # SMH はボラ大のため QQQ より少し緩め
+SMH_UPTREND_60M_PCT:   float = 0.40
+
+# ── ★ v2.94 + v3.9.10: SMH 専用の追加チェック用定数 ────────────────────────
+# SMH のみ Confidence しきい値を一段引き上げてハードコード。730 件分析で SMH の
+# 0.75 帯損失が -$212 と最大だったため。他銘柄は既存閾値を維持し SMH のみ厳格化。
+# v3.9.10: 5/12 観察ログで smh_strict が 6 件発火・もし通していたら平均
+#          +$6.20/share の勝ちだったため過剰保守と判断。0.80 → 0.78 に微緩和。
+#          v2.94 当初の「0.75 帯が最悪」分析と矛盾しない範囲 (0.78 ≥ 0.75) で調整。
+SMH_CONFIDENCE_THRESHOLD: float = 0.78  # SMH 発注の最低 confidence (固定値・v3.9.10 で 0.80→0.78)
+
+# SMH 固有のセクター下落判定 (v2.93 の QQQ ベース構成 B とは独立)。
+# SMH は QQQ よりボラが大きいため中庸設定 (−0.5% / −1.0%) を採用。
+# 5/5 SMH 終日下落事案（QQQ 横ばいでも SMH だけが下落）への対策。
+SMH_DOWNTREND_15M_PCT: float = -0.5  # 直近 15 分の SMH 騰落率 ≤ -0.5% でトレンド検知
+SMH_DOWNTREND_60M_PCT: float = -1.0  # 直近 60 分の SMH 騰落率 ≤ -1.0% でトレンド検知
+
+# ── ★ v3.9.5: SPY 専用のトレンド判定 (QQQ ベース構成 B/B' とは独立) ──────────
+# SPY は QQQ より約 40% 低ボラ (15分σ 0.05% / 60分σ 0.07% vs QQQ 0.08%/0.15%)。
+# QQQ と同じ閾値 (-0.30%/-0.70% 下落, +0.10%/+0.25% 上昇) を使うと SPY では 6〜10σ
+# 相当の極端な閾値となり、上昇 60分は P90=+0.20% に対し +0.25% で発火率ほぼ 0%。
+# SPY の σ に合わせて約 QQQ の 60% の閾値に再キャリブレーション。
+# 構成: SPY が QQQ より穏やかに動いている時のみブロック → 個別 SPY ロング/ショートの精度向上。
+SPY_DOWNTREND_15M_PCT: float = -0.20  # 直近 15 分の SPY 騰落率 ≤ -0.20% でトレンド検知 (~4σ)
+SPY_DOWNTREND_60M_PCT: float = -0.45  # 直近 60 分の SPY 騰落率 ≤ -0.45% でトレンド検知 (~6σ)
+SPY_UPTREND_15M_PCT:   float = 0.07   # 直近 15 分の SPY 騰落率 ≥ +0.07% で上昇判定 (~1.4σ)
+SPY_UPTREND_60M_PCT:   float = 0.15   # 直近 60 分の SPY 騰落率 ≥ +0.15% で上昇判定 (~2.1σ)
+
+# ── ★ v2.99.4 + v3.8.2: 構成 D - 個別株固有のトレンド判定 (env 化 + 対称版) ──
+# 個別株自身の直近騰落率から下落/上昇トレンドを判定。QQQ ベース (構成 B) や
+# SMH ベース (構成 C) と独立に「個別株が単独で急落/急騰」しているケースを検知。
+# 個別株は ETF よりボラが大きいため、閾値は SMH より緩めに設定。
+# 適用対象: STOCK_TICKERS (env で監視対象に設定した銘柄) のみ。
+#   - LONG ブロック (構成 D, 既存): place_buy で is_stock_downtrend
+#   - SHORT ブロック (構成 D', 新規): place_short で is_stock_uptrend
+# v3.8.2: 5/4-8 週間レポートで個別株 (AMD/MU/Finnhub-NVDA) が構造的損失を出した
+#         のを受け、SHORT 側の対称ガードを追加し、閾値を env で銘柄/受講生ごとに
+#         調整可能にした (ボラの大きい銘柄は閾値を緩める運用が可能)。
+def _env_stock_pct(name: str, default: float) -> float:
+    """env から個別株トレンド閾値 (%) を読み込み、無効値は default。"""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning(f"[env] {name}={raw!r} は無効、default {default}% を使用")
+        return default
+
+STOCK_DOWNTREND_15M_PCT: float = _env_stock_pct("STOCK_DOWNTREND_15M_PCT", -0.7)
+STOCK_DOWNTREND_60M_PCT: float = _env_stock_pct("STOCK_DOWNTREND_60M_PCT", -1.5)
+STOCK_UPTREND_15M_PCT:   float = _env_stock_pct("STOCK_UPTREND_15M_PCT",    0.7)
+STOCK_UPTREND_60M_PCT:   float = _env_stock_pct("STOCK_UPTREND_60M_PCT",    1.5)
+
+
+def record_risk_event(symbol: str, reason: str = "") -> None:
+    """place_close_all 等で「強制損切り」「パニック」「トレイリング」を含む reason の 場合のみ記録対象とする (時間切れ決済等の通常クローズは記録しない)。"""
+    if not symbol:
+        return
+    _RECENT_RISK_EVENT[symbol] = datetime.datetime.now()
+    if reason:
+        log.debug(f"[リスクイベント記録] {symbol}: {reason[:60]}")
+
+
+def is_recent_risk_event(symbol: str) -> tuple[bool, float]:
+    """構成 A: 直近 NEW_LONG_BLOCK_SEC 秒以内にリスクイベントがあったかを返す。
+    戻り値: (True/False, 経過秒数)
+    """
+    last = _RECENT_RISK_EVENT.get(symbol)
+    if last is None:
+        return False, 0.0
+    elapsed = (datetime.datetime.now() - last).total_seconds()
+    if elapsed < NEW_LONG_BLOCK_SEC:
+        return True, elapsed
+    return False, elapsed
+
+
+def is_macro_downtrend() -> tuple[bool, str]:
+    """戻り値: (True/False, 説明文字列) データ不足時は (False, "") を返す (履歴が浅いと安全側でブロックしない)。"""
+    pct_15 = get_index_pct_change("QQQ", 15)
+    pct_60 = get_index_pct_change("QQQ", 60)
+    if pct_15 is not None and pct_15 <= MACRO_DOWNTREND_15M_PCT:
+        return True, f"QQQ 15分 {pct_15:+.2f}% ≤ {MACRO_DOWNTREND_15M_PCT}%"
+    if pct_60 is not None and pct_60 <= MACRO_DOWNTREND_60M_PCT:
+        return True, f"QQQ 60分 {pct_60:+.2f}% ≤ {MACRO_DOWNTREND_60M_PCT}%"
+    return False, ""
+
+
+def is_macro_uptrend() -> tuple[bool, str]:
+    """★ v3.1.3: QQQ の上昇トレンドを判定する (SHORT fallback ブロック用)。
+
+    is_macro_downtrend() の対称版。AI が victims を明示しなかった単発の悪材料
+    (例: TTD 決算ミス) で QQQ ショート fallback が動作するのを抑止する。
+    QQQ が明確に上昇しているとき、個別株の悪材料は ETF 全体への影響が限定的
+    であり、空売りエッジが薄いため。
+
+    戻り値: (True/False, 説明文字列) データ不足時は (False, "") を返す。
+    """
+    pct_15 = get_index_pct_change("QQQ", 15)
+    pct_60 = get_index_pct_change("QQQ", 60)
+    if pct_15 is not None and pct_15 >= MACRO_UPTREND_15M_PCT:
+        return True, f"QQQ 15分 {pct_15:+.2f}% ≥ +{MACRO_UPTREND_15M_PCT}%"
+    if pct_60 is not None and pct_60 >= MACRO_UPTREND_60M_PCT:
+        return True, f"QQQ 60分 {pct_60:+.2f}% ≥ +{MACRO_UPTREND_60M_PCT}%"
+    return False, ""
+
+
+def is_smh_uptrend() -> tuple[bool, str]:
+    """★ v3.1.3: SMH の上昇トレンドを判定する (is_smh_downtrend の対称版)。
+    SHORT fallback で SMH を空売りする前のガード。
+    戻り値: (True/False, 説明文字列) データ不足時は (False, "") を返す。
+    """
+    pct_15 = get_index_pct_change("SMH", 15)
+    pct_60 = get_index_pct_change("SMH", 60)
+    if pct_15 is not None and pct_15 >= SMH_UPTREND_15M_PCT:
+        return True, f"SMH 15分 {pct_15:+.2f}% ≥ +{SMH_UPTREND_15M_PCT}%"
+    if pct_60 is not None and pct_60 >= SMH_UPTREND_60M_PCT:
+        return True, f"SMH 60分 {pct_60:+.2f}% ≥ +{SMH_UPTREND_60M_PCT}%"
+    return False, ""
+
+
+def is_smh_downtrend() -> tuple[bool, str]:
+    """★ v2.94: SMH 固有の下落トレンドを判定する (place_buy 内 symbol=='SMH' 時に使用)。
+
+    QQQ ベースの is_macro_downtrend() とは独立し、SMH 自身の直近騰落率から判定。
+    5/5 SMH 終日下落事案では QQQ は横ばいでも SMH だけが終日下落しており、
+    QQQ ベースの構成 B が発火しないケースをこの関数で補う。
+
+    SMH は QQQ よりボラが大きいため閾値は中庸設定 (−0.5% / −1.0%) を採用。
+    戻り値: (True/False, 説明文字列)
+    データ不足時は (False, "") を返す (履歴が浅いと安全側でブロックしない)。
+    """
+    pct_15 = get_index_pct_change("SMH", 15)
+    pct_60 = get_index_pct_change("SMH", 60)
+    if pct_15 is not None and pct_15 <= SMH_DOWNTREND_15M_PCT:
+        return True, f"SMH 15分 {pct_15:+.2f}% ≤ {SMH_DOWNTREND_15M_PCT}%"
+    if pct_60 is not None and pct_60 <= SMH_DOWNTREND_60M_PCT:
+        return True, f"SMH 60分 {pct_60:+.2f}% ≤ {SMH_DOWNTREND_60M_PCT}%"
+    return False, ""
+
+
+def is_spy_uptrend() -> tuple[bool, str]:
+    """★ v3.9.5: SPY 固有の上昇トレンドを判定する (place_short 内 symbol=='SPY' 時に使用)。
+
+    SPY は QQQ より約 40% 低ボラ (15分σ 0.05% / 60分σ 0.07%) のため、QQQ ベースの
+    is_macro_uptrend() (+0.10%/+0.25%) では発火率がほぼ 0% になる。
+    SPY 専用の閾値 (+0.07%/+0.15%, ~1.4σ/2.1σ) で SPY ショートを抑止する。
+
+    戻り値: (True/False, 説明文字列)
+    データ不足時は (False, "") を返す (履歴が浅いと安全側でブロックしない)。
+    """
+    pct_15 = get_index_pct_change("SPY", 15)
+    pct_60 = get_index_pct_change("SPY", 60)
+    if pct_15 is not None and pct_15 >= SPY_UPTREND_15M_PCT:
+        return True, f"SPY 15分 {pct_15:+.2f}% ≥ +{SPY_UPTREND_15M_PCT}%"
+    if pct_60 is not None and pct_60 >= SPY_UPTREND_60M_PCT:
+        return True, f"SPY 60分 {pct_60:+.2f}% ≥ +{SPY_UPTREND_60M_PCT}%"
+    return False, ""
+
+
+def is_spy_downtrend() -> tuple[bool, str]:
+    """★ v3.9.5: SPY 固有の下落トレンドを判定する (place_buy 内 symbol=='SPY' 時に使用)。
+
+    QQQ ベースの is_macro_downtrend() とは独立。SPY は QQQ より低ボラのため、
+    QQQ ベースの構成 B (-0.30%/-0.70%) では SPY 単独下落の検知精度が低い。
+    SPY 専用の閾値 (-0.20%/-0.45%, ~4σ/~6σ) で SPY ロングを抑止する。
+
+    戻り値: (True/False, 説明文字列)
+    データ不足時は (False, "") を返す (履歴が浅いと安全側でブロックしない)。
+    """
+    pct_15 = get_index_pct_change("SPY", 15)
+    pct_60 = get_index_pct_change("SPY", 60)
+    if pct_15 is not None and pct_15 <= SPY_DOWNTREND_15M_PCT:
+        return True, f"SPY 15分 {pct_15:+.2f}% ≤ {SPY_DOWNTREND_15M_PCT}%"
+    if pct_60 is not None and pct_60 <= SPY_DOWNTREND_60M_PCT:
+        return True, f"SPY 60分 {pct_60:+.2f}% ≤ {SPY_DOWNTREND_60M_PCT}%"
+    return False, ""
+
+
+def is_stock_downtrend(symbol: str) -> tuple[bool, str]:
+    """★ v2.99.4: 構成 D - 個別株固有の下落トレンドを判定する。
+
+    place_buy 内で symbol が STOCK_TICKERS に含まれる場合のみ呼ばれる。
+    QQQ/SMH 系の構成 B/C では拾えない「個別株の単独急落」を検知する。
+
+    例: テック市場全体は静かでも、特定の個別株がアナリストダウングレードで
+        急落しているケースで、好材料ニュースに飛び乗らないようガードする。
+
+    閾値は env (STOCK_DOWNTREND_15M_PCT / STOCK_DOWNTREND_60M_PCT) で調整可能。
+    デフォルトは ETF より緩め (-0.7% / -1.5%、個別株のボラを考慮)。
+    戻り値: (True/False, 説明文字列)
+    データ不足時は (False, "") を返す (履歴が浅いと安全側でブロックしない)。
+    """
+    if symbol not in _INDEX_PRICE_HISTORY:
+        return False, ""  # 履歴未追跡銘柄は判定しない (安全側)
+    pct_15 = get_index_pct_change(symbol, 15)
+    pct_60 = get_index_pct_change(symbol, 60)
+    if pct_15 is not None and pct_15 <= STOCK_DOWNTREND_15M_PCT:
+        return True, f"{symbol} 15分 {pct_15:+.2f}% ≤ {STOCK_DOWNTREND_15M_PCT}%"
+    if pct_60 is not None and pct_60 <= STOCK_DOWNTREND_60M_PCT:
+        return True, f"{symbol} 60分 {pct_60:+.2f}% ≤ {STOCK_DOWNTREND_60M_PCT}%"
+    return False, ""
+
+
+def is_stock_uptrend(symbol: str) -> tuple[bool, str]:
+    """★ v3.8.2: 構成 D' - 個別株固有の上昇トレンドを判定する (place_short 用)。
+
+    is_stock_downtrend の対称版。place_short 内で symbol が STOCK_TICKERS に
+    含まれる場合のみ呼ばれる。QQQ/SMH 系のマクロ判定では拾えない「個別株の
+    単独急騰」中に SHORT を撃たないようガードする。
+
+    例: 市場全体は静かでも、特定の個別株が好材料アナウンスで急騰中のとき、
+        誤判定の悪材料ニュースに引きずられて空売りしないようにする。
+
+    閾値は env (STOCK_UPTREND_15M_PCT / STOCK_UPTREND_60M_PCT) で調整可能。
+    デフォルトは下落側と対称 (+0.7% / +1.5%)。SHORT を厳しく抑制したい場合は
+    env でより小さい値 (例: +0.3% / +0.7%) を設定して感度を上げる。
+    戻り値: (True/False, 説明文字列)
+    データ不足時は (False, "") を返す (履歴が浅いと安全側でブロックしない)。
+    """
+    if symbol not in _INDEX_PRICE_HISTORY:
+        return False, ""  # 履歴未追跡銘柄は判定しない (安全側)
+    pct_15 = get_index_pct_change(symbol, 15)
+    pct_60 = get_index_pct_change(symbol, 60)
+    if pct_15 is not None and pct_15 >= STOCK_UPTREND_15M_PCT:
+        return True, f"{symbol} 15分 {pct_15:+.2f}% ≥ +{STOCK_UPTREND_15M_PCT}%"
+    if pct_60 is not None and pct_60 >= STOCK_UPTREND_60M_PCT:
+        return True, f"{symbol} 60分 {pct_60:+.2f}% ≥ +{STOCK_UPTREND_60M_PCT}%"
+    return False, ""
+
+
+def log_market_state() -> None:
+    """★ v2.99.4: 5分ごとの市場状態を INFO レベルで出力する。
+
+    内容:
+      - ETF (QQQ/SPY/SMH): 5分・15分・60分の3点騰落率
+      - 個別株 (STOCK_TICKERS): 60分騰落率の絶対値上位5銘柄を1行圧縮表示
+      - 下落トレンド判定状態 (構成 B/C/D)
+      - データ蓄積状況 (ウォームアップ表示)
+
+    risk_monitor_loop から定期的に呼ばれる前提。
+
+    ★ 副作用: 価格履歴のバックフィル
+       追跡対象だがデータが浅い銘柄について、ここで quote 取得して価格を補完する。
+       これは「ポジションを持っているとき、他銘柄の価格が record されない」問題への対策。
+       (既存ロジックでは exec_syms ループで position_qty==0 の銘柄をスキップするため)
+    """
+    # ── ★ 価格履歴のバックフィル: 全追跡銘柄を quote 取得して record ─────
+    # 5分に1回しか呼ばれないため、追加 API 負荷は最小限。
+    for sym in list(_INDEX_PRICE_HISTORY.keys()):
+        try:
+            _q = get_quote(sym)
+            _price = _q.get("last", 0) or _q.get("ask", 0) or 0
+            if _price > 0:
+                record_index_price(sym, _price)
+        except Exception:
+            pass  # quote 取得失敗時は静かにスキップ (ログノイズ回避)
+
+    # ── ★ v3.9.14: 市場状態の表示を色付き 3 行展開に改善 ───────────────────
+    # 旧 v3.9.13 までは 1 行に QQQ/SPY/SMH を詰め込んで読みにくかった。
+    # 視認性向上のため、銘柄ごとに 1 行 + 各 % を ANSI 色付き表示 + 銘柄ヘッドに
+    # 60min ベースの方向絵文字 (📈/📉/➡️) を追加。
+    # 端末では緑/赤で表示、ログファイルは _PlainFormatter が ANSI を剥離。
+    def _fmt_pct_colored(pct: Optional[float], width: int = 7) -> str:
+        """% を ANSI 色付きで返す (整列用に幅指定)。データ不足時は灰色のテキスト。"""
+        if pct is None:
+            txt = "データ不足".ljust(width, "　")  # 全角空白で整列
+            return f"\033[2m{txt}\033[0m"  # 薄字
+        # しきい値で色分け (色覚多様性に配慮し緑/赤の濃淡差で表現)
+        sign = "+" if pct >= 0 else ""
+        body = f"{sign}{pct:.2f}%".rjust(width)
+        if pct > 0.10:
+            return f"\033[1;32m{body}\033[0m"     # 太字 緑 (明確な上昇)
+        elif pct < -0.10:
+            return f"\033[1;31m{body}\033[0m"     # 太字 赤 (明確な下落)
+        elif pct > 0:
+            return f"\033[32m{body}\033[0m"       # 緑 (微小上昇)
+        elif pct < 0:
+            return f"\033[31m{body}\033[0m"       # 赤 (微小下落)
+        else:
+            return body                            # ゼロは無色
+
+    def _dir_emoji(pct60: Optional[float]) -> str:
+        """60min 騰落率に基づく方向絵文字。"""
+        if pct60 is None:
+            return "❓"
+        if pct60 > 0.10:
+            return "📈"
+        elif pct60 < -0.10:
+            return "📉"
+        else:
+            return "➡️"
+
+    _etf_display_lines: List[str] = []   # 表示用 (展開)
+    _etf_lines: List[str] = []           # 旧形式 (互換のため変数は残す・後段で未使用)
+    _data_status = []
+    _has_any_etf = False
+    # ★ v3.9.33: IWM (シャドーモメンタム観察銘柄) も市場状態表示に追加
+    for sym in ("QQQ", "SPY", "SMH", "IWM"):
+        if sym not in _INDEX_PRICE_HISTORY:
+            continue
+        _hist = _INDEX_PRICE_HISTORY[sym]
+        if not _hist:
+            _etf_display_lines.append(f"  ❓ {sym}  │ データ不足")
+            _data_status.append(f"{sym}=0分")
+            continue
+
+        _has_any_etf = True
+        # データ蓄積時間
+        _oldest_age_min = (datetime.datetime.now() - _hist[0][0]).total_seconds() / 60
+        _data_status.append(f"{sym}={_oldest_age_min:.0f}分")
+
+        _p5  = get_index_pct_change(sym, 5)
+        _p15 = get_index_pct_change(sym, 15)
+        _p60 = get_index_pct_change(sym, 60)
+        _emo = _dir_emoji(_p60)
+        # 整列して読みやすく ("│" は罫線・等幅フォントで整う)
+        _etf_display_lines.append(
+            f"  {_emo} {sym}  │  5分 {_fmt_pct_colored(_p5)}"
+            f"  │  15分 {_fmt_pct_colored(_p15)}"
+            f"  │  60分 {_fmt_pct_colored(_p60)}"
+        )
+
+    # ── 下落トレンド判定状態 ───────────────────────────────────────────────
+    _macro_down, _macro_reason = is_macro_downtrend()
+    _smh_down,   _smh_reason   = is_smh_downtrend()
+    _macro_label = f"🚫({_macro_reason})" if _macro_down else "OK"
+    _smh_label   = f"🚫({_smh_reason})"   if _smh_down   else "OK"
+
+    # ── 個別株状態を構築 (STOCK_TICKERS が空ならフォールバック) ────────────
+    _stock_section = ""
+    _stock_filter_label = ""
+    if STOCK_TICKERS:
+        # 60分騰落率を全銘柄で取得し、絶対値上位5銘柄を抽出
+        _stock_pcts: list[tuple[str, float]] = []
+        _stock_data_count = 0
+        for sym in STOCK_TICKERS:
+            _pct60 = get_index_pct_change(sym, 60)
+            if _pct60 is not None:
+                _stock_pcts.append((sym, _pct60))
+                _stock_data_count += 1
+
+        if _stock_pcts:
+            # 絶対値降順で上位5銘柄
+            _top5 = sorted(_stock_pcts, key=lambda x: abs(x[1]), reverse=True)[:5]
+            _segs = []
+            for sym, pct in _top5:
+                _emoji = "📈" if pct > 0 else ("📉" if pct < 0 else "➡")
+                _segs.append(f"{_emoji}{sym} {pct:+.2f}%")
+            _stock_section = "個別株60分騰落率(変動上位): " + " / ".join(_segs)
+
+            # 構成 D の発動状況 (上位5に下落トレンドが含まれているか)
+            _down_stocks = []
+            for sym, _ in _top5:
+                _is_down, _reason = is_stock_downtrend(sym)
+                if _is_down:
+                    _down_stocks.append(sym)
+            if _down_stocks:
+                _stock_filter_label = f"🚫({len(_down_stocks)}銘柄: {','.join(_down_stocks)})"
+            else:
+                _stock_filter_label = "OK"
+
+            _data_status.append(f"個別株{len(STOCK_TICKERS)}銘柄(データ有={_stock_data_count})")
+        else:
+            _stock_section = f"個別株: データ蓄積中 (0/{len(STOCK_TICKERS)}銘柄)"
+            _stock_filter_label = "判定スキップ(データ不足)"
+            _data_status.append(f"個別株{len(STOCK_TICKERS)}銘柄(データ有=0)")
+    else:
+        _stock_section = "(個別株は監視対象なし)"
+
+    # ── 出力 (★ v3.9.14: 色付き 3 行展開・銘柄ごと 1 行 + 個別株は従来形式) ──
+    if _etf_display_lines and _has_any_etf:
+        log.info("[市場状態]")
+        for _line in _etf_display_lines:
+            log.info(_line)
+    else:
+        log.info("[市場状態] ETFデータ不足")
+    if _stock_section:
+        log.info(f"  {_stock_section}")
+    _filter_str = f"全銘柄ブロック={_macro_label}  SMH専用={_smh_label}"
+    if STOCK_TICKERS:
+        _filter_str += f"  個別株版={_stock_filter_label}"
+    log.info(f"  下落トレンド: {_filter_str}")
+    log.info(f"  データ蓄積: " + " ".join(_data_status))
+
+
+def get_tracked_portfolio_total() -> float:
+    """自前管理のポジションコスト合計を返す"""
+    return sum(_tracked_position_cost.values())
+
+def track_position_add(symbol: str, order_cost: float, qty: int = 0) -> None:
+    """発注成功時にポジションコストと株数を加算"""
+    # ★ v3.9.134: この銘柄で Bot が建玉を持ったことを台帳に記録する。
+    #   発注が通った時点で記録するのは意図的。約定確認前に Bot が落ちても
+    #   「自分の建玉」と分かるようにするため（見失うと損切りが止まる）。
+    _ledger_mark(symbol, None, getattr(state.get(symbol), "entry_time", None))
+    _tracked_position_cost[symbol] = _tracked_position_cost.get(symbol, 0.0) + order_cost
+    if qty > 0:
+        _tracked_qty[symbol] = _tracked_qty.get(symbol, 0) + qty
+    log.info(
+        f"[ポジション管理] {symbol} +${order_cost:,.0f}"
+        f"  追跡株数={_tracked_qty.get(symbol, 0)}株"
+        f" → 合計=${get_tracked_portfolio_total():,.0f}"
+    )
+
+def track_position_clear(symbol: str, clear_ledger: bool = True) -> None:
+    """決済時にポジションコストと株数をゼロにリセット"""
+    # ★ v3.9.134: 建玉が無くなったので台帳からも消す
+    if clear_ledger:
+        _ledger_unmark(symbol, None)
+    prev_cost = _tracked_position_cost.get(symbol, 0.0)
+    prev_qty  = _tracked_qty.get(symbol, 0)
+    _tracked_position_cost[symbol] = 0.0
+    _tracked_qty[symbol] = 0
+    # ★ v2.99.4: ポジション完全解消 → 決済FAILEDロックアウトを自動解除
+    _clear_failed_close(symbol)
+    log.info(
+        f"[ポジション管理] {symbol} クリア（-${prev_cost:,.0f}  -{prev_qty}株）"
+        f" → 合計=${get_tracked_portfolio_total():,.0f}"
+    )
+
+# 未約定注文管理: {order_id: {"symbol": str, "placed_at": datetime, "trd_env": TrdEnv, "is_cover": bool}}
+_pending_orders: dict[str, dict] = {}
+_cancel_raw = os.environ.get("ORDER_CANCEL_MINUTES", "").strip()
+try:
+    ORDER_CANCEL_MINUTES = int(_cancel_raw) if _cancel_raw else 1
+    ORDER_CANCEL_MINUTES = max(1, ORDER_CANCEL_MINUTES)
+except ValueError:
+    ORDER_CANCEL_MINUTES = 1  # 発注から何分後にキャンセルするか
+
+# ── ★ v3.9.20: ピラミッディング撤去済 ───────────────────────────────────
+# 旧 v3.9.19 までは PYRAMID_ALLIN_THRESHOLD / PYRAMID_MAX_ENTRIES / PYRAMID_STEP_PCT
+# の 3 env で多段エントリーを制御していたが、実データ分析で:
+#   1) 1,293 件の運用記録で一度もピラミッド追加発注が発動していなかった
+#   2) タイムアウト 10 分 / 再エントリー禁止 30 分 / AI キャッシュ 15 分 / トピック
+#      クールダウン 30 分 と仕組みが衝突
+#   3) スキャル戦略 (短時間決済) と「上昇継続中の増し玉」の思想が根本的に合わない
+# が判明したため撤去。発注金額は calc_order_size() の「山型サイズ配分」で決定。
+# .env の PYRAMID_* 設定が残っていても無視される (削除推奨だが副作用なし)。
+
+def _cancel_order(order_id: str, symbol: str, trd_env: TrdEnv, reason: str = "") -> bool:
+    """指定した注文IDをキャンセルする。成功したら True を返す。"""
+    tag = f"【{symbol}】"
+    try:
+        # ★ v2.86: with _trade_ctx() で例外時の close を保証
+        with _trade_ctx() as ctx:
+            _acc_id_cancel = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
+            ret, data = ctx.modify_order(
+                modify_order_op = ModifyOrderOp.CANCEL,
+                order_id        = order_id,
+                qty             = 0,
+                price           = 0,
+                trd_env         = trd_env,
+                acc_id          = _acc_id_cancel,
+            )
+        if ret == RET_OK:
+            log.info(f"{tag} [キャンセル] 成功 orderId={order_id}  理由: {reason}")
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                f"[Bot] {tag} ⏱ 未約定注文キャンセル\n"
+                f"orderId: {order_id}\n"
+                f"理由: {reason}"
+            ))
+            return True
+        else:
+            err_str = str(data).lower()
+            # 「FILLED_ALL status, does not support Cancel」→ 実は約定済み
+            # → 管理リストから削除して無限ループを防ぐ
+            if "filled" in err_str or "dealt" in err_str:
+                log.info(
+                    f"{tag} [キャンセル] orderId={order_id} は約定済みのため削除 "
+                    f"（watchdog管理リストから除外）"
+                )
+                _unregister_pending_order(order_id)
+                return True   # 実質的に「管理対象ではなくなった」= 成功扱い
+            log.warning(f"{tag} [キャンセル] 失敗 orderId={order_id}: {data}")
+            return False
+    except Exception as e:
+        log.warning(f"{tag} [キャンセル] 例外 orderId={order_id}: {e}")
+        return False
+
+
+async def pending_order_watchdog() -> None:
+    """
+    未約定注文を1分ごとに監視する。
+    ① ORDER_CANCEL_MINUTES 経過した注文をタイムアウトキャンセル
+    ② 同一銘柄に複数の未約定注文が積み上がっている場合、古い順にキャンセル
+       （大量約定防止: 1銘柄あたり未約定は常に最新1件のみ残す）
+
+    ★ v2.87: 休日中はタイムアウト判定を停止
+       約定するはずがないので、無駄なキャンセル発火と再発注を防ぐ。
+    """
+    log.info(f"=== 未約定注文ウォッチドッグ 開始（タイムアウト: {ORDER_CANCEL_MINUTES}分）===")
+    while True:
+        await asyncio.sleep(60)  # 1分ごとにチェック
+
+        # ★ v2.87: 休日中はタイムアウト判定をスキップ
+        # 取引が走らないので未約定がそのまま残るが、市場再開後に通常通り判定される。
+        today_et = datetime.datetime.now(_ET).date()
+        if is_nyse_holiday(today_et):
+            continue
+
+        now = datetime.datetime.now()
+
+        # ── ② 同一銘柄の注文が複数積み上がっていたら古い順にキャンセル ──────
+        # 銘柄ごとにグループ化
+        from collections import defaultdict
+        sym_orders: dict = defaultdict(list)
+        for oid, info in list(_pending_orders.items()):
+            # ★ v3.9.105 (C2): 決済注文(is_close)も除外する。place_close_all は建玉
+            #   (position_id)ごとに複数の決済注文を同時発注し、発注時点で内部状態を
+            #   クリア済みのため、ここで「重複」と誤認してキャンセルすると
+            #   「決済済み扱いなのに実際は未決済」の建玉が生まれ、損切り監視なしで残る。
+            #   従来はショートカバー(is_cover)のみ除外していた。
+            if not info.get("is_cover") and not info.get("is_close"):
+                sym_orders[info["symbol"]].append((oid, info))
+
+        for sym, orders in sym_orders.items():
+            if len(orders) <= 1:
+                continue
+            # 古い順にソートして最新1件以外をキャンセル
+            orders_sorted = sorted(orders, key=lambda x: x[1]["placed_at"])
+            to_cancel = orders_sorted[:-1]  # 最新1件を残して古いものをキャンセル
+            log.warning(
+                f"【{sym}】 ⚠ 未約定注文が{len(orders)}件積み上がっています"
+                f" → 古い{len(to_cancel)}件をキャンセル（大量約定防止）"
+            )
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                f"[Bot] 【{sym}】 ⚠ 未約定注文 {len(orders)}件を検出\n"
+                f"古い{len(to_cancel)}件をキャンセルします（大量約定防止）"
+            ))
+            for order_id, info in to_cancel:
+                elapsed = (now - info["placed_at"]).total_seconds() / 60
+                ok = _cancel_order(order_id, sym, info["trd_env"],
+                                   f"重複注文キャンセル（{elapsed:.0f}分前の注文）")
+                if ok:
+                    _pending_orders.pop(order_id, None)
+
+        # ── ① タイムアウト処理 ────────────────────────────────────────────────
+        expired = [
+            (oid, info) for oid, info in list(_pending_orders.items())
+            if (now - info["placed_at"]).total_seconds() / 60 >= ORDER_CANCEL_MINUTES
+        ]
+        for order_id, info in expired:
+            sym      = info["symbol"]
+            trd_env  = info["trd_env"]
+            is_cover = info.get("is_cover", False)
+            is_close = info.get("is_close", False)   # 損切り/決済注文かどうか
+            elapsed  = (now - info["placed_at"]).total_seconds() / 60
+            reason   = f"{elapsed:.0f}分経過（タイムアウト）{'[ショートカバー]' if is_cover else ''}"
+            log.warning(f"【{sym}】 ⏱ 未約定タイムアウト orderId={order_id}  {reason}")
+
+            ok = _cancel_order(order_id, sym, trd_env, reason)
+            if ok:
+                _pending_orders.pop(order_id, None)
+            else:
+                # キャンセルAPIが失敗した場合でも FAILED ステータスの注文は除去する
+                # （FAILEDはすでに無効なので残しても意味がない）
+                try:
+                    # ★ v2.86: with _trade_ctx() で例外時の close を保証
+                    with _trade_ctx() as ctx:
+                        _acc_id_wdog = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
+                        ret, data = ctx.order_list_query(
+                            code=to_moomoo_code(sym), trd_env=trd_env,
+                            order_id=order_id,
+                            acc_id=_acc_id_wdog,
+                        )
+                    if ret == RET_OK and not data.empty:
+                        status_str = str(data["order_status"].iloc[0]).upper()
+                        if any(s in status_str for s in ("FAILED", "CANCELLED", "DELETED", "REJECTED")):
+                            log.info(f"【{sym}】 [watchdog] {status_str}注文をリストから除去: {order_id}")
+                            _pending_orders.pop(order_id, None)
+                            ok = True  # 後続のis_close処理をスキップ
+                            # BUY注文が取消済の場合 → _tracked_position_cost もリセット
+                            if not is_close:
+                                try:
+                                    ts_wdog = state.get(sym)
+                                    if not (ts_wdog.position_qty > 0 or ts_wdog.avg_cost > 0):
+                                        prev_cost = _tracked_position_cost.get(sym, 0.0)
+                                        _tracked_position_cost[sym] = 0.0
+                                        ts_wdog.entry_count = 0
+                                        ts_wdog.entry_time  = None
+                                        log.warning(
+                                            f"【{sym}】 [watchdog] BUY取消検出 → state/tracked リセット"
+                                            f"  解放額:${prev_cost:,.0f}"
+                                        )
+                                except Exception as _we:
+                                    log.debug(f"【{sym}】 [watchdog] リセット処理例外: {_we}")
+                except Exception as _e:
+                    log.debug(f"【{sym}】 [watchdog] ステータス確認失敗: {_e}")
+
+            # FAILEDループ防止: 再発注は最大2回まで
+            retry_count = info.get("retry_count", 0)
+            if ok and is_close and retry_count >= 3:
+                log.error(
+                    f"【{sym}】 ⛔ 損切り再発注が{retry_count}回FAILEDしました。"
+                    f" 手動での決済を確認してください。"
+                )
+                _threadsafe_future(asyncio.to_thread(
+                    send_discord_message,
+                    f"[Bot] 【{sym}】 ⛔ 損切り再発注が{retry_count}回連続でFAILEDしました\n"
+                    f"⚠️ 手動での決済が必要です。moomooアプリで確認してください。"
+                ))
+                ok = False  # 再発注しない
+
+            if ok and is_close:
+                # ── 損切り注文が未約定 → 再発注（バッファをさらに拡大） ──
+                ts = state.get(sym)
+                # ── ポジション実態チェック: 既に0なら約定済み → 再発注スキップ ──
+                # （"約定済みのため削除" で ok=True になったケースを含む）
+                _actual_qty  = ts.position_qty
+                _tracked_val = _tracked_position_cost.get(sym, 0.0)
+                # ★ v3.9.120: SHORT カバーの誤スキップ修正（外部AIレビュー指摘・High）。
+                #   ショート建玉は position_qty が負（-N）で保持され、place_close_all は
+                #   カバー発注時点で tracked と is_short を先にクリアするため、旧判定
+                #   （qty<=0 and tracked<=0）は「未約定のまま残っている生きたショート」
+                #   まで『約定済み』と誤判断して再発注をスキップしていた。
+                #   → カバー注文は「qty==0（完全にフラット）」の場合のみスキップする。
+                _side_pend = str(info.get("side", "LONG"))
+                if is_cover or _side_pend == "SHORT":
+                    _already_flat = (_actual_qty == 0)
+                else:
+                    _already_flat = (_actual_qty <= 0 and _tracked_val <= 0)
+                if _already_flat:
+                    log.info(
+                        f"【{sym}】 [watchdog] 決済注文は約定済みと判断"
+                        f"（qty={_actual_qty} tracked=${_tracked_val:.0f} side={_side_pend}）"
+                        f"→ 再発注スキップ"
+                    )
+                    continue  # 再発注しない
+                qty = info.get("qty", ts.position_qty)
+                if qty > 0:
+                    quote = get_quote(sym)
+                    session, _ = get_session_info()
+                    # 再発注: RTH=成行 / 時間外=bid 0.1%下の指値 (時間外は成行不可、
+                    # 指値が離れると価格制限で FAILED するため bid 近接を選択)。
+                    _retry_count = info.get("retry_count", 0)
+                    if session == SESSION_RTH:
+                        new_price  = 0.0
+                        new_type   = OrderType.MARKET
+                        retry_desc = "成行（RTH・確実決済）"
+                    else:
+                        bid       = quote.get("bid") or quote.get("last") or 0.0
+                        new_price = round(bid * (1 - 0.005), 2) if bid > 0 else 0.0
+                        new_type  = OrderType.NORMAL
+                        retry_desc = f"指値 ${new_price:.2f}（bid基準0.5%下・{_retry_count+1}回目）"
+
+                    log.warning(f"【{sym}】 🔄 損切り再発注: {retry_desc}  qty={qty}")
+                    _threadsafe_future(asyncio.to_thread(
+                        send_discord_message,
+                        f"[Bot] 【{sym}】 🔄 損切り未約定のため再発注\n"
+                        f"{retry_desc}  qty={qty}株\n"
+                        f"理由: {info.get('reason', '')}"
+                    ))
+                    # ★ v2.98: position_id を必須化。pending_orders に保存された
+                    # position_id を利用して再発注。SHORT/LONG も方向情報から判別。
+                    _pid_retry  = info.get("position_id", "")
+                    _side_retry = info.get("side", "LONG")
+                    if not _pid_retry:
+                        log.error(
+                            f"【{sym}】 ❌ 損切り再発注失敗: position_id が pending 情報に未保存"
+                        )
+                        _threadsafe_future(asyncio.to_thread(
+                            send_discord_message,
+                            f"❌ 【{sym}】 損切り再発注失敗\n"
+                            f"position_id が取得できないため再発注できません。\n"
+                            f"moomoo アプリで手動決済してください。"
+                        ))
+                        continue
+                    # ★ v3.5.2/v3.9.63: SHORT 決済サイドは環境別 (_cover_trd_side)。
+                    # 実口座=BUY_BACK / デモ=BUY (デモは BUY_BACK 非対応)。
+                    _trd_side_retry = _cover_trd_side(trd_env) if _side_retry == "SHORT" else TrdSide.SELL
+                    ret, oid_or_msg = _close_one_position_id(
+                        symbol      = sym,
+                        trd_env     = trd_env,
+                        position_id = _pid_retry,
+                        qty         = qty,
+                        limit_price = new_price,
+                        trd_side    = _trd_side_retry,
+                        order_type  = new_type,
+                        is_cover    = (_side_retry == "SHORT"),
+                        reason      = info.get("reason", "損切り再発注"),
+                        log_label   = "損切り再発注",
+                    )
+                    if ret == RET_OK:
+                        new_oid = oid_or_msg
+                        _pending_orders[new_oid] = {
+                            "symbol":      sym,
+                            "placed_at":   datetime.datetime.now(),
+                            "trd_env":     trd_env,
+                            "is_cover":    (_side_retry == "SHORT"),
+                            "is_close":    True,
+                            "qty":         qty,
+                            "limit_price": new_price,
+                            "reason":      info.get("reason", "損切り再発注"),
+                            "retry_count": retry_count + 1,
+                            "position_id": _pid_retry,
+                            "side":        _side_retry,
+                        }
+                        # ★ v3.8.5: 再発注「成功」は INFO に降格 (失敗ケースは log.error で別系統)
+                        log.info(f"【{sym}】 🔄 損切り再発注成功 orderId={new_oid}")
+                    else:
+                        log.error(f"【{sym}】 🔄 損切り再発注失敗: {oid_or_msg}")
+                continue   # ポジション管理はクリアしない（再発注したので）
+
+            elif ok and not is_close:
+                # 通常の新規発注タイムアウト
+                if not is_cover:
+                    ts_chk = state.get(sym)
+                    # ポジションが実在する場合はclearしない
+                    # （BUY注文が"約定済みのため削除"になったケース: 実際は約定済み）
+                    if ts_chk.position_qty > 0 or _tracked_position_cost.get(sym, 0.0) > 0:
+                        log.info(
+                            f"【{sym}】 [watchdog] BUYキャンセルだがポジション検出"
+                            f"（qty={ts_chk.position_qty}）→ clearスキップ"
+                        )
+                    else:
+                        track_position_clear(sym)
+                if is_cover:
+                    log.warning(f"【{sym}】 ⛔ ショートカバー注文タイムアウト")
+
+
+def _register_pending_order(order_id: str, symbol: str, trd_env: TrdEnv, is_cover: bool = False) -> None:
+    """発注成功時に未約定管理辞書に登録する。"""
+    _pending_orders[order_id] = {
+        "symbol":     symbol,
+        "placed_at":  datetime.datetime.now(),
+        "trd_env":    trd_env,
+        "is_cover":   is_cover,
+    }
+    log.info(f"【{symbol}】 [注文管理] 登録 orderId={order_id}  {'[ショートカバー]' if is_cover else ''}")
+
+
+def _unregister_pending_order(order_id: str) -> None:
+    """約定確認済みの注文を管理辞書から削除する。"""
+    if order_id in _pending_orders:
+        _pending_orders.pop(order_id)
+
+
+# ── ★ v2.98: position_id ベース決済ヘルパー (JP 信用建玉ごとの個別決済用) ──────
+# moomoo SDK 10.4+ の place_order が受ける隠しパラメータ。
+# moomoo サポート (2026-05-06) 回答により決済時 position_id 必須化を採用 (PAN 指示)。
+# 1注文=1建玉 (1 pid) なので複数建玉時は各 pid に対し個別 place_order を発行する。
+
+def _get_position_ids_for_close(
+    symbol: str, side: str
+) -> list[dict]:
+    """戻り値: [{"pid": str, "qty": int, "cost": float}, ...] 空リストの場合は決済対象なし (position_id 未取得 = 決済不可)。"""
+    ts = state.get(symbol)
+    side_key = "LONG" if side == "LONG" else "SHORT"
+    return list(ts.position_ids.get(side_key, []))
+
+
+def _close_one_position_id(
+    *,
+    symbol: str,
+    trd_env: TrdEnv,
+    position_id: str,
+    qty: int,
+    limit_price: float,
+    trd_side,           # ★ v3.5.2: LONG決済は TrdSide.SELL / SHORT決済は TrdSide.BUY_BACK 必須
+    order_type,         # OrderType.NORMAL or OrderType.MARKET
+    is_cover: bool,
+    reason: str,
+    log_label: str,
+) -> tuple[int, str]:
+    """1建玉 (1 position_id) に対する決済 place_order を実行する。
+
+    戻り値: (ret_code, order_id_or_err_msg)
+            成功時は ret=RET_OK, 第2要素は order_id 文字列。
+            失敗時は ret≠RET_OK, 第2要素はエラーメッセージ。
+
+    呼び出し側は ret==RET_OK のときのみ _pending_orders 登録 / 約定監視を行う。
+    成行 (MARKET) の場合は price=0、それ以外は limit_price を使用。
+
+    ★ v3.5.2: trd_side / is_cover の整合性を厳格に検証する。
+       moomoo サポート (2026-05-08) からの正式回答:
+         "use BUY and SELL_SHORT for opening positions, and use SELL and
+          BUY_BACK for closing positions"
+       これに従い、call site が直接正規定数を指定する設計に統一。
+       旧 v3.1.1〜v3.5.1 の hasattr ベースの silent 自動変換は廃止。
+       (古い SDK で hasattr=False になると BUY のまま送信され、moomoo 側で
+        order failure が発生していた問題を解消)。
+
+    ★ v2.99.2: moomoo SDK 10.4 は position_id を int 型で期待するため、
+       sync_positions で str 化された値を int に変換してから place_order に渡す。
+       旧コードは str のまま渡していたため、SDK 内部の Protobuf 型チェックで
+       「Cannot set Trd_PlaceOrder.C2S.positionID to '...': has type <class 'str'>,
+        but expected one of: (<class 'int'>,)」エラーが発生し、
+       全ての決済 (時間切れ・損切り・トレール・ニュース起点) が失敗していた。
+    """
+    tag = f"【{symbol}】"
+    # ★ v3.9.134: 台帳に無い建玉（Bot が建てたものではない）は決済しない。
+    #   決済経路は複数あるが、実際に発注する低レベル関数を含めてすべてここで塞ぐ。
+    if getattr(state.get(symbol), "externally_held", False):
+        log.warning(f"[建玉台帳] 【{symbol}】 Bot 以外の建玉のため決済しません（{reason}）")
+        _k = f"_ext_close_notified_{symbol}"
+        if not getattr(place_close_all, _k, False):
+            setattr(place_close_all, _k, True)
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                f"🛡️ 【{symbol}】 決済しようとしましたが、Bot 以外の建玉のため見送りました\n"
+                f"発動した処理: {reason}\n"
+                f"決済する場合は moomoo アプリで操作してください。"
+            ))
+        return False
+
+    use_market = (order_type == OrderType.MARKET)
+
+    # ── ★ v2.99.2 hotfix: position_id を int に変換 ───────────────────────────
+    _pos_id_str = str(position_id) if position_id is not None else ""
+    if not _pos_id_str:
+        log.error(f"{tag} [{log_label}] position_id が空のため発注不可")
+        return -1, "empty position_id"
+    try:
+        _pos_id_int = int(_pos_id_str)
+    except (ValueError, TypeError) as e:
+        log.error(
+            f"{tag} [{log_label}] position_id を int に変換できません: "
+            f"'{_pos_id_str}' → {e}"
+        )
+        return -1, f"invalid position_id: {_pos_id_str}"
+    if _pos_id_int <= 0:
+        log.error(
+            f"{tag} [{log_label}] position_id が無効値 (0以下): {_pos_id_int}"
+        )
+        return -1, f"invalid position_id value: {_pos_id_int}"
+
+    try:
+        with _trade_ctx() as ctx:
+            _acc_id_close = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
+            # ── ★ v3.5.2/v3.9.63: trd_side / is_cover の整合検証 (環境別) ──────
+            # FUTUJP 実口座の正規仕様 (moomoo サポート 2026-05-08 確認):
+            #   新規 LONG  : TrdSide.BUY        + jp_acc_type=JP_TOKUTEI
+            #   新規 SHORT : TrdSide.SELL_SHORT + jp_acc_type=JP_TOKUTEI_SHORT
+            #   LONG 決済  : TrdSide.SELL       + jp_acc_type=JP_TOKUTEI
+            #   SHORT 決済 : TrdSide.BUY_BACK   + jp_acc_type=JP_TOKUTEI_SHORT
+            # ★ v3.9.63: デモ口座は BUY_BACK 非対応 → SHORT 決済はプレーン BUY。
+            #   期待サイドは _cover_trd_side(trd_env) で環境別に決まる。
+            if is_cover:
+                _expected_short = _cover_trd_side(trd_env)
+                if _expected_short is None:
+                    log.error(
+                        f"{tag} [{log_label}] 致命的: SDK に決済用 TrdSide が"
+                        f" 存在しません。moomoo-api を最新版に更新してください。"
+                    )
+                    return -1, "SDK missing cover TrdSide"
+                if trd_side != _expected_short:
+                    _env_lbl = "実口座" if trd_env == TrdEnv.REAL else "デモ"
+                    log.error(
+                        f"{tag} [{log_label}] 致命的: SHORT 決済 (is_cover=True) なのに"
+                        f" trd_side={trd_side} が指定されました"
+                        f" (期待値: {_expected_short} / {_env_lbl})。"
+                        f" 呼び出し側のバグの可能性があります。発注を中止します。"
+                    )
+                    return -1, f"trd_side mismatch for SHORT close: {trd_side}"
+            else:
+                _expected_long = getattr(TrdSide, "SELL", None)
+                if trd_side != _expected_long:
+                    log.error(
+                        f"{tag} [{log_label}] 致命的: LONG 決済 (is_cover=False) なのに"
+                        f" trd_side={trd_side} が指定されました (期待値: SELL)。"
+                        f" 呼び出し側のバグの可能性があります。発注を中止します。"
+                    )
+                    return -1, f"trd_side mismatch for LONG close: {trd_side}"
+
+            _kwargs = dict(
+                price            = 0.0 if use_market else limit_price,
+                qty              = qty,
+                code             = to_moomoo_code(symbol),
+                trd_side         = trd_side,
+                order_type       = order_type,
+                trd_env          = trd_env,
+                time_in_force    = TimeInForce.DAY,
+                # 成行は fill_outside_rth=False 必須 (moomoo 制約)
+                fill_outside_rth = (not use_market),
+                acc_id           = _acc_id_close,
+                position_id      = _pos_id_int,   # ★ v2.99.2: int で渡す (旧 str)
+                # SHORT 建玉決済は JP_TOKUTEI_SHORT 区分必須
+                **_tokutei_kwargs(trd_env, is_short=is_cover),
+            )
+            ret, data = ctx.place_order(**_kwargs)
+        if ret == RET_OK:
+            order_id = str(data["order_id"][0])
+            log.info(
+                f"{tag} [{log_label}] place_order 成功 pid={_pos_id_str[:12]}... "
+                f"qty={qty} price={'MKT' if use_market else f'${limit_price:.2f}'} "
+                f"trd_side={trd_side} orderId={order_id}"
+            )
+            return ret, order_id
+        else:
+            # ★ v3.9.63: 「Not enough positions」= 建玉は既に決済済み (二重決済レース等)。
+            # 失敗 (ERROR + 無限リトライ) ではなく「解決済み」扱いにして state をクリアさせる。
+            _msg_low = str(data).lower()
+            if "not enough position" in _msg_low or "no enough position" in _msg_low:
+                log.info(
+                    f"{tag} [{log_label}] 建玉は既に決済済み (Not enough positions) → "
+                    f"解決済み扱い pid={_pos_id_str[:12]}..."
+                )
+                return _RET_ALREADY_CLOSED, "already_closed"
+            # ★ v3.9.125: 「Invalid position ID」= その建玉は当該口座に存在しない
+            #   (別口座の建玉を誤って取り込んだ／既に消滅した残骸)。リトライしても永久に
+            #   成功しないため「解決済み」扱いにして state から除去させる。
+            #   利用者B報告 2026-07-23: 60秒ごとの決済失敗ループと15分の新規ブロックを防ぐ。
+            if "invalid position id" in _msg_low or "invalid positionid" in _msg_low:
+                log.warning(
+                    f"{tag} [{log_label}] この口座に存在しない建玉 (Invalid position ID) → "
+                    f"内部状態から除去 pid={_pos_id_str[:12]}..."
+                )
+                return _RET_ALREADY_CLOSED, "invalid_position_id"
+            log.error(
+                f"{tag} [{log_label}] place_order 失敗 pid={_pos_id_str[:12]}... "
+                f"qty={qty}  ret_code={ret}  trd_side={trd_side}  "
+                f"is_cover={is_cover}  msg={data}"
+            )
+            return ret, str(data)
+    except Exception as e:
+        log.error(
+            f"{tag} [{log_label}] place_order 例外 pid={_pos_id_str[:12]}...: {e}",
+            exc_info=True,
+        )
+        return -1, f"exception: {e}"
+
+
+# ★ v3.9.73: 残留決済失敗通知の間引き (symbol+side ごとに once per N分)。
+#   リスク監視ループ (60秒毎) が同じ残留に対し決済を試み続けるため、無通知だと
+#   Discord が埋まる。下記スロットルで「残留している間は N分に1回だけ」通知する。
+_close_fail_notify_at: dict = {}
+_CLOSE_FAIL_NOTIFY_INTERVAL_MIN = 15
+
+
+def _notify_close_failed_no_pid(
+    symbol: str,
+    side: str,
+    reason: str,
+    trd_env: "Optional[TrdEnv]" = None,
+    qty: "Optional[int]" = None,
+) -> None:
+    """position_id が取得できず決済できない「残留建玉」を通知する。
+
+    原因: sync_positions の API 取得失敗 / qty=0 残骸のみ / SDK バージョン古い /
+          デモ(ネッティング)口座で建玉が position_id を持たない、等。
+    ★ v3.9.73: trd_env / qty を受け取り、デモ SHORT 残留 (DRAM/SMH 事例) を明示。
+       symbol+side ごとに _CLOSE_FAIL_NOTIFY_INTERVAL_MIN 分に1回だけ Discord 通知
+       (リスク監視ループの再試行による通知連投を防止)。ログ (error) は毎回出す。
+    """
+    tag = f"【{symbol}】"
+    _is_demo = (trd_env == TrdEnv.SIMULATE)
+    _env_lbl = "デモ(ネッティング)" if _is_demo else ("実(信用)" if trd_env == TrdEnv.REAL else "不明")
+    _qty_lbl = f"{abs(qty)}株 " if qty else ""
+
+    log.error(
+        f"{tag} [決済失敗/残留] {side} 建玉 {_qty_lbl}の position_id が取得できず決済できません "
+        f"(env={_env_lbl} / reason: {reason})。moomoo アプリで手動決済してください。"
+    )
+
+    # ── Discord 通知の間引き (symbol+side 単位で N分に1回) ───────────────────
+    _key = f"{symbol}:{side}"
+    _now = datetime.datetime.now()
+    _last = _close_fail_notify_at.get(_key)
+    if _last is not None:
+        _elapsed_min = (_now - _last).total_seconds() / 60.0
+        if _elapsed_min < _CLOSE_FAIL_NOTIFY_INTERVAL_MIN:
+            log.debug(
+                f"{tag} [決済失敗/残留] 通知間引き中 "
+                f"(前回 {_elapsed_min:.1f}分前 < {_CLOSE_FAIL_NOTIFY_INTERVAL_MIN}分)"
+            )
+            return
+    _close_fail_notify_at[_key] = _now
+
+    # デモ(ネッティング) SHORT 残留は手動「買い戻し」で解消する旨を明示。
+    if _is_demo and side == "SHORT":
+        _hint = (
+            "※ デモ(ネッティング)口座のショートは、手動の『買い (BUY)』で\n"
+            "  同株数を買い戻すと解消されます (建玉と相殺=ネッティング)。\n"
+            "  position_id が割り当たらない残留建玉のため Bot から自動決済できません。"
+        )
+    else:
+        _hint = "(原因: sync_positions の取得失敗 / SDK バージョン古い等)"
+
+    _threadsafe_future(asyncio.to_thread(
+        send_discord_message,
+        f"❌ 【{symbol}】 決済失敗・建玉残留 ({side} / {_env_lbl})\n"
+        f"{_qty_lbl}の position_id が取得できず決済を実行できませんでした。\n"
+        f"理由: {reason}\n"
+        f"moomoo アプリで建玉を手動決済してください。\n"
+        f"{_hint}\n"
+        f"(この通知は残留が続く間 {_CLOSE_FAIL_NOTIFY_INTERVAL_MIN}分に1回のみ送信)"
+    ))
+
+
+def place_close_partial(
+    symbol: str,
+    trd_env: TrdEnv,
+    qty: int,
+    reason: str = "",
+) -> None:
+    """
+    指定した株数だけ部分決済する（超過分のみ売却）。
+    place_close_all と異なり qty を外部から指定できる。
+
+    ★ v2.98: position_id 必須化。LONG ポジション (qty>0) のみ対象。
+       state.position_ids["LONG"] から先頭の建玉を1つ取り出し、その position_id
+       を指定して place_order を発行する。1建玉から `qty` 株だけ部分決済する形式。
+       要求 qty が建玉 qty より大きい場合は、複数建玉にまたがって決済する。
+    """
+    tag  = f"【{symbol}】"
+    # ★ v3.9.134: 台帳に無い建玉（Bot が建てたものではない）は決済しない。
+    #   決済経路は複数あるが、実際に発注する低レベル関数を含めてすべてここで塞ぐ。
+    if getattr(state.get(symbol), "externally_held", False):
+        log.warning(f"[建玉台帳] 【{symbol}】 Bot 以外の建玉のため決済しません（{reason}）")
+        _k = f"_ext_close_notified_{symbol}"
+        if not getattr(place_close_all, _k, False):
+            setattr(place_close_all, _k, True)
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                f"🛡️ 【{symbol}】 決済しようとしましたが、Bot 以外の建玉のため見送りました\n"
+                f"発動した処理: {reason}\n"
+                f"決済する場合は moomoo アプリで操作してください。"
+            ))
+        return None
+
+    mode = "【デモ】" if trd_env == TrdEnv.SIMULATE else "【実注文】"
+    if qty <= 0:
+        return
+
+    # ── ★ v2.98: position_id 取得 (必須) ────────────────────────────────────
+    long_pids = _get_position_ids_for_close(symbol, "LONG")
+    if not long_pids:
+        _notify_close_failed_no_pid(symbol, "LONG", f"部分決済要求 qty={qty} ({reason})")
+        return
+
+    session, _ = get_session_info()
+    quote       = get_quote(symbol)
+    limit_price = calc_limit_price(quote, "SELL", symbol)  # ★ v2.99.4: シンボル別バッファ
+    if limit_price <= 0:
+        log.warning(f"{tag} [部分決済] 価格取得失敗: スキップ")
+        return
+
+    log.info(_fmt_order_log(
+        symbol, "SELL(部分)", qty, limit_price, session,
+        trd_env=trd_env, reason=reason[:35],
+    ))
+
+    # ── 複数建玉にまたがって部分決済 ────────────────────────────────────────
+    # 例: 建玉 [10株, 5株, 3株] に対して qty=12 を部分決済する場合、
+    # → 1番目の建玉から 10株、2番目から 2株 を順に決済 (合計 12 株)。
+    remaining = qty
+    placed_orders: list[str] = []
+    for entry in long_pids:
+        if remaining <= 0:
+            break
+        pid = entry["pid"]
+        avail = int(entry["qty"])
+        if avail <= 0:
+            continue
+        order_qty = min(avail, remaining)
+        ret, oid_or_msg = _close_one_position_id(
+            symbol      = symbol,
+            trd_env     = trd_env,
+            position_id = pid,
+            qty         = order_qty,
+            limit_price = limit_price,
+            trd_side    = TrdSide.SELL,
+            order_type  = OrderType.NORMAL,
+            is_cover    = False,
+            reason      = reason,
+            log_label   = "部分決済",
+        )
+        if ret == RET_OK:
+            placed_orders.append(oid_or_msg)
+            _pending_orders[oid_or_msg] = {
+                "symbol":      symbol,
+                "placed_at":   datetime.datetime.now(),
+                "trd_env":     trd_env,
+                "is_cover":    False,
+                "is_close":    True,
+                "qty":         order_qty,
+                "limit_price": limit_price,
+                "reason":      reason,
+                "position_id": pid,        # ★ v2.98: 再発注時に再利用
+                "side":        "LONG",     # ★ v2.98: 方向情報
+            }
+            remaining -= order_qty
+        else:
+            log.error(f"{tag} [部分決済] pid={pid[:12]}... 失敗: {oid_or_msg}")
+            # 残り建玉でリトライを試みる (continue)
+
+    if placed_orders:
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"[Bot] {tag} ✂ ポジション上限超過・部分決済 {mode}\n"
+            f"発注済み: {len(placed_orders)}件  合計売却予定株数: {qty - remaining}/{qty}株\n"
+            f"指値: ${limit_price:.2f}  理由: {reason}"
+        ))
+    else:
+        log.error(f"{tag} [部分決済] 全 position_id 発注失敗")
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"❌ {tag} 部分決済全失敗\n"
+            f"全 {len(long_pids)} 建玉の発注に失敗しました。\n"
+            f"moomoo アプリで手動確認してください。"
+        ))
+
+
+def _cancel_pending_closes_for_symbol(symbol: str, trd_env: TrdEnv, reason: str = "") -> int:
+    """★ v3.9.64: 同一銘柄に既に出ている未約定の決済注文をすべてキャンセルし、
+    _pending_orders から除外する。新たな決済を出す前に必ず呼ぶ (cancel-replace)。
+
+    5/27 デモ QQQ -8 ショート化の根本対策:
+      時間切れ決済とデモ日次決済(15:45 ET)が同一の +8 ロングに対し同時に SELL を発注。
+      時間外の指値 SELL(299110) が即約定せず、その間に日次決済が 2 本目(299111)を発注。
+      両方が遅れて約定 → 計 16 株売り → +8 から -8 へ反転 (ネッティング口座で
+      「保有を超える SELL = ショート新規」)。決済注文を常に 1 本だけに保てば防げる。
+    戻り値: キャンセルを試みた件数。
+    """
+    targets = [
+        oid for oid, info in list(_pending_orders.items())
+        if info.get("symbol") == symbol and info.get("is_close")
+    ]
+    for oid in targets:
+        _ok = False
+        try:
+            _ok = _cancel_order(oid, symbol, trd_env, reason=(f"二重決済回避(再決済前): {reason}")[:60])
+        except Exception as _e:
+            log.debug(f"【{symbol}】[決済前キャンセル] orderId={oid} 例外: {_mask_secrets(_e)}")
+            _ok = False
+        # ★ v3.9.130: 取消が成功した時だけ追跡から外す。
+        #   従来は finally で成否に関わらず pop していたため、取消失敗（生きた決済注文が
+        #   残った状態）でも追跡から消え、watchdog のタイムアウト取消も重複整理も届かず、
+        #   古い決済＋新しい決済が両方約定 → 売り過ぎ（5/27 ショート反転）の起点になり得た。
+        #   未確定時は追跡に残置し、watchdog のタイムアウト取消に後始末を委ねる。
+        if _ok:
+            _pending_orders.pop(oid, None)
+        else:
+            log.warning(
+                f"【{symbol}】[決済前キャンセル] orderId={oid} 取消が未確定 "
+                f"→ 追跡に残置（watchdogのタイムアウト取消に委譲・二重決済防止）"
+            )
+    return len(targets)
+
+
+def place_close_all(
+    symbol: str,
+    trd_env: TrdEnv,
+    reason: str,
+    is_panic: bool = False,
+) -> bool:
+    """
+    保有ポジションを全決済する (LONG / SHORT 両対応)。
+    Panic Sell 時も指値で発注（moomoo は時間外の成行を制限する場合がある）。
+
+    ★ v2.98: position_id 必須化。
+       state.position_qty の符号で方向を判定し、state.position_ids[side] の
+       全建玉に対して個別の place_order を発行する (1建玉=1注文)。
+       moomoo SDK 10.4 の隠しパラメータ position_id を使用する仕様変更で、
+       JP 信用口座の建玉ごと管理に対応。
+    ★ v2.99: ETF (TRIGGER_TICKERS) の場合、決済時刻を記録して
+       ETF_REENTRY_LOCKOUT_MIN 分間は再エントリーを禁止する。
+    ★ v2.99.2: 戻り値を bool に変更。
+       True  = 1件以上の position_id で発注成功 (placed_orders >= 1)
+       False = 全 position_id で発注失敗 / 対象ポジションなし / 早期 return
+       呼び出し側 (タイムアウト・損切り・トレール) はこの戻り値を見て
+       entry_time のクリア可否を判断する。失敗時に entry_time を残すことで
+       次のリスク監視ループで再発動できるようにする。
+    """
+    tag = f"【{symbol}】"
+    # ★ v3.9.134: 台帳に無い建玉（Bot が建てたものではない）は決済しない。
+    #   決済経路は複数あるが、実際に発注する低レベル関数を含めてすべてここで塞ぐ。
+    if getattr(state.get(symbol), "externally_held", False):
+        log.warning(f"[建玉台帳] 【{symbol}】 Bot 以外の建玉のため決済しません（{reason}）")
+        _k = f"_ext_close_notified_{symbol}"
+        if not getattr(place_close_all, _k, False):
+            setattr(place_close_all, _k, True)
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                f"🛡️ 【{symbol}】 決済しようとしましたが、Bot 以外の建玉のため見送りました\n"
+                f"発動した処理: {reason}\n"
+                f"決済する場合は moomoo アプリで操作してください。"
+            ))
+        return False
+
+    ts  = state.get(symbol)
+
+    # ── ★ v2.99: ETF 再エントリー禁止タイマー開始 ─────────────────────────────
+    # 決済発注時点でタイマーを開始する (約定確認まで待たない)。
+    # 同じニュースが繰り返し流れた際の即時再エントリーを防ぐのが主目的のため、
+    # 厳密な約定タイミングよりも素早いブロックを優先する。
+    _mark_etf_close(symbol)  # ETF でない場合は内部で何もしない
+
+    # ── ★ v2.93: リスクイベントの記録 (構成 A: 急落直後の新規ロングブロック) ──
+    # 「強制損切り」「パニックセル」「トレイリングストップ」のいずれかで決済した場合、
+    # 直近 NEW_LONG_BLOCK_SEC 秒間は同一銘柄への新規ロングをブロックする。
+    # 時間切れ決済 / 通常クローズ / シグナル決済等は記録対象外。
+    _is_risk_event = (
+        is_panic
+        or "強制損切り" in reason
+        or "パニック" in reason
+        or "トレイリング" in reason
+        or "トレイル" in reason
+    )
+    if _is_risk_event:
+        record_risk_event(symbol, reason)
+        log.info(
+            f"{tag} [リスクイベント検知] {reason[:40]} "
+            f"→ 今後 {NEW_LONG_BLOCK_SEC}秒 ({NEW_LONG_BLOCK_SEC // 60}分) は新規ロングをブロック"
+        )
+
+    # ── 売却株数の確定 ─────────────────────────────────────────────────────────
+    # moomoo API の position_qty は sync 中に瞬間変動 (38買→23→3→12→23 等)。
+    # _tracked_qty (BUY/SHORT 約定確認時の正確値) の絶対値が大きければ優先。
+    # ★ v2.98: SHORT (qty<0) も絶対値ベースで補正。
+    api_qty     = ts.position_qty
+    tracked_qty = _tracked_qty.get(symbol, 0)
+    # API側 qty の符号を維持しつつ、絶対値が大きい方を採用
+    if abs(tracked_qty) > abs(api_qty):
+        # 符号は API 側を優先 (API がポジションを認識している方向を信じる)
+        # API qty=0 の場合は方向不明 → tracked の符号を使う必要があるが、
+        # _tracked_qty は伝統的に LONG では正数、SHORT では絶対値で記録されてきたため
+        # 符号判定は ts.is_short を使う。
+        if api_qty != 0:
+            qty = int(math.copysign(abs(tracked_qty), api_qty))
+        else:
+            qty = -abs(tracked_qty) if ts.is_short else abs(tracked_qty)
+        log.warning(
+            f"{tag} [決済株数補正] API値={api_qty}株 (絶対値) < 内部追跡={tracked_qty}株"
+            f" → {qty}株で発注（API瞬間値変動による売り漏れを防止）"
+        )
+    else:
+        qty = api_qty
+
+    if qty == 0:
+        return False  # ★ v2.99.2: 対象なし
+
+    # ── 方向判定と position_id 取得 ────────────────────────────────────────────
+    if qty < 0:
+        side       = "SHORT"
+        # ★ v3.5.2/v3.9.63: SHORT 決済サイドは環境別 (_cover_trd_side)。
+        #   実口座=BUY_BACK (moomoo 2026-05-08 回答) / デモ=BUY (デモは BUY_BACK 非対応で
+        #   「Order side must be BUY or SELL」を返し決済全失敗→ショート残留していた)。
+        trd_side   = _cover_trd_side(trd_env)
+        side_label = "ショートカバー"
+        _is_real_cover = (trd_env == TrdEnv.REAL)
+        order_label = "BUY_BACK(買戻)" if _is_real_cover else "BUY(買戻/デモ)"
+        action     = "BUY"   # calc_limit_price 用 (買い戻しは ask 基準なので BUY と同じ)
+    else:
+        side       = "LONG"
+        trd_side   = TrdSide.SELL
+        side_label = "ロング決済"
+        order_label = "SELL(決済)"
+        action     = "SELL"
+
+    # ── ★ v3.9.64: 二重決済レース防止 (5/27 デモ QQQ -8 ショート化の根本対策) ──
+    # 新たな決済を出す前に、同銘柄に出ている未約定の決済注文を必ずキャンセルする。
+    # これにより「時間切れ決済」と「デモ日次決済」等が同一建玉に 2 本の決済を出し、
+    # 時間外指値の遅延約定で売り過ぎ → ショート反転する事故を防ぐ (常に決済 1 本)。
+    _cancelled_n = _cancel_pending_closes_for_symbol(symbol, trd_env, reason)
+    if _cancelled_n:
+        log.info(
+            f"{tag} [二重決済防止] 既存の未約定決済 {_cancelled_n} 件をキャンセル"
+            f" → ポジション再同期してから決済します"
+        )
+        try:
+            sync_positions(trd_env)
+        except Exception as _e_sync0:
+            log.debug(f"{tag} [二重決済防止] 再同期例外: {_mask_secrets(_e_sync0)}")
+
+    # ★ v2.98: position_id 必須化。取得できなければ決済中止 + 通知。
+    # ★ v3.9.15: 注文受付直後の sync 遅延に対応するリトライを追加。
+    # 5/13 認定サポーター環境で「SHORT 発注 14ms 後の panic sell で position_id 空」
+    # 事例が発覚。moomoo は注文受付から約定確認 (= 新ポジション報告) まで
+    # 数秒のラグがあるため、2 秒 × 最大 3 回のリトライで sync を待つ。
+    pids = _get_position_ids_for_close(symbol, side)
+    if not pids:
+        # 内部状態に position_qty があるなら「sync 遅延の可能性」と判断してリトライ
+        _state_qty = state.get(symbol).position_qty
+        _has_state_position = (
+            (side == "LONG"  and _state_qty > 0) or
+            (side == "SHORT" and _state_qty < 0)
+        )
+        if _has_state_position:
+            import time as _time_retry
+            # ★ v3.9.73: リトライ 3→5 回に強化 + 漸増バックオフ (2,2,3,3,4=計14秒)。
+            #   デモ(ネッティング)口座の SHORT は sync 反映が遅く、3 回 (6秒) では
+            #   取り切れず DRAM/SMH 等が残留する事例があったため待ち時間を延長。
+            _backoffs = [2, 2, 3, 3, 4]
+            log.info(
+                f"{tag} [{side_label}] position_id 取得失敗・内部状態は {_state_qty}株 保有中"
+                f" → sync 遅延の可能性 → 最大 {len(_backoffs)} 回 (計 {sum(_backoffs)}秒) リトライします"
+            )
+            for _attempt, _wait in enumerate(_backoffs):
+                _time_retry.sleep(_wait)
+                try:
+                    sync_positions(trd_env)
+                except Exception as _e_sync:
+                    log.debug(f"{tag} [決済リトライ {_attempt+1}] sync 例外: {_e_sync}")
+                    continue
+                pids = _get_position_ids_for_close(symbol, side)
+                if pids:
+                    log.info(
+                        f"{tag} [{side_label}] ✅ リトライ {_attempt+1}回目で "
+                        f"position_id 取得成功 (建玉 {len(pids)} 件)"
+                    )
+                    break
+        if not pids:
+            # ★ v3.9.73: 取得不能 → 残留通知 (qty/環境を渡してデモSHORT残留を明示)。
+            _notify_close_failed_no_pid(symbol, side, reason, trd_env=trd_env, qty=qty)
+            return False  # ★ v2.99.2: position_id 取得失敗
+
+    # 取得した建玉の合計 qty と要求 qty の整合性チェック
+    _avail_total = sum(int(e["qty"]) for e in pids)
+    _req_qty     = abs(qty)
+    if _avail_total < _req_qty:
+        log.warning(
+            f"{tag} [{side_label}] 建玉合計 {_avail_total}株 < 要求 {_req_qty}株"
+            f" → 取得済建玉のみ ({_avail_total}株) を決済"
+        )
+
+    # ── セッションと指値の決定 ────────────────────────────────────────────────
+    mode  = "【デモ】" if trd_env == TrdEnv.SIMULATE else "【実注文】"
+    label = "🆘 パニックセル" if is_panic else f"▼ {order_label}"
+    session, _  = get_session_info()
+    outside_rth = session != SESSION_RTH
+    quote = get_quote(symbol)
+
+    # 注文タイプ決定:
+    #   RTH かつ LONG: 成行（即約定優先, moomoo 仕様で SELL のみ MARKET 可）
+    #   RTH かつ SHORT: 買い戻しは指値（moomoo は SHORT カバーの成行制限あり）
+    #   時間外: 指値バッファ 0.5%（成行不可）
+    if session == SESSION_RTH and side == "LONG":
+        use_market = True
+        limit_price = 0.0
+        order_type_to_use = OrderType.MARKET
+        order_desc = f"成行（RTH/LONG決済）"
+        _ind_price = quote.get("bid") or quote.get("last") or 0.0
+        log.info(_fmt_order_log(
+            symbol, order_label, _req_qty, _ind_price, session,
+            trd_env=trd_env, reason=reason[:35],
+        ))
+    else:
+        use_market = False
+        order_type_to_use = OrderType.NORMAL
+        # SHORT カバー: ask の指値で買い戻し / LONG 決済 (時間外): bid の指値
+        # ★ v2.99.4: シンボル種別に応じた指値バッファを適用
+        if side == "SHORT":
+            limit_price = calc_limit_price(quote, "BUY", symbol)
+            order_desc  = f"指値 ${limit_price:.2f}（ask基準/買戻）  時間外={outside_rth}"
+        else:
+            buf_pct     = get_limit_buffer_pct(symbol)  # ★ v2.99.4: ETF=0.3% / 個別株=0.5%
+            bid         = quote.get("bid") or quote.get("last") or 0.0
+            limit_price = round(bid * (1 - buf_pct), 2) if bid > 0 else 0.0
+            order_desc  = f"指値 ${limit_price:.2f}（bid基準{buf_pct*100:.1f}%下）  時間外={outside_rth}"
+        if limit_price <= 0:
+            log.warning(
+                f"{tag} 価格取得失敗: {order_label} をスキップ"
+                f"（bid={quote.get('bid')}, last={quote.get('last')}, ask={quote.get('ask')}）"
+            )
+            return False  # ★ v2.99.2: 価格取得失敗
+        log.info(_fmt_order_log(
+            symbol, order_label, _req_qty, limit_price, session,
+            trd_env=trd_env, reason=reason[:35],
+        ))
+
+    # ── pending_close_reason / pending_avg_cost / pending_entry_time 退避 ────
+    # _check_order_filled の TRADE_RESULT 計算用。LONG/SHORT 両方で必要。
+    ts.pending_close_reason = reason
+    if ts.entry_time is not None:
+        ts.pending_entry_time = ts.entry_time
+    if ts.avg_cost > 0:
+        ts.pending_avg_cost = ts.avg_cost
+
+    # ── 各 position_id に対して個別 place_order ──────────────────────────────
+    placed_orders: list[tuple[str, int]] = []   # (order_id, qty)
+    failed_count = 0
+    already_closed_count = 0   # ★ v3.9.63: Not enough positions = 既決済 pid 数
+    remaining = _req_qty
+    for entry in pids:
+        if remaining <= 0:
+            break
+        pid       = entry["pid"]
+        avail_qty = int(entry["qty"])
+        if avail_qty <= 0:
+            continue
+        order_qty = min(avail_qty, remaining)
+        ret, oid_or_msg = _close_one_position_id(
+            symbol      = symbol,
+            trd_env     = trd_env,
+            position_id = pid,
+            qty         = order_qty,
+            limit_price = limit_price,
+            trd_side    = trd_side,
+            order_type  = order_type_to_use,
+            is_cover    = (side == "SHORT"),
+            reason      = reason,
+            log_label   = side_label,
+        )
+        # ── 成行注文が拒否された場合 → 指値にフォールバック ────────────────
+        if ret != RET_OK and use_market:
+            err_str = oid_or_msg.lower() if isinstance(oid_or_msg, str) else ""
+            if "rth" in err_str or "market order" in err_str or "only place" in err_str:
+                # ★ v2.99.4: シンボル別バッファ × 3 倍でフォールバック
+                # ★ v3.8.5: 自動リカバリ動作のため WARNING → INFO に降格
+                _buf_fb = get_limit_buffer_pct(symbol) * 3.0
+                log.info(
+                    f"{tag} 成行拒否（pid={pid[:12]}...）→ 指値フォールバック（{_buf_fb*100:.1f}%バッファ）"
+                )
+                bid = quote.get("bid") or quote.get("last") or 0.0
+                fb_price = round(bid * (1 - _buf_fb), 2) if bid > 0 else 0.0
+                if fb_price > 0:
+                    ret, oid_or_msg = _close_one_position_id(
+                        symbol      = symbol,
+                        trd_env     = trd_env,
+                        position_id = pid,
+                        qty         = order_qty,
+                        limit_price = fb_price,
+                        trd_side    = trd_side,
+                        order_type  = OrderType.NORMAL,
+                        is_cover    = (side == "SHORT"),
+                        reason      = reason,
+                        log_label   = side_label + "(FB)",
+                    )
+                    if ret == RET_OK:
+                        order_desc = f"指値 ${fb_price:.2f}（成行→指値FB）"
+        if ret == RET_OK:
+            placed_orders.append((oid_or_msg, order_qty))
+            _pending_orders[oid_or_msg] = {
+                "symbol":      symbol,
+                "placed_at":   datetime.datetime.now(),
+                "trd_env":     trd_env,
+                "is_cover":    (side == "SHORT"),
+                "is_close":    True,
+                "qty":         order_qty,
+                "limit_price": limit_price,
+                "reason":      reason,
+                "position_id": pid,         # ★ v2.98: 再発注で再利用
+                "side":        side,        # ★ v2.98: "LONG" or "SHORT"
+            }
+            log.info(f"{tag} [注文管理] {side_label}注文を監視登録 orderId={oid_or_msg}")
+            remaining -= order_qty
+        elif ret == _RET_ALREADY_CLOSED:
+            # ★ v3.9.63: この建玉は既に決済済み → 失敗扱いにせず残数を消化。
+            already_closed_count += 1
+            remaining -= order_qty
+        else:
+            failed_count += 1
+            log.error(f"{tag} [{side_label}] pid={pid[:12]}... 発注失敗: {oid_or_msg}")
+
+    # ── state 更新 (発注成功した分だけ反映) ──────────────────────────────────
+    ts.total_orders += len(placed_orders)
+    if placed_orders:
+        ts.entry_count = 0
+        ts.reset_trail()
+        if is_panic:
+            ts.panic_exits += 1
+        # 自前ポジション管理をクリア (約定確認後に再同期される)
+        # 注文受付だけでは建玉消滅は未確定。未約定・取消・一部失敗でも
+        # Bot建玉を見失わないよう、台帳は sync の連続不在確認まで残す。
+        track_position_clear(symbol, clear_ledger=False)
+        if side == "LONG":
+            # ロング決済完了 → 60秒間のグレースタイムを設定 (誤検知防止)
+            _long_close_grace[symbol] = datetime.datetime.now()
+        else:
+            # SHORT カバー → is_short フラグを下ろす (発注時点で意図的に下ろす)
+            ts.is_short = False
+
+    # ── 約定確認を非同期で実行 ────────────────────────────────────────────────
+    for oid, oq in placed_orders:
+        _threadsafe_future(
+            _check_order_filled(oid, symbol, oq, limit_price, trd_env,
+                                f"{mode}[{side_label}]", wait_sec=8)
+        )
+
+    # ── Discord 通知 ─────────────────────────────────────────────────────────
+    if placed_orders:
+        _placed_qty = sum(q for _, q in placed_orders)
+        _summary = (
+            f"発注済み: {len(placed_orders)}件 / 合計 {_placed_qty}株 (要求 {_req_qty}株)"
+            if len(placed_orders) > 1 else
+            f"株数: {_placed_qty}株"
+        )
+        _threadsafe_discord(
+            f"[Bot] {tag} {label} 発動 {mode}\n"
+            f"{_summary}  {order_desc}\n"
+            f"理由: {reason}"
+            + (f"\n⚠ 一部建玉の発注に失敗 ({failed_count}件)" if failed_count else "")
+        )
+        return True  # ★ v2.99.2: 1件以上の発注成功
+    elif already_closed_count > 0 and failed_count == 0:
+        # ★ v3.9.63: 対象建玉がすべて「既に決済済み (Not enough positions)」だった。
+        # 実害なし → 内部状態をクリーンにして成功扱いで返し、無限リトライを止める。
+        log.info(
+            f"{tag} [{side_label}] 対象建玉 {already_closed_count} 件はすべて既に決済済み "
+            f"→ state をクリアして完了扱い (entry_time クリア)"
+        )
+        ts.entry_count = 0
+        ts.reset_trail()
+        # "already closed" 応答も口座全体のフラットを保証しないため、
+        # 台帳削除は直後の sync の連続不在確認に委ねる。
+        track_position_clear(symbol, clear_ledger=False)
+        if side == "LONG":
+            _long_close_grace[symbol] = datetime.datetime.now()
+        else:
+            ts.is_short = False
+        # 実態を反映させるため非同期で再同期
+        _threadsafe_future(asyncio.to_thread(sync_positions, trd_env))
+        return True
+    else:
+        log.error(f"{tag} [{side_label}] 全 position_id 発注失敗")
+        # ★ v3.9.19: ショートカバー全失敗時のみアラート音 (損失拡大リスク大)
+        if side == "SHORT":
+            _play_alert_sound("short_cover_all_failed")
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"❌ {tag} {side_label} 全失敗\n"
+            f"全 {len(pids)} 建玉の発注に失敗しました。\n"
+            f"理由: {reason}\n"
+            f"moomoo アプリで手動確認してください。"
+        ))
+        return False  # ★ v2.99.2: 全 position_id 失敗 → 呼び出し側で entry_time を維持して再発動可能に
+
+# ── 緊急全決済（Panic Sell） ───────────────────────────────────────────────────────
+async def panic_sell_all(
+    trd_env: TrdEnv,
+    trigger_symbol: str,
+    reason: str,
+) -> None:
+    # ★ v3.9.61: モメンタム実発注銘柄も panic sell 対象に含める (LONG 監視漏れ防止)
+    exec_syms = {sym for syms in EXECUTION_MAP.values() for sym in syms} | _momentum_live_symbols()
+    # ★ v3.9.15: LONG (position_qty > 0) のみを panic sell 対象にする。
+    # 旧 v2.98 では SHORT (qty<0) も対象にしていたが、5/13 認定サポーター環境で
+    # 「高 conf ネガニュース → 新規 SHORT 発注 → 直後に panic_sell_all で自分の
+    # SHORT を閉じようとして決済失敗 (position_id 取得不能)」という矛盾が発覚。
+    # 本来 panic_sell の意図は「悪材料で LONG を急いで切る」ことなので、SHORT は
+    # 既にネガティブシグナルへの応答ポジションのため panic で閉じる必要なし。
+    targets = [sym for sym in exec_syms if state.get(sym).position_qty > 0]
+
+    if not targets:
+        log.info(f"[パニックセル] {trigger_symbol} → 決済対象 LONG ポジションなし")
+        return
+
+    # ── ★ v3.9.17: peak リトレース ガード ──────────────────────────────────
+    # peak (LONG なら最高値) から既に PANIC_RETRACE_SKIP_PCT 以上戻している場合は
+    # 「急落の底で売って傷を広げる」誤発動の可能性が高いのでスキップする。
+    # 5/13 22:49 hma SPY -$23.78 パニックセル誤発動 (直後 SHORT 組は 60min 後
+    # -$3〜6 程度に収束) への対策。デフォルトは無効化 (0.0) で .env で有効化。
+    # PANIC_RETRACE_SKIP_PCT=0.3 → peak から 30% 戻したら panic スキップ。
+    try:
+        _PANIC_SKIP_PCT = float(os.environ.get("PANIC_RETRACE_SKIP_PCT", "0.0"))
+    except (ValueError, TypeError):
+        _PANIC_SKIP_PCT = 0.0
+    if _PANIC_SKIP_PCT > 0:
+        _filtered_targets = []
+        for sym in targets:
+            ts = state.get(sym)
+            quote = get_quote(sym)
+            cur_price = quote.get("last") or quote.get("bid") or 0.0
+            if cur_price <= 0 or ts.peak_price <= 0 or ts.avg_cost <= 0:
+                _filtered_targets.append(sym)  # データ不足 → 通常通り panic
+                continue
+            # LONG の peak (最高値) から現値までの下落幅
+            _peak_drop      = (ts.peak_price - cur_price) / ts.peak_price
+            # 含み損のうち、現在は底からどれだけ戻したか
+            _max_loss_pct   = (ts.peak_price - ts.avg_cost * (1 - MAX_LOSS_PCT)) / ts.peak_price if ts.peak_price > 0 else 0
+            # シンプル指標: 現値 > avg_cost なら panic 不要 (含み益)
+            if cur_price >= ts.avg_cost:
+                log.info(
+                    f"[パニックセル] 【{sym}】 既に含み益域 "
+                    f"(現値=${cur_price:.2f} ≥ avg=${ts.avg_cost:.2f}) → panic スキップ"
+                )
+                continue
+            # peak からの戻り率 (= 現値が peak-下げ幅の何割回復したか) を計算
+            # 「下げきった底」を avg_cost * (1 - MAX_LOSS_PCT) と仮定
+            _theoretical_bottom = ts.avg_cost * (1 - MAX_LOSS_PCT)
+            if cur_price > _theoretical_bottom:
+                # 底→peak の距離のうち、現値の位置
+                _recovery_range = ts.peak_price - _theoretical_bottom
+                if _recovery_range > 0:
+                    _recovery_ratio = (cur_price - _theoretical_bottom) / _recovery_range
+                    if _recovery_ratio >= _PANIC_SKIP_PCT:
+                        log.info(
+                            f"[パニックセル] 【{sym}】 底からの戻り {_recovery_ratio*100:.0f}% ≥ "
+                            f"閾値 {_PANIC_SKIP_PCT*100:.0f}% → panic スキップ "
+                            f"(peak=${ts.peak_price:.2f} 想定底=${_theoretical_bottom:.2f} 現値=${cur_price:.2f})"
+                        )
+                        continue
+            _filtered_targets.append(sym)
+        targets = _filtered_targets
+        if not targets:
+            log.info(f"[パニックセル] {trigger_symbol} → 全銘柄が戻り判定でスキップ")
+            return
+
+    log.warning(f"🆘 パニックセル発動！  トリガー: 【{trigger_symbol}】  対象: {targets}  理由: {reason}")
+
+    targets_str = ", ".join(targets)
+    _threadsafe_future(asyncio.to_thread(
+        send_discord_message,
+        f"[Bot] 🆘 緊急全決済（Panic Sell）\n"
+        f"【トリガー】{trigger_symbol} の急落ニュースにより\n"
+        f"{targets_str} のポジションを一括決済します\n"
+        f"理由: {reason}"
+    ))
+
+    for sym in targets:
+        # ★ v2.86: 銘柄単位ロックで race 防止
+        async with _get_sym_lock(sym):
+            place_close_all(sym, trd_env, f"パニックセル: {trigger_symbol}急落", is_panic=True)
+
+# ── ニュース処理コア（セクター連動ロジック） ────────────────────────────────────────────────────
+async def process_headlines(
+    trd_env: None,                  # 未使用（呼び出し元はすべてNoneを渡す）
+    client: anthropic.Anthropic,
+    headlines,
+    trd_env_real: TrdEnv,
+) -> None:
+    """
+    新着ヘッドラインを受け取り、トリガー銘柄ごとに AI 判定 → 連動発注を行う。
+    """
+    if headlines is None:
+        log.warning("[process_headlines] headlines が None のためスキップ")
+        return
+
+    new = [h for h in headlines if state.is_new_article(h.articleId)]
+    if not new:
+        return
+
+    # ── 起動時ニュース無視チェック ────────────────────────────────────────────
+    # 起動直後 STARTUP_NEWS_IGNORE_SEC 秒以内のニュースは Bot 起動前から存在した
+    # 古いニュース (既に価格織込済) の可能性が高いため発注しない。既読登録のみ。
+    _elapsed = (datetime.datetime.now() - _BOT_START_TIME).total_seconds()
+    if _elapsed < STARTUP_NEWS_IGNORE_SEC:
+        log.info(f"[起動待機中] {STARTUP_NEWS_IGNORE_SEC - int(_elapsed)}秒後に発注開始 → {len(new)}件を既読登録のみ")
+        return
+    # ── ★ v3.9.56: セッション切替直後のクワイエットウィンドウ ──────────────
+    # OVERNIGHT/WEEKEND 等の停止セッション中に Alpaca WebSocket / RSS が蓄積
+    # した古いニュースが、セッション再開の瞬間に一斉処理されることを防ぐ。
+    # SESSION_CHANGE_QUIET_SEC 秒間は新着ニュースを「既読登録のみ」してスキップ。
+    if (
+        SESSION_CHANGE_QUIET_SEC > 0
+        and _last_session_change_at is not None
+    ):
+        _sess_elapsed = (datetime.datetime.now() - _last_session_change_at).total_seconds()
+        if _sess_elapsed < SESSION_CHANGE_QUIET_SEC:
+            log.info(
+                f"[セッション切替待機] {SESSION_CHANGE_QUIET_SEC - int(_sess_elapsed)}秒後に発注開始 "
+                f"→ {len(new)}件を既読登録のみ (蓄積ニュース対策)"
+            )
+            return
+    # STOCK_TICKERS / EARNINGS銘柄のニュースを個別株AIに転送する。
+    # SPY/QQQのフィルタチェーンとは独立して並列処理する（ensure_future）。
+    # bypass_filter=True でprefix重複チェックをバイパスして個別株AIを確実に起動。
+    # is_new_article による重複チェックは process_stock_news 内で引き続き行う。
+    _env_route_syms = list(dict.fromkeys(STOCK_TICKERS + _all_earnings))
+    if _env_route_syms:
+        import re as _re_env
+        for _h in new:
+            _hl_upper = _h.headline.upper()
+            for _rsym in _env_route_syms:
+                if _re_env.search(rf"\b{_re_env.escape(_rsym)}\b", _hl_upper):
+                    _threadsafe_future(
+                        process_stock_news(
+                            client, trd_env_real, _rsym, [_h],
+                            bypass_filter=True,
+                        )
+                    )
+                    break  # 1ニュースにつき最初にマッチした1銘柄のみルーティング
+
+    # ── 無関係ニュースの事前フィルタリング ────────────────────────────────────
+    _SKIP_KEYWORDS = {
+        # スポーツ
+        "fifa", "soccer", "nba", "nfl", "mlb", "nhl", "tennis", "golf",
+        "olympic", "super bowl", "world cup", "basketball", "baseball",
+        "football", "hockey", "esport", "formula 1", "f1 race", "ufc", "boxing",
+        # エンタメ・メディア
+        "hollywood", "movie", "film", "box office", "celebrity", "oscar",
+        "grammy", "emmy", "billboard", "album", "concert", "tour", "singer",
+        "actor", "actress", "director", "entertainment", "streaming show",
+        "netflix show", "disney+", "tv show", "podcast host",
+        # ライフスタイル・個人向け
+        "lifestyle", "music", "fashion", "beauty", "wellness", "diet",
+        "gen z", "millennial", "baby boomer", "student loan", "university",
+        "college tuition", "retirement planning", "saving tips", "career advice",
+        "personal finance", "home buying tips", "dating", "relationship",
+        # ノイズ人物・コメンテーター
+        "jim cramer", "elon musk twitter", "celebrity investor",
+        # 政治・社会（市場無関係のもの）
+        "abortion", "immigration policy", "gun control", "lgbtq",
+        "protest march", "local election", "mayor", "governor race",
+        "school board", "city council",
+        # その他ノイズ
+        "horoscope", "lottery", "casino jackpot", "weather forecast",
+        "traffic report", "recipe", "travel tips", "vacation",
+    }
+    # ── ★ v3.8.3: 1 日 1 回ノイズフィルタ統計を出力 (日付変わり時のみ実行) ──
+    _maybe_log_noise_filter_summary()
+
+    filtered = []
+    for h in new:
+        # ① 短文フィルタ: 単語数が5以下は情報不足としてスキップ
+        word_count = len(h.headline.split())
+        if word_count <= 5:
+            log.debug(f"[フィルタ] 短文スキップ({word_count}語): {h.headline}")
+            continue
+        # ② キーワードフィルタ
+        lower   = h.headline.lower()
+        matched = next((kw for kw in _SKIP_KEYWORDS if kw in lower), None)
+        if matched:
+            log.debug(f"[フィルタ] キーワードスキップ({matched!r}): {h.headline}")
+            continue
+        # ②.5 ★ v3.8.3: 高信頼度ノイズパターン (常に score=0 確実 → AI 呼出を節約)
+        # 5/4-9 ログ分析で全 AI 判定の 48% が score=0、月 $40-90 のコスト削減見込み。
+        _noise_label = _check_noise_pattern(h.headline)
+        if _noise_label:
+            _record_noise_filter_hit(_noise_label)
+            log.info(f"[ノイズフィルタ] {_noise_label} → AI呼出スキップ: {h.headline[:90]}")
+            continue
+        # ③ 先頭20文字による類似重複フィルタ
+        if not state.is_new_headline_prefix(h.headline):
+            log.debug(f"[フィルタ] 類似重複スキップ(先頭35文字): {h.headline}")
+            continue
+        filtered.append(h)
+    if not filtered:
+        log.info("[フィルタ] 全件がフィルタに該当したためAI送信をスキップ")
+        return
+    new = filtered
+
+    # ── ニュース一覧をログに出力（1回だけ）────────────────────────────────────
+    log.info(f"[ニュース] 新着 {len(new)}件 → AI判定（1回）...")
+    for h in new:
+        # ★ v2.99: ニュースソース二段表示 [finnhub:reuters] 等
+        log.info(f"  ・[{_format_news_source(h)}] {h.headline}")
+
+    texts = [h.headline for h in new]
+
+    # ── ③ トピック重複チェック（30分以内の既報トピックはスキップ）────────────
+    _topic_blocked, _topic_reason = state.check_topic_cooldown(texts)
+    if _topic_blocked:
+        log.info(f"[トピック重複] スキップ: {_topic_reason}")
+        return
+
+    # ── ★ v3.9.8: ③' 正規化ヘッドライン重複チェック ────────────────────────
+    # TOPIC_KEYWORDS では拾えない「同一ヘッドラインの繰り返し配信」を 60 分 dedup。
+    # Yahoo Finance が GUID 更新で同一記事を 5 分おきに再配信するパターン等を吸収。
+    # 1 件目のヘッドラインが新規かを判定し、既出ならバッチ全体をスキップ。
+    if texts:
+        _hl_seen, _hl_elapsed, _hl_hits = state.check_headline_seen(texts[0])
+        if _hl_seen:
+            log.info(
+                f"[正規化重複] {_hl_elapsed // 60}分前と同一ヘッドライン (累計 {_hl_hits + 1} 件目) "
+                f"→ AI 呼出スキップ: {texts[0][:120]!r}"
+            )
+            state.mark_headline_seen(texts[0])  # hit_count をインクリメント
+            return
+
+    # ── AI判定：トリガーに関係なく1回だけ実行（コスト1/3）────────────────────
+    # カテゴリ（SEMI/TECH/MACRO）で発注対象ETFを決めるため、トリガー銘柄は不要
+    cached = state.get_ai_cache("SHARED", texts)
+    if cached is not None:
+        log.info(f"[キャッシュ] 前回判定を流用(API スキップ)"
+                 f"  score={cached['score']}  confidence={cached['confidence']:.2f}")
+        result = cached
+    else:
+        # ★ v2.92: マクロ環境(直近 5/15/60 分の QQQ/SPY 騰落率)を AI に文脈として渡す
+        # 5/4 NY11時の急落事案で、相場全体の流れを AI が考慮できなかった問題への対策。
+        # 履歴が不十分な場合は build_market_context が空文字を返し、従来通りの動作。
+        _mkt_ctx = build_market_context()
+        if _mkt_ctx:
+            log.debug(f"[市場文脈] AI に文脈付与: {_mkt_ctx[:120]}...")
+        result = await analyze_news(client, texts, "SHARED", market_context=_mkt_ctx)
+        state.set_ai_cache("SHARED", result, texts)
+        state.mark_topic_seen(texts)  # ③ 判定後にトピックを記録
+        # ★ v3.9.8: 正規化ヘッドラインも記録 (次回以降の同一テキスト判定で dedup される)
+        if texts:
+            state.mark_headline_seen(texts[0])
+
+    score         = result["score"]
+    confidence    = result["confidence"]
+    horizon       = result.get("horizon", "unknown")
+    reason        = result["reason"]
+    beneficiaries = result["beneficiaries"]
+    victims       = result["victims"]
+    category      = result.get("category", "MACRO").upper()
+
+    # ── ★ v2.99: ETF 影響ガード ─────────────────────────────────────────────
+    # AI が beneficiaries/victims に ETF を入れたとき、ニュース内容に主要構成銘柄
+    # またはセクター語が登場するか検証する。Azenta のような小型株の決算ミスを
+    # QQQ への victims と誤判定するケースに対する二重防御。
+    # 除外時は log.warning で記録される。
+    # ★ v3.1.3: bear ETF フォールバック抑止のため、フィルタ前後の ETF 構成を保持
+    # ★ v3.8.1: 強化版で空リスト検知に使用 (元AI指定があったか / 元から空かのログ用)
+    _orig_beneficiaries_etfs = [s for s in (beneficiaries or []) if s in _ETF_MAJOR_MAP]
+    _orig_victims_etfs       = [s for s in (victims       or []) if s in _ETF_MAJOR_MAP]
+    beneficiaries = _validate_etf_impact(texts, beneficiaries, "beneficiaries")
+    victims       = _validate_etf_impact(texts, victims,       "victims")
+
+    # ── ④ ニュースソースの信頼度重み付け ─────────────────────────────────────
+    # ★ v2.93: 730件の実トレード分析で重み再調整 (STEP1, 1-2週後 STEP2 判断)。
+    # 旧版は業界一般論ベースで、実勝率と完全に逆評価していた:
+    #   Yahoo (旧0.85→0.95): 実勝率54.2% 合計+$366 (唯一プラス、過小評価)
+    #   Alpaca (旧1.00→0.95): 実勝率48.3% 合計-$329 (過大評価)
+    #   Finnhub (旧0.90→0.85): 実勝率45.6% 合計-$671 (最大損失源)
+    _SOURCE_WEIGHTS = {
+        "Alpaca":           0.95,  # 1.00 → 0.95 (実勝率 48.3% で過大評価)
+        "Finnhub":          0.85,  # 0.90 → 0.85 (実勝率 45.6%、特に個別株で悪化)
+        "Yahoo Finance":    0.95,  # 0.85 → 0.95 (実勝率 54.2% で過小評価、機会損失発生)
+        # v2.97: Reuters/AP は _RSS_FEEDS から削除済 / 未知ソースはデフォルト0.90。
+    }
+    # 最も信頼度の高いソースの重みを使用
+    _sources = [getattr(h, "source", "Unknown") for h in new]
+    _max_weight = max((_SOURCE_WEIGHTS.get(s, 0.90) for s in _sources), default=0.90)
+    # ★ v2.88: ログ用 _top_source も _max_weight と同一の選択ロジックに統一。
+    # 旧版は _sources[0] 固定で、max_weight 算出元とずれて TRADE_RESULT 勝率相関を歪めていた。
+    _top_source = max(
+        _sources,
+        key=lambda s: _SOURCE_WEIGHTS.get(s, 0.90),
+        default="RSS",
+    ) if _sources else "RSS"
+    if _max_weight < 1.0:
+        _orig_conf = confidence
+        confidence = round(confidence * _max_weight, 3)
+        log.debug(
+            f"[ソース重み] {_top_source} weight={_max_weight} "
+            f"confidence {_orig_conf:.2f}→{confidence:.2f}"
+        )
+
+    # ── ★ v2.93: Finnhub × 個別株の追加ディスカウント (process_stock_news側で実装) ──
+    # 730 件の実データ分析で、Finnhub × 個別株は勝率 35.6%・平均 -$9.65 と特に悪い
+    # ことが判明 (Finnhub × ETF は勝率 70%・平均 +$1.09 で問題なし)。
+    # process_headlines は通常 ETF 銘柄 (SPY/QQQ/SMH) に発注するため、Finnhub 個別株
+    # ディスカウントは process_stock_news 側でのみ適用する (個別株 AI 判定の直後)。
+
+    # ニュースソースを記録（TRADE_RESULT分析用）
+    # ★ v2.88: 最大重みソースを記録（_sources[0] 固定から変更）
+    _news_src = _top_source
+    # ★ v3.9.2: 中立矢印に Variation Selector (U+FE0F) を追加してカラー絵文字に
+    # 強制描画する。"➡ 中立" は地味なテキスト字形でターミナルでの見た目が
+    # 📈/📉 と統一されていなかったため、"➡️" に変更して 3 種類とも emoji 表示に。
+    score_label = {1: "📈 ポジティブ", 0: "➡️ 中立", -1: "📉 ネガティブ"}.get(score, "?")
+    log.info(
+        f"[AI判定] {score_label}  confidence={confidence:.2f}"
+        f"  horizon={horizon}  category={category}  reason={reason}"
+        f"  beneficiaries={beneficiaries}  victims={victims}"
+    )
+
+    if score == 0:
+        log.info("[AI判定] → 中立: 何もしない")
+        # ★ v3.9.7: META 倒錯ガード等で AI 元判定を 0 に書き換えたケースを観察ログに記録
+        # (元の score は reason 欄の追記文字列で判別)
+        _reason_full = (result.get("reason") or "")
+        _CATEGORY_TO_SYM = {"SEMI_STRONG": _semi_sym, "TECH": _tech_sym, "MACRO": _macro_sym}
+        _would_be_sym = _CATEGORY_TO_SYM.get(category, _macro_sym)
+        if "METAネガ語幹" in _reason_full:
+            # ネガ語幹は score=1 (BUY) を止めたケース (Keel 倒錯ガード発火)
+            _log_observation(
+                symbol=_would_be_sym, side="BUY", confidence=confidence, score=1,
+                category=category, headlines=texts,
+                beneficiaries=beneficiaries, victims=victims,
+                outcome="blocked", block_stage="meta_negtone",
+                block_reason=_reason_full[:300],
+            )
+        elif "META疑問形" in _reason_full:
+            # 疑問形は score=±1 両方ありえるが、BUY 側が圧倒的に多いため BUY 仮定で記録
+            _log_observation(
+                symbol=_would_be_sym, side="BUY", confidence=confidence, score=1,
+                category=category, headlines=texts,
+                beneficiaries=beneficiaries, victims=victims,
+                outcome="blocked", block_stage="meta_question",
+                block_reason=_reason_full[:300],
+            )
+        return
+
+    # ── ★ v3.8.1: ETFガード後の空リスト → カテゴリ単独発動を停止 ──────────────
+    # AI が特定銘柄を指名したがETFガードで全件除外されたケース、または AI が
+    # 元から空リストを返したケースのいずれも、resolve_execution_symbols が
+    # EXECUTION_MAP[trigger_sym] (例: TECH→QQQ) へフォールバックする経路は
+    # 危険なため中立化する。
+    # 2026-05-08 TTD ニュース事案: AI が victims=['QQQ'] を返し、ETFガードが
+    # QQQ を除外したのに victims=[] のまま下流に流れ、TECH カテゴリの
+    # EXECUTION_MAP['QQQ']=['QQQ'] 経由で QQQ SHORT 6株 @ $699.12 が暴発した。
+    # v3.1.3 の `_victims_all_etfs_rejected and not exec_targets` ガードは
+    # EXECUTION_MAP が常に非空を返すため事実上機能しておらず、本ガードで包含。
+    if score == 1 and not beneficiaries:
+        _detail = f" (元AI指定ETF: {_orig_beneficiaries_etfs})" if _orig_beneficiaries_etfs else ""
+        log.info(
+            f"[ETFガード強化] beneficiaries 空 → カテゴリ単独発動を停止{_detail}  "
+            f"reason={reason}"
+        )
+        return
+    if score == -1 and not victims:
+        _detail = f" (元AI指定ETF: {_orig_victims_etfs})" if _orig_victims_etfs else ""
+        log.info(
+            f"[ETFガード強化] victims 空 → カテゴリ単独発動を停止{_detail}  "
+            f"reason={reason}"
+        )
+        return
+
+    # ── ★ v2.94: SEMI_STRONG/SEMI の二段階カテゴリ判定 ─────────────────────────
+    # 5/4-5/5 「半導体っぽいニュース」→ SMH 流入損失事案への対策。
+    # SEMI_STRONG: 大型半導体 (NVDA/TSM/AVGO/AMD) の明確好材料・セクター波及確定 → SMH発注
+    # SEMI:        中堅小型・観測記事・確度低 → 発注しない (QQQ にも流用なし)
+    # 後方互換: 旧 AI の "SEMI" 返答も発注しない (移行中は SEMI 発注機会減少)。
+    if category == "SEMI":
+        log.info(
+            f"[SEMI弱] category=SEMI (中堅・小型半導体株 or 観測記事レベル) "
+            f"→ 発注しない (SEMI_STRONG 以外の半導体ニュースは確度不足)"
+        )
+        return
+
+    # ── カテゴリからトリガー銘柄を決定（発注先を特定）────────────────────────
+    # SEMI_STRONG → SMH（TRIGGER_TICKERSにSMH含む場合）or QQQ / TECH → QQQ / MACRO → SPY
+    _CATEGORY_TO_TRIGGER: Dict[str, str] = {
+        "SEMI_STRONG": _semi_sym,  # ★ v2.94: 強い半導体ニュースのみ SMH 発注対象
+        "TECH":        _tech_sym,
+        "MACRO":       _macro_sym,
+    }
+    trigger_sym = _CATEGORY_TO_TRIGGER.get(category, _macro_sym)
+    tag = f"【{trigger_sym}】"
+
+    if score == 1:
+        exec_targets = resolve_execution_symbols(texts, trigger_sym, beneficiaries)
+    else:
+        exec_targets = resolve_execution_symbols(texts, trigger_sym, victims)
+
+    # ── ★ v2.91 → v2.94: SEMI_STRONG は _semi_sym (通常 SMH) のみに絞る ────────
+    # AI が beneficiaries=['QQQ', 'SMH'] と返す場合の同時発注防止。SMH 構成なら
+    # _semi_sym=SMH、SPY+QQQ 構成なら _semi_sym=QQQ となり QQQ のみが残る。
+    if category == "SEMI_STRONG" and _semi_sym in exec_targets:
+        _orig_targets = exec_targets
+        exec_targets = [_semi_sym]
+        if len(_orig_targets) > 1:
+            log.info(
+                f"[SEMI_STRONG絞り込み] SEMI_STRONG カテゴリのため発注先を {_semi_sym} のみに絞ります "
+                f"(元: {_orig_targets} → {exec_targets})"
+            )
+
+    sync_positions(trd_env_real)
+
+    # ── score=-1: ショート（空売り or 既存ロング決済）────────────────────────────
+    if score == -1:
+        # ★ v3.8.1: 旧 v3.1.3 の `_victims_all_etfs_rejected` 分岐は削除済み。
+        # EXECUTION_MAP が常に非空 ([trigger_sym]) を返すため `not exec_targets`
+        # 条件が事実上 False となり機能していなかった。代わりに上流の
+        # 「ETFガード強化 (空リスト→中立化)」が同等以上のガードを提供する。
+
+        # ★ v3.1.3: ETF を bear fallback で空売りする前に、当該 ETF の上昇トレンドを確認。
+        # is_macro_uptrend / is_smh_uptrend が True なら QQQ/SMH ショートをスキップ。
+        # AI が明示的に victims を返した場合 (exec_targets あり) はこのチェックをかけず、
+        # 純粋なフォールバック時のみ適用 (AI 判断を覆さない)。
+        if not exec_targets:
+            _bear_sym = LEVERAGED_MAP.get(category, {}).get("bear", "SPY")
+            if _bear_sym == "QQQ":
+                _is_up, _up_reason = is_macro_uptrend()
+                if _is_up:
+                    log.info(
+                        f"{tag} [上昇トレンドブロック] {_up_reason} → "
+                        f"QQQ ショート fallback をスキップ "
+                        f"(victims 未指定の単発悪材料を上昇相場で空売りしない)"
+                    )
+                    return
+            elif _bear_sym == "SMH":
+                _is_up, _up_reason = is_smh_uptrend()
+                if _is_up:
+                    log.info(
+                        f"{tag} [上昇トレンドブロック] {_up_reason} → "
+                        f"SMH ショート fallback をスキップ "
+                        f"(victims 未指定の単発悪材料を上昇相場で空売りしない)"
+                    )
+                    return
+
+        # 発注対象銘柄を決定（カテゴリ対応）
+        short_targets = exec_targets if exec_targets else [LEVERAGED_MAP.get(category, {}).get("bear", "SPY")]
+
+        _thresh = get_confidence_threshold()
+        if confidence >= _thresh:
+            # ① 既存ロングポジションをまず全決済
+            # ★ v2.86: 銘柄単位ロックで race 防止（process_stock_news との並列発注抑止）
+            sold = []
+            for sym in short_targets:
+                async with _get_sym_lock(sym):
+                    if state.get(sym).position_qty > 0:
+                        place_close_all(sym, trd_env_real, f"ショートシグナルのためロング決済: {reason}")
+                        sold.append(sym)
+            if sold:
+                log.info(f"{tag} 既存ロング決済: {', '.join(sold)}")
+                await asyncio.sleep(1)  # 決済後に少し待機
+
+            # ② 空売り新規エントリー
+            log.info(f"{tag} → ネガティブシグナル: ショート新規エントリー {short_targets}")
+            ordered_short = []
+            # ★ v3.9.29: 「既存ショートあり or 余力不足」を分離して表示
+            # 5/20 PAN ログで「余力不足」表示が実は既存 SHORT 保有中のケースだった事例。
+            # 受講生の誤解 (「証券口座の残高が足りないのか?」) を防ぐため分岐ログ。
+            _skipped_existing_short: list = []   # 既存 SHORT 保有でスキップ
+            _skipped_etf_reentry:    list = []   # ETF 再エントリー禁止でスキップ
+            _skipped_with_long:      list = []   # 同銘柄 LONG 保有のためスキップ (まずは LONG 決済が必要)
+            for sym in short_targets:
+                # ★ v2.99: ETF 再エントリー禁止チェック (決済から N 分以内ならスキップ)
+                if _is_etf_ticker(sym):
+                    _locked, _elapsed = _is_etf_reentry_locked(sym)
+                    if _locked:
+                        _remaining = ETF_REENTRY_LOCKOUT_MIN - _elapsed
+                        log.info(
+                            f"【{sym}】 [ETF再エントリー禁止] "
+                            f"{_elapsed:.1f}分前に決済済 → あと{_remaining:.1f}分待機 "
+                            f"(SHORT スキップ)"
+                        )
+                        _skipped_etf_reentry.append(sym)
+                        continue
+                async with _get_sym_lock(sym):
+                    _cur_qty = state.get(sym).position_qty
+                    if _cur_qty < 0:
+                        # 既に SHORT を保有中 → 重複エントリースキップ
+                        _skipped_existing_short.append(sym)
+                        continue
+                    if _cur_qty > 0:
+                        # LONG 保有中 → ショート前に LONG 決済が必要
+                        _skipped_with_long.append(sym)
+                        continue
+                    # 中立 (qty=0) なら空売り可能
+                    ok = place_short(sym, trd_env_real, confidence=confidence,
+                                     trigger=trigger_sym, reason=f"[ベア] {reason}",
+                                     category=category, news_source=_news_src,
+                                     headlines=texts[:3],
+                                     beneficiaries=beneficiaries, victims=victims)  # ★ v2.95
+                    if ok:
+                        ordered_short.append(sym)
+            if ordered_short:
+                ordered_str = ", ".join(ordered_short)
+                log.info(f"{tag} ✅ ショートエントリー完了: {ordered_str}")
+                _threadsafe_future(asyncio.to_thread(
+                    send_discord_message,
+                    f"[Bot] 【ショート】{trigger_sym} ネガティブニュースにより\n"
+                    f"{ordered_str} を空売り（新規SELL）しました ▼\n"
+                    f"confidence: {confidence:.2f}  horizon: {horizon}\n"
+                    f"理由: {reason}\n"
+                    f"--- ニュース ---\n" + "\n".join(f"・{t}" for t in texts[:3])
+                ))
+            else:
+                # ★ v3.9.29: 全件スキップの理由を明示 (受講生が「余力不足」と誤解しないよう)
+                _reasons = []
+                if _skipped_existing_short:
+                    _reasons.append(f"既存 SHORT 保有中: {','.join(_skipped_existing_short)}")
+                if _skipped_with_long:
+                    _reasons.append(f"LONG 保有中・SHORT 不可: {','.join(_skipped_with_long)}")
+                if _skipped_etf_reentry:
+                    _reasons.append(f"ETF 再エントリー禁止: {','.join(_skipped_etf_reentry)}")
+                if not _reasons:
+                    # 上記いずれにも該当しない場合 = place_short() 内で却下 (余力不足/急変動/トレンドガード等)
+                    _reasons.append("place_short() 内でブロック (詳細は直前ログ参照)")
+                log.info(f"{tag} → 空売り試行: 全銘柄スキップ ({' / '.join(_reasons)})")
+
+            if confidence >= PANIC_CONFIDENCE:
+                await panic_sell_all(trd_env_real, trigger_sym, reason)
+        else:
+            # confidence < _thresh → 空売りも既存ロング決済もしない
+            # しきい値はすべての発注（新規・決済とも）に適用する
+            if confidence >= PANIC_CONFIDENCE:
+                await panic_sell_all(trd_env_real, trigger_sym, reason)
+            else:
+                _has_long = any(state.get(sym).position_qty > 0 for sym in short_targets)
+                if _has_long:
+                    log.info(
+                        f"{tag} → ショートシグナルだが confidence={confidence:.2f} < {_thresh:.2f}"
+                        f"（{get_session_info()[0].upper()} しきい値）→ 決済・空売りともスキップ"
+                    )
+                else:
+                    log.info(f"{tag} → ショートシグナルだが決済対象ポジションなし・confidence不足で空売りもスキップ")
+                # ★ v3.9.7: 観察ログ — confidence 閾値ブロック (SHORT)
+                for _sym in short_targets:
+                    _log_observation(symbol=_sym, side="SELL_SHORT", confidence=confidence, score=-1,
+                                     category=category, headlines=texts,
+                                     beneficiaries=beneficiaries, victims=victims,
+                                     outcome="blocked", block_stage="conf_threshold",
+                                     block_reason=f"conf={confidence:.2f} < {_thresh:.2f}")
+        return
+
+    # ── score=1: ロング (現物買い or 既存ショート決済) ────────────────────────
+    # ★ v2.70: victims ガード - score=1 でも victims に対象銘柄含むなら BUY ブロック
+    # (例: 輸出規制で beneficiaries=[] victims=['QQQ'] なのに score=1 ケース)
+    # ★ v2.90: 検出は WARNING ログのみで Discord 通知抑制 (受講生問合せ増対応)。
+    _victim_blocked = [sym for sym in exec_targets if sym in victims]
+    if _victim_blocked:
+        log.warning(
+            f"{tag} ⚠️ BUYブロック: exec_targets {_victim_blocked} が"
+            f" victims={victims} に含まれています（AI内部矛盾を検出）。"
+            f" reason={reason}"
+        )
+        # ★ v2.90: Discord 通知は抑制（log.warning のみ残す）
+        # ★ v3.9.7: 観察ログ — victim ガードブロック
+        for _sym in _victim_blocked:
+            _log_observation(symbol=_sym, side="BUY", confidence=confidence, score=1,
+                             category=category, headlines=texts,
+                             beneficiaries=beneficiaries, victims=victims,
+                             outcome="blocked", block_stage="victim_in_beneficiary",
+                             block_reason=f"AI内部矛盾: exec_targets {_victim_blocked} が victims に含まれる")
+        return
+    _thresh = get_confidence_threshold()
+    if confidence < _thresh:
+        log.info(f"{tag} → confidence={confidence:.2f} < {_thresh:.2f} 発注見送り（セッション別しきい値）")
+        # ★ v3.9.7: 観察ログ — confidence 閾値ブロック (BUY)
+        for _sym in exec_targets:
+            _log_observation(symbol=_sym, side="BUY", confidence=confidence, score=1,
+                             category=category, headlines=texts,
+                             beneficiaries=beneficiaries, victims=victims,
+                             outcome="blocked", block_stage="conf_threshold",
+                             block_reason=f"conf={confidence:.2f} < {_thresh:.2f}")
+        return
+    if not exec_targets:
+        log.info(f"{tag} → 連動対象銘柄なし")
+        return
+
+    ordered = []
+    for sym in exec_targets:
+        # ★ v2.99: ETF 再エントリー禁止チェック (決済から N 分以内ならスキップ)
+        # v3.9.20: ピラミッド撤去により「既存ポジ無し」のときだけチェック。
+        # 既存ポジションがあれば place_buy 内で「保有中スキップ」される。
+        if _is_etf_ticker(sym) and state.get(sym).position_qty == 0:
+            _locked, _elapsed = _is_etf_reentry_locked(sym)
+            if _locked:
+                _remaining = ETF_REENTRY_LOCKOUT_MIN - _elapsed
+                log.info(
+                    f"【{sym}】 [ETF再エントリー禁止] "
+                    f"{_elapsed:.1f}分前に決済済 → あと{_remaining:.1f}分待機 "
+                    f"(BUY スキップ)"
+                )
+                continue
+        # ★ v2.86: 銘柄単位ロックで「ショート決済→BUY」一連を atomic に
+        async with _get_sym_lock(sym):
+            # 既存ショートがあれば先に買い戻し
+            if state.get(sym).position_qty < 0:
+                log.info(f"{tag} 既存ショートを買い戻し → {sym}")
+                place_close_all(sym, trd_env_real, f"ロングシグナルのためショート決済: {reason}")
+                await asyncio.sleep(1)
+            ok = place_buy(sym, trd_env_real, confidence=confidence,
+                           trigger=trigger_sym, reason=reason,
+                           category=category, news_source=_news_src,
+                           headlines=texts[:3],
+                           beneficiaries=beneficiaries, victims=victims)  # ★ v2.95
+            if ok:
+                ordered.append(sym)
+
+    if ordered:
+        ordered_str = ", ".join(ordered)
+        log.info(f"{tag} ✅ 連動買い完了: {ordered_str}")
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"[Bot] 【トリガー】{trigger_sym} のニュースにより\n"
+            f"関連する {ordered_str} の注文を実行しました ▲\n"
+            f"confidence: {confidence:.2f}  horizon: {horizon}\n"
+            f"理由: {reason}\n"
+            f"--- ニュース ---\n" + "\n".join(f"・{t}" for t in texts[:3])
+        ))
+    else:
+        log.info(f"{tag} → 発注試行したが全銘柄スキップ（余力不足または価格取得失敗）")
+
+# ── 外部ニュースAPI（Finnhub） ──────────────────────────────────────
+def _fetch_finnhub() -> list[SimpleNamespace]:
+    """
+    Finnhubニュース取得（タイムアウト15秒・最大3回リトライ, v2.69）。
+    429 Too Many Requests: Exponential Backoff（1→2→4秒）を適用。
+    Timeout: 2秒待ってリトライ（最大1回）。
+    """
+    import time as _time
+    _backoff = 1
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                _FINNHUB_URL,
+                params={"category": "general", "token": FINNHUB_API_KEY},
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                log.warning(f"[Finnhub] 429 Too Many Requests → {_backoff}秒待機 ({attempt+1}/3)")
+                _time.sleep(_backoff)
+                _backoff *= 2  # 1→2→4秒
+                continue
+            resp.raise_for_status()
+            results = []
+            for item in resp.json()[:20]:
+                article_id = f"finnhub-{item.get('id', item.get('datetime', ''))}"
+                headline   = item.get("headline", "").strip()
+                if headline:
+                    # ★ v2.99: source_detail に元媒体名を保持 (Reuters / Bloomberg / Yahoo 等)
+                    _detail = (item.get("source", "") or "").strip()
+                    results.append(SimpleNamespace(
+                        articleId=article_id, headline=headline,
+                        source="Finnhub", source_detail=_detail,
+                    ))
+            return results
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                log.debug("[Finnhub] タイムアウト → 2秒後にリトライ（1/2）")
+                _time.sleep(2)
+                continue
+            log.debug("[Finnhub] タイムアウト（リトライ後も失敗）: このサイクルはスキップ")
+            return []
+        except Exception as e:
+            log.debug(f"[Finnhub] 取得エラー: {_mask_secrets(e)}")
+            return []
+    log.debug("[Finnhub] リトライ上限到達 → このサイクルはスキップ")
+    return []
+
+
+async def fetch_external_news() -> List[SimpleNamespace]:
+    if FINNHUB_API_KEY:
+        return await asyncio.to_thread(_fetch_finnhub)
+    return []
+
+
+# ── 個別株専用ニュース取得（Alpaca優先 → Finnhubフォールバック） ──────────────────────────────────
+_FINNHUB_COMPANY_NEWS_URL = "https://finnhub.io/api/v1/company-news"
+_ALPACA_NEWS_REST_URL     = "https://data.alpaca.markets/v1beta1/news"
+_STOCK_NEWS_CACHE: Dict[str, List[str]] = {}   # {symbol: [articleId, ...]}
+
+
+def _fetch_stock_news_alpaca_batch(symbols: List[str], days: int = 7) -> Dict[str, List[SimpleNamespace]]:
+    """
+    Alpaca News REST API で複数銘柄を1リクエストでバッチ取得する（v2.69）。
+    最大10銘柄/リクエスト。Finnhub company-news の代替として429を根本的に回避。
+
+    戻り値: { "AAPL": [SimpleNamespace, ...], "MSFT": [...], ... }
+    空dict: APIキー未設定 / エラー時
+    """
+    import time as _time
+    # ★ v3.9.42: サニタイズ済みのモジュールレベル定数を使用
+    alpaca_key    = ALPACA_API_KEY_ID
+    alpaca_secret = ALPACA_API_SECRET_KEY
+    if not alpaca_key or not alpaca_secret:
+        return {}
+
+    start = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).strftime("%Y-%m-%dT00:00:00Z")
+    params  = {"symbols": ",".join(symbols), "start": start, "limit": 50, "sort": "desc"}
+    headers = {"APCA-API-KEY-ID": alpaca_key, "APCA-API-SECRET-KEY": alpaca_secret}
+
+    result: Dict[str, List[SimpleNamespace]] = {}
+    try:
+        resp = requests.get(_ALPACA_NEWS_REST_URL, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        news_items = resp.json().get("news", [])
+        log.debug(f"[Alpaca News] バッチ取得: {len(news_items)}件 対象: {symbols}")
+
+        for article in news_items:
+            headline     = article.get("headline", "").strip()
+            article_syms = article.get("symbols", [])
+            if not headline:
+                continue
+            for sym in article_syms:
+                if sym not in symbols:
+                    continue
+                article_id = f"stock-{sym}-alpaca-{article.get('id', '')}"
+                seen = _STOCK_NEWS_CACHE.setdefault(sym, [])
+                if article_id in seen:
+                    continue
+                seen.append(article_id)
+                if len(seen) > 200:
+                    _STOCK_NEWS_CACHE[sym] = seen[-200:]
+                result.setdefault(sym, []).append(SimpleNamespace(
+                    articleId = article_id,
+                    headline  = headline,
+                    source    = f"Alpaca({sym})",
+                    symbol    = sym,
+                ))
+    except Exception as e:
+        log.debug(f"[Alpaca News] バッチ取得エラー: {_mask_secrets(e)}")
+    return result
+
+
+def _fetch_stock_news(symbol: str) -> List[SimpleNamespace]:
+    """
+    個別銘柄ニュース取得（v2.69）: Alpaca → Finnhub の順でフォールバック。
+    ・Alpaca: ALPACA_API_KEY_ID が設定されていれば優先使用（429なし）
+    ・Finnhub: 429発生時にExponential Backoff（1→2→4秒）を適用
+    """
+    import time as _time
+
+    # ── Alpaca優先 ────────────────────────────────────────────────────────────
+    alpaca_key = ALPACA_API_KEY_ID  # v3.9.42: サニタイズ済み
+    if alpaca_key:
+        batch    = _fetch_stock_news_alpaca_batch([symbol], 1)
+        articles = batch.get(symbol, [])
+        if articles:
+            return articles
+        log.debug(f"[個別株ニュース] {symbol}: Alpaca新着なし → Finnhubフォールバック")
+
+    # ── Finnhub フォールバック（Exponential Backoff付き）──────────────────────
+    if not FINNHUB_API_KEY:
+        return []
+
+    _backoff = 1
+    for attempt in range(3):
+        try:
+            today    = datetime.datetime.now().strftime("%Y-%m-%d")
+            week_ago = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+            resp = requests.get(
+                _FINNHUB_COMPANY_NEWS_URL,
+                params={"symbol": symbol, "from": week_ago, "to": today, "token": FINNHUB_API_KEY},
+                timeout=10,
+            )
+            if resp.status_code == 429:
+                log.warning(
+                    f"[個別株ニュース] {symbol}: Finnhub 429 → {_backoff}秒待機 ({attempt+1}/3)"
+                )
+                _time.sleep(_backoff)
+                _backoff *= 2  # 1→2→4秒
+                continue
+            resp.raise_for_status()
+            results = []
+            seen = _STOCK_NEWS_CACHE.setdefault(symbol, [])
+            for item in resp.json()[:10]:
+                article_id = f"stock-{symbol}-{item.get('id', item.get('datetime', ''))}"
+                headline   = item.get("headline", "").strip()
+                if not headline or article_id in seen:
+                    continue
+                seen.append(article_id)
+                if len(seen) > 200:
+                    _STOCK_NEWS_CACHE[symbol] = seen[-200:]
+                results.append(SimpleNamespace(
+                    articleId = article_id,
+                    headline  = headline,
+                    source    = f"Finnhub({symbol})",
+                    source_detail = (item.get("source", "") or "").strip(),  # ★ v2.99
+                    symbol    = symbol,
+                ))
+            return results
+        except Exception as e:
+            log.debug(f"[個別株ニュース] {symbol}: 取得エラー: {_mask_secrets(e)}")
+            return []
+
+    log.warning(f"[個別株ニュース] {symbol}: Finnhub リトライ上限到達 → スキップ")
+    return []
+
+
+async def process_stock_news(
+    client: anthropic.Anthropic,
+    trd_env: TrdEnv,
+    symbol: str,
+    articles: List[SimpleNamespace],
+    thresh_override: Optional[float] = None,
+    bypass_filter: bool = False,
+) -> None:
+    """
+    個別株のニュースをAIに送り、その銘柄を直接売買する。
+    既存の SEMI→SMH(or QQQ) / TECH→QQQ / MACRO→SPY ロジックとは完全に独立して動作する。
+    リスク管理（損切り・トレイル・タイムアウト）は既存のまま適用される。
+
+    bypass_filter=True（決算監視経由）の場合: headline重複フィルタをバイパス。
+    process_headlinesが先読みしてprefixを既読にしても個別株AIを止めない。
+    articleIdの重複チェックは引き続き行い完全な重複送信は防止する。
+    """
+    tag = f"【{symbol}】"
+
+    # ── 起動時ニュース無視チェック (発注スキップ + 既読登録のみ) ──────────────
+    _elapsed = (datetime.datetime.now() - _BOT_START_TIME).total_seconds()
+    if _elapsed < STARTUP_NEWS_IGNORE_SEC:
+        log.debug(f"{tag} [起動待機中] {STARTUP_NEWS_IGNORE_SEC - int(_elapsed)}秒後に発注開始 → 個別株スキップ")
+        for art in articles:
+            state.is_new_article(art.articleId)
+        return
+    # ── ★ v3.9.56: セッション切替直後のクワイエットウィンドウ ──────────────
+    # 5/28 GOOGL Insider Trading 記事のような OVN 中蓄積ニュースが PREMARKET
+    # 切替の瞬間に発注されることを防ぐ。SESSION_CHANGE_QUIET_SEC 秒間は既読
+    # 登録のみで発注スキップ。
+    if (
+        SESSION_CHANGE_QUIET_SEC > 0
+        and _last_session_change_at is not None
+    ):
+        _sess_elapsed = (datetime.datetime.now() - _last_session_change_at).total_seconds()
+        if _sess_elapsed < SESSION_CHANGE_QUIET_SEC:
+            log.info(
+                f"{tag} [セッション切替待機中] "
+                f"{SESSION_CHANGE_QUIET_SEC - int(_sess_elapsed)}秒後に発注開始 → "
+                f"個別株{len(articles)}件を既読登録のみ"
+            )
+            for art in articles:
+                state.is_new_article(art.articleId)
+            return
+    # EARNINGS_PRE銘柄はプリマーケット(04:00〜09:30 ET)のみ発注
+    # EARNINGS_AFTER銘柄はアフターアワーズ(16:00〜20:00 ET)のみ発注
+    # セッション外のニュースは重複IDのみ記録して発注しない
+    if symbol in EARNINGS_PRE_TICKERS:
+        _earn_sess, _ = get_session_info()
+        if _earn_sess != SESSION_PREMARKET:
+            log.debug(f"{tag} [決算PRE] プリマーケット以外({_earn_sess}) → スキップ")
+            return
+    elif symbol in EARNINGS_AFTER_TICKERS:
+        _earn_sess, _ = get_session_info()
+        if _earn_sess != SESSION_AFTERHOURS:
+            log.debug(f"{tag} [決算AFTER] アフター以外({_earn_sess}) → スキップ")
+            return
+
+    # 重複排除
+    # bypass_filter=True（決算監視経由）はheadline prefixフィルタをスキップ。
+    # process_headlinesが先読みしてprefixを"既読"にしても個別株AIを止めない。
+    if bypass_filter:
+        new = [a for a in articles if state.is_new_article(a.articleId)]
+    else:
+        new = [a for a in articles if state.is_new_article(a.articleId)
+               and state.is_new_headline_prefix(a.headline)]
+    if not new:
+        return
+
+    # ── ★ v3.8.4: 個別株モードにもノイズフィルタを適用 (AI コスト削減) ──────
+    # process_headlines と同じ高信頼度ノイズパターンで pre-filter する。
+    # 個別株モードでもアナリスト目標株価変更/transcript/個人金融などは常に score=0
+    # を返すため、AI 呼出を節約できる。
+    _noise_survived = []
+    for a in new:
+        _noise_label = _check_noise_pattern(a.headline)
+        if _noise_label:
+            _record_noise_filter_hit(_noise_label)
+            log.info(f"{tag} [ノイズフィルタ] {_noise_label} → AI呼出スキップ: {a.headline[:90]}")
+            continue
+        _noise_survived.append(a)
+    if not _noise_survived:
+        log.info(f"{tag} [ノイズフィルタ] 全件がノイズパターンに該当 → AI判定スキップ")
+        return
+    new = _noise_survived
+
+    texts = [a.headline for a in new]
+    log.info(f"{tag} [個別株ニュース] 新着{len(texts)}件 → AI判定")
+    for a in new:
+        # ★ v2.99: ニュースソース二段表示
+        log.info(f"  ・[{_format_news_source(a)}] {a.headline}")
+
+    # ニュースソースをarticleから自動検出（v2.85）
+    # _fetch_stock_news_alpaca_batch は source=f"Alpaca({sym})"
+    # _fetch_stock_news（Finnhub）      は source=f"Finnhub({symbol})"
+    # を各記事に付与しているため、呼び出し元を変更せずに正確なソースを記録できる。
+    _detected_source = (
+        new[0].source
+        if new and hasattr(new[0], "source") and new[0].source
+        else f"Finnhub({symbol})"
+    )
+
+    # ── ★ v3.9.8: 正規化ヘッドライン重複チェック (個別株モード) ───────────────
+    # process_headlines と同じ層を個別株ニュースにも適用。Finnhub/Alpaca の同一銘柄
+    # 記事が複数フィード経由で再到来するケース (例: AAPL の同一決算記事を
+    # Alpaca と Finnhub で別 articleId で受信) を 60 分 dedup する。
+    if texts:
+        _hl_seen, _hl_elapsed, _hl_hits = state.check_headline_seen(texts[0])
+        if _hl_seen:
+            log.info(
+                f"{tag} [正規化重複] {_hl_elapsed // 60}分前と同一ヘッドライン "
+                f"(累計 {_hl_hits + 1} 件目) → AI 呼出スキップ: {texts[0][:120]!r}"
+            )
+            state.mark_headline_seen(texts[0])
+            return
+
+    # AI判定（個別株モード）
+    # 市場全体モードを使うとGS→"Big Tech好調"のような誤判定が起きるため
+    # 「このニュースは {symbol} に直接関係するか」を厳密に判定させる
+    # v1.3.0: target_symbol で個別株モードを指定。SYSTEM_PROMPT は統合版で共通。
+    result = await analyze_news(client, texts, symbol, target_symbol=symbol)
+    # ★ v3.9.8: AI 呼出後にヘッドラインを記録 (次回以降の同一テキスト判定で dedup される)
+    if texts:
+        state.mark_headline_seen(texts[0])
+    score      = result["score"]
+    confidence = result["confidence"]
+    reason     = result.get("reason", "")
+    horizon    = result.get("horizon", "unknown")
+
+    # ── ★ v3.9.49: 個別株のソース別ディスカウントを撤去 ─────────────────────
+    # 旧 v2.93 〜 v3.9.48 までは Finnhub/Alpaca 個別株に対して confidence を
+    # 機械的に減衰させていた:
+    #   Alpaca: × 0.95 (5%減)
+    #   Finnhub: × 0.85 (15%減) + 追加 × 0.95 = 合計 × 0.81 (19%減)
+    # 結果として個別株発注が事実上抑制され、判定データが集まらない状態に。
+    # 5/19-26 期間の改善 (v3.9.41 海外単一企業フィルタ・v3.9.46 損切り改訂・
+    # v3.9.47 モメンタムタイムアウト分離) によりベース勝率が改善したため、
+    # 個別株判定はソース別ディスカウントなしで動作させる。
+    # AI が出した confidence をそのまま STRONG_BUY_CONFIDENCE 閾値と比較する。
+    # ETF 判定 (process_headlines) 側のソース重み付けは継続 (別途検証中)。
+    pass
+
+    # v3.9.2: 中立絵文字に VS-16 を付与 (詳細はファイル先頭側の同型行コメント参照)
+    score_label = {1: "📈 ポジティブ", 0: "➡️ 中立", -1: "📉 ネガティブ"}.get(score, "?")
+    log.info(
+        f"{tag} [個別株AI判定] {score_label}  confidence={confidence:.2f}"
+        f"  horizon={horizon}  reason={reason}"
+    )
+
+    if score == 0:
+        log.info(f"{tag} [個別株] 中立 → 何もしない")
+        # ★ v3.9.7: 個別株 META 倒錯/疑問形で score を 0 に書き換えたケースを観察ログ記録
+        _reason_full = (result.get("reason") or "")
+        if "METAネガ語幹" in _reason_full:
+            _log_observation(
+                symbol=symbol, side="BUY", confidence=confidence, score=1,
+                category="STOCK", headlines=texts,
+                outcome="blocked", block_stage="meta_negtone",
+                block_reason=_reason_full[:300],
+            )
+        elif "META疑問形" in _reason_full:
+            _log_observation(
+                symbol=symbol, side="BUY", confidence=confidence, score=1,
+                category="STOCK", headlines=texts,
+                outcome="blocked", block_stage="meta_question",
+                block_reason=_reason_full[:300],
+            )
+        return
+
+    _thresh = thresh_override if thresh_override is not None else get_confidence_threshold()
+    if confidence < _thresh:
+        log.info(f"{tag} [個別株] confidence={confidence:.2f} < {_thresh:.2f} → 発注見送り")
+        # ★ v3.9.7: 個別株 confidence 閾値ブロックを観察ログ記録
+        _side = "BUY" if score == 1 else "SELL_SHORT"
+        _log_observation(
+            symbol=symbol, side=_side, confidence=confidence, score=score,
+            category="STOCK", headlines=texts,
+            outcome="blocked", block_stage="conf_threshold",
+            block_reason=f"個別株 conf={confidence:.2f} < {_thresh:.2f}",
+        )
+        return
+
+    # ── ★ v2.99: 個別株クールダウンチェック ───────────────────────────────────
+    # 同じ銘柄に対する直近の発注から COOLDOWN_STOCK_MIN 分以内なら新規発注をスキップ。
+    # 同じニュースが複数フィードから繰り返し流れても誤発注を抑制する。
+    _cool, _cool_elapsed = _is_stock_cooldown(symbol)
+    if _cool:
+        _cool_remaining = COOLDOWN_STOCK_MIN - _cool_elapsed
+        log.info(
+            f"{tag} [個別株クールダウン] "
+            f"{_cool_elapsed:.1f}分前に発注済 → あと{_cool_remaining:.1f}分待機 "
+            f"(score={score} confidence={confidence:.2f} スキップ)"
+        )
+        return
+
+    await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+
+    # ★ v2.86: 銘柄単位ロックで race 防止（process_headlines との並列発注抑止）
+    async with _get_sym_lock(symbol):
+        if score == 1:
+            # ポジティブ → 直接BUY
+            log.info(f"{tag} [個別株] ポジティブシグナル → BUY")
+            _ok_buy = place_buy(symbol, trd_env, confidence=confidence,
+                      trigger=symbol, reason=reason,
+                      category="STOCK", news_source=_detected_source,
+                      headlines=texts[:3],
+                      beneficiaries=[symbol], victims=[])  # ★ v2.95
+            if _ok_buy:
+                _mark_stock_order(symbol)  # ★ v2.99: クールダウンタイマー開始
+
+        elif score == -1:
+            # ネガティブシグナル
+            _is_earnings_sym = symbol in EARNINGS_PRE_TICKERS or symbol in EARNINGS_AFTER_TICKERS
+            if _is_earnings_sym:
+                # 決算銘柄: ロング決済後にショートも試みる
+                # （place_short内で貸株在庫を自動確認し、在庫なしなら自動スキップ）
+                log.info(f"{tag} [決算] ネガティブシグナル → ロング決済後にショート試行(貸株在庫次第)")
+                if state.get(symbol).position_qty > 0:
+                    place_close_all(symbol, trd_env, f"決算ネガティブシグナル: ロング決済→ショート移行: {reason}")
+                    await asyncio.sleep(1)
+                _ok_short = place_short(symbol, trd_env, confidence=confidence,
+                            trigger=symbol, reason=reason,
+                            category="STOCK", news_source=f"Earnings({symbol})",
+                            headlines=texts[:3],
+                            beneficiaries=[], victims=[symbol])  # ★ v2.95
+                if _ok_short:
+                    _mark_stock_order(symbol)  # ★ v2.99
+            else:
+                # 通常の個別株: ネガティブ → SHORT（貸株確認付き）
+                log.info(f"{tag} [個別株] ネガティブシグナル → SHORT（貸株確認）")
+                # 既存ロングがあれば先に決済
+                if state.get(symbol).position_qty > 0:
+                    place_close_all(symbol, trd_env, f"個別株ネガティブシグナルによりロング決済: {reason}")
+                    await asyncio.sleep(1)
+                _ok_short = place_short(symbol, trd_env, confidence=confidence,
+                            trigger=symbol, reason=reason,
+                            category="STOCK", news_source=_detected_source,
+                            headlines=texts[:3],
+                            beneficiaries=[], victims=[symbol])  # ★ v2.95
+                if _ok_short:
+                    _mark_stock_order(symbol)  # ★ v2.99
+
+
+# ── 個別株ニュース監視ループ（既存ループと並列動作） ────────────────────────────────────────────────
+STOCK_NEWS_POLL_SEC = 30  # 30秒間隔（Alpacaバッチ取得でレート制限を大幅緩和）
+
+async def stock_news_loop(
+    client: anthropic.Anthropic,
+    trd_env: TrdEnv,
+) -> None:
+    """
+    STOCK_TICKERS で指定した個別株のニュースを30秒間隔で取得・AI判定・売買する（v2.69）。
+    STOCK_TICKERS が未設定の場合は即座にリターン（既存動作に影響ゼロ）。
+
+    ニュース取得の優先順位:
+      1. Alpaca（ALPACA_API_KEY_ID 設定済み）: 全銘柄をバッチ取得（1〜2リクエスト）
+         → Finnhub 429 を根本的に回避
+      2. Finnhub（ALPACA_API_KEY_ID 未設定）: 従来の個別取得（後退互換性を維持）
+
+    既存の SPY/QQQ ロジックと完全に独立して並列動作する。
+    """
+    if not STOCK_TICKERS:
+        log.info("[個別株] STOCK_TICKERS 未設定 → スキップ")
+        return
+
+    _alpaca_key   = ALPACA_API_KEY_ID  # v3.9.42: サニタイズ済み
+    _use_alpaca   = bool(_alpaca_key)
+    _source_label = "Alpaca（バッチ）→ Finnhub（フォールバック）" if _use_alpaca else "Finnhub（個別）"
+
+    if not _alpaca_key and not FINNHUB_API_KEY:
+        log.warning("[個別株] ALPACA_API_KEY_ID / FINNHUB_API_KEY 両方未設定 → 個別株ニュース取得不可（スキップ）")
+        return
+
+    log.info(
+        f"=== 個別株ニュースループ 開始（{STOCK_NEWS_POLL_SEC}秒間隔）===\n"
+        f"  監視銘柄    : {', '.join(STOCK_TICKERS)}\n"
+        f"  ニュースソース: {_source_label}"
+    )
+
+    _BATCH_SIZE = 10  # Alpaca 1リクエストで取得できる銘柄数上限
+
+    while True:
+        await market_open_event.wait()
+
+        if _use_alpaca:
+            # ── Alpacaバッチ取得（全STOCK_TICKERSを1〜2リクエストで処理）────────
+            batch_results: Dict[str, List[SimpleNamespace]] = {}
+            for i in range(0, len(STOCK_TICKERS), _BATCH_SIZE):
+                _batch = STOCK_TICKERS[i : i + _BATCH_SIZE]
+                try:
+                    _partial = await asyncio.to_thread(_fetch_stock_news_alpaca_batch, _batch, 1)
+                    batch_results.update(_partial)
+                except Exception as e:
+                    log.error(f"[個別株バッチ] Alpaca取得エラー: {e}", exc_info=True)
+
+            for symbol in STOCK_TICKERS:
+                articles = batch_results.get(symbol, [])
+                if not articles:
+                    continue
+                try:
+                    await process_stock_news(client, trd_env, symbol, articles)
+                except Exception as e:
+                    log.error(f"[個別株ループ] {symbol}: エラー: {e}", exc_info=True)
+        else:
+            # ── Finnhub個別取得（Alpaca未設定時の従来動作）──────────────────────
+            for symbol in STOCK_TICKERS:
+                try:
+                    articles = await asyncio.to_thread(_fetch_stock_news, symbol)
+                    if articles:
+                        await process_stock_news(client, trd_env, symbol, articles)
+                except Exception as e:
+                    log.error(f"[個別株ループ] {symbol}: エラー: {e}", exc_info=True)
+
+        await asyncio.sleep(STOCK_NEWS_POLL_SEC)
+
+
+# ── 決算後モメンタム待機チェック（v2.50 / アイデアB） ───────────────────────────────────────────
+# 銘柄ごとのモメンタム監視中フラグ（重複エントリー防止）
+_earnings_momentum_in_progress: Dict[str, bool] = {}
+
+async def _earnings_momentum_check(
+    client: anthropic.Anthropic,
+    trd_env: TrdEnv,
+    sym: str,
+    earn_art: SimpleNamespace,
+) -> None:
+    """
+    決算後モメンタム戦略（アイデアB）:
+    ニュース検知直後に飛びつかず、EARNINGS_MOMENTUM_WAIT_SEC秒待機して
+    価格方向が確定してからエントリーする。
+
+    フロー:
+      1. 検知時点の株価を記録（price_before）
+      2. EARNINGS_MOMENTUM_WAIT_SEC秒待機
+      3. 待機後の株価を取得（price_after）
+      4. 変化率 = (price_after - price_before) / price_before × 100
+      5. abs(変化率) ≥ EARNINGS_MOMENTUM_MIN_PCT → 方向確定 → process_stock_news
+      6. 変化率が小さい → 見送り・エントリーなし
+
+    EARNINGS_MOMENTUM_WAIT_SEC=0 の場合は即AI判定（モメンタム待機スキップ）。
+    株価取得失敗時はフォールバックで即AI判定。
+    同一銘柄が既に監視中の場合はスキップ（重複エントリー防止）。
+    """
+    global _earnings_momentum_in_progress
+    tag = f"【{sym}】"
+
+    if _earnings_momentum_in_progress.get(sym):
+        log.info(f"[決算モメンタム] {tag} すでに監視中 → スキップ")
+        return
+    _earnings_momentum_in_progress[sym] = True
+
+    try:
+        # モメンタム待機なし（EARNINGS_MOMENTUM_WAIT_SEC=0）→ 即AI判定
+        if EARNINGS_MOMENTUM_WAIT_SEC <= 0:
+            await process_stock_news(
+                client, trd_env, sym, [earn_art],
+                thresh_override=EARNINGS_CONFIDENCE,
+                bypass_filter=True,
+            )
+            return
+
+        # ── 検知時点の株価を記録 ────────────────────────────────────────────
+        _q_before  = get_quote(sym)
+        price_before = _q_before.get("last") or _q_before.get("bid") or 0.0
+        if price_before <= 0:
+            log.warning(
+                f"[決算モメンタム] {tag} 検知時点の株価取得失敗"
+                f" → フォールバック（即AI判定）"
+            )
+            await process_stock_news(
+                client, trd_env, sym, [earn_art],
+                thresh_override=EARNINGS_CONFIDENCE,
+                bypass_filter=True,
+            )
+            return
+
+        log.info(
+            f"[決算モメンタム] {tag} 検知時点 ${price_before:.2f}"
+            f" → {EARNINGS_MOMENTUM_WAIT_SEC}秒待機（方向確認中）..."
+        )
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"[Bot] ⏳ [決算モメンタム] {sym}\n"
+            f"ニュース検知: ${price_before:.2f}\n"
+            f"{EARNINGS_MOMENTUM_WAIT_SEC}秒後に方向確認します"
+        ))
+
+        # ── EARNINGS_MOMENTUM_WAIT_SEC 秒待機 ───────────────────────────────
+        await asyncio.sleep(EARNINGS_MOMENTUM_WAIT_SEC)
+
+        # ── 待機後の株価を取得 ─────────────────────────────────────────────
+        _q_after   = get_quote(sym)
+        price_after = _q_after.get("last") or _q_after.get("bid") or 0.0
+        if price_after <= 0:
+            log.warning(f"[決算モメンタム] {tag} 待機後の株価取得失敗 → スキップ")
+            return
+
+        # ── 変化率を計算して方向確定判断 ───────────────────────────────────
+        change_pct = (price_after - price_before) / price_before * 100
+        abs_change = abs(change_pct)
+        direction  = "📈 上昇" if change_pct > 0 else "📉 下落"
+
+        log.info(
+            f"[決算モメンタム] {tag} {price_before:.2f} → {price_after:.2f}"
+            f"  {direction} {change_pct:+.2f}%"
+            f"  最小必要: {EARNINGS_MOMENTUM_MIN_PCT:.1f}%"
+        )
+
+        if abs_change < EARNINGS_MOMENTUM_MIN_PCT:
+            log.info(
+                f"[決算モメンタム] {tag} 動きが小さい"
+                f" ({abs_change:.2f}% < {EARNINGS_MOMENTUM_MIN_PCT:.1f}%) → 見送り"
+            )
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                f"[Bot] ⏭ [決算モメンタム] {sym} 見送り\n"
+                f"変化率: {change_pct:+.2f}%  最小: {EARNINGS_MOMENTUM_MIN_PCT:.1f}%\n"
+                f"方向が確定しなかったためエントリーしません"
+            ))
+            return
+
+        # ── 方向確定 → AI判定 → 発注 ─────────────────────────────────────
+        log.info(
+            f"[決算モメンタム] {tag} ✅ 方向確定！"
+            f"  {change_pct:+.2f}% ≥ {EARNINGS_MOMENTUM_MIN_PCT:.1f}%"
+            f"  ${price_before:.2f} → ${price_after:.2f}"
+            f"  → AI判定 → 発注"
+        )
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"[Bot] 🚀 [決算モメンタム] {sym} 方向確定！\n"
+            f"{direction} {change_pct:+.2f}% ≥ {EARNINGS_MOMENTUM_MIN_PCT:.1f}%\n"
+            f"${price_before:.2f} → ${price_after:.2f}\n"
+            f"AI判定・発注を開始します"
+        ))
+
+        await process_stock_news(
+            client, trd_env, sym, [earn_art],
+            thresh_override=EARNINGS_CONFIDENCE,
+            bypass_filter=True,
+        )
+
+    except Exception as e:
+        log.error(f"[決算モメンタム] {tag} エラー: {e}", exc_info=True)
+    finally:
+        _earnings_momentum_in_progress[sym] = False
+# ─────────────────────────────────────────────────────────────────────────────
+async def earnings_monitor_loop(
+    client: anthropic.Anthropic,
+    trd_env: TrdEnv,
+) -> None:
+    """
+    EARNINGS_PRE / EARNINGS_AFTER 銘柄を2秒間隔で高速監視するループ（v2.69）。
+    stock_news_loop（30秒）より高速な応答が必要な決算プレイ専用。
+    決算発表直後の急騰・急落ニュースを素早くキャッチしてprocess_stock_newsへ転送。
+
+    ニュース取得の優先順位:
+      1. Alpaca（ALPACA_API_KEY_ID 設定済み）: アクティブ銘柄をバッチ取得（1リクエスト）
+      2. Finnhub（Alpaca未設定）: 従来の個別取得
+
+    セッション制御:
+      - PRE銘柄 : プリマーケット(04:00〜09:30 ET)のみ2秒ポーリング
+      - AFTER銘柄: アフターアワーズ(16:00〜20:00 ET)のみ2秒ポーリング
+      - ウィンドウ外は60秒スリープ（APIレート制限を考慮）
+
+    LIMIT_RETRY_SEC / LIMIT_RETRY_MAX:
+      発注後に指値が刺さらない場合、LIMIT_RETRY_SEC秒後に再ニュースチェックして
+      最新価格で再発注する（最大LIMIT_RETRY_MAX回）。
+      pending_order_watchdog（1分タイムアウト）との競合を避けるため
+      総リトライ時間はLIMIT_RETRY_SEC × LIMIT_RETRY_MAX ≤ 30秒に収める推奨。
+
+    EARNINGS_PRE / EARNINGS_AFTER が両方未設定の場合は即座にリターン。
+    """
+    _all_earn = list(dict.fromkeys(EARNINGS_PRE_TICKERS + EARNINGS_AFTER_TICKERS))
+    if not _all_earn:
+        log.info("[決算監視] EARNINGS_PRE/AFTER 未設定 → スキップ")
+        return
+
+    _alpaca_key = ALPACA_API_KEY_ID  # v3.9.42: サニタイズ済み
+    _use_alpaca = bool(_alpaca_key)
+    if not _alpaca_key and not FINNHUB_API_KEY:
+        log.warning("[決算監視] ALPACA_API_KEY_ID / FINNHUB_API_KEY 両方未設定 → スキップ")
+        return
+
+    _source_label = "Alpaca（バッチ）" if _use_alpaca else "Finnhub（個別）"
+    _pre_str   = ", ".join(EARNINGS_PRE_TICKERS)   or "未設定"
+    _after_str = ", ".join(EARNINGS_AFTER_TICKERS) or "未設定"
+    log.info(
+        f"=== 決算銘柄監視ループ 開始（2秒間隔）===\n"
+        f"  PRE銘柄  : {_pre_str}  （04:00〜09:30 ET）\n"
+        f"  AFTER銘柄: {_after_str}  （16:00〜20:00 ET）\n"
+        f"  指値リトライ: {LIMIT_RETRY_SEC}秒×{LIMIT_RETRY_MAX}回\n"
+        f"  ニュースソース: {_source_label}"
+    )
+
+    while True:
+        await market_open_event.wait()
+
+        # ── 現在アクティブな銘柄を決定 ──────────────────────────────────────
+        _now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
+        _hm = _now_et.hour * 100 + _now_et.minute
+        _active: List[str] = []
+        if 400 <= _hm < 930 and EARNINGS_PRE_TICKERS:
+            _active += EARNINGS_PRE_TICKERS
+        if 1600 <= _hm < 2000 and EARNINGS_AFTER_TICKERS:
+            _active += EARNINGS_AFTER_TICKERS
+        _active = list(dict.fromkeys(_active))
+
+        if not _active:
+            # アクティブウィンドウ外は60秒スリープ（APIレート節約）
+            await asyncio.sleep(60)
+            continue
+
+        # ── アクティブ銘柄のニュースを取得（Alpaca優先バッチ / Finnhub個別）─────
+        if _use_alpaca:
+            # Alpacaバッチ: 全アクティブ銘柄を1リクエスト
+            try:
+                _batch_results = await asyncio.to_thread(_fetch_stock_news_alpaca_batch, _active, 1)
+                for _sym in _active:
+                    _articles = _batch_results.get(_sym, [])
+                    if _articles:
+                        _threadsafe_future(
+                            process_stock_news(
+                                client, trd_env, _sym, _articles,
+                                thresh_override=EARNINGS_CONFIDENCE,
+                                bypass_filter=True,
+                            )
+                        )
+            except Exception as e:
+                log.error(f"[決算監視] Alpacaバッチエラー: {e}", exc_info=True)
+        else:
+            # Finnhub個別取得（Alpaca未設定時の従来動作）
+            for _sym in _active:
+                try:
+                    _articles = await asyncio.to_thread(_fetch_stock_news, _sym)
+                    if _articles:
+                        _threadsafe_future(
+                            process_stock_news(
+                                client, trd_env, _sym, _articles,
+                                thresh_override=EARNINGS_CONFIDENCE,
+                                bypass_filter=True,
+                            )
+                        )
+                except Exception as e:
+                    log.error(f"[決算監視] {_sym}: エラー: {e}", exc_info=True)
+
+        await asyncio.sleep(2)  # 2秒間隔
+# ─────────────────────────────────────────────────────────────────────────────
+async def process_dynamic_stock(
+    client: anthropic.Anthropic,
+    trd_env: TrdEnv,
+    symbol: str,
+    articles_raw: list,
+) -> None:
+    """ダイナミック個別株機能（隠し機能）。 / AlpacaニュースのsymbolsにS&P500銘柄が含まれる場合にAI判定→発注する。 / DYNAMIC_STOCKS_ENABLED=true の場合のみ呼ばれる。"""
+    global _dynamic_calls_today, _dynamic_calls_date
+
+    # ── 日次カウンターのリセット ────────────────────────────────────────────
+    _today_et = datetime.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    if _dynamic_calls_date != _today_et:
+        _dynamic_calls_today = 0
+        _dynamic_calls_date  = _today_et
+
+    # ── 上限チェック ────────────────────────────────────────────────────────
+    if _dynamic_calls_today >= DYNAMIC_STOCKS_MAX_CALLS_PER_DAY:
+        log.debug(
+            f"[動的銘柄] 【{symbol}】 本日のAI呼び出し上限"
+            f"({DYNAMIC_STOCKS_MAX_CALLS_PER_DAY}回)に達したためスキップ"
+        )
+        return
+
+    # ── キャッシュ確認（5分以内に同一銘柄を重複処理しない）───────────────────
+    headlines = [a.get("headline", "") for a in articles_raw if a.get("headline")]
+    if not headlines:
+        return
+    cached = state.get_ai_cache(f"DYN_{symbol}", headlines)
+    if cached is not None:
+        log.debug(f"[動的銘柄] 【{symbol}】 キャッシュヒット → スキップ")
+        return
+
+    # ── AI判定 ──────────────────────────────────────────────────────────────
+    _dynamic_calls_today += 1
+    log.info(
+        f"[動的銘柄] 🔍 【{symbol}】 AI判定"
+        f"（本日{_dynamic_calls_today}/{DYNAMIC_STOCKS_MAX_CALLS_PER_DAY}回目）"
+    )
+    # v1.3.0: target_symbol で個別株モードを指定 (統合 SYSTEM_PROMPT を共通利用)
+    result = await analyze_news(client, headlines[:5], symbol, target_symbol=symbol)
+    state.set_ai_cache(f"DYN_{symbol}", result, headlines[:5])
+
+    score      = result["score"]
+    confidence = result["confidence"]
+    reason     = result.get("reason", "")
+
+    # v3.9.2: 中立絵文字に VS-16 を付与 (詳細はファイル先頭側の同型行コメント参照)
+    score_label = {1: "📈 ポジティブ", 0: "➡️ 中立", -1: "📉 ネガティブ"}.get(score, "?")
+    log.info(
+        f"[動的銘柄] 【{symbol}】 {score_label}"
+        f"  confidence={confidence:.2f}  reason={reason}"
+    )
+
+    if score == 0:
+        return
+    if confidence < DYNAMIC_STOCKS_CONFIDENCE:
+        log.info(
+            f"[動的銘柄] 【{symbol}】 confidence={confidence:.2f}"
+            f" < {DYNAMIC_STOCKS_CONFIDENCE:.2f} → 見送り"
+        )
+        return
+
+    await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+
+    # ★ v2.86: 銘柄単位ロックで race 防止
+    async with _get_sym_lock(symbol):
+        # ── 1銘柄あたりのポジション上限チェック・発注額計算 ─────────────────────
+        # DYNAMIC_STOCKS_MAX_POSITION_USD > 0 の場合:
+        #   既存コストがすでに上限に達していれば追加エントリーをブロック。
+        #   上限未満の場合は残余額が発注額の上限となる。
+        _dyn_order_usd: Optional[float] = None  # None = BUDGET_USD通常計算に任せる
+        if DYNAMIC_STOCKS_MAX_POSITION_USD > 0:
+            _cur_cost = _tracked_position_cost.get(symbol, 0.0)
+            if _cur_cost >= DYNAMIC_STOCKS_MAX_POSITION_USD:
+                log.info(
+                    f"[動的銘柄] 【{symbol}】 1銘柄上限"
+                    f" ${DYNAMIC_STOCKS_MAX_POSITION_USD:,.0f}"
+                    f" に達しているためスキップ（現在: ${_cur_cost:,.0f}）"
+                )
+                return
+            _dyn_remaining = DYNAMIC_STOCKS_MAX_POSITION_USD - _cur_cost
+            _dyn_order_usd = _dyn_remaining
+            log.info(
+                f"[動的銘柄] 【{symbol}】 1銘柄上限"
+                f" ${DYNAMIC_STOCKS_MAX_POSITION_USD:,.0f}"
+                f" 残余: ${_dyn_remaining:,.0f} で発注"
+            )
+
+        if score == 1:
+            # _dyn_order_usd が設定されている場合は株数を事前計算して qty で渡す
+            _dyn_qty: Optional[int] = None
+            if _dyn_order_usd is not None:
+                _q = get_quote(symbol)
+                _ask = _q.get("ask", 0) or _q.get("last", 0) or 0
+                if _ask > 0:
+                    _dyn_qty = max(1, math.floor(_dyn_order_usd / (_ask * 1.005)))
+            log.info(
+                f"[動的銘柄] 【{symbol}】 ポジティブ → BUY"
+                + (f" 上限制御: {_dyn_qty}株" if _dyn_qty else "")
+            )
+            place_buy(
+                symbol, trd_env, confidence=confidence,
+                trigger=symbol, reason=reason,
+                category="STOCK", news_source="Alpaca-Dynamic",
+                headlines=headlines[:3],
+                qty=_dyn_qty,
+                beneficiaries=[symbol], victims=[],  # ★ v2.95
+            )
+        elif score == -1:
+            # ショート: ロングが残っていれば先に決済
+            ts = state.get(symbol)
+            if ts.position_qty > 0:
+                log.info(f"[動的銘柄] 【{symbol}】 ネガティブ → 既存ロング決済")
+                place_close_all(symbol, trd_env, reason)
+            else:
+                _dyn_qty_s: Optional[int] = None
+                if _dyn_order_usd is not None:
+                    _q = get_quote(symbol)
+                    _bid = _q.get("bid", 0) or _q.get("last", 0) or 0
+                    if _bid > 0:
+                        _dyn_qty_s = max(1, math.floor(_dyn_order_usd / (_bid * 0.995)))
+                log.info(
+                    f"[動的銘柄] 【{symbol}】 ネガティブ → SHORT"
+                    + (f" 上限制御: {_dyn_qty_s}株" if _dyn_qty_s else "")
+                )
+                place_short(symbol, trd_env, confidence=confidence,
+                            trigger=symbol, reason=reason,
+                            category="STOCK", news_source="Alpaca-Dynamic",
+                            headlines=headlines[:3],
+                            qty=_dyn_qty_s,
+                            beneficiaries=[], victims=[symbol])  # ★ v2.95
+
+
+async def alpaca_news_loop(
+    client: anthropic.Anthropic,
+    trd_env: TrdEnv,
+) -> None:
+    """
+    Alpaca News WebSocket からリアルタイムにニュースを受信して AI 判定する。
+    .env に ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY が未設定の場合はスキップ。
+    無料プラン: WebSocket 1接続・プッシュ型（回数制限なし）
+    ソース: Benzinga（Finnhubより高速・高品質）
+    """
+    if not ALPACA_API_KEY_ID or not ALPACA_API_SECRET_KEY:
+        log.info("[Alpaca News] APIキー未設定のためスキップ（ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY）")
+        return
+
+    _ALPACA_WS_URL = "wss://stream.data.alpaca.markets/v1beta1/news"
+    _RECONNECT_WAIT = 10   # 切断時の再接続待機秒数 (通常切断・接続応答異常)
+    # ★ v3.9.11: 認証失敗時の指数バックオフ設定
+    # 5/11 ログで「同じ Alpaca キーを Mac/Windows で同時使用 → connection limit
+    # exceeded (code 406)」が 738 件発生。固定間隔 10秒で再接続を試みていたため
+    # ログ汚染が膨大に。指数バックオフ (10s → 20s → 40s ... 最大 10分) で抑制。
+    # 認証成功時は _auth_fail_count を 0 にリセット。
+    _AUTH_BACKOFF_BASE_SEC = 10
+    _AUTH_BACKOFF_MAX_SEC = 600
+    # ★ v3.9.89: 認証失敗が連続でこの回数に達したら、このセッションのAlpaca News受信を停止する。
+    #   402(無効/未購読キー)・406(キー併用)は復旧見込みが薄く、無限再接続はログ汚染の最大要因。
+    #   Alpacaはニュース源の1つで、停止してもRSS/Finnhubでニュース取得は継続する。再開はBot再起動。
+    _AUTH_FAIL_GIVEUP = 20
+    _auth_fail_count = 0
+    _last_auth_log_at_local: Optional[datetime.datetime] = None  # ★ v3.9.63: 認証失敗ログ間引き用
+    _seen_alpaca: set = set()
+
+    log.info("=== Alpaca News WebSocket ループ開始（Benzingaリアルタイム）===")
+
+    while True:
+        # market_open_event が clear されている間は待機
+        await market_open_event.wait()
+
+        try:
+            import websockets
+            # ★ v3.9.21: websockets ライブラリのバージョン互換性対応
+            # 5/16 受講生環境で 21 件発生していたエラー:
+            #   "BaseEventLoop.create_connection() got an unexpected keyword
+            #    argument 'additional_headers'"
+            # websockets 13.0 で `extra_headers` → `additional_headers` に改名された。
+            # 古い websockets (<13.0) + Python 3.13 の組合せで上記エラーが起きる。
+            # 両バージョン対応するため、ライブラリバージョンを判定してキーワード切替。
+            try:
+                _ws_ver_str = getattr(websockets, "__version__", "0.0")
+                _ws_ver = tuple(int(x) for x in _ws_ver_str.split(".")[:2])
+            except Exception:
+                _ws_ver = (13, 0)  # 不明時は新版扱い
+            _headers_kw = "additional_headers" if _ws_ver >= (13, 0) else "extra_headers"
+            _headers_dict = {
+                "APCA-API-KEY-ID":     ALPACA_API_KEY_ID,
+                "APCA-API-SECRET-KEY": ALPACA_API_SECRET_KEY,
+            }
+            async with websockets.connect(
+                _ALPACA_WS_URL,
+                ping_interval=20,
+                ping_timeout=60,
+                **{_headers_kw: _headers_dict},
+            ) as ws:
+                # 接続確認
+                raw = await ws.recv()
+                msg = json.loads(raw)
+                if not (isinstance(msg, list) and msg[0].get("T") == "success"):
+                    log.warning(f"[Alpaca News] 接続応答が想定外: {msg}")
+                    await asyncio.sleep(_RECONNECT_WAIT)
+                    continue
+
+                # 認証
+                await ws.send(json.dumps({
+                    "action": "auth",
+                    "key":    ALPACA_API_KEY_ID,
+                    "secret": ALPACA_API_SECRET_KEY,
+                }))
+                raw = await ws.recv()
+                auth_msg = json.loads(raw)
+                if not (isinstance(auth_msg, list) and auth_msg[0].get("T") == "success"):
+                    # ★ v3.9.11: 認証失敗時の指数バックオフ
+                    # connection limit exceeded (code 406) や auth failed (code 402) を
+                    # 数秒間隔で再試行するとログ膨張と Alpaca サーバへの負荷増を招くため、
+                    # 10秒 → 20秒 → 40秒 ... 最大 10分 で間隔を倍々に延ばす。
+                    _auth_fail_count += 1
+                    _backoff_sec = min(
+                        _AUTH_BACKOFF_BASE_SEC * (2 ** (_auth_fail_count - 1)),
+                        _AUTH_BACKOFF_MAX_SEC
+                    )
+                    # ★ v3.9.63: connection limit (code 406 = 同一キーを複数 PC で同時使用)
+                    # を専用判定し、専用の案内文を出す。
+                    _auth_str = str(auth_msg).lower()
+                    _is_conn_limit = ("406" in _auth_str
+                                      or "connection limit" in _auth_str
+                                      or "limit exceeded" in _auth_str)
+                    # ★ v3.9.63: ログ間引き。毎リトライ出すと 1 日数百件に膨らむため
+                    # (5/25-6/1 で 757 件確認)、初回 + 2 回目のみ即時、以降は 5 分に 1 回。
+                    _now_auth = datetime.datetime.now()
+                    _should_log = (
+                        _auth_fail_count <= 2
+                        or _last_auth_log_at_local is None
+                        or (_now_auth - _last_auth_log_at_local).total_seconds() >= 300
+                    )
+                    if _should_log:
+                        _last_auth_log_at_local = _now_auth
+                        _log_fn = log.error if _auth_fail_count == 1 else log.warning
+                        if _is_conn_limit:
+                            _log_fn(
+                                f"[Alpaca News] 認証失敗 ({_auth_fail_count}回連続/接続数上限): {auth_msg} "
+                                f"→ {_backoff_sec}秒後に再接続。"
+                                f"【原因濃厚】同じ Alpaca API キーを複数 PC / 複数 Bot で同時使用すると "
+                                f"接続数上限(406)で弾かれます。1 キー 1 PC に分けてください "
+                                f"(この警告は 5 分ごとに間引き表示)。"
+                            )
+                        else:
+                            _log_fn(
+                                f"[Alpaca News] 認証失敗 ({_auth_fail_count}回連続): {auth_msg} "
+                                f"→ {_backoff_sec}秒後に再接続 "
+                                f"(同じ Alpaca キーを複数 PC で同時使用していないかご確認ください"
+                                f"・5 分ごとに間引き表示)"
+                            )
+                    # ★ v3.9.31: 健全性状態を記録 (health_warning_loop が参照)
+                    _alpaca_news_health["auth_fail_count"] = _auth_fail_count
+                    _alpaca_news_health["last_error"] = f"認証失敗 {auth_msg}"
+                    # ★ v3.9.89: 連続失敗が上限に達したら Alpaca News を停止（無限再接続のログ汚染を回避）。
+                    #   RSS/Finnhub でニュース取得は継続。再開は Bot 再起動。
+                    if _auth_fail_count >= _AUTH_FAIL_GIVEUP:
+                        log.error(
+                            f"[Alpaca News] 認証失敗が {_auth_fail_count} 回連続 → "
+                            f"このセッションの Alpaca News 受信を停止します（RSS/Finnhub でニュースは継続）。"
+                            f"APIキー/購読/キー併用(406)を確認のうえ、再開は Bot 再起動。"
+                        )
+                        _alpaca_news_health["last_error"] = f"認証失敗{_auth_fail_count}回で停止"
+                        _alpaca_news_health["stopped"] = True
+                        return
+                    await asyncio.sleep(_backoff_sec)
+                    continue
+
+                # ★ v3.9.11: 認証成功 → 失敗カウンタリセット
+                if _auth_fail_count > 0:
+                    log.info(
+                        f"[Alpaca News] ✅ 認証復旧 ({_auth_fail_count}回失敗の後) "
+                        f"→ バックオフカウンタをリセット"
+                    )
+                    _auth_fail_count = 0
+                # ★ v3.9.31: 認証成功 → 健全性状態を更新
+                _alpaca_news_health["auth_fail_count"] = 0
+                _alpaca_news_health["last_success_at"] = datetime.datetime.now()
+                _alpaca_news_health["last_error"] = ""
+
+                # 全ニュースを購読
+                await ws.send(json.dumps({"action": "subscribe", "news": ["*"]}))
+                raw = await ws.recv()
+                _sub_resp = json.loads(raw)
+                # ★ v2.90: "already authenticated" レスポンスは実害なし
+                # （認証済み状態でのサーバ通知）のため、ログレベルを DEBUG に下げる。
+                # 受講生が WARNING/エラーと誤認しないようにするため。
+                # それ以外のレスポンスは従来通り INFO で表示。
+                _is_already_auth = (
+                    isinstance(_sub_resp, list)
+                    and len(_sub_resp) > 0
+                    and isinstance(_sub_resp[0], dict)
+                    and _sub_resp[0].get("T") == "error"
+                    and _sub_resp[0].get("code") == 403
+                    and "already authenticated" in str(_sub_resp[0].get("msg", "")).lower()
+                )
+                if _is_already_auth:
+                    log.debug(f"[Alpaca News] 購読レスポンス(既認証通知・実害なし): {_sub_resp}")
+                else:
+                    log.info(f"[Alpaca News] 購読開始: {_sub_resp}")
+
+                log.info("[Alpaca News] ✅ WebSocket接続・認証・購読完了（Benzingaリアルタイム受信中）")
+
+                # メッセージ受信ループ
+                async for raw_msg in ws:
+                    # ★ v3.9.39: メッセージを 1 件でも受信できた = WebSocket 接続・
+                    #   購読が生きている証拠。受信のたびに最終正常受信時刻を更新する。
+                    #   旧実装は認証成功時 (12146 行) にしか last_success_at を
+                    #   更新せず、接続が 20 分以上続くと正常受信中でも
+                    #   health_warning_loop が「Alpaca News 接続不全」を誤発火して
+                    #   いた (5/22 ログで確認: 22:24:04 にニュース受信 →
+                    #   22:24:05 に誤警告)。
+                    _alpaca_news_health["last_success_at"] = datetime.datetime.now()
+                    _alpaca_news_health["last_error"] = ""
+                    # market_open_event がクリアされたら受信は続けるが AI判定はスキップ
+                    articles = json.loads(raw_msg)
+                    if not isinstance(articles, list):
+                        continue
+
+                    new_items = []
+                    for art in articles:
+                        if art.get("T") != "n":
+                            continue
+                        article_id = f"alpaca-{art.get('id', '')}"
+                        headline   = art.get("headline", "").strip()
+                        if not headline or article_id in _seen_alpaca:
+                            continue
+                        _seen_alpaca.add(article_id)
+                        # seen_alpacaが肥大化しないよう最大5000件に制限
+                        if len(_seen_alpaca) > 5000:
+                            _seen_alpaca.clear()
+                        # ★ v2.99: source_detail に元媒体名 (Benzinga 等) を保持
+                        _alpaca_detail = (art.get("source", "") or "").strip()
+                        new_items.append(SimpleNamespace(
+                            articleId=article_id,
+                            headline=headline,
+                            source="Alpaca",   # ④ ソース重み付け用
+                            source_detail=_alpaca_detail,
+                        ))
+
+                    if not new_items or not market_open_event.is_set():
+                        continue
+
+                    # ── 決算監視ルーティング ──────────────────────────────────
+                    # EARNINGS_PRE / EARNINGS_AFTER が設定されていて、かつ
+                    # 現在時刻が監視ウィンドウ内の場合、銘柄ごとに分岐処理する
+                    _all_earn = list(dict.fromkeys(
+                        EARNINGS_PRE_TICKERS + EARNINGS_AFTER_TICKERS))
+                    if _all_earn:
+                        _now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
+                        _hm = _now_et.hour * 100 + _now_et.minute
+                        _earn_active: List[str] = []
+                        # PRE: 04:00-09:30 ET（旧: 06:00-08:00）
+                        if 400 <= _hm < 930:
+                            _earn_active += EARNINGS_PRE_TICKERS
+                        # AFTER: 16:00-20:00 ET（旧: 16:00-16:30）
+                        if 1600 <= _hm < 2000:
+                            _earn_active += EARNINGS_AFTER_TICKERS
+                        _earn_active = list(dict.fromkeys(_earn_active))
+
+                        if _earn_active:
+                            for _art_raw in articles:
+                                if _art_raw.get("T") != "n":
+                                    continue
+                                _art_syms = {s.upper() for s in _art_raw.get("symbols", [])}
+                                _art_hl   = _art_raw.get("headline", "").upper()
+                                for _sym in _earn_active:
+                                    # ① symbols完全一致 or ② 単語境界マッチ（"T"誤検知防止）
+                                    import re
+                                    _hl_match = bool(
+                                        re.search(rf"\b{re.escape(_sym)}\b", _art_hl)
+                                    )
+                                    if _sym in _art_syms or _hl_match:
+                                        _earn_art = SimpleNamespace(
+                                            articleId=f"earn-{_art_raw.get('id','')}-{_sym}",
+                                            headline=_art_raw.get("headline", ""),
+                                            source="Alpaca-Earnings",
+                                            source_detail=(_art_raw.get("source", "") or "").strip(),  # ★ v2.99
+                                        )
+                                        log.info(
+                                            f"[決算監視] 🔔 {_sym} のニュース検知 "
+                                            f"→ モメンタム確認（待機{EARNINGS_MOMENTUM_WAIT_SEC}秒）\n"
+                                            f"  ・{_earn_art.headline}"
+                                        )
+                                        _threadsafe_future(
+                                            _earnings_momentum_check(
+                                                client, trd_env, _sym, _earn_art,
+                                            )
+                                        )
+                    # ── 通常の SPY/QQQ ルーティング ──────────────────────────
+                    # ── ダイナミック個別株ルーティング（隠し機能）────────────────
+                    if DYNAMIC_STOCKS_ENABLED and market_open_event.is_set():
+                        for _art_raw in articles:
+                            if _art_raw.get("T") != "n":
+                                continue
+                            _dyn_syms = {
+                                s.upper() for s in _art_raw.get("symbols", [])
+                                if s.upper() in _SP500_TICKERS
+                                and s.upper() not in _DYNAMIC_EXCLUDE
+                            }
+                            for _dyn_sym in _dyn_syms:
+                                _threadsafe_future(
+                                    process_dynamic_stock(
+                                        client, trd_env, _dyn_sym, [_art_raw]
+                                    )
+                                )
+                    log.info(
+                        f"[Alpaca News] 新着 {len(new_items)}件 → AI判定..."
+                        # ★ v2.99: ニュースソース二段表示 [alpaca:benzinga] 等
+                        + "".join(f"\n  ・[{_format_news_source(a)}] {a.headline}" for a in new_items[:5])
+                    )
+                    await process_headlines(None, client, new_items, trd_env)
+
+        except ImportError:
+            # ★ v3.9.29: 5/20 集計で 利用者J / 利用者I で 4 件発生。
+            # 旧版は return で永久スキップ → 受講生が気づかず Alpaca News が来ない状態継続。
+            # 新版は 5 分ごとに目立つ警告を継続表示し、インストール後の自動復旧も可能に。
+            _RED    = "\033[91m"
+            _BOLD   = "\033[1m"
+            _RESET  = "\033[0m"
+            log.error(
+                f"\n{_RED}{_BOLD}"
+                "╔════════════════════════════════════════════════════════════════╗\n"
+                "║  🚨  Alpaca News 起動失敗: websockets ライブラリが未インストール  ║\n"
+                "╠════════════════════════════════════════════════════════════════╣\n"
+                "║  対処: 以下のコマンドを実行してください                          ║\n"
+                "║                                                                ║\n"
+                "║    Mac:     python3 -m pip install websockets                  ║\n"
+                "║    Windows: python -m pip install websockets                   ║\n"
+                "║    (「pip」単体のコマンドは無い環境が多いため python 経由で実行)   ║\n"
+                "║                                                                ║\n"
+                "║  影響: Alpaca News (Benzinga リアルタイム) のニュースが取得されません ║\n"
+                "║        Yahoo Finance / Finnhub は引き続き動作します              ║\n"
+                "║                                                                ║\n"
+                "║  ※ この警告は 5 分ごとに表示されます (インストールで自動解除)    ║\n"
+                "╚════════════════════════════════════════════════════════════════╝"
+                f"{_RESET}"
+            )
+            await asyncio.sleep(300)  # 5 分待機して再試行 (インストール後は自動復旧)
+            continue
+        except Exception as e:
+            log.warning(f"[Alpaca News] 接続エラー・再接続待機 ({_RECONNECT_WAIT}秒): {_mask_secrets(e)}")
+            # ★ v3.9.31: 接続エラーも健全性状態に記録 (health_warning_loop が参照)
+            _alpaca_news_health["last_error"] = f"接続エラー {_mask_secrets(e)}"[:120]
+            await asyncio.sleep(_RECONNECT_WAIT)
+
+
+# ── ★ v3.9.31: 重大な健全性問題の 5 分おき警告ループ ──────────────────────────
+# 初回しか目立たず WARNING に埋もれてしまう 2 つの重大問題を、5 分間隔で端末に
+# 赤字で再表示する。受講生が「気づかないまま放置」する事態を防ぐ。
+#   ① Anthropic クレジット残高ゼロ (AI 判定が全件停止)
+#   ② Alpaca News 接続不全 (ニュースの約半分が来ない状態)
+async def _heartbeat_beat_loop() -> None:
+    """★ v3.9.131: 20秒ごとに鼓動を刻む。イベントループが凍結すると鼓動が止まり、
+    独立OSスレッドの監視(_heartbeat_watchdog_thread)が検知して警告する。"""
+    global _last_heartbeat_mono
+    while True:
+        _last_heartbeat_mono = time.monotonic()
+        await asyncio.sleep(20)
+
+
+def _hb_dispatch(msg: str, is_error: bool = True) -> None:
+    """★ v3.9.131: 警告/復帰の送信は使い捨てスレッドで行う（Codexレビュー対応）。
+    send_discord_message は HTTP 送信後に logging を呼ぶため、logging ロックが凍結に
+    巻き込まれた病的ケースでは送信スレッドがそこで固まり得る。使い捨てスレッドに
+    分離することで、監視本体（_heartbeat_watchdog_thread）は絶対に塞がれない。
+    ※HTTP POST は内部 logging より先に実行されるため、固まっても Discord 自体は届く。"""
+    def _send():
+        try:
+            send_discord_message(f"[Bot] {msg}")
+        except Exception:
+            pass
+        try:
+            (log.error if is_error else log.info)(f"[HEARTBEAT] {msg}")
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=_send, name="hb-alert", daemon=True).start()
+    except Exception:
+        pass
+
+
+def _heartbeat_watchdog_thread() -> None:
+    """★ v3.9.131: 独立OSスレッド。イベントループ凍結(型B)を『最後の鼓動からの経過』で検知。
+    asyncio が止まっても OS スレッドは動くため「通知ゼロ(型B)」を破れる。通知のみ・自動再起動なし。
+    ・端末表示(print=loggingロック非依存)を即時に出し、Discord/log は使い捨てスレッドへ
+      分離（監視本体はどんな病的状態でも塞がれない）。
+    ・鼓動が再開したら「約N分の無応答があった」と凍結時間つきで復帰を1回通知する
+      （凍結中の警告がネットワーク断で届かなかった場合でも、復帰通知だけで全容が伝わる）。
+    ・monotonic のスリープ横断はOS依存（macOS=スリープ除外/Windows=包含）。Windows では
+      長いスリープ復帰直後に「応答なし→復帰」のペア通知が1回出ることがあるが、
+      実質「Botが止まっていた」事実の通知であり許容（既知の挙動）。"""
+    global _hb_last_alert_mono, _hb_alerted, _hb_freeze_start_mono
+    _timeout = HEARTBEAT_TIMEOUT_MIN * 60
+    while True:
+        time.sleep(30)
+        try:
+            stale = time.monotonic() - _last_heartbeat_mono
+            if stale >= _timeout:
+                if _hb_last_alert_mono is None or (time.monotonic() - _hb_last_alert_mono) >= 1800:
+                    _hb_last_alert_mono = time.monotonic()   # 30分おきに再通知
+                    if not _hb_alerted:
+                        _hb_alerted = True
+                        _hb_freeze_start_mono = _last_heartbeat_mono   # 凍結開始（最後の鼓動）
+                    _mins = int(stale // 60)
+                    msg = (f"🚨 Bot応答なし: 約{_mins}分間、内部の鼓動(ログ)が更新されていません。"
+                           f"イベントループ凍結／OpenD無応答の可能性。OpenDの起動・接続とネットワークをご確認ください。")
+                    try:
+                        # print は logging ロックを取らない＝病的状態でも出る
+                        print(f"\033[91m\033[1m[HEARTBEAT] {msg}\033[0m", flush=True)
+                    except Exception:
+                        pass
+                    _hb_dispatch(msg, is_error=True)
+            elif _hb_alerted:
+                # 鼓動が再開＝凍結から復帰。凍結時間つきで1回だけ通知してリセット。
+                _hb_alerted = False
+                _hb_last_alert_mono = None
+                _fmin = 0
+                if _hb_freeze_start_mono is not None:
+                    _fmin = int((time.monotonic() - _hb_freeze_start_mono) // 60)
+                _hb_freeze_start_mono = None
+                rmsg = (f"✅ Bot応答が復帰しました（約{_fmin}分の無応答がありました）。"
+                        f"ポジション・注文状態を念のためご確認ください。")
+                try:
+                    print(f"\033[92m[HEARTBEAT] {rmsg}\033[0m", flush=True)
+                except Exception:
+                    pass
+                _hb_dispatch(rmsg, is_error=False)
+        except Exception:
+            pass
+
+
+async def health_warning_loop() -> None:
+    """5 分おきに Anthropic クレジット切れ / Alpaca News 不全を端末に再警告。"""
+    _RED   = "\033[91m"
+    _BOLD  = "\033[1m"
+    _RESET = "\033[0m"
+    await asyncio.sleep(300)  # 起動直後 5 分は猶予
+    while True:
+        try:
+            # ── ① Anthropic クレジット残高ゼロ ──────────────────────────────
+            if _anthropic_credit_exhausted:
+                _elapsed_disp = "不明"
+                if _anthropic_credit_exhausted_at is not None:
+                    _sec = int((datetime.datetime.now(JST) - _anthropic_credit_exhausted_at).total_seconds())
+                    _h, _rem = divmod(_sec, 3600)
+                    _m, _ = divmod(_rem, 60)
+                    _elapsed_disp = (f"{_h}時間{_m}分" if _h > 0 else f"{_m}分")
+                log.error(
+                    f"\n{_RED}{_BOLD}"
+                    "╔════════════════════════════════════════════════════════════════╗\n"
+                    "║  🚨  Anthropic API クレジット残高ゼロ — AI 判定が停止中          ║\n"
+                    "╠════════════════════════════════════════════════════════════════╣\n"
+                    f"║  停止継続: 約 {_elapsed_disp:<10}  スキップ AI 判定: {_anthropic_skip_count:<6}件        ║\n"
+                    "║                                                                ║\n"
+                    "║  対処: https://console.anthropic.com/settings/billing          ║\n"
+                    "║        にアクセスしてクレジットを追加購入してください          ║\n"
+                    "║        追加後は Bot 再起動不要 (自動で復帰します)              ║\n"
+                    "║                                                                ║\n"
+                    "║  影響: ニュース起点の新規発注・決済判断が停止                  ║\n"
+                    "║        損切り / トレール / 時間切れ決済 は通常どおり動作       ║\n"
+                    "║                                                                ║\n"
+                    "║  ※ この警告は 5 分ごとに表示されます (クレジット追加で解除)    ║\n"
+                    "╚════════════════════════════════════════════════════════════════╝"
+                    f"{_RESET}"
+                )
+                # ★ v3.9.71: 30 分おきに Discord へも再通知 (端末を見ていなくても気づける)
+                global _anthropic_credit_last_discord_at
+                _now_d = datetime.datetime.now()
+                if (_anthropic_credit_last_discord_at is None
+                        or (_now_d - _anthropic_credit_last_discord_at).total_seconds()
+                        >= _ANTHROPIC_CREDIT_DISCORD_INTERVAL_SEC):
+                    _anthropic_credit_last_discord_at = _now_d
+                    try:
+                        _threadsafe_discord(
+                            "🚨 【継続中】 Anthropic API クレジット残高ゼロ\n"
+                            f"AI判定が停止して約 {_elapsed_disp}・スキップ {_anthropic_skip_count} 件。\n"
+                            "クレジット追加: https://console.anthropic.com/settings/billing\n"
+                            "（追加後は再起動不要で自動復帰。本通知は30分おき）"
+                        )
+                    except Exception as _e_disc:
+                        log.debug(f"[クレジット切れ] 30分Discord通知失敗: {_e_disc}")
+
+            # ── ② Alpaca News 接続不全 ──────────────────────────────────────
+            # Alpaca キーが設定済みの環境でのみ判定。
+            # ★ v3.9.40: 週末・OVERNIGHT・取引不可セッション中は alpaca_news_loop
+            #   が market_open_event.wait() で意図的に WebSocket を停止している。
+            #   この間は「正常受信なし」が当然の状態なので、誤警告を出さない
+            #   よう market_open_event.is_set() を必須条件に追加した。
+            # ★ v3.9.51: 警告頻度をセッション別に分岐 + 表示を 1 行のコンパクト形式に変更。
+            #   RTH 中はニュース流量が多い → 5 分間隔の警告を維持 (本物の異常を素早く検知)
+            #   RTH 外 (プリ/アフター) はニュース流量が少なく沈黙は正常範囲 → 60 分間隔に間引き
+            #   表示も大きな ASCII アート枠から WARNING 1 行に変更し、ログを汚さないように。
+            if (
+                ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY
+                and market_open_event.is_set()
+            ):
+                _h = _alpaca_news_health
+                _auth_fails = _h.get("auth_fail_count", 0)
+                _last_ok    = _h.get("last_success_at")
+                _stale_min  = None
+                if _last_ok is not None:
+                    _stale_min = (datetime.datetime.now() - _last_ok).total_seconds() / 60
+                # 警告条件: 認証 3 回以上連続失敗 / または 20 分以上正常受信なし
+                _alpaca_bad = (_auth_fails >= 3) or (_stale_min is not None and _stale_min >= 20)
+                if _alpaca_bad:
+                    # ★ v3.9.77 (B-1): 端末は赤字で 5 分おき / Discord は 30 分おき。
+                    _now = datetime.datetime.now()
+                    _err = (_h.get("last_error") or "詳細不明")[:60]
+                    _stale_disp = (
+                        f"{_stale_min:.0f}分前" if _stale_min is not None
+                        else "起動後未接続"
+                    )
+                    # 端末: 赤字 (5分ごと=本ループ毎)
+                    log.error(
+                        f"{_RED}{_BOLD}[Alpaca News] 🚨 接続不全: "
+                        f"最終受信 {_stale_disp} / 認証失敗 {_auth_fails}回 / 直近: {_err}\n"
+                        f"  → Alpaca の APIキー/購読を確認してください "
+                        f"(未設定でも RSS/Finnhub で稼働継続・本警告は5分ごと){_RESET}"
+                    )
+                    # Discord: 30 分おき
+                    _last_disc = _h.get("last_discord_at")
+                    if (_last_disc is None or (_now - _last_disc).total_seconds() >= 1800):
+                        _alpaca_news_health["last_discord_at"] = _now
+                        try:
+                            _threadsafe_discord(
+                                "🚨 【継続中】 Alpaca News 接続不全\n"
+                                f"最終受信 {_stale_disp} / 認証失敗 {_auth_fails}回。\n"
+                                "Alpaca の APIキー/購読をご確認ください。\n"
+                                "（未設定でも RSS/Finnhub でニュースは継続取得・本通知は30分おき）"
+                            )
+                        except Exception as _e_disc:
+                            log.debug(f"[Alpaca News] 30分Discord通知失敗: {_e_disc}")
+                    _alpaca_news_health["last_warning_at"] = _now
+
+            # ── ③ sync_positions 連続失敗 (OpenD/ネットワーク不安定) ★v3.9.77 B-4 ──
+            #   端末は赤字で 5 分おき / Discord は 30 分おき。成功で自動解除。
+            if int(_sync_health.get("consecutive_fail", 0)) >= 3:
+                _now_s = datetime.datetime.now()
+                _last_ok_s = _sync_health.get("last_success_at")
+                _stale_s = (f"{(_now_s - _last_ok_s).total_seconds()/60:.0f}分前"
+                            if _last_ok_s is not None else "起動後成功なし")
+                _serr = (_sync_health.get("last_error") or "詳細不明")[:60]
+                _nfail = _sync_health.get("consecutive_fail", 0)
+                log.error(
+                    f"{_RED}{_BOLD}[sync_positions] 🚨 ポジション取得が連続失敗中 ({_nfail}回): "
+                    f"最終成功 {_stale_s} / 直近: {_serr}\n"
+                    f"  → OpenD の起動/接続(Connected)とネットワークを確認してください "
+                    f"(本警告は5分ごと・復旧で自動解除){_RESET}"
+                )
+                _last_disc_s = _sync_health.get("last_discord_at")
+                if (_last_disc_s is None or (_now_s - _last_disc_s).total_seconds() >= 1800):
+                    _sync_health["last_discord_at"] = _now_s
+                    try:
+                        _threadsafe_discord(
+                            "🚨 【継続中】 ポジション取得が連続失敗\n"
+                            f"連続失敗 {_nfail}回 / 最終成功 {_stale_s}。\n"
+                            "OpenD の起動・接続(Connected)とネットワークをご確認ください。\n"
+                            "（決済判断に影響する可能性あり・本通知は30分おき）"
+                        )
+                    except Exception as _e_ds:
+                        log.debug(f"[sync_positions] 30分Discord通知失敗: {_e_ds}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as _e:
+            log.debug(f"[health_warning] ループ例外 (継続): {_mask_secrets(_e)}")
+        await asyncio.sleep(300)  # 5 分間隔
+
+
+# ── RSS 並列取得（Yahoo Finance） ─────────────────────────────────────────────────
+# ★ v2.97: 起動時 DNS 事前チェック
+# ─────────────────────────────────────────────────────────────────────────────
+def _rss_dns_precheck() -> None:
+    """
+    各 RSS フィードのホスト名を起動時に DNS 解決してみる。
+    解決できないものは _rss_excluded に追加し、以降の取得対象から外す。
+
+    socket.getaddrinfo は timeout 引数を直接受け付けないため、
+    socket.setdefaulttimeout を一時的に 2 秒に設定して呼び出し、
+    終了時に元の値へ復元する。
+
+    Yahoo Finance のみが残っている通常状態では実質 1 件の解決で完了するため
+    起動オーバーヘッドは無視できる (失敗時最大 2 秒、成功時 < 100ms)。
+    """
+    import socket as _socket
+    from urllib.parse import urlparse as _urlparse
+    _alive: list[str] = []
+    _dead:  list[str] = []
+    _orig_timeout = _socket.getdefaulttimeout()
+    try:
+        _socket.setdefaulttimeout(2.0)
+        for feed in _RSS_FEEDS:
+            name = feed["name"]
+            host = _urlparse(feed["url"]).hostname or ""
+            if not host:
+                _dead.append(f"{name} (URL 解析不可)")
+                _rss_excluded.add(name)
+                continue
+            try:
+                _socket.getaddrinfo(host, 443, type=_socket.SOCK_STREAM)
+                _alive.append(name)
+            except (OSError, _socket.gaierror) as e:
+                _dead.append(f"{name} ({host}: {e})")
+                _rss_excluded.add(name)
+    finally:
+        _socket.setdefaulttimeout(_orig_timeout)
+
+    if _dead:
+        log.warning(
+            f"[RSS DNS事前チェック] {len(_dead)}件のフィードが解決不可のため除外:\n"
+            + "\n".join(f"  - {d}" for d in _dead)
+        )
+    if _alive:
+        log.info(
+            f"[RSS DNS事前チェック] 有効フィード {len(_alive)}件: "
+            f"{', '.join(_alive)}"
+        )
+    else:
+        log.error(
+            "[RSS DNS事前チェック] 有効な RSS フィードがありません。"
+            "RSS 高速ニュースループは空回りします。"
+            "他のニュースソース (Alpaca / Finnhub) のみで稼働します。"
+        )
+
+
+def _fetch_rss_feed(feed: Dict[str, str]) -> List[SimpleNamespace]:
+    """
+    1本の RSS フィードを取得してパースする（標準ライブラリのみ・追加依存なし）。
+    遅延目安: Yahoo Finance ~5分
+
+    ★ v2.97: 連続失敗カウンタ + ログレベル段階制御
+    - 動的除外済みフィード (_rss_excluded) は即座にスキップ
+    - 例外発生時: 初回 WARNING / 以降 DEBUG にログレベルを段階制御
+    - 連続 _RSS_FAIL_THRESHOLD 回失敗で _rss_excluded に追加 + Discord 通知 1 回
+    - 成功時はカウンタをリセット
+    """
+    name = feed["name"]
+    url  = feed["url"]
+    # 動的除外済みフィードはスキップ
+    if name in _rss_excluded:
+        return []
+    try:
+        resp = requests.get(
+            url,
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"},
+        )
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        results = []
+        # RSS 2.0 形式: channel > item > title / guid
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        items = root.findall(".//item")
+        if not items:
+            # Atom フォーマットにも対応
+            items = root.findall(".//atom:entry", ns)
+        for item in items[:20]:
+            # タイトル取得（RSS/Atom 両対応）
+            title_el = item.find("title")
+            if title_el is None:
+                title_el = item.find("atom:title", ns)
+            title = (title_el.text or "").strip() if title_el is not None else ""
+            if not title:
+                continue
+            # ID 取得（guid / link / id）
+            for tag in ("guid", "link", "atom:id"):
+                id_el = item.find(tag) if ":" not in tag else item.find(tag, ns)
+                if id_el is not None and id_el.text:
+                    article_id = f"rss-{name}-{id_el.text.strip()[:80]}"
+                    break
+            else:
+                article_id = f"rss-{name}-{title[:60]}"
+            results.append(SimpleNamespace(articleId=article_id, headline=title, source=name))
+        # 成功 → カウンタリセット (回復シナリオ)
+        if _rss_fail_count.get(name, 0) > 0:
+            log.info(f"[RSS:{name}] 取得回復 (連続失敗カウンタをリセット)")
+            _rss_fail_count[name] = 0
+        log.debug(f"[RSS:{name}] {len(results)}件取得")
+        return results
+    except Exception as e:
+        # ★ v2.97: 連続失敗カウンタを更新
+        _rss_fail_count[name] = _rss_fail_count.get(name, 0) + 1
+        _count = _rss_fail_count[name]
+        # 初回のみ WARNING、以降は DEBUG
+        if name not in _rss_warn_emitted:
+            log.warning(
+                f"[RSS:{name}] 取得エラー (初回): {type(e).__name__}: {e}"
+            )
+            _rss_warn_emitted.add(name)
+        else:
+            log.debug(f"[RSS:{name}] 取得エラー (連続{_count}回目): {e}")
+
+        # 連続失敗が閾値到達 → 動的除外 + Discord 通知 (1 回のみ)
+        if _count >= _RSS_FAIL_THRESHOLD and name not in _rss_excluded:
+            _rss_excluded.add(name)
+            log.warning(
+                f"[RSS:{name}] 連続 {_count} 回失敗のため動的除外しました。"
+                f"以降のループでは取得をスキップします。"
+            )
+            try:
+                _threadsafe_future(asyncio.to_thread(
+                    send_discord_message,
+                    f"⚠️ RSS フィード動的除外\n"
+                    f"フィード「{name}」が連続 {_count} 回失敗したため、"
+                    f"自動取得対象から除外しました。\n"
+                    f"他のニュースソース (Alpaca / Finnhub) は継続稼働します。"
+                ))
+            except RuntimeError:
+                # 起動直後でイベントループ未起動の場合は通知をスキップ
+                pass
+        return []
+
+
+async def fetch_rss_all() -> List[SimpleNamespace]:
+    """全 RSS フィードを並列取得して重複なしでまとめる
+    ★ v2.97: _rss_excluded に含まれるフィードはスキップ"""
+    tasks = [
+        asyncio.to_thread(_fetch_rss_feed, feed)
+        for feed in _RSS_FEEDS
+        if feed["name"] not in _rss_excluded
+    ]
+    results_per_feed = await asyncio.gather(*tasks, return_exceptions=True)
+    merged: List[SimpleNamespace] = []
+    seen_ids: set = set()
+    for result in results_per_feed:
+        if isinstance(result, Exception):
+            continue
+        for article in result:
+            if article.articleId not in seen_ids:
+                seen_ids.add(article.articleId)
+                merged.append(article)
+    return merged
+
+
+async def close_order_chaser() -> None:
+    """
+    損切り注文の追いかけ指値（チェイシング）ループ。
+    5秒ごとに is_close=True の未約定指値注文を監視し、
+    現在のbidより高い（＝急落で刺さらない）場合は即キャンセルして
+    現在のbidの0.1%下で再発注する。
+    RTH中は成行なので本ループでは何もしない。
+    """
+    log.info("=== 損切りチェイサーループ 開始（5秒間隔）===")
+    while True:
+        await asyncio.sleep(5)
+
+        close_orders = [
+            (oid, info) for oid, info in list(_pending_orders.items())
+            if info.get("is_close") and not info.get("is_cover")
+               and info.get("limit_price", 0) > 0  # 指値注文のみ（成行は0）
+        ]
+        if not close_orders:
+            continue
+
+        session, _ = get_session_info()
+        if session == SESSION_RTH:
+            continue  # RTHは成行なのでチェイス不要
+
+        for order_id, info in close_orders:
+            sym     = info["symbol"]
+            trd_env = info["trd_env"]
+            old_price = info.get("limit_price", 0)
+
+            # 現在のbidを取得
+            quote = get_quote(sym)
+            bid   = quote.get("bid") or quote.get("last") or 0.0
+            if bid <= 0:
+                continue
+
+            # 指値がbidより高い（急落で刺さらない状態）→ 追いかける
+            if old_price > bid:
+                new_price = round(bid * (1 - 0.001), 2)  # bid基準0.1%下
+                log.warning(
+                    f"【{sym}】 🏃 損切りチェイス: 旧指値=${old_price:.2f} > 現bid=${bid:.2f}"
+                    f" → 新指値=${new_price:.2f}"
+                )
+                # キャンセル
+                ok = _cancel_order(order_id, sym, trd_env, f"チェイス（旧${old_price:.2f}→新${new_price:.2f}）")
+                if not ok:
+                    # FAILEDならリストから除去するだけ
+                    _pending_orders.pop(order_id, None)
+                    continue
+
+                # ★ v3.9.130: 軽い緩和 — 取消の「受付」を「完了」と即断せず、1回だけ
+                #   状態照会で確認してから再発注する。modify_order(CANCEL) の戻りは「受付」
+                #   までで、実際に取り消せたかは含まれないため、未取消のまま再発注すると
+                #   「生きた決済2本 → 売りすぎ(5/27型ショート反転)」の恐れがある。
+                #   ・取消/失敗を確認     → 再発注（安全）
+                #   ・まだ生存 or 約定済み → 再発注しない（既存注文が有効 / 既に決済済み）
+                #   ・照会自体が失敗/不明 → 従来どおり再発注（現行動作と同等・悪化させない）
+                #   本格対応（非同期でのポーリング確認）は別途。ここは同期1回照会の軽量ガード。
+                _confirmed_gone = None
+                try:
+                    with _trade_ctx() as _ctx_cf:
+                        _acc_cf = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
+                        _ret_cf, _data_cf = _ctx_cf.order_list_query(
+                            code=to_moomoo_code(sym), trd_env=trd_env,
+                            order_id=order_id, acc_id=_acc_cf,
+                        )
+                    if _ret_cf == RET_OK and _data_cf is not None and not _data_cf.empty:
+                        _st_cf = str(_data_cf["order_status"].iloc[0]).upper()
+                        if any(s in _st_cf for s in ("CANCELLED", "FAILED", "DELETED", "REJECTED")):
+                            _confirmed_gone = True   # 取消確定 → 再発注OK
+                        else:
+                            _confirmed_gone = False  # SUBMITTED/WAITING/FILLED等 → 再発注しない
+                except Exception as _e_cf:
+                    log.debug(f"【{sym}】 [チェイス] 取消確認の照会失敗（従来どおり再発注）: {_e_cf}")
+
+                if _confirmed_gone is False:
+                    # まだ生きている/約定済みを確認 → 二重決済回避のため今回は再発注を見送り。
+                    #   追跡には残置（pop しない）＝次の5秒サイクル/watchdogが引き続き扱える。
+                    log.warning(
+                        f"【{sym}】 🏃 チェイス: 旧注文の取消が未完了/約定済みを確認 "
+                        f"→ 今回は再発注を見送り（二重決済防止・次サイクルで再評価）"
+                    )
+                    continue
+
+                _pending_orders.pop(order_id, None)
+
+                # 現値で再発注
+                retry_count = info.get("retry_count", 0)
+                # ★ v2.98: position_id 必須化。pending_orders に保存されたものを再利用。
+                _pid_chase  = info.get("position_id", "")
+                _side_chase = info.get("side", "LONG")
+                if not _pid_chase:
+                    log.error(
+                        f"【{sym}】 ❌ 損切りチェイス再発注失敗: position_id 未保存 → スキップ"
+                    )
+                    _threadsafe_future(asyncio.to_thread(
+                        send_discord_message,
+                        f"❌ 【{sym}】 損切りチェイス再発注失敗\n"
+                        f"position_id が pending 情報に保存されていないため再発注できません。\n"
+                        f"moomoo アプリで手動決済をご確認ください。"
+                    ))
+                    continue
+                # ★ v3.5.2/v3.9.63: SHORT 決済サイドは環境別 (_cover_trd_side)。
+                # 実口座=BUY_BACK / デモ=BUY (デモは BUY_BACK 非対応)。
+                _trd_side_chase = _cover_trd_side(trd_env) if _side_chase == "SHORT" else TrdSide.SELL
+                ret, oid_or_msg = _close_one_position_id(
+                    symbol      = sym,
+                    trd_env     = trd_env,
+                    position_id = _pid_chase,
+                    qty         = info.get("qty", 0),
+                    limit_price = new_price,
+                    trd_side    = _trd_side_chase,
+                    order_type  = OrderType.NORMAL,
+                    is_cover    = (_side_chase == "SHORT"),
+                    reason      = info.get("reason", "損切りチェイス"),
+                    log_label   = "損切りチェイス",
+                )
+                if ret == RET_OK:
+                    new_oid = oid_or_msg
+                    _pending_orders[new_oid] = {
+                        "symbol":      sym,
+                        "placed_at":   datetime.datetime.now(),
+                        "trd_env":     trd_env,
+                        "is_cover":    (_side_chase == "SHORT"),
+                        "is_close":    True,
+                        "qty":         info.get("qty", 0),
+                        "limit_price": new_price,
+                        "reason":      info.get("reason", "損切りチェイス"),
+                        "retry_count": retry_count + 1,
+                        "position_id": _pid_chase,
+                        "side":        _side_chase,
+                    }
+                    log.warning(f"【{sym}】 🏃 チェイス再発注成功 orderId={new_oid}  ${new_price:.2f}")
+                    _threadsafe_future(asyncio.to_thread(
+                        send_discord_message,
+                        f"[Bot] 【{sym}】 🏃 損切りチェイス\n"
+                        f"急落で旧指値 ${old_price:.2f} が刺さらず → ${new_price:.2f} で再発注"
+                    ))
+                else:
+                    log.error(f"【{sym}】 🏃 チェイス再発注失敗: {oid_or_msg}")
+
+
+async def external_news_loop(
+    client: anthropic.Anthropic,
+    trd_env: TrdEnv,
+) -> None:
+    if not FINNHUB_API_KEY:
+        log.info("[外部ニュース] API キー未設定のためスキップ")
+        return
+
+    log.info(f"=== 外部ニュースループ開始 (Finnhub / {EXTERNAL_NEWS_POLL_SEC}秒間隔) ===")
+
+    while True:
+        # market_open_event が clear されている間はここで待機する。
+        # 金曜 15:45 ET の週末決済後も clear されるため、
+        # 月曜プリマーケット開始まで自動的にニュース取得・発注が停止する。
+        await market_open_event.wait()
+        try:
+            articles = await fetch_external_news()
+            if articles:
+                await process_headlines(None, client, articles, trd_env)
+        except Exception as e:
+            log.error(f"[外部ニュース] ループエラー: {e}", exc_info=True)
+        await asyncio.sleep(EXTERNAL_NEWS_POLL_SEC)
+
+# ── ⑤ RSS 並列高速ニュース監視ループ（5秒間隔・追加ライブラリ不要） ─────────────────────────────────────
+async def global_news_loop(
+    client: anthropic.Anthropic,
+    trd_env: TrdEnv,
+) -> None:
+    """
+    RSS を 5秒間隔で並列取得する高速ニュースループ。
+
+    ★ v2.97: Reuters/AP RSS は廃止のため削除。Yahoo Finance のみで稼働。
+    DNS 解決失敗 / 連続失敗フィードは _rss_excluded に動的追加され除外される。
+
+    Finnhub REST（10秒間隔）と独立して並走し、合計で ~5 分遅延のニュースを
+    ほぼリアルタイムに近い形で処理できる。
+
+    ・追加ライブラリ不要（xml.etree.ElementTree は Python 標準ライブラリ）
+    ・全フィードを asyncio.gather で同時に叩くため I/O 待ち時間がほぼゼロ
+    ・既存の重複排除・フィルタ・AI キャッシュ・発注ロジックはすべて流用
+
+    週末決済後は market_open_event が clear されるため、
+    月曜プリマーケット開始まで自動的にループが待機状態に入る。
+    """
+    # ★ v2.97: 起動時 DNS 事前チェックで _rss_excluded に登録されたフィードは除外
+    feed_names = [f["name"] for f in _RSS_FEEDS if f["name"] not in _rss_excluded]
+    if not feed_names:
+        log.warning(
+            f"=== RSS 高速ニュースループ 開始（{RSS_POLL_SEC}秒間隔）===\n"
+            f"  有効ソースなし → ループは空回りします（他のニュース系で稼働継続）"
+        )
+    else:
+        log.info(
+            f"=== RSS 高速ニュースループ 開始（{RSS_POLL_SEC}秒間隔）===\n"
+            f"  ソース: {', '.join(feed_names)}"
+        )
+
+    while True:
+        # market_open_event が clear されている間はここで待機する。
+        # 金曜 15:45 ET の週末決済後も clear されるため、
+        # 月曜プリマーケット開始まで自動的にニュース取得・発注が停止する。
+        await market_open_event.wait()
+        try:
+            articles = await fetch_rss_all()
+            if articles:
+                await process_headlines(None, client, articles, trd_env)
+        except Exception as e:
+            log.error(f"[RSS高速ニュース] ループエラー: {e}", exc_info=True)
+        await asyncio.sleep(RSS_POLL_SEC)
+
+# ── リスク監視ループ ────────────────────────────────────────────────────────────────
+async def risk_monitor_loop(trd_env: TrdEnv) -> None:
+    """
+    実行銘柄のリスクを RISK_CHECK_SEC 秒ごとに監視する。
+
+    改善点:
+    ① 起動時に実行銘柄を一括サブスクライブ（get_quote が正確に動くための前処理）
+    ② ポジションなし銘柄への OpenD 接続を省略（sync_positions を先行実行して
+       position_qty > 0 の銘柄にのみ get_quote を呼ぶ）
+    ③ 株価取得権限なし環境向け「時間切れ決済」:
+       TIMEOUT_EXIT_MINUTES > 0 かつ entry_time から指定分経過したら強制決済
+    ④ 価格取得失敗ログの頻度抑制（20回に1回 WARNING、他は DEBUG）
+
+    週末決済後は market_open_event が clear されるため、
+    月曜プリマーケット開始まで自動的にリスク監視が待機状態に入る。
+    """
+    # SPY/QQQ等のETF対象 + 個別株（STOCK_TICKERS）+ 決算銘柄（EARNINGS）を監視する
+    # ★ v3.9.61: モメンタム実発注銘柄 (_momentum_live_symbols) を必ず含める。
+    #   「発注はできるが監視されない」ポジション (5/29 IWM orphan) の構造的防止。
+    _etf_syms      = sorted({sym for syms in EXECUTION_MAP.values() for sym in syms})
+    _all_earn_syms = list(dict.fromkeys(EARNINGS_PRE_TICKERS + EARNINGS_AFTER_TICKERS))
+    _mom_live_syms = _momentum_live_symbols()
+    exec_syms      = sorted(set(_etf_syms) | set(STOCK_TICKERS) | set(_all_earn_syms) | _mom_live_syms)
+    _all_earnings_set = set(_all_earnings)  # 決算銘柄判定用セット（ループ前に一度だけ作成）
+    log.info(f"=== リスク監視ループ 開始 対象: {exec_syms} ===")
+    if _mom_live_syms:
+        log.info(f"  (モメンタム実発注銘柄 {sorted(_mom_live_syms)} を監視対象に含めています)")
+    log.info(
+        f"  強制損切り: -{MAX_LOSS_PCT*100:.2f}%（ポジション評価額基準） / "
+        f"トレール発動: +{TRAIL_TRIGGER_PCT*100:.1f}%（投下額基準） / "
+        f"トレール幅: {TRAIL_DROP_PCT*100:.1f}%"
+        + (f" / 時間切れ決済: {TIMEOUT_EXIT_MINUTES}分" if TIMEOUT_EXIT_MINUTES > 0 else "")
+    )
+    if _all_earnings_set:
+        log.info(
+            f"  　決算銘柄専用: トレール発動 +{EARNINGS_TRAIL_TRIGGER_PCT*100:.1f}% / "
+            f"トレール幅 {EARNINGS_TRAIL_DROP_PCT*100:.1f}% / "
+            f"時間切れ {'無効' if EARNINGS_TIMEOUT_EXIT_MINUTES == 0 else f'{EARNINGS_TIMEOUT_EXIT_MINUTES}分'} / "
+            f"損切り {'MAX_LOSS_PCT流用(' + f'{MAX_LOSS_PCT*100:.2f}' + '%)' if EARNINGS_MAX_LOSS_PCT == 0 else f'{EARNINGS_MAX_LOSS_PCT*100:.2f}%[決算専用]'}"
+        )
+
+    # ── 実行銘柄を一括サブスクライブ（get_quote の前提条件）─────────────────
+    try:
+        # ★ v2.86: with _quote_ctx() で例外時の close を保証
+        with _quote_ctx() as sub_ctx:
+            sub_codes = [to_moomoo_code(s) for s in exec_syms]
+            ret_sub, err_sub = sub_ctx.subscribe(
+                sub_codes,
+                [SubType.QUOTE, SubType.ORDER_BOOK],
+                subscribe_push=False,
+            )
+        if ret_sub == RET_OK:
+            log.info(f"[subscribe] リスク監視対象サブスクライブ成功: {sub_codes}")
+        else:
+            log.warning(f"[subscribe] リスク監視サブスクライブ警告: {err_sub}")
+    except Exception as e:
+        log.warning(f"[subscribe] リスク監視サブスクライブ例外: {e}")
+
+    _price_fail_count: dict[str, int] = {sym: 0 for sym in exec_syms}
+    _PRICE_FAIL_LOG_INTERVAL = 20
+
+    _status_interval = max(1, 60 // RISK_CHECK_SEC)  # 約60秒ごとに表示（例: 15秒×4=60秒）
+    _status_counter  = 0
+    # ★ v2.99.4: 5分ごとの市場状態ログ用カウンタ
+    _market_state_interval = max(1, 300 // RISK_CHECK_SEC)  # 約300秒(5分)ごと
+    _market_state_counter  = 0
+
+    while True:
+        # market_open_event が clear されている間はここで待機する。
+        # 金曜 15:45 ET の週末決済後も clear されるため、
+        # 月曜プリマーケット開始まで自動的にリスク監視が停止する。
+        await market_open_event.wait()
+        await asyncio.sleep(RISK_CHECK_SEC)
+
+        # ── ポジション同期（1回の接続でまとめて取得）──────────────────────────
+        await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+
+        # ── 定期ステータス表示（約60秒ごと）──────────────────────────────────
+        _status_counter += 1
+
+        # ── ★ v2.99.4: 5分ごとの市場状態ログ ─────────────────────────────
+        _market_state_counter += 1
+        if _market_state_counter >= _market_state_interval:
+            _market_state_counter = 0
+            try:
+                log_market_state()
+            except Exception as _e:
+                log.warning(f"[市場状態] ログ生成失敗: {_e}")
+
+        if _status_counter >= _status_interval:
+            _status_counter = 0
+
+            # 取引ロック中なら赤い警告を繰り返し表示
+            if _trade_locked:
+                global _trade_lock_last_warned
+                now_warn = datetime.datetime.now()
+                if (_trade_lock_last_warned is None or
+                        (now_warn - _trade_lock_last_warned).total_seconds() >= _TRADE_LOCK_WARN_INTERVAL_SEC):
+                    _trade_lock_last_warned = now_warn
+                    _warn_trade_locked()
+            _has_any_pos = any(
+                state.get(s).position_qty != 0 or _tracked_position_cost.get(s, 0) > 0
+                for s in exec_syms
+            )
+            if not _has_any_pos and not _startup_position_unknown:
+                # ポジションなし
+                session_now, _ = get_session_info()
+                _prices = []
+                for s in exec_syms:
+                    q = get_quote(s)
+                    if q.get("last", 0) > 0:
+                        _prices.append(f"{s}:${q['last']:.2f}")
+                        # ★ v2.92/v2.94: QQQ/SPY/SMH の価格スナップショットを記録
+                        # （AI 判定時のマクロ文脈に使う、追加 API コールなし）
+                        # v2.94: SMH を追加 (SMH 固有の下落トレンド検知に使用)
+                        if s in _INDEX_PRICE_HISTORY:  # ★ v2.99.4: STOCK_TICKERS も自動対象
+                            record_index_price(s, q["last"])
+                price_str = "  ".join(_prices) if _prices else "価格取得失敗"
+                log.info(
+                    f"[状況] ポジションなし  セッション:{session_now.upper()}"
+                    f"  {price_str}" + _ext_status_suffix()
+                )
+            elif _startup_position_unknown and not _has_any_pos:
+                # long_mv>0 で検出済みだが position_list_query では確認できていない状態
+                session_now, _ = get_session_info()
+                _prices = []
+                for s in exec_syms:
+                    q = get_quote(s)
+                    if q.get("last", 0) > 0:
+                        _prices.append(f"{s}:${q['last']:.2f}")
+                        # ★ v2.92/v2.94: QQQ/SPY/SMH の価格スナップショットを記録
+                        if s in _INDEX_PRICE_HISTORY:  # ★ v2.99.4: STOCK_TICKERS も自動対象
+                            record_index_price(s, q["last"])
+                price_str = "  ".join(_prices) if _prices else "価格取得失敗"
+                log.warning(
+                    f"[状況] ⚠️ ポジション詳細不明（建玉あり・発注ブロック中）"
+                    f"  セッション:{session_now.upper()}  {price_str}"
+                    f"  ※moomooアプリで確認してください"
+                )
+            else:
+                # ポジションあり → 各銘柄の状況を表示
+                for s in exec_syms:
+                    ts_s = state.get(s)
+                    tracked = _tracked_position_cost.get(s, 0)
+                    if ts_s.position_qty == 0 and tracked <= 0:
+                        continue
+                    q = get_quote(s)
+                    price_now = q.get("last", 0) or q.get("ask", 0) or 0
+                    # ★ v2.92/v2.94: QQQ/SPY/SMH の価格スナップショットを記録（追加 API コールなし）
+                    if s in _INDEX_PRICE_HISTORY and price_now > 0:  # ★ v2.99.4
+                        record_index_price(s, price_now)
+                    qty   = ts_s.position_qty
+                    cost  = ts_s.avg_cost
+                    if qty > 0 and cost > 0 and price_now > 0:
+                        pnl     = (price_now - cost) * qty
+                        unr_pct = (price_now - cost) / cost * 100
+                        log.info(
+                            f"[状況] 【{s}】 ロング {qty}株"
+                            f"  取得単価:${cost:.2f}  現在:${price_now:.2f}"
+                            f"  PnL={pnl_colored(pnl)}({pct_colored(unr_pct)})"
+                            f"  投資額:${tracked:,.0f}"
+                        )
+                    elif qty == 0 and tracked > 0:
+                        # 注文中（約定待ち）→ APIのポジション一覧にはまだ現れない
+                        # entry_time から経過時間を表示して「いつから待っているか」を明示
+                        _entry_t = ts_s.entry_time
+                        _elapsed_str = ""
+                        if _entry_t is not None:
+                            _elapsed_sec = (datetime.datetime.now() - _entry_t).total_seconds()
+                            _elapsed_str = f"  経過:{_elapsed_sec/60:.1f}分"
+                        log.info(
+                            f"[状況] 【{s}】 📋 注文中（約定待ち・未ポジション）"
+                            f"  発注額:${tracked:,.0f}  現在値:${price_now:.2f}{_elapsed_str}"
+                        )
+                    elif qty > 0 and price_now <= 0:
+                        log.info(
+                            f"[状況] 【{s}】 ロング {qty}株"
+                            f"  取得単価:${cost:.2f}  現在値取得失敗"
+                            f"  投資額:${tracked:,.0f}"
+                        )
+
+        for symbol in exec_syms:
+            try:
+                tag = f"【{symbol}】"
+                ts  = state.get(symbol)
+
+                # ── 決算銘柄か通常銘柄かでトレール・タイムアウトを切り替え（アイデアC）──
+                _is_earn_sym = symbol in _all_earnings_set
+                _t_trigger   = EARNINGS_TRAIL_TRIGGER_PCT   if _is_earn_sym else TRAIL_TRIGGER_PCT
+                _t_drop      = EARNINGS_TRAIL_DROP_PCT       if _is_earn_sym else TRAIL_DROP_PCT
+                # ★ v3.9.47: モメンタム発注のポジションはニュースとは別のタイムアウト
+                # を適用 (ニュースの鮮度ベースではなく、トレンド継続時間ベース)。
+                # entry_ai_category == "MOMENTUM" で識別。優先順位: 決算 > モメンタム > 通常。
+                _is_momentum = (ts.entry_ai_category == "MOMENTUM")
+                if _is_earn_sym:
+                    _t_timeout = EARNINGS_TIMEOUT_EXIT_MINUTES
+                elif _is_momentum:
+                    _t_timeout = MOMENTUM_TIMEOUT_MIN
+                else:
+                    _t_timeout = TIMEOUT_EXIT_MINUTES
+
+                # ★ v2.98: place_short で建てた SHORT のみ正規扱い。
+                # sync_positions は position_side='SHORT' で is_short=True を自動セット。
+                # is_short=False + qty<0 は同期遅延/手動取引のため自動カバーせず警告のみ。
+                if ts.position_qty < 0 and not ts.is_short:
+                    _warn_key = f"_unknown_short_warned_{symbol}"
+                    if not getattr(risk_monitor_loop, _warn_key, False):
+                        log.warning(
+                            f"{tag} ⚠️ is_short=False のまま qty<0 を検出: qty={ts.position_qty}"
+                            f" → 同期遅延 or 外部要因の可能性。次の sync_positions で自動補正されます。"
+                            f" 解消しない場合は moomoo アプリで建玉をご確認ください。"
+                        )
+                        setattr(risk_monitor_loop, _warn_key, True)
+                elif ts.position_qty >= 0:
+                    # 解消したら警告フラグをリセット (次回再発時に再通知できるようにする)
+                    setattr(risk_monitor_loop, f"_unknown_short_warned_{symbol}", False)
+
+                # ── ポジションなし・entry_timeもなし・自前管理コストも0 → 完全スキップ ──
+                # ★ v2.98: SHORT (qty<0) を「ポジションなし」と誤判定しないよう == 0 に変更
+                _tracked_cost = _tracked_position_cost.get(symbol, 0.0)
+                if ts.position_qty == 0 and ts.avg_cost <= 0 and ts.entry_time is None and _tracked_cost <= 0:
+                    if ts.trail_active:
+                        ts.reset_trail()
+                    _price_fail_count[symbol] = 0
+                    continue
+
+                # 管理対象外建玉は表示だけ行い、時間切れ・上限超過・損切り・
+                # トレールの判定へ入れない。低レベル決済ガードだけに任せると、
+                # 決済失敗カウントや再エントリーブロックが汚染される。
+                if getattr(ts, "externally_held", False):
+                    _ext_q = get_quote(symbol)
+                    _ext_price = _ext_q.get("last", 0) or _ext_q.get("bid", 0) or _ext_q.get("ask", 0) or 0
+                    if _ext_price > 0 and ts.avg_cost > 0 and ts.position_qty != 0:
+                        _ext_pnl = ((_ext_price - ts.avg_cost) * ts.position_qty
+                                    if ts.position_qty > 0
+                                    else (ts.avg_cost - _ext_price) * abs(ts.position_qty))
+                        _ext_pct = (_ext_pnl / (ts.avg_cost * abs(ts.position_qty)) * 100)
+                        log.warning(
+                            f"{tag} [ポジション] ${_ext_price:.2f}  "
+                            f"PnL={pnl_colored(_ext_pnl)}({pct_colored(_ext_pct)})"
+                            f"  ⚠️ Bot 以外の建玉のため自動売買は停止中"
+                            f"（決済しません。この建玉を決済すると再開します）"
+                        )
+                    else:
+                        log.warning(
+                            f"{tag} [ポジション] ⚠️ Bot 以外の建玉のため自動売買は停止中"
+                            f"（決済しません。この建玉を決済すると再開します）"
+                        )
+                    continue
+
+                # ── API未反映だが自前管理でポジションあり → P&L表示 ──────────
+                # position_qty=0 だが _tracked_cost>0 (moomoo API 未反映状態)。
+                # v2.98: API未反映 = position_qty==0 のみ対象 (SHORT は <0 で取れる)。
+                # v2.99 hotfix: SHORT の PnL 符号反転を修正、avg_cost>0 で旧entry_timeなら
+                # タイムアウト判定も実施。
+                if ts.position_qty == 0 and _tracked_cost > 0:
+                    _fp  = get_quote(symbol)
+                    _cur = _fp.get("last", 0) or _fp.get("ask", 0) or 0
+                    if _cur > 0:
+                        # avg_cost(約定反映済み)があれば正確なP&L、なければ推定
+                        if ts.avg_cost > 0:
+                            _shares_actual = round(_tracked_cost / ts.avg_cost)
+                            # ★ v2.99 hotfix: SHORT/LONG で計算式を分岐
+                            if ts.is_short:
+                                _pnl_actual = (ts.avg_cost - _cur) * _shares_actual
+                                _pct_actual = (ts.avg_cost - _cur) / ts.avg_cost * 100
+                                _label      = "ポジション/約定済・API未反映/SHORT"
+                            else:
+                                _pnl_actual = (_cur - ts.avg_cost) * _shares_actual
+                                _pct_actual = (_cur - ts.avg_cost) / ts.avg_cost * 100
+                                _label      = "ポジション/約定済・API未反映"
+                            log.info(
+                                f"{tag} [{_label}] ${_cur:.2f}  "
+                                f"PnL={pnl_colored(_pnl_actual)}({pct_colored(_pct_actual)})"
+                                f"  {_shares_actual}株  取得単価:${ts.avg_cost:.2f}"
+                            )
+
+                            # ★ v2.99.2: API未反映時のタイムアウト処理を堅牢化
+                            # 旧 v2.99.1 は place_close_all を直接呼んでいたが v2.98 で
+                            # position_id 必須化され API未反映時に決済失敗。
+                            # ① 再同期を1回試行 ② 反映されれば通常経路で決済
+                            # ③ それでも未反映なら Discord 緊急通知 ④ entry_time は決済成功時のみクリア
+                            if _t_timeout > 0 and ts.entry_time is not None:
+                                _elapsed_min = (datetime.datetime.now() - ts.entry_time).total_seconds() / 60
+                                if _elapsed_min >= _t_timeout:
+                                    log.warning(
+                                        f"{tag} ⏰ 時間切れ条件成立 (API未反映)！ "
+                                        f"エントリから {_elapsed_min:.1f}分経過 (上限: {_t_timeout}分) "
+                                        f"is_short={ts.is_short} → 強制再同期を試行"
+                                    )
+                                    # ── ① 強制再同期 (moomoo 側の同期遅延を解消する最後の試み) ──
+                                    try:
+                                        await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+                                    except Exception as _e_resync:
+                                        log.warning(f"{tag} [強制再同期] エラー: {_e_resync}")
+
+                                    # ── ② 再同期後の状態をリロード ──
+                                    ts_after = state.get(symbol)
+                                    if ts_after.position_qty != 0:
+                                        # 反映された → 通常経路で決済
+                                        log.info(
+                                            f"{tag} ✅ 再同期で qty={ts_after.position_qty} を取得 "
+                                            f"→ place_close_all で決済発注"
+                                        )
+                                        # ★ v2.99.2: 戻り値で発注成否を判定し、失敗時は entry_time を維持
+                                        ts._last_close_attempt_at = datetime.datetime.now()
+                                        _close_ok2 = place_close_all(
+                                            symbol, trd_env,
+                                            f"時間切れ決済(再同期後): {_elapsed_min:.1f}分経過",
+                                        )
+                                        if _close_ok2:
+                                            ts.entry_time = None  # 決済発注成功 → クリア
+                                            ts._last_close_attempt_at = None
+                                            _clear_failed_close(symbol)  # ★ v2.99.4
+                                        else:
+                                            log.error(
+                                                f"{tag} ⏰ 再同期後の時間切れ決済が全失敗 → "
+                                                f"entry_time 維持で次サイクル再試行"
+                                            )
+                                            _mark_failed_close(symbol)  # ★ v2.99.4: 新規BUYブロック
+                                    else:
+                                        # ── ③ それでも API 未反映 → 警告 + Discord 通知 ──
+                                        # 同じ警告を連発しないよう 5 分間隔で間引く
+                                        _alert_key  = f"_api_unreflected_alert_{symbol}"
+                                        _last_alert = getattr(risk_monitor_loop, _alert_key, None)
+                                        _now        = datetime.datetime.now()
+                                        _should_alert = (
+                                            _last_alert is None
+                                            or (_now - _last_alert).total_seconds() >= 300
+                                        )
+                                        if _should_alert:
+                                            setattr(risk_monitor_loop, _alert_key, _now)
+                                            _side_lbl = "SHORT" if ts.is_short else "LONG"
+                                            log.warning(
+                                                f"{tag} ⛔ API 同期が {_elapsed_min:.1f}分以上反映されていません。"
+                                                f" 自動決済不能 ({_side_lbl} {_shares_actual}株)。"
+                                                f" moomoo アプリで建玉を確認し、必要なら手動決済してください。"
+                                            )
+                                            # Discord に緊急通知 (block=True にせず非同期で投げる)
+                                            try:
+                                                _threadsafe_future(asyncio.to_thread(
+                                                    send_discord_message,
+                                                    f"[Bot] ⛔ 緊急: {symbol} の API 同期が {_elapsed_min:.1f}分以上"
+                                                    f"反映されません\n"
+                                                    f"・方向: {_side_lbl}  株数: {_shares_actual}  "
+                                                    f"取得単価: ${ts.avg_cost:.2f}  現在: ${_cur:.2f}\n"
+                                                    f"・含み損益: ${_pnl_actual:+.2f} ({_pct_actual:+.2f}%)\n"
+                                                    f"・時間切れ決済 ({_t_timeout}分) を発動しようとしましたが、"
+                                                    f"moomoo API から建玉が取得できないため決済発注ができません。\n"
+                                                    f"・moomoo アプリで建玉をご確認の上、必要なら手動決済を"
+                                                    f"お願いします。"
+                                                ))
+                                            except Exception as _e_disc:
+                                                log.warning(f"{tag} [Discord緊急通知] 送信失敗: {_e_disc}")
+                                        # entry_time はクリアしない (次のサイクルでも再判定するため)
+                        else:
+                            # avg_costがない場合(fill確認前)は推定表示 → 約定未確認と明示
+                            _shares_est = round(_tracked_cost / _cur) if _cur > 0 else 0
+                            _pnl_est    = (_cur * _shares_est) - _tracked_cost if _shares_est > 0 else 0
+                            _pct_est    = _pnl_est / _tracked_cost * 100 if _tracked_cost > 0 else 0
+                            log.info(
+                                f"{tag} [ポジション/約定未確認] ${_cur:.2f}  "
+                                f"PnL≈{pnl_colored(_pnl_est)}({pct_colored(_pct_est)})"
+                                f"  📋約定確認待ち 推定{_shares_est}株  発注額:${_tracked_cost:,.0f}"
+                            )
+                    else:
+                        log.warning(f"{tag} [ポジション] 📋 注文中 価格取得失敗  発注額:${_tracked_cost:,.0f}")
+                    continue
+
+                # ── ポジションなし・entry_timeあり → 再同期してからタイムアウト判断 ──
+                # ポジション取得失敗（API不安定）や発注済み未約定のケースも含む
+                # ★ v2.98: SHORT を「ポジションなし」と誤判定しないよう == 0 に変更
+                if ts.position_qty == 0 and ts.avg_cost <= 0:
+                    if _t_timeout > 0 and ts.entry_time is not None:
+                        elapsed = (datetime.datetime.now() - ts.entry_time).total_seconds() / 60
+                        if elapsed >= _t_timeout:
+                            # 時間切れ前にもう一度sync_positionsで再確認
+                            await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+                            if ts.position_qty != 0:   # ★ v2.98: SHORT も含めて検出
+                                # ポジション確認できた → 通常の時間切れ決済へ
+                                log.warning(
+                                    f"{tag} ⏰ 時間切れ決済（再同期後確認）: エントリから {elapsed:.1f}分経過"
+                                )
+                                # ★ v2.86: 銘柄単位ロックで race 防止
+                                # ★ v2.99.2: 戻り値で発注成否を判定し、失敗時は entry_time を維持
+                                ts._last_close_attempt_at = datetime.datetime.now()
+                                async with _get_sym_lock(symbol):
+                                    _close_ok3 = place_close_all(symbol, trd_env, f"時間切れ決済: {elapsed:.1f}分経過")
+                                if _close_ok3:
+                                    ts.forced_exits += 1
+                                    ts.entry_time = None
+                                    ts._last_close_attempt_at = None
+                                    _clear_failed_close(symbol)  # ★ v2.99.4
+                                else:
+                                    log.error(
+                                        f"{tag} ⏰ 時間切れ決済(再同期後確認)が全失敗 → "
+                                        f"entry_time 維持で次サイクル再試行"
+                                    )
+                                    _mark_failed_close(symbol)  # ★ v2.99.4
+                            else:
+                                # 再同期後もポジションなし → 未約定とみなしリセット
+                                log.warning(
+                                    f"{tag} ⏰ 時間切れ（再同期後もポジションなし）: エントリから {elapsed:.1f}分経過"
+                                    f" → entry_timeをリセット"
+                                )
+                                ts.entry_count = 0
+                                ts.entry_time  = None
+                                _threadsafe_future(asyncio.to_thread(
+                                    send_discord_message,
+                                    f"[Bot] {tag} ⏰ 時間切れ（ポジション未確認）\n"
+                                    f"エントリから {elapsed:.1f}分経過  上限: {_t_timeout}分\n"
+                                    f"再同期後もポジションなし → 未約定とみなしリセット"
+                                ))
+                    continue
+
+                # ── ① ポジション上限超過チェック ────────────────────────────
+                # ★ v2.98: SHORT (position_qty<0) も評価額計算に含めるため abs() を使用。
+                # 以降のロジック (excess_qty 算出, place_close_partial 呼び出し等) は
+                # LONG 前提のため、SHORT の場合はチェックのみで部分決済は行わない。
+                _abs_qty       = abs(ts.position_qty)
+                position_value = _abs_qty * ts.last_price if ts.last_price > 0 else _abs_qty * ts.avg_cost
+                if position_value > _BUDGET_USD * 1.05 and ts.position_qty > 0:  # 5%の余裕を持たせる + LONG のみ
+                    excess_value = position_value - _BUDGET_USD
+                    excess_qty   = max(1, math.floor(excess_value / (ts.last_price or ts.avg_cost)))
+                    log.warning(
+                        f"{tag} ⚠ ポジション上限超過！"
+                        f" 評価額=${position_value:,.0f}  上限=${_BUDGET_USD:,.0f}"
+                        f" → 超過分 {excess_qty}株（約${excess_value:,.0f}）を部分決済"
+                    )
+                    _threadsafe_future(asyncio.to_thread(
+                        send_discord_message,
+                        f"[Bot] {tag} ⚠ ポジション上限超過検出\n"
+                        f"現在評価額: ${position_value:,.0f}  上限: ${_BUDGET_USD:,.0f}\n"
+                        f"超過分 {excess_qty}株（約${excess_value:,.0f}）を部分決済します"
+                    ))
+                    place_close_partial(symbol, trd_env, excess_qty,
+                                        f"ポジション上限超過: ${position_value:,.0f} > ${_BUDGET_USD:,.0f}")
+                    continue
+
+                # ── ② 時間切れ決済チェック ────────────────────────────────────
+                if _t_timeout > 0 and ts.entry_time is not None:
+                    elapsed = (datetime.datetime.now() - ts.entry_time).total_seconds() / 60
+                    if elapsed >= _t_timeout:
+                        # ★ v3.9.59: モメンタム + トレール ON 中はタイムアウト見送り
+                        # トレール ON = 既に利益確定モードに入っている (peak が
+                        # TRAIL_TRIGGER_PCT 超え)。タイムアウトで早期切るとトレールが
+                        # 捕捉できたはずの利益を取り逃がす。トレールは TRAIL_DROP_PCT
+                        # の戻しで自動利確するため、それを待つほうが期待値が高い。
+                        # (5/29 QQQ ケース: trail=ON peak=$734.19・PnL +0.27% で
+                        #  60.2分タイムアウト発火 → +$28.52 確定。トレールに任せれば
+                        #  さらに伸びる可能性があった)
+                        if ts.entry_ai_category == "MOMENTUM" and ts.trail_active:
+                            # 1分に1回だけログ (連発防止)
+                            _bypass_last = getattr(ts, "_timeout_bypass_logged_at", None)
+                            _now_check = datetime.datetime.now()
+                            if _bypass_last is None or (_now_check - _bypass_last).total_seconds() >= 60:
+                                log.info(
+                                    f"{tag} ⏳ モメンタム + トレール ON → タイムアウト見送り "
+                                    f"({elapsed:.1f}分経過・peak=${ts.peak_price:.2f}・トレールで利確待ち)"
+                                )
+                                ts._timeout_bypass_logged_at = _now_check
+                            continue   # 時間切れ決済をスキップしてループ次サイクルへ
+                        # ★ v2.99.2: 決済発注失敗時の再試行クールダウン (60秒)
+                        # entry_time を維持しつつ毎ループで再発注すると過剰トラフィックになるため、
+                        # 直近の発注試行から60秒以内なら今回はスキップする。
+                        _last_attempt = getattr(ts, "_last_close_attempt_at", None)
+                        if _last_attempt is not None:
+                            _elapsed_since_attempt = (datetime.datetime.now() - _last_attempt).total_seconds()
+                            if _elapsed_since_attempt < 60:
+                                log.debug(
+                                    f"{tag} ⏰ 時間切れ {elapsed:.1f}分経過だが直近発注から {_elapsed_since_attempt:.0f}秒 "
+                                    f"→ クールダウン中 (60秒待機)"
+                                )
+                                continue
+
+                        # ★ v3.8.5: 時間切れ決済は通常運用フロー (タイマー満了の自動決済) のため
+                        # WARNING → INFO に降格。発注失敗時の error / panic ログは別経路で出力される。
+                        log.info(
+                            f"{tag} ⏰ 時間切れ決済！ エントリから {elapsed:.1f}分経過"
+                            f"（上限: {_t_timeout}分{'・決算銘柄' if _is_earn_sym else ''}）"
+                        )
+                        _threadsafe_future(asyncio.to_thread(
+                            send_discord_message,
+                            f"[Bot] {tag} ⏰ 時間切れ決済\n"
+                            f"エントリから {elapsed:.1f}分経過  上限: {_t_timeout}分\n"
+                            f"（ニュースのエッジ消失・タイムアウトによる強制決済）"
+                        ))
+                        # ★ v2.86: 銘柄単位ロックで race 防止
+                        # ★ v2.99.2: 戻り値を受けて成功時のみ entry_time をクリア
+                        ts._last_close_attempt_at = datetime.datetime.now()
+                        async with _get_sym_lock(symbol):
+                            _close_ok = place_close_all(symbol, trd_env, f"時間切れ決済: {elapsed:.1f}分経過")
+                        if _close_ok:
+                            ts.forced_exits += 1
+                            ts.entry_time = None
+                            ts._last_close_attempt_at = None  # 成功時はクールダウン解除
+                            ts.close_fail_count = 0          # ★ v3.9.31: 成功で失敗カウントリセット
+                            _clear_failed_close(symbol)  # ★ v2.99.4
+                        else:
+                            # ★ v3.9.31: 連続失敗カウント + 無限リトライ防止
+                            # 5/21 利用者T事例: ショートカバーが moomoo に拒否され続け
+                            # 時間切れ決済が 11 分間無限ループした。N 回連続失敗で
+                            # sync_positions を強制実行し、実態 qty=0 なら諦める。
+                            ts.close_fail_count += 1
+                            log.error(
+                                f"{tag} ⏰ 時間切れ決済の発注が全失敗しました "
+                                f"({ts.close_fail_count}回連続) → entry_time を維持し 60秒後に再試行"
+                            )
+                            _mark_failed_close(symbol)  # ★ v2.99.4
+                            if ts.close_fail_count >= _CLOSE_FAIL_GIVEUP_LIMIT:
+                                log.warning(
+                                    f"{tag} ⏰ 決済発注が {ts.close_fail_count} 回連続失敗 → "
+                                    f"sync_positions を強制実行してポジション実態を確認します"
+                                )
+                                try:
+                                    await asyncio.to_thread(sync_positions, trd_env)
+                                except Exception as _e_sync:
+                                    log.warning(f"{tag} sync_positions 強制実行エラー: {_mask_secrets(_e_sync)}")
+                                # sync 後にポジション実態を再確認
+                                _ts_after = state.get(symbol)
+                                if _ts_after.position_qty == 0:
+                                    # 実態は既に決済済み → Bot 側の状態を確定クリアして無限ループ停止
+                                    log.warning(
+                                        f"{tag} ✅ sync 後 position_qty=0 を確認 → 既に決済済みと判断。"
+                                        f"entry_time をクリアしてリトライを停止します"
+                                    )
+                                    _ts_after.entry_time = None
+                                    _ts_after._last_close_attempt_at = None
+                                    _ts_after.close_fail_count = 0
+                                    _ts_after.is_short = False
+                                    _ts_after.position_ids = {"LONG": [], "SHORT": []}
+                                    _clear_failed_close(symbol)
+                                    _threadsafe_future(asyncio.to_thread(
+                                        send_discord_message,
+                                        f"[Bot] {tag} ⏰ 時間切れ決済が連続失敗しましたが、"
+                                        f"口座を確認したところ既にポジションが無いことを確認しました。"
+                                        f"リトライを停止します（実害なし）。"
+                                    ))
+                                else:
+                                    # 実態でもポジションが残っている → 真の決済失敗
+                                    log.error(
+                                        f"{tag} 🚨 sync 後も position_qty={_ts_after.position_qty} が残存。"
+                                        f"決済が本当に失敗しています → moomoo アプリで手動決済を検討してください"
+                                    )
+                                    _threadsafe_future(asyncio.to_thread(
+                                        send_discord_message,
+                                        f"[Bot] 🚨 {tag} 時間切れ決済が {ts.close_fail_count} 回連続で失敗し、"
+                                        f"口座にポジション (qty={_ts_after.position_qty}) が残っています。"
+                                        f"moomoo アプリで手動決済をご検討ください。"
+                                    ))
+                                    # カウントを途中までリセットして次のサイクルで再度 sync を試みる
+                                    ts.close_fail_count = max(0, _CLOSE_FAIL_GIVEUP_LIMIT - 2)
+                        continue
+
+                # ── ③ リアルタイム株価の取得 ─────────────────────────────────
+                quote = get_quote(symbol)
+                price = quote["last"] or quote["bid"] or 0.0
+                if price <= 0:
+                    _price_fail_count[symbol] += 1
+                    cnt = _price_fail_count[symbol]
+                    if cnt == 1 or cnt % _PRICE_FAIL_LOG_INTERVAL == 0:
+                        log.warning(
+                            f"{tag} [ポジション] 株価取得失敗 ({cnt}回目): スキップ"
+                            f"  ※Quote Right 未付与の可能性"
+                        )
+                    else:
+                        log.debug(f"{tag} [ポジション] 株価取得失敗 ({cnt}回目): スキップ")
+                    continue
+
+                # 取得成功 → 失敗カウントをリセット
+                _price_fail_count[symbol] = 0
+                ts.last_price = price
+                qty = ts.position_qty
+
+                # ★ v3.1.3: avg_cost 未確定の場合は監視をスキップ (約定反映待ち)
+                # 発注直後の数秒間、position_qty は更新されているが avg_cost が未設定の
+                # ままになるケースがある。この間 PnL = (0 - price) * abs(qty) が
+                # 大幅マイナス値となり、強制損切りの誤発動を引き起こす。
+                # _check_order_filled (5秒後) または sync_positions が avg_cost を
+                # 反映するまで待機する。
+                if qty != 0 and ts.avg_cost <= 0:
+                    log.debug(
+                        f"{tag} [ポジション] avg_cost未確定 (qty={qty}株, 約定反映待機中) → "
+                        f"PnL/損切り判定をスキップ"
+                    )
+                    continue
+
+                # ★ v3.9.17: 約定確認待ち中はリスク判定をスキップ
+                # SHORT 発注時 avg_cost は limit_price で仮設定されているため (v3.1.3)、
+                # 実約定価格との乖離で誤った PnL 算出 → 強制損切り誤発動が起きる。
+                # 5/13 22:49 SPY 事例: limit=$732.32 vs 現値$736.05 → 誤算 -0.51% で
+                # 強制損切り発動 → BUY_BACK 即時自己決済 (-$0.54)。
+                # FILLED_ALL 約定確認 / sync_positions ポジ反映で flag は False に戻る。
+                if ts.entry_pending_fill:
+                    log.debug(
+                        f"{tag} [ポジション] 約定確認待ち中 (qty={qty}株 avg_cost仮設定=${ts.avg_cost:.2f}) → "
+                        f"PnL/損切り/トレール判定をスキップ"
+                    )
+                    continue
+
+                # ロング/ショートで損益計算を分岐
+                if qty > 0:
+                    pnl     = (price - ts.avg_cost) * qty
+                    unr_pct = (price - ts.avg_cost) / ts.avg_cost * 100 if ts.avg_cost > 0 else 0.0
+                elif qty < 0:
+                    pnl     = (ts.avg_cost - price) * abs(qty)
+                    unr_pct = (ts.avg_cost - price) / ts.avg_cost * 100 if ts.avg_cost > 0 else 0.0
+                else:
+                    continue
+
+                # ── ★ v2.95: 保有中最大含み益を更新（GAS送信用）──────────────
+                # 含み益が正値の時だけ更新。含み損は更新しない（最大ドローダウンは別途管理）。
+                # ロング・ショート両対応（qty>0/qty<0 両方で pnl は正なら含み益）
+                if pnl > 0:
+                    ts.entry_peak_pnl = max(ts.entry_peak_pnl, pnl)
+
+                # peak_price追跡: ロング=最高値、ショート=最安値（トレール基準）
+                if qty > 0:
+                    if price > ts.peak_price:
+                        ts.peak_price = price
+                else:
+                    # ショート: 価格が下がるほど利益 → 最安値を追跡
+                    if ts.peak_price == 0 or price < ts.peak_price:
+                        ts.peak_price = price
+
+                # トレール発動：EARNINGS銘柄は専用しきい値、通常は TRAIL_TRIGGER_PCT
+                trail_trigger_dollar = ts.avg_cost * abs(qty) * _t_trigger
+                if not ts.trail_active and pnl >= trail_trigger_dollar:
+                    ts.trail_active = True
+                    _trail_label = f"{'決算専用' if _is_earn_sym else ''}トレール発動"
+                    if qty > 0:
+                        log.info(f"{tag} [{_trail_label}] 利益 {pnl_colored(pnl)}  peak=${ts.peak_price:.2f}  発動条件: +{_t_trigger*100:.1f}%")
+                    else:
+                        log.info(f"{tag} [{_trail_label}] ショート利益 {pnl_colored(pnl)}  trough=${ts.peak_price:.2f}  発動条件: +{_t_trigger*100:.1f}%")
+
+                trail_str = ""
+                if ts.trail_active and ts.peak_price > 0:
+                    if qty > 0:
+                        dfp = (ts.peak_price - price) / ts.peak_price * 100
+                        trail_str = f"  peak=${ts.peak_price:.2f} 下落={dfp:.2f}%"
+                    else:
+                        dfp = (price - ts.peak_price) / ts.peak_price * 100
+                        trail_str = f"  trough=${ts.peak_price:.2f} 上昇={dfp:.2f}%"
+                # ★ v3.9.134: 管理対象外の建玉は、その旨を毎回はっきり出す。
+                #   従来は「ポジションなし」の行にだけ注意書きを足していたため、
+                #   建玉があるとき＝まさに知らせたい場面で画面に出ていなかった
+                #   （デモ実機テストで判明）。
+                if getattr(ts, "externally_held", False):
+                    log.warning(
+                        f"{tag} [ポジション] ${price:.2f}  PnL={pnl_colored(pnl)}({pct_colored(unr_pct)})"
+                        f"  ⚠️ Bot 以外の建玉のため自動売買は停止中"
+                        f"（決済しません。この建玉を決済すると再開します）"
+                    )
+                else:
+                    log.info(
+                        f"{tag} [ポジション] ${price:.2f}  PnL={pnl_colored(pnl)}({pct_colored(unr_pct)})"
+                        f"  trail={'ON' if ts.trail_active else 'off'}{trail_str}"
+                    )
+
+                # ── ④ 強制損切り（ポジション評価額の MAX_LOSS_PCT %）──────────
+                position_cost   = ts.avg_cost * abs(qty)
+                # 決算銘柄は EARNINGS_MAX_LOSS_PCT（0なら MAX_LOSS_PCT を流用）
+                # ★ v3.9.63: モメンタム建玉は専用の MOMENTUM_STOP_LOSS_PCT を適用。
+                #   従来は共通 MAX_LOSS_PCT(0.30%) で切られ、6/1 実発注でも QQQ 0.20-0.31%
+                #   で被弾が頻発し 60分タイムアウト前に刈られていた (寄り高値掴みの早期損切り
+                #   連発)。MOMENTUM_STOP_LOSS_PCT は % 単位 (例 0.50) のため /100 で小数化。
+                #   優先順位: 決算 > モメンタム > 通常。0 以下のときは通常値にフォールバック。
+                if _is_earn_sym and EARNINGS_MAX_LOSS_PCT > 0:
+                    _eff_max_loss = EARNINGS_MAX_LOSS_PCT
+                elif _is_momentum and MOMENTUM_STOP_LOSS_PCT > 0:
+                    _eff_max_loss = MOMENTUM_STOP_LOSS_PCT / 100.0
+                else:
+                    _eff_max_loss = MAX_LOSS_PCT
+                # ★ v3.9.32: 高ボラ銘柄 (NVDA/SMH/TSLA 等) は損切り幅を拡大
+                # (発注時にサイズを縮小済みなのでドル損失額は ETF と同水準に保たれる)
+                # モメンタム専用値を使う場合は二重拡大を避けるため倍率は適用しない。
+                # ※ 案a(高ボラ損切り拡大)は実取引を変えず「シャドー計測」で検証する方針(v3.9.93)。
+                if not (_is_momentum and MOMENTUM_STOP_LOSS_PCT > 0):
+                    _eff_max_loss = _effective_max_loss_pct(symbol, _eff_max_loss)
+                # ★ v3.9.133: ここで確定した「実際に適用される損切り%」を建玉に保存する。
+                #   決済記録(_send_trade_result)はこの値をそのまま出力し、後からグローバル値で
+                #   再計算しない（モメンタムは高ボラ倍率をスキップするため、再計算すると
+                #   記録=1.50% / 実際=0.50% のように乖離する。今週の分析で判明）。
+                try:
+                    ts.enforced_stop_pct = round(_eff_max_loss * 100.0, 4)
+                except Exception:
+                    pass
+                max_loss_dollar = position_cost * _eff_max_loss
+                # ★ v3.9.66 (施策B'): 個別株は 1 トレード絶対損失上限 (USD) も併用。
+                # % 損切りが間に合わない急変動でも -STOCK_MAX_LOSS_USD で必ず切る。
+                _is_stock_rm = (symbol in STOCK_TICKERS or symbol in EARNINGS_PRE_TICKERS
+                                or symbol in EARNINGS_AFTER_TICKERS)
+                _usd_cap_hit = (
+                    _is_stock_rm and STOCK_MAX_LOSS_USD > 0 and pnl <= -STOCK_MAX_LOSS_USD
+                )
+                # ★ v3.9.85: PAN案（任意・MOMENTUM_TRAIL_FROM_ENTRY=true）。
+                #   モメンタム建玉は固定損切り(建値基準)の代わりに「建玉からのトレール
+                #   (幅=損切り幅 _eff_max_loss)」で損失保護する。peak は毎ループ更新済みで
+                #   建玉時から有利側へ動けば損切り線も切り上がる。下方向(一直線逆行)では
+                #   peak≒建値となり固定損切りと同値=劣らない。trail_active 後は下の狭い
+                #   トレール(_t_drop < _eff_max_loss)が先に発火し2段階トレールになる。
+                # ★ v3.9.86 (レビュー指摘修正):
+                #   (1) peak_price は建玉時に seed されず「最初に観測した市場価格」で
+                #       初期化されるため、建玉直後に逆行(ギャップ/観測遅延)すると
+                #       トレール基準が建値より不利側に置かれ、固定損切りより"緩く"なる
+                #       不具合があった。基準を建値で floor/cap し、固定損切りに決して
+                #       劣らない(弱意味で優位)ことを保証する。
+                #         LONG : ref = max(peak, avg_cost)
+                #         SHORT: ref = min(peak, avg_cost)
+                #   (2) trail_active 到達後は狭いトレール(⑤)に委ね、広い建玉トレール(④)は
+                #       発火させない(急落1tickで利確が損切り計上されA/B分類を汚す問題の解消)。
+                _pan_trail_mode = bool(
+                    MOMENTUM_TRAIL_FROM_ENTRY and _is_momentum
+                    and ts.peak_price > 0 and ts.avg_cost > 0
+                    and not ts.trail_active
+                )
+                if _pan_trail_mode:
+                    if qty > 0:
+                        _ref = max(ts.peak_price, ts.avg_cost)   # 建値を下限に
+                        _drop_from_peak = (_ref - price) / _ref
+                    else:
+                        _ref = min(ts.peak_price, ts.avg_cost)   # 建値を上限に
+                        _drop_from_peak = (price - _ref) / _ref
+                    _stop_hit = (_drop_from_peak >= _eff_max_loss)
+                else:
+                    _stop_hit = (pnl <= -max_loss_dollar)
+                # ★ v3.9.101: 約定直後の猶予中は損失保護（建玉トレール/強制損切り）を抑止。
+                #   指値の仮設定→実約定単価の反映までの過渡期に誤発火しない保険。
+                #   利益確定のトレール(⑤)は対象外（損失保護のみ抑止）。
+                # ★ v3.9.105: 猶予はモメンタム建玉のみに限定（v3.9.101 の実装漏れ修正）。
+                #   従来は _is_momentum 条件が抜けており、ニュース/決算建玉の損切りまで
+                #   15秒遅延していた。
+                if (_stop_hit or _usd_cap_hit) and _is_momentum \
+                        and MOMENTUM_ENTRY_GRACE_SEC > 0 \
+                        and ts.entry_time is not None:
+                    _sec_since_entry = (datetime.datetime.now() - ts.entry_time).total_seconds()
+                    if _sec_since_entry < MOMENTUM_ENTRY_GRACE_SEC:
+                        log.debug(
+                            f"{tag} 損失保護条件成立だが約定直後の猶予中"
+                            f"（{_sec_since_entry:.0f}s < {MOMENTUM_ENTRY_GRACE_SEC}s）→ スキップ"
+                            f"（実約定単価の反映待ち・誤発火防止）"
+                        )
+                        _stop_hit = False
+                        _usd_cap_hit = False
+                if _stop_hit or _usd_cap_hit:
+                    # ★ v2.99.2: 発注失敗時の再試行クールダウン (60秒)
+                    _last_attempt_lc = getattr(ts, "_last_close_attempt_at", None)
+                    if _last_attempt_lc is not None:
+                        _elapsed_since_lc = (datetime.datetime.now() - _last_attempt_lc).total_seconds()
+                        if _elapsed_since_lc < 60:
+                            log.debug(
+                                f"{tag} ⚠ 損失保護条件成立だが直近発注から {_elapsed_since_lc:.0f}秒 → クールダウン中"
+                            )
+                            continue
+
+                    loss_pct = abs(pnl) / position_cost * 100 if position_cost > 0 else 0
+                    # ★ v3.9.102: 表記改善。利益トレール作動後(trail_active=含み益が+発動閾値に
+                    #   達してトレール管理下に入った建玉)の戻り決済を「強制損切り」と表記すると
+                    #   誤解を招くため、トレール表記にする（exit_code は TRAIL）。
+                    #   一度も利益が乗らずライン到達で切れた純粋な損切りのみ「強制損切り」。
+                    if _pan_trail_mode:
+                        _exit_label = "建玉トレールストップ"
+                    elif ts.trail_active:
+                        _exit_label = "トレイリングストップ（利益確保後の戻り）"
+                    else:
+                        _exit_label = "強制損切り"
+                    # ── ★ v3.9.84: 強制損切りA/B計測（シャドー・挙動は一切不変）──────────
+                    #   強制損切りした建玉について「もし損切りせずトレール/+60分保有していたら」
+                    #   の反実仮想を、観察ログの仮想exit列（32=基準PnL%・33=仮想MFEトレールPnL%）で
+                    #   後追い計測する。block_stage="forced_stop_ab"。実現損≒実効損切り%（列43）と
+                    #   比較し、反実仮想が実現損を継続的に上回れば「損切りが早すぎる＝緩める/トレール
+                    #   委任の検証材料」になる。観察ログ既存の +60分 vexit パイプラインに相乗りする
+                    #   ため新規GAS列・新規ロジックは不要（送信1件増のみ・売買は完全に不変）。
+                    #   ※ PAN案(建玉トレール)・利益トレール戻りで決済した分はA/Bの対照群を
+                    #     汚さないため記録しない（純粋な強制損切りのみ計測）。
+                    if not _pan_trail_mode and not ts.trail_active:
+                        try:
+                            _log_observation(
+                                symbol=symbol,
+                                side=("BUY" if qty > 0 else "SELL_SHORT"),
+                                confidence=0.0,
+                                score=(1 if qty > 0 else -1),
+                                category=(ts.entry_ai_category or ("MOMENTUM" if _is_momentum else "")),
+                                outcome="ordered",
+                                block_stage="forced_stop_ab",
+                                block_reason=(f"forced_stop realized={-loss_pct:.3f}% "
+                                              f"thr={_eff_max_loss*100:.3f}% entry={ts.avg_cost:.2f} "
+                                              f"stop_px={price:.2f}"),
+                                price_at_decision=ts.avg_cost,   # 取得単価を基準に反実仮想を算出
+                                live_allowed=True,
+                                eff_stop_loss_pct=_eff_max_loss * 100.0,
+                            )
+                        except Exception:
+                            pass
+                    if _usd_cap_hit:
+                        _cut_reason = f"USD上限 -${STOCK_MAX_LOSS_USD:.0f}"
+                    elif _pan_trail_mode:
+                        _cut_reason = f"建玉トレール幅{_eff_max_loss*100:.2f}%(peak基準)"
+                    elif ts.trail_active:
+                        _cut_reason = f"利益トレール戻り(幅{_eff_max_loss*100:.2f}%)"
+                    else:
+                        _cut_reason = f"ライン{_eff_max_loss*100:.2f}%"
+                    log.warning(
+                        f"{tag} ⚠ {_exit_label}！  PnL={pnl_colored(pnl)}"
+                        f"  ({pct_colored(-loss_pct if pnl < 0 else loss_pct)} / {_cut_reason})"
+                    )
+                    _threadsafe_future(asyncio.to_thread(
+                        send_discord_message,
+                        f"[Bot] {tag} ⚠ {_exit_label}発動\n"
+                        f"{discord_pnl(pnl, (pnl/position_cost*100 if position_cost>0 else 0), qty)}\n"
+                        f"基準幅: {_eff_max_loss*100:.2f}%（{_cut_reason}）\n"
+                        f"株価: ${price:.2f}  取得単価: ${ts.avg_cost:.2f}"
+                    ))
+                    # ★ v2.86: 銘柄単位ロックで race 防止
+                    # ★ v2.99.2: 戻り値で発注成否を判定
+                    ts._last_close_attempt_at = datetime.datetime.now()
+                    async with _get_sym_lock(symbol):
+                        _close_ok_lc = place_close_all(symbol, trd_env, f"{_exit_label}: ${pnl:.2f} ({loss_pct:.2f}%)")
+                    if _close_ok_lc:
+                        ts.forced_exits += 1
+                        ts._last_close_attempt_at = None
+                        _clear_failed_close(symbol)  # ★ v2.99.4
+                    else:
+                        log.error(
+                            f"{tag} ⚠ {_exit_label}の発注が全失敗 → 60秒後に再試行します"
+                        )
+                        _play_alert_sound("force_loss_cut_failed")  # ★ v3.9.19: アラート音
+                        _mark_failed_close(symbol)  # ★ v2.99.4
+                    continue
+
+                # ── ⑤ トレイリングストップ ───────────────────────────────────
+                if ts.trail_active and ts.peak_price > 0:
+                    if qty > 0:
+                        # ロング: ピークから下落で利確
+                        drop     = (ts.peak_price - price) / ts.peak_price
+                        peak_pnl = (ts.peak_price - ts.avg_cost) * qty
+                        label_peak = f"peak=${ts.peak_price:.2f}→${price:.2f}  下落={drop*100:.3f}%"
+                    else:
+                        # ショート: トラフから上昇で利確
+                        drop     = (price - ts.peak_price) / ts.peak_price
+                        peak_pnl = (ts.avg_cost - ts.peak_price) * abs(qty)
+                        label_peak = f"trough=${ts.peak_price:.2f}→${price:.2f}  上昇={drop*100:.3f}%"
+                    if drop >= _t_drop:
+                        # ★ v2.99.2: 発注失敗時の再試行クールダウン (60秒)
+                        _last_attempt_tr = getattr(ts, "_last_close_attempt_at", None)
+                        if _last_attempt_tr is not None:
+                            _elapsed_since_tr = (datetime.datetime.now() - _last_attempt_tr).total_seconds()
+                            if _elapsed_since_tr < 60:
+                                log.debug(
+                                    f"{tag} ★ トレイリングストップ条件成立だが直近発注から {_elapsed_since_tr:.0f}秒 → クールダウン中"
+                                )
+                                continue
+
+                        drop_pct = drop * 100
+                        log.warning(
+                            f"{tag} ★ トレイリングストップ！"
+                            f"  現在利益={pnl_colored(pnl)}  最高利益時={pnl_colored(peak_pnl)}"
+                            f"  {label_peak}"
+                        )
+                        _threadsafe_future(asyncio.to_thread(
+                            send_discord_message,
+                            f"[Bot] {tag} ★ トレイリングストップ発動\n"
+                            f"{discord_pnl(pnl, unr_pct, qty)}\n"
+                            f"最高利益時: +${peak_pnl:.2f}\n"
+                            f"{label_peak}"
+                        ))
+                        # ★ v2.86: 銘柄単位ロックで race 防止
+                        # ★ v2.99.2: 戻り値で発注成否を判定
+                        ts._last_close_attempt_at = datetime.datetime.now()
+                        async with _get_sym_lock(symbol):
+                            _close_ok_tr = place_close_all(
+                                symbol, trd_env,
+                                f"トレイリングストップ: {label_peak}"
+                            )
+                        if _close_ok_tr:
+                            ts.trail_exits += 1
+                            ts._last_close_attempt_at = None
+                            _clear_failed_close(symbol)  # ★ v2.99.4
+                        else:
+                            log.error(
+                                f"{tag} ★ トレイリングストップの発注が全失敗 → 60秒後に再試行します"
+                            )
+                            _mark_failed_close(symbol)  # ★ v2.99.4
+
+            except Exception as e:
+                log.error(f"[{symbol}] リスク監視エラー: {e}", exc_info=True)
+
+# ── エントリポイント ────────────────────────────────────────────────────────────────
+async def main(live: bool) -> None:
+    global market_open_event, _main_loop, _anthropic_api_lock
+    market_open_event = asyncio.Event()
+    # ★ v3.9.7 hotfix: Python 3.10+ で asyncio.get_event_loop() は実行中ループ外で
+    # RuntimeError を投げる。本関数は async def main 内なので get_running_loop()
+    # が正解。A-saka 環境の "no current event loop in thread 'asyncio_N'" 系
+    # 報告に対する根本対策 (worker thread 経由で ensure_future が呼ばれる経路で
+    # _main_loop を確実に参照できるよう、main コルーチン自身のループを保持)。
+    _main_loop = asyncio.get_running_loop()
+    # ★ v3.9.13: Anthropic API 並列呼出シリアライズ用 Semaphore を初期化。
+    # Semaphore(1) で同時 1 呼出のみ許可 → 異なる async ループからの並列発火を排除。
+    # 5/13 04:44 認定サポーター環境で観測の 529 連発事例への根本対策。
+    _anthropic_api_lock = asyncio.Semaphore(1)
+
+    trd_env              = TrdEnv.REAL if live else TrdEnv.SIMULATE
+    # ★ v3.9.99: 実取引/デモの判別タグを確定（トレード送信に付与・レポートで分離集計可能に）。
+    global _RUN_TRADE_ENV
+    _RUN_TRADE_ENV = "REAL" if live else "DEMO"
+
+    # ★ v3.9.115: 当日サマリ集計を再起動後に復元（同一 ET 日付ならマージ）。
+    # DATA_COLLECT 非依存で日次サマリを正しく表示するため、ここで1回読み戻す。
+    try:
+        _n_restored = _load_today_state()
+        if _n_restored:
+            log.info(f"[当日サマリ] 再起動前の当日トレード {_n_restored}件 を復元しました（日次サマリに合算）")
+    except Exception as _e_lts:
+        log.debug(f"[当日サマリ] 復元失敗(黙殺): {_mask_secrets(_e_lts)}")
+
+    # ★ v3.9.134: 建玉台帳を読み込む（起動時ポジション復元より前に必ず実行）
+    try:
+        _n_led = _ledger_load()
+        log.info(f"[建玉台帳] 読込完了: Bot の建玉 {_n_led}銘柄")
+        if _ledger_broken:
+            log.error(
+                "🔴 [建玉台帳] 台帳を読めませんでした。いま持っている建玉はすべて "
+                "Bot の管理対象外になり、損切り・時間切れ決済が動きません。"
+            )
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                "🔴 【重要】建玉の管理台帳を読み込めませんでした\n"
+                "いま持っている建玉はすべて『Bot のものではない』と判断され、\n"
+                "**損切り・時間切れ決済が行われません。**\n"
+                "建玉が残っている場合は moomoo アプリで手動決済するか、Bot を停止してください。"
+            ))
+    except Exception as _e_led0:
+        log.warning(f"[建玉台帳] 読込で例外: {_mask_secrets(_e_led0)}")
+
+    # ★ v3.9.73: PCT 旧表記(小数)を検出していれば起動時に1回まとめて警告
+    _emit_pct_unit_warnings()
+
+    # ★ v3.9.90: 建玉トレールの状態を起動時に明示（既定ON＝標準）。
+    if MOMENTUM_TRAIL_FROM_ENTRY:
+        log.info(
+            "[建玉トレール] 有効（標準・既定ON）→ モメンタム建玉は"
+            f"「建玉時からのトレール(幅={MOMENTUM_STOP_LOSS_PCT:.2f}%)」で損失保護します"
+            "（固定の強制損切りを置き換え。含み益が出れば損切り線も切り上がる）。"
+            " 決済理由は『建玉トレールストップ』で記録。従来の固定損切りに戻すには MOMENTUM_TRAIL_FROM_ENTRY=false。"
+        )
+    else:
+        log.info("[建玉トレール] 無効（MOMENTUM_TRAIL_FROM_ENTRY=false）→ 従来の固定の強制損切りで損失保護します。")
+
+    # ★ v3.9.103: 当日トレンド・フィルターの状態
+    if MOMENTUM_TREND_FILTER_PCT > 0:
+        if MOMENTUM_TREND_FILTER_ENABLED:
+            log.info(
+                f"[トレンドフィルター] 実ブロック有効 → SPY{MOMENTUM_TREND_LOOKBACK_MIN}分が"
+                f"±{MOMENTUM_TREND_FILTER_PCT:.2f}%超の日は逆張り（上昇日ショート/下落日ロング）の実発注を停止。"
+            )
+        else:
+            log.info(
+                f"[トレンドフィルター] 計測のみ（売買不変）→ 逆張り判定を観察ログ trend_filter_ab に記録。"
+                f" 実ブロックは MOMENTUM_TREND_FILTER_ENABLED=true。"
+            )
+
+    # ★ v3.9.104: プレマーケット抑制フィルターの状態
+    if MOMENTUM_PREMARKET_FILTER_ENABLED:
+        log.info("[プレマーケット抑制] 実ブロック有効 → premarket の新規モメンタム実発注を停止。")
+    else:
+        log.info(
+            "[プレマーケット抑制] 計測のみ（売買不変）→ premarket 実発注を観察ログ "
+            "premarket_filter_ab に記録。実ブロックは MOMENTUM_PREMARKET_FILTER_ENABLED=true。"
+        )
+
+    # ★ v3.9.65: デモ・ネッティング空売りの状態を起動時に明示
+    if trd_env == TrdEnv.SIMULATE:
+        if DEMO_SHORT_ENABLED:
+            log.warning(
+                "[デモ空売り] DEMO_SHORT_ENABLED=true → デモ口座でショートを実発注します "
+                "(プレーン SELL で建て / BUY で決済・ネッティング方式)。"
+                " SELL_SHORT シグナルが flat 時に実発注化されます。"
+            )
+        else:
+            log.info(
+                "[デモ空売り] DEMO_SHORT_ENABLED=false (明示設定) → デモのショートはシャドー記録のみ。"
+                " 既定は ON です。実発注化するには .env の DEMO_SHORT_ENABLED 行を true にするか削除してください。"
+            )
+
+    # ★ v3.9.69: 実口座の買い専用オプションの状態を起動時に明示
+    if trd_env == TrdEnv.REAL:
+        if REAL_SHORT_ENABLED:
+            log.info("[実口座ショート] REAL_SHORT_ENABLED=true (既定) → 実口座でも空売りを実発注します。")
+        else:
+            log.warning(
+                "[実口座ショート] REAL_SHORT_ENABLED=false → 実口座は買い専用。"
+                " ニュース駆動・モメンタムの SHORT はすべてシャドー記録のみ(実発注なし)になります。"
+            )
+
+    # ─────────────────────────────────────────────────────────────
+    # ★ v2.96 / v3.9.83: OpenD 到達性チェック（起動時・デモ/実の両方）
+    # OpenD が起動していないと OpenSecTradeContext / OpenQuoteContext の
+    # TCP 接続が無言でハングし、Mac/Windows が固まったように見える。
+    # さらにデモ環境でも OpenD 未起動のままだと「ポジション取得失敗+
+    # リトライ連発(リトライ嵐)」が起きるため、--live だけでなく
+    # デモ起動でも 3 秒タイムアウトで事前チェックして明示エラーを出す。
+    # ─────────────────────────────────────────────────────────────
+    if True:   # ★ v3.9.83: 以前は if live: だったがデモにも適用 (大多数の受講生はデモ)
+        import socket as _socket
+        try:
+            with _socket.create_connection((MOOMOO_HOST, MOOMOO_PORT), timeout=3.0):
+                pass
+        except (OSError, _socket.timeout) as _e:
+            _login_kind = "実口座" if live else "デモ口座"
+            print()
+            print("  ╔══════════════════════════════════════════════════════════════╗")
+            print("  ║  ❌  OpenD に接続できません                                  ║")
+            print("  ║                                                              ║")
+            print(f"  ║  接続先: {MOOMOO_HOST}:{MOOMOO_PORT}".ljust(63) + "║")
+            print(f"  ║  エラー: {str(_e)[:50]}".ljust(63) + "║")
+            print("  ║                                                              ║")
+            print("  ║  確認事項:                                                   ║")
+            print("  ║    1) OpenD が起動している                                   ║")
+            _l2 = f"    2) OpenD で{_login_kind}にログイン済み"
+            _w2 = sum(2 if ord(c) > 0x2E7F else 1 for c in _l2)  # 全角=2 概算で枠を揃える
+            print("  ║" + _l2 + " " * max(0, 62 - _w2) + "║")
+            print("  ║    3) OpenD が「Connected」表示                              ║")
+            print("  ║    4) .env の MOOMOO_HOST / MOOMOO_PORT が正しい             ║")
+            print("  ╚══════════════════════════════════════════════════════════════╝")
+            print()
+            _play_alert_sound("opend_connection_failed")  # ★ v3.9.19: アラート音
+            sys.exit(1)
+        log.info(f"[起動時検証] OpenD 到達性 OK ({MOOMOO_HOST}:{MOOMOO_PORT}・{'実' if live else 'デモ'})")
+
+    # ── ★ v3.5.2: moomoo SDK の TrdSide.BUY_BACK 存在チェック (実口座のみ) ──
+    # moomoo サポート (2026-05-08) 確認: 開設は BUY/SELL_SHORT、決済は SELL/BUY_BACK。
+    # 旧 SDK は BUY_BACK 不在 → silent fallback で order failure 発生 (受講生環境で
+    # moomoo から直接通知)。v3.5.2 以降は明示拒否。推奨: moomoo-api 10.4.6408+。
+    if live and not hasattr(TrdSide, "BUY_BACK"):
+        print()
+        print("  ╔══════════════════════════════════════════════════════════════╗")
+        print("  ║  ❌  moomoo SDK が古すぎます                                 ║")
+        print("  ║                                                              ║")
+        print("  ║  原因: TrdSide.BUY_BACK 定数がインストール済み SDK に        ║")
+        print("  ║        存在しません。SHORT 決済が moomoo 側で失敗します。   ║")
+        print("  ║                                                              ║")
+        print("  ║  対応: 以下のコマンドで SDK を最新版に更新してください       ║")
+        print("  ║                                                              ║")
+        print("  ║    pip install --upgrade moomoo-api                          ║")
+        print("  ║                                                              ║")
+        print("  ║  最低要件: moomoo-api 10.4.6408 以降                         ║")
+        print("  ║                                                              ║")
+        print("  ║  参考: moomoo サポート (2026-05-08) 通知                     ║")
+        print("  ║    新規ポジション : BUY  / SELL_SHORT                        ║")
+        print("  ║    決済           : SELL / BUY_BACK                          ║")
+        print("  ╚══════════════════════════════════════════════════════════════╝")
+        print()
+        _play_alert_sound("moomoo_sdk_outdated")  # ★ v3.9.19: アラート音
+        sys.exit(1)
+    if live:
+        log.info("[起動時検証] moomoo SDK TrdSide.BUY_BACK OK (SHORT 決済対応)")
+
+    # ─────────────────────────────────────────────────────────────
+    # 実口座モード(--live)の事前処理:
+    #   - MOOMOO_ACC_ID が設定済み    → 検証のみ(特定口座・MARGINか)
+    #   - MOOMOO_ACC_ID が未設定      → 自動取得 → .env に書き込み → 再起動案内
+    # REQUIRE_TOKUTEI_ACC=false で検証と自動取得をスキップ可(非推奨)
+    # ─────────────────────────────────────────────────────────────
+    if live:
+        _require_tokutei = os.environ.get("REQUIRE_TOKUTEI_ACC", "true").strip().lower() != "false"
+        _env_path        = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+        if _require_tokutei:
+            # ── get_acc_list を1回だけ取得してロジック内で使い回す ──
+            _acc_list_df = None
+            try:
+                # ★ v2.86: with _trade_ctx() で例外時の close を保証
+                with _trade_ctx() as _verify_ctx:
+                    _vret, _vdata = _verify_ctx.get_acc_list()
+                if _vret == RET_OK and _df_has_rows(_vdata):
+                    _acc_list_df = _vdata
+                else:
+                    log.warning(f"[起動時検証] get_acc_list 取得失敗: ret={_vret}")
+            except Exception as _e:
+                log.warning(f"[起動時検証] get_acc_list 呼び出しエラー: {_e}")
+
+            # ── 「特定口座・MARGIN・REAL」の行を抽出するヘルパー ────
+            def _is_tokutei_val(v):
+                """jp_acc_type の値が特定口座を示すかを判定"""
+                if v is None: return False
+                s = str(v).strip()
+                if not s or s.lower() in ("nan", "none", ""): return False
+                # 英語表記・日本語表記・数値表記いずれにも対応
+                for marker in ("SpecificAcc", "特定", "tokutei"):
+                    if marker.lower() in s.lower():
+                        return True
+                try:
+                    if int(s) == 1:
+                        return True
+                except (ValueError, TypeError):
+                    pass
+                return False
+
+            def _filter_real_margin_tokutei(df):
+                """REAL × MARGIN × 特定口座 の行だけに絞る"""
+                if df is None or len(df) == 0: return None
+                try:
+                    hits = df[df["trd_env"].astype(str).str.upper().str.contains("REAL")]
+                    hits = hits[hits["acc_type"].astype(str).str.upper().str.contains("MARGIN")]
+                    if "jp_acc_type" in df.columns:
+                        hits = hits[hits["jp_acc_type"].apply(_is_tokutei_val)]
+                    return hits if _df_has_rows(hits) else None
+                except Exception as _e:
+                    log.warning(f"[起動時検証] フィルタ処理エラー: {_e}")
+                    return None
+
+            # ── ケースA: MOOMOO_ACC_ID が未設定 → 自動取得 ─────────
+            if REAL_ACC_ID == 0:
+                if _acc_list_df is None:
+                    print()
+                    print("  ╔══════════════════════════════════════════════════════════╗")
+                    print("  ║  ❌  口座一覧の取得に失敗しました                        ║")
+                    print("  ║                                                          ║")
+                    print("  ║  確認事項:                                               ║")
+                    print("  ║    1) OpenD が起動している                               ║")
+                    print("  ║    2) OpenD で実口座にログイン済み                       ║")
+                    print("  ║    3) OpenD が「Connected」表示                          ║")
+                    print("  ╚══════════════════════════════════════════════════════════╝")
+                    print()
+                    sys.exit(1)
+
+                _candidates = _filter_real_margin_tokutei(_acc_list_df)
+                if _candidates is None:
+                    # 特定口座が見つからない
+                    print()
+                    print("  ╔══════════════════════════════════════════════════════════════╗")
+                    print("  ║  ❌  実口座の「特定口座・信用(MARGIN)」が見つかりません      ║")
+                    print("  ║                                                              ║")
+                    print("  ║  考えられる原因:                                             ║")
+                    print("  ║    ・特定口座を未開設                                        ║")
+                    print("  ║    ・信用取引口座を未開設                                    ║")
+                    print("  ║                                                              ║")
+                    print("  ║  対処: moomoo アプリで口座情報を確認し、必要なら開設申請を   ║")
+                    print("  ║  行ってください(通常1〜3営業日で承認)。                     ║")
+                    print("  ║                                                              ║")
+                    print("  ║  デバッグ用: .env に REQUIRE_TOKUTEI_ACC=false を設定すると  ║")
+                    print("  ║  検証をスキップできます(一般口座で取引する場合は確定申告が   ║")
+                    print("  ║  必要になるため非推奨)                                       ║")
+                    print("  ╚══════════════════════════════════════════════════════════════╝")
+                    print()
+                    # デバッグ情報として取得した口座一覧を表示
+                    print("  [参考] 取得した口座一覧:")
+                    try:
+                        print(_acc_list_df.to_string(index=False))
+                    except Exception:
+                        print(_acc_list_df)
+                    print()
+                    sys.exit(1)
+
+                # 候補が見つかった
+                if len(_candidates) == 1:
+                    # 候補1つ → 自動的にそれを使う
+                    _auto_acc_id = int(_candidates.iloc[0]["acc_id"])
+                    print()
+                    print("  ╔══════════════════════════════════════════════════════════════╗")
+                    print("  ║  🎯  特定口座・信用口座を自動検出しました                    ║")
+                    print(f"  ║     acc_id = {_auto_acc_id}")
+                    print("  ╚══════════════════════════════════════════════════════════════╝")
+                    print()
+                else:
+                    # 候補が複数 → ユーザーに選んでもらう
+                    print()
+                    print("  複数の「特定口座・信用口座」が見つかりました。使用する口座を選んでください:")
+                    print()
+                    _rows = list(_candidates.itertuples(index=False))
+                    for _i, _r in enumerate(_rows, 1):
+                        _acc = getattr(_r, "acc_id", "?")
+                        _cn  = getattr(_r, "card_num", "") or getattr(_r, "uni_card_num", "")
+                        print(f"    [{_i}] acc_id={_acc}   card_num={_cn}")
+                    print()
+                    while True:
+                        try:
+                            _sel = input(f"  番号を選択 (1-{len(_rows)}) またはキャンセルで Ctrl+C: ").strip()
+                            _idx = int(_sel) - 1
+                            if 0 <= _idx < len(_rows):
+                                _auto_acc_id = int(_rows[_idx].acc_id)
+                                break
+                        except (ValueError, IndexError):
+                            pass
+                        except (KeyboardInterrupt, EOFError):
+                            print("\n  キャンセルしました。")
+                            sys.exit(1)
+                        print(f"  1〜{len(_rows)} の番号を入力してください。")
+
+                # .env に追記(自動書き込み)
+                try:
+                    _env_lines = []
+                    _found_existing_key = False
+                    if os.path.exists(_env_path):
+                        with open(_env_path, encoding="utf-8") as _f:
+                            _env_lines = _f.readlines()
+                    for _i, _line in enumerate(_env_lines):
+                        if _line.strip().startswith("MOOMOO_ACC_ID="):
+                            _env_lines[_i] = f"MOOMOO_ACC_ID={_auto_acc_id}\n"
+                            _found_existing_key = True
+                            break
+                    if not _found_existing_key:
+                        if _env_lines and not _env_lines[-1].endswith("\n"):
+                            _env_lines.append("\n")
+                        _env_lines.append(f"\n# ── 実口座acc_id(自動検出) ──\n")
+                        _env_lines.append(f"MOOMOO_ACC_ID={_auto_acc_id}\n")
+
+                    # バックアップを取ってから書き込み
+                    if os.path.exists(_env_path):
+                        import shutil as _sh
+                        _ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        _sh.copy(_env_path, f"{_env_path}.backup_{_ts}")
+
+                    with open(_env_path, "w", encoding="utf-8") as _f:
+                        _f.writelines(_env_lines)
+
+                    print()
+                    print(f"  ✅  .env に MOOMOO_ACC_ID={_auto_acc_id} を書き込みました")
+                    print(f"      (バックアップ: .env.backup_{_ts})")
+                    print()
+                    print("  ╔══════════════════════════════════════════════════════════════╗")
+                    print("  ║  ℹ️   Botを再起動して、書き込まれた設定で実口座取引を開始します║")
+                    print("  ║                                                              ║")
+                    print("  ║     python moomoo_trade_v1.py --live                         ║")
+                    print("  ║                                                              ║")
+                    print("  ║  2回目以降は自動的に特定口座で起動します。                   ║")
+                    print("  ╚══════════════════════════════════════════════════════════════╝")
+                    print()
+                    sys.exit(0)
+                except Exception as _e:
+                    print()
+                    print(f"  ❌  .env への書き込みに失敗しました: {_e}")
+                    print(f"      手動で .env に以下の行を追加してください:")
+                    print(f"        MOOMOO_ACC_ID={_auto_acc_id}")
+                    print()
+                    sys.exit(1)
+
+            # ── ケースB: MOOMOO_ACC_ID が設定済み → 検証のみ ────────
+            else:
+                if _acc_list_df is None:
+                    log.warning("[起動時検証] ⚠️  get_acc_list 取得不可のため acc_type/jp_acc_type 検証をスキップ")
+                else:
+                    # REAL_ACC_ID と一致する行を探す
+                    _matching = None
+                    try:
+                        _hits = _acc_list_df[_acc_list_df["acc_id"].astype(str) == str(REAL_ACC_ID)]
+                        if _df_has_rows(_hits):
+                            _matching = _hits.iloc[0]
+                    except Exception as _e:
+                        log.warning(f"[起動時検証] acc_idマッチング中にエラー: {_e}")
+
+                    if _matching is not None:
+                        _acc_type_val = str(_matching.get("acc_type", "")) if hasattr(_matching, "get") else str(_matching["acc_type"])
+                        _jp_type_val  = ""
+                        if "jp_acc_type" in _acc_list_df.columns:
+                            _jp_type_val = str(_matching.get("jp_acc_type", "")) if hasattr(_matching, "get") else str(_matching["jp_acc_type"])
+
+                        # acc_type チェック: MARGIN
+                        if "MARGIN" not in _acc_type_val.upper():
+                            print()
+                            print("  ╔══════════════════════════════════════════════════════════════╗")
+                            print("  ║  ❌  指定された acc_id は信用口座(MARGIN)ではありません      ║")
+                            print(f"  ║     acc_id    = {REAL_ACC_ID}")
+                            print(f"  ║     acc_type  = {_acc_type_val}")
+                            print("  ║                                                              ║")
+                            print("  ║  対処: .env の MOOMOO_ACC_ID を削除して再起動すると         ║")
+                            print("  ║       Botが自動で正しい口座を検出して書き込みます。          ║")
+                            print("  ╚══════════════════════════════════════════════════════════════╝")
+                            print()
+                            sys.exit(1)
+
+                        # jp_acc_type チェック: 特定口座
+                        if _jp_type_val and not _is_tokutei_val(_jp_type_val):
+                            print()
+                            print("  ╔══════════════════════════════════════════════════════════════╗")
+                            print("  ║  ❌  指定された acc_id は「特定口座」ではありません          ║")
+                            print(f"  ║     acc_id      = {REAL_ACC_ID}")
+                            print(f"  ║     acc_type    = {_acc_type_val}")
+                            print(f"  ║     jp_acc_type = {_jp_type_val}")
+                            print("  ║                                                              ║")
+                            print("  ║  「一般口座」で取引すると確定申告が必要になります。          ║")
+                            print("  ║                                                              ║")
+                            print("  ║  対処: .env の MOOMOO_ACC_ID= の行を削除して再起動すると    ║")
+                            print("  ║       Botが自動で特定口座を検出して書き込みます。            ║")
+                            print("  ╚══════════════════════════════════════════════════════════════╝")
+                            print()
+                            sys.exit(1)
+
+                        log.info(f"[起動時検証] ✅ acc_id={REAL_ACC_ID} → {_acc_type_val} / jp_acc_type={_jp_type_val or '(未取得)'}")
+                    else:
+                        log.warning(f"[起動時検証] ⚠️  acc_id={REAL_ACC_ID} が get_acc_list に見つかりません")
+                        log.warning("             → .env の MOOMOO_ACC_ID が古い可能性があります。")
+                        log.warning("             → 削除して再起動すると自動で最新の特定口座を検出します。")
+        else:
+            # REQUIRE_TOKUTEI_ACC=false の場合、MOOMOO_ACC_ID 未設定なら停止
+            if REAL_ACC_ID == 0:
+                print()
+                print("  ╔══════════════════════════════════════════════════════════╗")
+                print("  ║  ⚠️  MOOMOO_ACC_ID が未設定です                          ║")
+                print("  ║                                                          ║")
+                print("  ║  REQUIRE_TOKUTEI_ACC=false 指定時は自動検出が無効です。  ║")
+                print("  ║  .env に MOOMOO_ACC_ID=<あなたのID> を手動で設定するか、 ║")
+                print("  ║  REQUIRE_TOKUTEI_ACC 設定を削除して再起動してください。  ║")
+                print("  ╚══════════════════════════════════════════════════════════╝")
+                print()
+                sys.exit(1)
+
+    # ── ★ v3.9.106: 実口座の購買力と BUDGET_USD の整合チェック（--live のみ）──
+    # BUDGET_USD は自己申告値のため、実口座の信用余力を上回っていると
+    # 「Insufficient buying power」で発注拒否が発生する（Bot内の残余力チェックは
+    # BUDGET_USD 基準なので防げない）。起動時に実際の購買力(power)を取得して警告する。
+    # 取得失敗時は警告なしで続行（best-effort・起動は止めない）。
+    if live and REAL_ACC_ID:
+        try:
+            with _trade_ctx() as _ctx_pw:
+                _r_pw, _d_pw = _ctx_pw.accinfo_query(
+                    trd_env=trd_env, currency=ft.Currency.USD, acc_id=REAL_ACC_ID
+                )
+            if _r_pw == RET_OK and _df_has_rows(_d_pw):
+                _power = None
+                for _fld in ("power", "max_power_short", "cash"):
+                    try:
+                        _v_pw = float(_d_pw[_fld].iloc[0] if hasattr(_d_pw, "iloc") else _d_pw[_fld][0])
+                        if _v_pw > 0:
+                            _power = _v_pw
+                            break
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        continue
+                if _power is not None:
+                    if _BUDGET_USD > _power:
+                        log.warning(
+                            f"[起動時検証] ⚠ BUDGET_USD=${_BUDGET_USD:,.0f} が口座の購買力"
+                            f"（約${_power:,.0f}）を上回っています。"
+                            f" 複数銘柄の同時保有時に『信用余力不足』で発注拒否が発生します。"
+                            f" .env の BUDGET_USD を購買力の範囲内に下げることを検討してください。"
+                        )
+                        _threadsafe_future(asyncio.to_thread(
+                            send_discord_message,
+                            f"[Bot] ⚠ 設定確認: BUDGET_USD=${_BUDGET_USD:,.0f} が実口座の購買力"
+                            f"（約${_power:,.0f}）を上回っています。\n"
+                            f"複数銘柄の同時保有時に発注拒否が起こり得ます。"
+                            f" BUDGET_USD を購買力の範囲内に設定してください。"
+                        ))
+                    else:
+                        log.info(
+                            f"[起動時検証] ✅ BUDGET_USD=${_BUDGET_USD:,.0f} ≤ 購買力 約${_power:,.0f}（整合OK）"
+                        )
+        except Exception as _e_pw:
+            log.debug(f"[起動時検証] 購買力チェックをスキップ（取得失敗）: {_e_pw}")
+
+    state.simulation_mode = not live
+
+    mode_label     = f"🔴 実口座（acc_id={REAL_ACC_ID}・特定口座・信用）" if live else "🟡 デモ口座（シミュレーション）"
+    # ★ v3.8.9: Discord 送信用は acc_id を含めない (機密情報の漏えい防止)
+    # ローカルログは引き続き acc_id 付きで記録 (運営側の監査・トラブル調査用)
+    mode_label_safe = "🔴 実口座（特定口座・信用）" if live else "🟡 デモ口座（シミュレーション）"
+    discord_status = "有効" if DISCORD_WEBHOOK_URL else "未設定（スキップ）"
+    _ext_sources = []
+    if FINNHUB_API_KEY:       _ext_sources.append("Finnhub")
+    if ALPACA_API_KEY_ID:     _ext_sources.append("Alpaca(WebSocket)")
+    ext_src = "+".join(_ext_sources) if _ext_sources else "未設定（スキップ）"
+
+    exec_syms = sorted({sym for syms in EXECUTION_MAP.values() for sym in syms})
+    log.info("=" * 60)
+    log.info(f"  moomoo_trade_v1.py  {BOT_VERSION}  {mode_label}")
+    log.info(f"  OpenD: {MOOMOO_HOST}:{MOOMOO_PORT}")
+
+    # ── ★ v3.9.18: 過去 24 時間のクレジット切れ警告 (起動時) ──────────────────
+    # 5/13-5/14 で受講生 10-15 名がクレジット切れに気づかず Bot が中立スキップ状態の
+    # まま放置されていた事象への対策。Bot は AI 失敗時に中立判定 (発注スキップ) と
+    # なるため「Bot が動いていない」ことに本人が気づきにくい。起動時に明示警告を出す。
+    try:
+        _credit_cnt, _credit_last = _check_recent_credit_exhaustion(hours=24)
+        if _credit_cnt > 0:
+            _last_disp = _credit_last.strftime("%m/%d %H:%M") if _credit_last else "?"
+            log.warning("")
+            log.warning("  ╔══════════════════════════════════════════════════════════════════╗")
+            log.warning("  ║  ⚠️  Anthropic API クレジット切れ警告 (過去 24 時間)            ║")
+            log.warning("  ╠══════════════════════════════════════════════════════════════════╣")
+            log.warning(f"  ║  発生件数: {_credit_cnt} 件    最終発生: {_last_disp:<28} ║")
+            log.warning("  ║                                                                  ║")
+            log.warning("  ║  [影響] AI判定が失敗し、ニュース起点の発注が停止しています       ║")
+            log.warning("  ║         （損切り / トレール / 時間切れ決済は通常通り動作）       ║")
+            log.warning("  ║                                                                  ║")
+            log.warning("  ║  [対応] https://console.anthropic.com/settings/billing にて      ║")
+            log.warning("  ║         クレジット残高を確認し、追加購入してください              ║")
+            log.warning("  ║         （クレジット追加後は Bot 再起動不要・自動復帰）          ║")
+            log.warning("  ╚══════════════════════════════════════════════════════════════════╝")
+            log.warning("")
+    except Exception as _e_credit:
+        log.debug(f"[起動時] クレジット切れチェック失敗 (黙殺): {_e_credit}")
+
+    log.info(f"  トリガー銘柄: {', '.join(TRIGGER_TICKERS)}")
+    log.info(f"  トリガー銘柄: {', '.join(TRIGGER_TICKERS)}")
+    log.info(f"  発注銘柄:     {', '.join(exec_syms)}")
+    log.info(f"  セッション制御: 月〜金 04:00〜翌04:00  週末のみ停止")
+    log.info(f"  週末決済: 金曜 {_FRIDAY_CLOSE_TIME.strftime('%H:%M')} ET に全ポジション強制決済・ニュース停止")
+    if trd_env == TrdEnv.SIMULATE:
+        log.info(f"  🟡 デモ日次決済: 平日毎日 {_FRIDAY_CLOSE_TIME.strftime('%H:%M')} ET に全決済・翌プリマーケットまで停止（デモ：株価更新なし）")
+    else:
+        log.info(f"  🔴 実口座: 夜間セッションも取引継続（週末のみ {_FRIDAY_CLOSE_TIME.strftime('%H:%M')} ET に全決済）")
+        log.info(f"  　　→ moomoo確認済: オーバーナイトも株価取得・発注・ポジション照会すべて対応")
+    log.info(f"  戦略: SPY/QQQ ロング（現物買い）/ ショート（空売り）")
+    # ★ v2.99.4: ETF/個別株でバッファを分離表示
+    log.info(
+        f"  指値バッファ: ETF={LIMIT_BUFFER_PCT_ETF*100:.2f}% / "
+        f"個別株={LIMIT_BUFFER_PCT_STOCK*100:.2f}%（気配値基準）  時間外: outsideRth=True"
+    )
+    # AIしきい値は上の損切りログ行で出力済み
+    log.info(f"  予算上限: ${_BUDGET_USD:,.0f}（BUDGET_USD）")
+    log.info(f"  サイズ配分: 弱30% / 主力60% / ★ｽｲｰﾄ100% / 強気40%（confidence山型）"
+             f"  範囲: ${ORDER_SIZE_MIN_USD:,.0f}〜${ORDER_SIZE_MAX_USD:,.0f}")
+    log.info(f"  損切り: -{MAX_LOSS_PCT*100:.2f}%（ポジション評価額基準）")
+    timeout_str = f"{TIMEOUT_EXIT_MINUTES}分" if TIMEOUT_EXIT_MINUTES > 0 else "無効"
+    log.info(f"  時間切れ決済: {timeout_str}  トレール発動: +{TRAIL_TRIGGER_PCT*100:.1f}%  トレール幅: {TRAIL_DROP_PCT*100:.1f}%")
+    log.info(f"  AIしきい値: confidence>{STRONG_BUY_CONFIDENCE}（ベース）  パニックしきい値: confidence>{PANIC_CONFIDENCE}")
+    if any([_CONF_RTH, _CONF_PREMARKET, _CONF_AFTERHOURS, _CONF_OVERNIGHT]):
+        log.info(f"  　時間帯別しきい値: RTH={_CONF_RTH or '-'}  Pre={_CONF_PREMARKET or '-'}  After={_CONF_AFTERHOURS or '-'}  OVN={_CONF_OVERNIGHT or '-'}")
+    # ★ v3.9.6: 「発注しない」設定セッションの一覧 (CONFIDENCE_*=2.00 sentinel)
+    _disabled_sess_list = [
+        (name, flag) for name, flag in [
+            ("RTH",        _DISABLED_RTH),
+            ("Pre",        _DISABLED_PREMARKET),
+            ("After",      _DISABLED_AFTERHOURS),
+            ("OVN",        _DISABLED_OVERNIGHT),
+        ] if flag
+    ]
+    if _disabled_sess_list:
+        _disabled_names = "/".join(n for n, _ in _disabled_sess_list)
+        log.info(
+            f"  　発注しない設定: {_disabled_names} (CONFIDENCE_*=2.00 sentinel) "
+            f"→ ニュース取得・AI判定・発注を停止し Anthropic API 課金回避"
+        )
+    else:
+        log.info(f"  　発注しない設定: なし (全セッション稼働)")
+    # ★ v3.9.12 / v3.9.16 / v3.9.35: モメンタム設定 (シャドー観察 / Phase 1 実発注)
+    if (MOMENTUM_SHADOW_ENABLED or MOMENTUM_LIVE_TRADING) and MOMENTUM_ORDER_SIZE_PCT > 0:
+        _level_name = _MOMENTUM_LEVEL_NAMES.get(MOMENTUM_LEVEL, "?")
+        if MOMENTUM_LIVE_TRADING:
+            _mom_hdr = "モメンタム: ⚡ 実発注モード (Phase 1)"
+            _mom_note = f"実発注対象サイド={sorted(MOMENTUM_ENABLED_SIDES)} (それ以外はシャドー記録のみ)"
+        else:
+            _mom_hdr = "モメンタム: シャドー観察モード (Phase 0・実発注なし)"
+            _mom_note = "全シグナルを観察ログに記録 (実発注なし)"
+        log.info(
+            f"  {_mom_hdr}  "
+            f"Level {MOMENTUM_LEVEL} ({_level_name})  対象={'/'.join(MOMENTUM_SYMBOLS)}"
+        )
+        log.info(f"  　{_mom_note}")
+        for _sym in MOMENTUM_SYMBOLS:
+            _t5, _t15 = _get_momentum_thresholds(_sym)
+            log.info(f"    {_sym}: 5min≥±{_t5}% AND 15min≥±{_t15}%")
+        log.info(
+            f"  　クールダウン: {MOMENTUM_COOLDOWN_MIN}分  "
+            f"最大発注額: {MOMENTUM_ORDER_SIZE_PCT}% (=${_BUDGET_USD * MOMENTUM_ORDER_SIZE_PCT / 100:.0f})"
+            f"  ※シグナル強度で 50/75/100% に山型配分"
+        )
+        # ── ★ v3.9.61: 実発注対象とリスク監視対象のズレ検証 ──────────────────
+        # 実発注される銘柄が監視系統 (risk_monitor / 週末決済 / panic) に
+        # 含まれていないと、損切り・タイムアウト・週末決済が効かない裸の
+        # ポジションが発生する (5/29 IWM orphan 事象)。起動時に検証して警告。
+        if MOMENTUM_LIVE_TRADING:
+            _monitored = (
+                {sym for syms in EXECUTION_MAP.values() for sym in syms}
+                | set(STOCK_TICKERS)
+                | set(EARNINGS_PRE_TICKERS) | set(EARNINGS_AFTER_TICKERS)
+                | _momentum_live_symbols()   # v3.9.61 で監視対象に自動取込済
+            )
+            _live_syms = _momentum_live_symbols()
+            _orphan = sorted(_live_syms - _monitored)
+            if _orphan:
+                # _momentum_live_symbols() を監視対象に含めているため通常ここには
+                # 到達しないが、将来のリファクタで漏れた場合の最終防衛線。
+                log.warning(
+                    f"  ⚠️ [整合性警告] モメンタム実発注対象 {_orphan} が"
+                    f" リスク監視対象に含まれていません。"
+                    f" 損切り/週末決済が効かない可能性 → .env の"
+                    f" MOMENTUM_ENABLED_SIDES か TRIGGER_TICKERS を確認してください。"
+                )
+            else:
+                log.info(
+                    f"  ✅ [整合性] モメンタム実発注対象 {sorted(_live_syms)} は"
+                    f" すべてリスク監視・週末決済の対象に含まれています。"
+                )
+    else:
+        log.info(f"  モメンタム機能: 無効")
+    # ★ v2.99: 発注クールダウン設定の表示
+    log.info(
+        f"  発注クールダウン: 個別株={COOLDOWN_STOCK_MIN}分（同一銘柄）  "
+        f"ETF再エントリー禁止={ETF_REENTRY_LOCKOUT_MIN}分（決済後）"
+    )
+    log.info(f"  ETF影響ガード: 有効（QQQ/SMH/SPY の victims/beneficiaries は主要構成銘柄登場時のみ通過）")
+    # ★ v3.8.3: ノイズフィルタ (AI 呼出前の早期 score=0 判定で API コスト削減)
+    log.info(
+        f"  ノイズフィルタ (AI 呼出前 pre-filter): "
+        f"{'有効' if NOISE_FILTER_ENABLED else '無効'} "
+        f"({len(HEADLINE_NOISE_PATTERNS)} パターン)"
+    )
+    # ★ v2.99.4: 新規安全制御 + 可視化機能の状態表示
+    log.info(
+        f"  決済FAILED時新規BUYブロック: {FAILED_CLOSE_LOCKOUT_MIN}分（既存ポジション解消優先）"
+    )
+    log.info(
+        f"  下落トレンドフィルタ (LONG ブロック): "
+        f"構成B(QQQ 15分≤{MACRO_DOWNTREND_15M_PCT}%/60分≤{MACRO_DOWNTREND_60M_PCT}%) "
+        f"/ 構成C(SMH 15分≤{SMH_DOWNTREND_15M_PCT}%/60分≤{SMH_DOWNTREND_60M_PCT}%) "
+        f"/ 構成S(SPY 15分≤{SPY_DOWNTREND_15M_PCT}%/60分≤{SPY_DOWNTREND_60M_PCT}%) "
+        f"/ 構成D(個別株 15分≤{STOCK_DOWNTREND_15M_PCT}%/60分≤{STOCK_DOWNTREND_60M_PCT}%)"
+    )
+    # ★ v3.8.1 / v3.8.2 / v3.9.5: 上昇トレンドフィルタ (SHORT ブロック)
+    log.info(
+        f"  上昇トレンドフィルタ (SHORT ブロック): "
+        f"構成B'(QQQ 15分≥+{MACRO_UPTREND_15M_PCT}%/60分≥+{MACRO_UPTREND_60M_PCT}%) "
+        f"/ 構成C'(SMH 15分≥+{SMH_UPTREND_15M_PCT}%/60分≥+{SMH_UPTREND_60M_PCT}%) "
+        f"/ 構成S'(SPY 15分≥+{SPY_UPTREND_15M_PCT}%/60分≥+{SPY_UPTREND_60M_PCT}%) "
+        f"/ 構成D'(個別株 15分≥+{STOCK_UPTREND_15M_PCT}%/60分≥+{STOCK_UPTREND_60M_PCT}%)"
+    )
+    log.info(
+        f"  価格履歴追跡: ETF(QQQ/SPY/SMH) + 個別株{len(STOCK_TICKERS)}銘柄"
+        + (f" → 5分ごとに [市場状態] ログ出力" if STOCK_TICKERS or True else "")
+    )
+    _poll_src = [s for s in _ext_sources if s != "Alpaca(WebSocket)"]
+    _ws_src   = [s for s in _ext_sources if s == "Alpaca(WebSocket)"]
+    _poll_joined = "+".join(_poll_src)
+    _src_disp = ""
+    if _poll_src: _src_disp += f"{_poll_joined}（{EXTERNAL_NEWS_POLL_SEC}秒間隔）"
+    if _ws_src:   _src_disp += ("  + " if _poll_src else "") + "Alpaca（WebSocketリアルタイム）"
+    if not _src_disp: _src_disp = "未設定（スキップ）"
+    log.info(f"  外部ニュース: {_src_disp}  Discord: {discord_status}")
+    if STOCK_TICKERS:
+        log.info(f"  個別株監視: {', '.join(STOCK_TICKERS)}（{STOCK_NEWS_POLL_SEC}秒間隔・Finnhub company-news）")
+        log.info(f"  　→ 貸株在庫確認: ショート発注後のmoomooエラーレスポンスで自動判定")
+    else:
+        log.info(f"  個別株監視: 未設定（.envにSTOCK_TICKERS=TSLA,NVDAで有効化）")
+    if DYNAMIC_STOCKS_ENABLED:
+        _pos_cap_disp = f"${DYNAMIC_STOCKS_MAX_POSITION_USD:,.0f}/銘柄" if DYNAMIC_STOCKS_MAX_POSITION_USD > 0 else "上限なし"
+        log.info(
+            f"  動的個別株: ✅ 有効"
+            f"  S&P500 {len(_SP500_TICKERS)}銘柄監視"
+            f"  上限: {DYNAMIC_STOCKS_MAX_CALLS_PER_DAY}回/日"
+            f"  1銘柄上限: {_pos_cap_disp}"
+            f"  confidence>{DYNAMIC_STOCKS_CONFIDENCE:.2f}"
+        )
+    # 個別株・決算銘柄の予算上限（STOCK_MAX_PCT）
+    if STOCK_MAX_USD > 0:
+        log.info(f"  個別株/決算上限: ${STOCK_MAX_USD:,.0f}/銘柄（BUDGET_USD ${_BUDGET_USD:,.0f} × {_STOCK_MAX_PCT*100:.1f}%）")
+    # 決算プレイ設定（EARNINGS_PRE / EARNINGS_AFTER）
+    if EARNINGS_PRE_TICKERS or EARNINGS_AFTER_TICKERS:
+        log.info(
+            f"  決算プレイ: ✅ 有効"
+            f"  PRE={EARNINGS_PRE_TICKERS or '未設定'}"
+            f"  AFTER={EARNINGS_AFTER_TICKERS or '未設定'}"
+            f"  しきい値={EARNINGS_CONFIDENCE:.2f}"
+            f"  指値リトライ={LIMIT_RETRY_SEC}秒×{LIMIT_RETRY_MAX}回"
+        )
+    log.info("-" * 60)
+    log.info("  [.env 読み込み状態]")
+    log.info(f"    ANTHROPIC_API_KEY   : {'✅ 設定済み' if os.environ.get('ANTHROPIC_API_KEY') else '❌ 未設定（必須）'}")
+    log.info(f"    DISCORD_WEBHOOK_URL : {'✅ 設定済み' if DISCORD_WEBHOOK_URL else '⚠️  未設定（Discord通知なし）'}")
+    log.info(f"    MOOMOO_HOST/PORT    : {MOOMOO_HOST}:{MOOMOO_PORT}")
+    log.info(f"    MOOMOO_RSA_KEY      : {'✅ 設定済み' if MOOMOO_RSA_KEY else '—  未設定（平文接続）'}")
+    log.info(f"    FINNHUB_API_KEY     : {'✅ 設定済み' if FINNHUB_API_KEY else '—  未設定'}")
+    log.info(f"    ALPACA_API_KEY_ID   : {'✅ 設定済み（WebSocketリアルタイム）' if ALPACA_API_KEY_ID else '—  未設定（スキップ）'}")
+    log.info("=" * 60)
+
+    # ── ベータ版免責事項（全モード共通）────────────────────────────────────────
+    print()
+    print("  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║                    ⚠️  ご利用上の注意                    ║")
+    print("  ╠══════════════════════════════════════════════════════════╣")
+    print("  ║  本バージョンは十分な検証を行っておりますが、           ║")
+    print("  ║  講義が始まる前まではベータ版という位置づけであり、     ║")
+    print("  ║  デモ口座でのご利用を推奨します。                       ║")
+    print("  ║                                                          ║")
+    print("  ║  実際の口座でもご利用いただけますが、デモ口座で         ║")
+    print("  ║  十分確認したうえで自己責任でご利用ください。           ║")
+    print("  ╚══════════════════════════════════════════════════════════╝")
+    print()
+
+    if live:
+        log.warning("実口座モードが有効です。5秒後に開始します... (Ctrl+C でキャンセル)")
+        await asyncio.sleep(5)
+
+    client = get_anthropic_client()
+
+    # ── 接続テスト・全銘柄サブスクライブ（株価ストリーミング権限確認）─────────────
+    # バッチsubscribeは部分失敗しても RET_OK を返す場合があるため、
+    # 銘柄ごとに個別にsubscribeして確実に登録する。
+    # テスト銘柄は TRIGGER_TICKERS[0]（主要取引対象の先頭）を使用する。
+    log.info(f"[接続] moomoo OpenD に接続中: {MOOMOO_HOST}:{MOOMOO_PORT}")
+    _test_symbol = TRIGGER_TICKERS[0] if TRIGGER_TICKERS else (ALL_TICKERS[0] if ALL_TICKERS else "SPY")
+    try:
+        # ★ v2.86: with _quote_ctx() で例外時の close を保証
+        with _quote_ctx() as test_ctx:
+            # 全監視対象銘柄を1件ずつ個別にサブスクライブ
+            # （バッチだと部分失敗してもRET_OKが返りsubscribeされないケースがある）
+            _sub_ok = []
+            _sub_ng = []
+            for _sym in ALL_TICKERS:
+                _code = to_moomoo_code(_sym)
+                _r, _e = test_ctx.subscribe(
+                    [_code],
+                    [SubType.QUOTE, SubType.ORDER_BOOK],
+                    subscribe_push=False,
+                )
+                if _r == RET_OK:
+                    _sub_ok.append(_sym)
+                else:
+                    _sub_ng.append(_sym)
+                    log.warning(f"[subscribe] {_sym} サブスクライブ失敗（続行）: {_e}")
+
+            if _sub_ok:
+                log.info(f"[subscribe] サブスクライブ成功: {[to_moomoo_code(s) for s in _sub_ok]}")
+            if _sub_ng:
+                log.warning(f"[subscribe] サブスクライブ失敗: {_sub_ng}")
+
+            # テスト銘柄で株価取得確認
+            ret_test, data_test = test_ctx.get_stock_quote([to_moomoo_code(_test_symbol)])
+
+        if ret_test == RET_OK and _df_has_rows(data_test):
+            try:
+                _test_price = float(
+                    data_test["last_price"].iloc[0]
+                    if hasattr(data_test, "iloc")
+                    else data_test["last_price"][0]
+                )
+            except (KeyError, IndexError, TypeError):
+                _test_price = 0.0
+            log.info(f"[OK] moomoo 接続成功・気配値取得確認（{_test_symbol}: ${_test_price:.2f}）")
+        else:
+            # 取引時間外や権限未設定の場合も警告のみで続行
+            log.warning(
+                f"[WARNING] {_test_symbol} 株価取得できませんでした（続行）: {data_test}\n"
+                f"  取引時間外の場合は正常です。市場が開くと自動で動き始めます。\n"
+                f"  それ以外の場合: moomoo アプリ → 設定 → API → 株価ストリーミング権限を確認してください。"
+            )
+
+    except Exception as e:
+        log.error(
+            f"[ERROR] moomoo 接続エラー: {e}\n"
+            f"  OpenD（moomoo デスクトップアプリ）が起動しているか確認してください。\n"
+            f"  ホスト: {MOOMOO_HOST}  ポート: {MOOMOO_PORT}"
+        )
+        sys.exit(1)
+
+    # ── 取引ロック解除（実口座のみ・起動時1回）
+    if trd_env == TrdEnv.REAL:
+        unlock_trade_if_needed(trd_env)
+
+    # ── ★ v2.87: NYSE 休日・早期クローズ日の起動時案内 ─────────────────────
+    # 起動時点の ET 日付で判定し、ログにのみ出力（Discord 通知は要件により省略）。
+    _today_et_startup = datetime.datetime.now(_ET).date()
+    if is_nyse_holiday(_today_et_startup):
+        _next_td_startup = next_trading_day(_today_et_startup)
+        log.info(
+            f"📅 本日 {_today_et_startup} ({_today_et_startup.strftime('%a')}) は"
+            f" NYSE 休場日です。次の取引日: {_next_td_startup}"
+        )
+    else:
+        _ec_startup = get_early_close_time(_today_et_startup)
+        if _ec_startup:
+            log.info(
+                f"📅 本日 {_today_et_startup} ({_today_et_startup.strftime('%a')}) は"
+                f" NYSE 早期クローズ日（{_ec_startup.strftime('%H:%M')} ET 終了予定）"
+            )
+
+    await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+
+    # ★ v2.98: 起動時 SHORT 自動クリーンアップ廃止 (v2.97 までの設計は誤動作源)。
+    # 持越し SHORT は通常ポジションとして維持しリスク監視/通常決済に任せる。
+
+    # ── 起動時ポジション復元 (_tracked_position_cost に反映) ────────────────
+    # 取得失敗時は最大8回×10秒リトライ (moomoo: refresh_cache=True は30秒10回制限)。
+    _MAX_SYNC_RETRY = 8
+    for _retry in range(_MAX_SYNC_RETRY):
+        await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+        exec_syms_list = sorted({sym for syms in EXECUTION_MAP.values() for sym in syms})
+        _any_position = any(
+            state.get(sym).position_qty != 0 or state.get(sym).avg_cost > 0
+            for sym in ALL_TICKERS
+        )
+        if _any_position or _retry == _MAX_SYNC_RETRY - 1:
+            break
+        if _retry == 0:
+            try:
+                # ★ v2.86: with _trade_ctx() で例外時の close を保証
+                with _trade_ctx() as _ctx_chk:
+                    _acc_chk = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
+                    _r_chk, _d_chk = _ctx_chk.accinfo_query(
+                        trd_env=trd_env, currency=ft.Currency.USD, acc_id=_acc_chk
+                    )
+                if _r_chk != RET_OK:
+                    log.warning(f"[起動時復元] accinfo_query ret={_r_chk} エラー: {_d_chk}")
+                elif _df_has_rows(_d_chk):
+                    _all_zero = True
+                    for _f in ("market_val", "long_mv", "short_mv"):
+                        try:
+                            _v = float(_d_chk[_f].iloc[0] if hasattr(_d_chk, "iloc") else _d_chk[_f][0])
+                            if _v > 0:
+                                _all_zero = False
+                                break
+                        except (KeyError, IndexError, TypeError, ValueError):
+                            pass
+                    _mode = "デモ口座" if trd_env == TrdEnv.SIMULATE else "実口座"
+                    if _all_zero:
+                        log.info(f"[起動時復元] [{_mode}] accinfo $0 → ポジションなし（クリーンスタート）")
+                    else:
+                        # ★ v3.8.5: accinfo フォールバックは正常なリカバリパスなので INFO に降格
+                        log.info(f"[起動時復元] [{_mode}] accinfo market_val > $0 / position_list_queryが空 → accinfo フォールバックへ")
+                    break
+            except Exception as _ec:
+                log.debug(f"[起動時復元] accinfo早期確認エラー: {_ec}")
+        wait = 10
+        # ★ v3.8.5: 起動時のリトライ過程は INFO に降格 (最終失敗時のみ WARNING)
+        log.info(f"[起動時復元] ポジション取得が空 → {_retry + 1}回目リトライ（{wait}秒後）")
+        await asyncio.sleep(wait)
+
+    # ── ポジション取得失敗時: accinfo_queryで保有残高を確認 ──────────────────
+    # position_list_query が空でも accinfo_query.market_val>0 ならポジションあり。
+    # v2.77: デモ口座にも適用 (旧版は実口座限定で、デモは毎回80秒待ちが発生)。
+    # v2.92: long_mv/short_mv/market_val 全て$0なら「ポジションなし確定」フラグ ON
+    #        → 受講生に不要な「⚠️ポジション取得失敗」通知を出さない。
+    _no_position_confirmed_by_accinfo = False
+    _need_accinfo_check = not any(
+        state.get(sym).position_qty != 0 for sym in ALL_TICKERS
+    )
+    if _need_accinfo_check:
+        try:
+            # ★ v2.86: with _trade_ctx() で例外時の close を保証
+            with _trade_ctx() as _ctx_acc:
+                _acc_id_c = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
+                _ret_acc, _data_acc = _ctx_acc.accinfo_query(
+                    trd_env=trd_env, currency=ft.Currency.USD, acc_id=_acc_id_c
+                )
+            # ★ moomoo サポート推奨: ret != RET_OK のとき必ずエラーメッセージを出力
+            if _ret_acc != RET_OK:
+                log.warning(f"[起動時復元] accinfo_query(最終確認) ret={_ret_acc} エラー: {_data_acc}")
+            elif _df_has_rows(_data_acc):
+                _mktval     = 0.0
+                _field_used = "（なし）"
+                for _f, _label in [
+                    ("market_val", "market_val"),
+                    ("long_mv",    "long_mv（ロング建玉）"),
+                    ("short_mv",   "short_mv（ショート建玉）"),
+                ]:
+                    try:
+                        _v = float(
+                            _data_acc[_f].iloc[0]
+                            if hasattr(_data_acc, "iloc")
+                            else _data_acc[_f][0]
+                        )
+                        if _v > 0:
+                            _mktval     = _v
+                            _field_used = _label
+                            log.info(
+                                f"[起動時復元] {_label}=${_v:,.0f} > 0"
+                                f" → ポジション残存と判断"
+                            )
+                            break
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        pass
+                if _mktval > 0:
+                    _est_total = _mktval
+                    for _sym in exec_syms_list:
+                        _q = get_price_finnhub(_sym)
+                        if _q <= 0:
+                            _qq = get_quote(_sym)
+                            _q  = _qq.get("last", 0) or _qq.get("ask", 0) or 0
+                        if _q > 0 and len(exec_syms_list) == 1:
+                            _est_qty  = round(_est_total / _q)
+                            _ts_est   = state.get(_sym)
+                            if _est_qty > 0:
+                                _ts_est.position_qty = _est_qty
+                                _ts_est.avg_cost     = _q
+                                _tracked_position_cost[_sym] = _est_total
+                                log.warning(
+                                    f"[起動時復元] 【{_sym}】 {_field_used}から推定復元: "
+                                    f"約{_est_qty}株 現在値${_q:.2f} 評価額${_est_total:,.0f}"
+                                )
+                    log.warning(
+                        f"[起動時復元] ⚠ position_list_queryは空だが"
+                        f" {_field_used}=${_mktval:,.0f} → JP口座APIの既知の不安定さ（ブロックなし）"
+                    )
+                    _threadsafe_future(asyncio.to_thread(
+                        send_discord_message,
+                        f"⚠️ 起動時 position_list_query が空\n"
+                        f"accinfo {_field_used}: ${_mktval:,.0f}\n"
+                        f"JP口座APIの既知の不安定さのため発注は継続します。\n"
+                        f"moomooアプリでポジションをご確認ください。"
+                    ))
+                else:
+                    # market_val=$0 → 本当にポジションなし（デモ・実口座共通）
+                    _mode = "デモ口座" if trd_env == TrdEnv.SIMULATE else "実口座"
+                    log.info(f"[起動時復元] [{_mode}] accinfo market_val/long_mv/short_mv すべて$0 → ポジションなし（正常）")
+                    # ★ v2.92: ポジションなし確定 → 後続の警告ブロックをスキップ
+                    _no_position_confirmed_by_accinfo = True
+        except Exception as _e:
+            log.warning(f"[起動時復元] accinfo確認エラー: {_e}")
+
+    exec_syms_list = sorted({sym for syms in EXECUTION_MAP.values() for sym in syms})
+    restored = []
+    for sym in exec_syms_list:
+        ts = state.get(sym)
+        # ★ v2.86: ショートポジション（position_qty < 0）も復元対象に含める。
+        # 旧コード `> 0` ではショート持越し時に _tracked_position_cost が空のまま
+        # 直後の sync_positions の冒頭ガード（`<= 0 → position_qty=0`）でショートが
+        # state から消されてしまう実害があった。
+        if ts.position_qty != 0 and ts.avg_cost > 0:
+            # コストは絶対株数 × 平均取得価格（ショートも建玉評価額として計上）
+            estimated_cost = abs(ts.position_qty) * ts.avg_cost
+            _tracked_position_cost[sym] = estimated_cost
+            _pos_label = "SHORT" if ts.position_qty < 0 else "LONG"
+            # ★ v2.98: position_id 数を確認 (決済時に必須となる)
+            _pid_count = len(ts.position_ids.get(_pos_label, []))
+            restored.append(
+                f"{sym}({_pos_label})=${estimated_cost:,.0f}/{_pid_count}建玉"
+            )
+            if _pid_count == 0:
+                log.warning(
+                    f"[起動時復元] ⚠️ {sym} ({_pos_label}) position_id 取得不能 "
+                    f"→ 決済時に position_id 必須エラーが発生する可能性あり。"
+                    f" 次サイクルの sync_positions で再取得を期待します。"
+                )
+            # ── ★ v3.9.134: 台帳と突き合わせて「Bot の建玉か」を判定する ────────
+            if _ledger_first_run and not _ledger_has(sym, trd_env):
+                # 台帳をこの環境で初めて作る起動。旧版は口座の建玉をすべて Bot の
+                # ものとして扱っていたので、初回だけその前提を引き継ぐ。これをしないと
+                # 建玉を持ったまま版を上げた利用者の損切りが一斉に止まる。
+                _ledger_mark(sym, trd_env, ts.entry_time)
+                log.warning(
+                    f"[建玉台帳] 【{sym}】 台帳を新しく作りました: いま持っている建玉 "
+                    f"({_pos_label} {abs(ts.position_qty)}株) は Bot の建玉として扱います"
+                    f"（これまでと同じ動きです）"
+                )
+                _threadsafe_future(asyncio.to_thread(
+                    send_discord_message,
+                    f"ℹ️ 【{sym}】 建玉の管理台帳を作成しました（{_pos_label} {abs(ts.position_qty)}株）\n"
+                    f"この版から、Bot は自分で建てた建玉だけを決済するようになります。\n"
+                    f"版を上げた時点で持っていたこの建玉は、これまでどおり Bot が管理します。\n"
+                    f"手動で保有されている建玉の場合は、moomoo アプリで決済してください。"
+                ))
+            if not _ledger_has(sym, trd_env):
+                _ext_set_held(
+                    sym, True,
+                    f"口座に {_pos_label} {abs(ts.position_qty)}株 ありますが、Bot の記録にありません。"
+                )
+            else:
+                # Bot の建玉。entry_time は台帳の値を優先して復元する
+                # （従来は再起動のたびに現在時刻へリセットされ、時間切れの
+                #   時計が巻き戻っていた）。
+                _ext_set_held(sym, False)
+                if ts.entry_time is None:
+                    ts.entry_time = _ledger_entry_time(sym, trd_env) or datetime.datetime.now()
+                    log.info(
+                        f"[起動時復元] {sym} ({_pos_label}) entry_time="
+                        f"{ts.entry_time:%m-%d %H:%M}（時間切れ監視開始）"
+                    )
+            # ショートの場合は is_short フラグも立てる（緊急買い戻し誤発動防止）
+            if ts.position_qty < 0:
+                ts.is_short = True
+    # 初回移行は建玉ゼロでもここで完了させる。これが無いと、後日の手動建玉を
+    # 次回起動時に「アップグレード時の既存建玉」と誤って取り込んでしまう。
+    if _ledger_first_run:
+        _first_run_saved = _ledger_save()
+        # 保存失敗時も「初回移行を試行済み」の目印は残す。次回起動で再び
+        # 初回扱いにすると、その間に手動保有された建玉まで取り込むため。
+        # 台帳なし＋目印ありは _ledger_load() が broken と判定し、安全側に倒す。
+        _ledger_touch_mark(trd_env)
+        if _first_run_saved:
+            log.info("[建玉台帳] 初回移行が完了しました（以後、台帳に無い建玉は管理対象外になります）")
+        else:
+            log.error(
+                "[建玉台帳] 初回移行の完了状態を保存できませんでした。"
+                "このセッションでは安全のため初回移行を終了し、以後の未知建玉は管理対象外にします"
+            )
+        # 保存失敗時もセッション内の初回移行は必ず終了する。True のまま残すと、
+        # このあと利用者が手で建てた建玉まで Bot 建玉として取り込んでしまう。
+        # 永続化失敗は上の ERROR/Discord で通知し、次回起動時は安全側に倒す。
+        globals()["_ledger_first_run"] = False
+    if restored:
+        total = get_tracked_portfolio_total()
+        log.info(f"[起動時復元] 既存ポジションを検出・復元: {', '.join(restored)}")
+        log.info(f"[起動時復元] ポートフォリオ合計=${total:,.0f} → このまま継続します")
+    elif _no_position_confirmed_by_accinfo:
+        # ★ v2.92: accinfo で「ポジションなし」が確定している正常ケース
+        # → 不要な警告を出さず、INFO ログでクリーンスタートを伝えるのみ
+        log.info("[起動時復元] 既存ポジションなし（クリーンスタート）")
+    else:
+        # accinfo でも確認できなかったケース（API エラー・レスポンス不正等）
+        # → 真にポジションが残っている可能性があるため従来通り警告
+        log.info("[起動時復元] 既存ポジションなし または取得不可 → クリーンスタート")
+        if trd_env == TrdEnv.REAL:
+            log.warning("⚠️  実口座: ポジションが取得できませんでした")
+            log.warning("⚠️  残存ポジションがある場合はmoomooアプリで手動確認・決済してください")
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                "⚠️ 起動時ポジション取得失敗\n"
+                "実口座にポジションが残っている可能性があります。\n"
+                "moomooアプリで残高・ポジションを手動確認してください。"
+            ))
+        # ★ v3.8.5: デモ口座のポジション取得失敗 warning は INFO に降格。
+        # デモ環境では position_list_query が頻繁に空を返し、その大半は
+        # 実害のないクリーンスタート相当。受講生からの問い合わせ削減のため、
+        # 通常の起動メッセージ程度のレベルに統一する。実口座ケースは引き続き warning。
+        if trd_env == TrdEnv.SIMULATE:
+            log.info("[起動時復元] デモ口座: ポジション取得スキップ → クリーンスタート扱い")
+
+    # ★ v3.9.3: 起動時に直近 60 分の K 線を取得して _INDEX_PRICE_HISTORY をバックフィル。
+    # 取引ループ開始前にトレンドフィルタ (構成 B/B'/C/C'/D/D') を即座に稼働状態にする。
+    # 失敗してもログを残して通常起動 (60 分かけてリアルタイム蓄積する後方互換動作)。
+    try:
+        await asyncio.to_thread(_backfill_index_price_history)
+    except Exception as _e_bf:
+        log.warning(f"[起動時バックフィル] 例外で完全失敗: {_e_bf} → スキップ")
+
+    await asyncio.to_thread(
+        send_discord_message,
+        # ★ v3.8.9: mode_label_safe (acc_id 非表示) を使用。acc_id を Discord に
+        # 出さないことで万一 Webhook URL が漏えいしても口座が特定されない。
+        f"🚀 moomoo 監視を開始しました\n"
+        f"モード: {mode_label_safe}\n"
+        f"トリガー: {', '.join(TRIGGER_TICKERS)}\n"
+        f"発注対象: {', '.join(exec_syms)}\n"
+        f"注文: 指値（気配値基準+{LIMIT_BUFFER_PCT*100:.1f}%バッファ）時間外OK\n"
+        f"外部ニュース: {_src_disp}\n"
+        f"週末決済: 金曜 {_FRIDAY_CLOSE_TIME.strftime('%H:%M')} ET に全決済・停止"
+    )
+
+    try:
+        # 起動時キャッチアップ：過去7日以内の未送信日をバックグラウンドで順次送信
+        # （Botを途中で閉じて15:45 ET定時送信を逃した日の分を後追い送信）
+        _threadsafe_future(catchup_data_send_on_startup())
+
+        async def _loop_guard(coro_fn, *args, name: str, **kwargs) -> None:
+            """
+            各ループを例外から守るラッパー。
+            予期しない例外が発生しても3秒後に自動再起動し、ボット全体を落とさない。
+            ・CancelledError（Ctrl+C / シャットダウン）は再raise してgatherに伝播。
+            ・正常return（未設定によるスキップ等）はそのまま終了。
+            """
+            while True:
+                try:
+                    await coro_fn(*args, **kwargs)
+                    return  # 正常終了（未設定スキップ等）はループしない
+                except asyncio.CancelledError:
+                    raise  # Ctrl+C等は正常伝播
+                except Exception as _e:
+                    log.error(
+                        f"[{name}] 予期しないエラーが発生しました: "
+                        f"{type(_e).__name__}: {_e}\n"
+                        f"→ 3秒後に自動再起動します",
+                        exc_info=True
+                    )
+                    _threadsafe_future(asyncio.to_thread(
+                        send_discord_message,
+                        f"⚠️ [{name}] エラー発生・自動再起動\n"
+                        f"{type(_e).__name__}: {_e}\n"
+                        f"3秒後に再起動します"
+                    ))
+                    await asyncio.sleep(3)
+
+        # ── ★ v2.97: RSS フィード起動時 DNS 事前チェック ─────────────────────
+        # DNS 解決できないフィードを _rss_excluded に追加し、
+        # 以降の取得対象から外すことで起動直後のログ汚染を防ぐ。
+        _rss_dns_precheck()
+
+        # ── 起動時ニュース無視タイマーをループ開始直前にリセット ──────────────
+        global _BOT_START_TIME
+        _BOT_START_TIME = datetime.datetime.now()
+        log.info(f"[起動待機] 最初の {STARTUP_NEWS_IGNORE_SEC} 秒間はニュース発注をスキップします")
+
+        # ── ★ v3.9.131: ハートビート監視スレッドを起動（凍結検知・通知のみ・自動再起動なし）──
+        if HEARTBEAT_WATCHDOG_ENABLED:
+            global _last_heartbeat_mono
+            _last_heartbeat_mono = time.monotonic()
+            threading.Thread(target=_heartbeat_watchdog_thread, name="heartbeat-watchdog", daemon=True).start()
+            log.info(f"[HEARTBEAT] 監視開始（{HEARTBEAT_TIMEOUT_MIN}分 無音で警告・通知のみ）")
+
+        await asyncio.gather(
+            _loop_guard(_heartbeat_beat_loop,                    name="ハートビート"),
+            _loop_guard(market_schedule_loop,   trd_env,         name="セッション監視"),
+            _loop_guard(external_news_loop,     client, trd_env, name="外部ニュース"),
+            _loop_guard(alpaca_news_loop,       client, trd_env, name="AlpacaWS"),
+            _loop_guard(global_news_loop,       client, trd_env, name="RSSニュース"),
+            _loop_guard(stock_news_loop,        client, trd_env, name="個別株ニュース"),
+            _loop_guard(earnings_monitor_loop,  client, trd_env, name="決算監視"),
+            _loop_guard(risk_monitor_loop,      trd_env,         name="リスク監視"),
+            _loop_guard(pending_order_watchdog,                  name="注文ウォッチドッグ"),
+            _loop_guard(close_order_chaser,                      name="損切りチェイサー"),
+            # ★ v3.5.1: Prompt Cache 利用統計の1時間ごとサマリ出力
+            _loop_guard(cache_stats_loop,                        name="Cache統計"),
+            # ★ v3.9.7: 観察ログ Phase 2 — pending observation の +60min 後 PnL 算出
+            #   DATA_COLLECT=true 環境でのみ実体動作 (それ以外は即 return でアイドル)
+            _loop_guard(observation_pnl_check_loop,              name="観察PnL"),
+            # ★ v3.9.75: GAS送信の未送信ローカルキューを定期再送 (記録欠落の自動復旧)
+            _loop_guard(gas_retry_loop,                          name="GAS再送"),
+            # ★ v3.9.76: 観察ログ/PnL のバッチ送信フラッシュ (30秒間隔・送信直列化)
+            _loop_guard(observation_batch_flush_loop,            name="観察バッチ"),
+            # ★ v3.9.12: モメンタム観察 / ★ v3.9.35: Phase 1 実発注対応
+            #   シャドーのみ: MOMENTUM_SHADOW_ENABLED=true + DATA_COLLECT=true
+            #   実発注: MOMENTUM_LIVE_TRADING=true (DATA_COLLECT 不問)
+            _loop_guard(momentum_shadow_loop,    trd_env,        name="モメンタム"),
+            # ★ v3.9.28: シャドー SHORT ライフサイクル監視 (デモ環境向け仮想 PnL シミュ)
+            #   SHADOW_SHORT_ENABLED=true + DATA_COLLECT=true 環境でのみ動作
+            _loop_guard(shadow_short_exit_loop,                  name="シャドーSHORT"),
+            # ★ v3.9.31: 重大な健全性問題 (Anthropic クレジット / Alpaca 不全) の 5 分警告
+            _loop_guard(health_warning_loop,                     name="健全性警告"),
+        )
+    except asyncio.CancelledError:
+        pass
+    except KeyboardInterrupt:
+        log.info("ユーザーが停止しました")
+    except Exception as e:
+        log.error(f"[予期しないエラー] {type(e).__name__}: {e}", exc_info=True)
+    finally:
+        # ★ v3.9.81 (P1-2): 終了時の最終フラッシュ＋キュー1回ドレイン（best-effort）。
+        #   クリーン停止時に、メモリ上の観察バッファと未送信キューを可能な限り送り切る。
+        #   （送れない分はローカルに残り、次回起動時に P1-1/P1-3 で回収される）
+        if _is_data_collect_enabled():
+            try:
+                _flush_obs_entry_buffer()
+                _flush_obs_pnl_buffer()
+                _gas_queue_drain_once()
+                log.info("[終了] 観察バッファをフラッシュし未送信キューを1回ドレインしました")
+            except Exception as _e_fin:
+                log.debug(f"[終了] 最終フラッシュ失敗(黙殺): {_mask_secrets(_e_fin)}")
+
+        summary = state.total_summary()
+        log.info(f"[終了]\n{summary}")
+        # ★ v3.8.6: 当日トレードサマリを端末表示 + Discord 送信 (取引なしならスキップ)
+        try:
+            _print_daily_summary_to_terminal()
+        except Exception:
+            pass
+        _daily_text = _format_daily_summary()
+        _exit_msg = f"🛑 moomoo 監視を終了しました\n{summary}"
+        if _daily_text:
+            _exit_msg += "\n\n```\n" + _daily_text + "\n```"
+        try:
+            # 通常終了時: イベントループ経由で送信
+            await asyncio.to_thread(send_discord_message, _exit_msg)
+        except Exception:
+            # Ctrl+C / シャットダウン中: イベントループが止まっている場合は同期で直接送信
+            try:
+                send_discord_message(_exit_msg)
+            except Exception:
+                pass
+        log.info("[完了] 終了しました")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# EOD後データ収集（DATA_COLLECT=true の場合のみ送信）
+# ═════════════════════════════════════════════════════════════════════════════
+
+# 送信履歴ファイル（重複送信防止・起動時キャッチアップで参照）
+_DATA_SENT_HISTORY_FILE = ".data_sent_history.json"
+
+def _load_sent_dates() -> set:
+    """送信済み日付（YYYY-MM-DD文字列）のセットを返す。存在しなければ空集合。"""
+    try:
+        with open(_DATA_SENT_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return set(data.get("sent_dates", []))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+
+def _mark_date_sent(date_str: str) -> None:
+    """指定日付を送信済みとして記録。90日以上古いエントリは自動削除。"""
+    try:
+        sent = _load_sent_dates()
+        sent.add(date_str)
+        # 90日以上古い履歴は削除（ファイル肥大化防止）
+        # ★ v2.86: 固定オフセット(-4h)を ZoneInfo に変更（DST 自動対応）。
+        from datetime import timedelta as _td
+        cutoff = (datetime.datetime.now(ZoneInfo("America/New_York")).date()
+                  - _td(days=90)).strftime("%Y-%m-%d")
+        sent = {d for d in sent if d >= cutoff}
+        with open(_DATA_SENT_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump({"sent_dates": sorted(sent)}, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning(f"[データ収集] 送信履歴保存エラー: {e}")
+
+# ── ★ v3.9.48: ログ + logbackup/ アーカイブ統合スキャン ──────────────────────
+# 旧版 (v3.9.47 以前) の find_unsent_trading_dates / run_daily_data_collect は
+# 現在のログ (moomoo_trade_v1.log) のみをスキャンしていた。WeeklyLogbackupHandler
+# が月曜 00:00 にログを logbackup/ へローテーションするため、月曜以降の起動で
+# 前週末 (金曜) のデータが未送信のまま残るバグが発生していた。
+# 本ヘルパは現在のログと logbackup/ の対象期間内のアーカイブ (.log および .zip)
+# を順にスキャンしてラインを yield する。
+def _iter_log_lines(log_path: str, cutoff_date):
+    """現在のログ + logbackup/ アーカイブから cutoff_date 以降のデータを含む
+    可能性のあるファイルを順にスキャンし、各行を yield する。
+
+    cutoff_date: datetime.date — この日以前のデータしか含まないアーカイブはスキップ。
+    .zip アーカイブは zipfile で展開して内部 .log を読み込む。
+    .log (旧形式) アーカイブは直接読み込む。
+    """
+    # 1) 現在のログ
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    yield line
+        except Exception as e:
+            log.warning(f"[データ収集] 現在ログ読込エラー ({log_path}): {e}")
+
+    # 2) logbackup/ 内のアーカイブ
+    backup_dir = "logbackup"
+    if not os.path.isdir(backup_dir):
+        return
+
+    archive_re = re.compile(
+        r"^.+\.(\d{4}-\d{2}-\d{2})_to_(\d{4}-\d{2}-\d{2})"
+        r"(?:_\d+)?(\.log|\.zip)$"
+    )
+
+    try:
+        files = sorted(os.listdir(backup_dir), reverse=True)  # 新しい順
+    except OSError:
+        return
+
+    import zipfile, io
+    for fname in files:
+        m = archive_re.match(fname)
+        if not m:
+            continue
+        try:
+            end_d = datetime.date.fromisoformat(m.group(2))
+        except ValueError:
+            continue
+        # アーカイブの終了日が cutoff_date より前なら対象期間外
+        if end_d < cutoff_date:
+            continue
+
+        full_path = os.path.join(backup_dir, fname)
+        ext = m.group(3)
+        try:
+            if ext == ".zip":
+                with zipfile.ZipFile(full_path) as zf:
+                    for inner in zf.namelist():
+                        if not inner.endswith(".log"):
+                            continue
+                        with zf.open(inner) as raw:
+                            text = io.TextIOWrapper(
+                                raw, encoding="utf-8", errors="replace"
+                            )
+                            for line in text:
+                                yield line
+            elif ext == ".log":
+                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        yield line
+        except Exception as e:
+            log.warning(f"[データ収集] バックアップ読込エラー ({fname}): {e}")
+            continue
+
+
+def find_unsent_trading_dates(log_path: str = "moomoo_trade_v1.log",
+                               lookback_days: int = 7) -> list:
+    """ログをスキャンして、過去lookback_days日以内でログ記録があり、かつ / まだ送信していないET日付のリストを返す（古い順）。 / 当日は含めない（定時送信で処理）。DATA_COLLECT=false の場合は空を返す。
+    ★ v3.9.48: logbackup/ 内のアーカイブ (.log/.zip) もスキャンするように改修。
+    月曜 00:00 ローテーション後の起動でも前週末のデータが拾えるようになる。"""
+    # ★ v2.86: 固定オフセット(-4h)は EDT 専用。ZoneInfo に変更で DST 自動対応。
+    from datetime import timedelta as _td
+
+    if os.environ.get("DATA_COLLECT", "").strip().lower() != "true":
+        return []
+    if not os.environ.get("STUDENT_NAME", "").strip():
+        return []
+
+    sent = _load_sent_dates()
+    _ET_TZ   = ZoneInfo("America/New_York")
+    _JST_TZ  = ZoneInfo("Asia/Tokyo")
+    today_et = datetime.datetime.now(_ET_TZ).date()
+    cutoff   = today_et - _td(days=lookback_days)
+
+    found = set()
+    ts_pat = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+    # ★ v3.9.48: 現在ログ + logbackup/ を統合スキャン
+    try:
+        for line in _iter_log_lines(log_path, cutoff):
+            m = ts_pat.match(line)
+            if not m:
+                continue
+            try:
+                # ログタイムスタンプは JST。
+                # naive にパースして JST タグ付け→ET 変換。DST も自動考慮。
+                dt_jst = datetime.datetime.strptime(
+                    m.group(1), "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=_JST_TZ)
+                d_et = dt_jst.astimezone(_ET_TZ).date()
+            except (ValueError, TypeError):
+                continue
+            if cutoff <= d_et < today_et:
+                found.add(d_et)
+    except Exception as e:
+        log.warning(f"[データ収集] ログスキャンエラー: {e}")
+        return []
+
+    # 送信済み除外
+    return sorted(d for d in found if d.strftime("%Y-%m-%d") not in sent)
+
+
+async def catchup_data_send_on_startup(log_path: str = "moomoo_trade_v1.log") -> None:
+    """Bot起動時：過去7日以内の未送信日を順次送信する。 取引ループをブロックしないよう to_thread 経由で実行。 各日の送信間に5秒のインターバルを入れ、GAS側の負荷を避ける。"""
+    try:
+        unsent = await asyncio.to_thread(find_unsent_trading_dates, log_path, 7)
+        if not unsent:
+            log.debug("[データ収集] 起動時キャッチアップ: 未送信日なし")
+            return
+        log.info(
+            f"[データ収集] 起動時キャッチアップ: 未送信日 {len(unsent)}件  "
+            f"{[d.isoformat() for d in unsent]}"
+        )
+        for d in unsent:
+            await asyncio.to_thread(run_daily_data_collect, log_path, d)
+            await asyncio.sleep(5)
+        log.info(f"[データ収集] 起動時キャッチアップ完了  {len(unsent)}件処理")
+    except Exception as e:
+        log.warning(f"[データ収集] 起動時キャッチアップエラー: {e}")
+
+
+
+
+# =============================================================================
+# 二重起動の防止
+# =============================================================================
+_SINGLE_INSTANCE_HANDLE = None   # プロセスが生きている間ロックを保持し続ける
+
+
+def _acquire_single_instance(tag: str = "bot"):
+    """同じBotが二重に起動しないようにOSのロックを取る。
+
+    「動いているか調べてから起動する」方式は、調べてから起動するまでの一瞬に
+    別経路が割り込むと二重起動する（実際に発生した）。OSのロックは取得が
+    不可分なので、同時に来ても必ず片方だけが成功する。
+
+    戻り値: 取得できた場合 True / 既に他が動いている場合 False
+    """
+    global _SINGLE_INSTANCE_HANDLE
+    import os as _o
+
+    lock_path = _o.path.join(_o.path.dirname(_o.path.abspath(__file__)),
+                             f".{tag}_single.lock")
+    try:
+        fh = open(lock_path, "a+")
+    except OSError as e:
+        print(f"[二重起動防止] ロックファイルを開けません（{e}）。起動は継続します。")
+        return True   # ロックが使えないだけで止めるのは過剰なので通す
+
+    try:
+        fh.seek(0)
+        if _o.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # 既に別のBotが持っている
+        try:
+            fh.seek(0)
+            other = (fh.read() or "").strip()
+        except Exception:
+            other = ""
+        fh.close()
+        print("=" * 60)
+        print("[二重起動防止] 既にBotが動いているため、この起動を中止します。")
+        if other:
+            print(f"  稼働中のプロセス: PID {other}")
+        print("  同じ口座へ二重に発注しないための安全装置です。")
+        print("=" * 60)
+        return False
+
+    # 取得できた。自分のPIDを書いておく（誰が持っているか分かるように）
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(_o.getpid()))
+        fh.flush()
+    except Exception:
+        pass
+
+    _SINGLE_INSTANCE_HANDLE = fh   # 閉じるとロックが外れるので保持し続ける
+
+    import atexit
+
+    def _release():
+        try:
+            if _o.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+    atexit.register(_release)
+    return True
+
+
+def run_daily_data_collect(log_path: str = "moomoo_trade_v1.log",
+                           target_date=None) -> None:
+    """
+    .env の DATA_COLLECT=true の場合のみ集計してGASに送信する。
+    センシティブな情報（APIキー・口座番号）は一切送信しない。
+
+    target_date (Optional[datetime.date]):
+      - None: 呼び出し時点のET日付を対象（定時送信・15:45 ET）
+      - 日付指定: その日を対象（起動時キャッチアップ）
+    """
+    import re, json as _json, random as _random, time as _time
+    from collections import defaultdict
+
+    # GAS Web App URL（講師PAN管理・全受講生共通）
+    # .env に WEBHOOK_URL が明示設定されていればそちらを優先（デバッグ・検証用）
+    DEFAULT_WEBHOOK_URL = (
+        "https://script.google.com/macros/s/"
+        "AKfycbwaeZlTBJKKXeeewH4xN1T2dN3LoPZm3IcWHdRooOlMqGyTaKaBmIPB_I7t3-bDiLil"
+        "/exec"
+    )
+
+    cfg_collect  = os.environ.get("DATA_COLLECT", "").strip().lower()
+    cfg_name     = os.environ.get("STUDENT_NAME", "").strip()
+    cfg_url      = os.environ.get("WEBHOOK_URL",  "").strip() or DEFAULT_WEBHOOK_URL
+
+    if cfg_collect != "true":
+        log.debug("[データ収集] DATA_COLLECT=false のためスキップ")
+        return
+    if not cfg_name:
+        log.warning("[データ収集] STUDENT_NAME 未設定のためスキップ")
+        return
+    if "script.google.com" not in cfg_url:
+        log.warning("[データ収集] WEBHOOK_URL が無効です（script.google.comを含まない）: スキップ")
+        return
+
+    # ── 対象日付の決定 ───────────────────────────────────────────────
+    # 引数で指定があればキャッチアップ送信、無ければ呼び出し時点のET日付。
+    # 日付はランダム遅延の「前」に確定させる（遅延で日付が跨いでもOK）。
+    # ★ v2.86: 固定オフセット(-4h)を ZoneInfo に変更（DST 自動対応）。
+    _ET_TZ  = ZoneInfo("America/New_York")
+    _JST_TZ = ZoneInfo("Asia/Tokyo")
+    if target_date is None:
+        today    = datetime.datetime.now(_ET_TZ).date()
+        is_catchup = False
+    else:
+        today    = target_date
+        is_catchup = True
+    date_str = today.strftime("%Y-%m-%d")
+
+    # ★ v2.87: 休日はトレードログがほぼないため定時送信をスキップ
+    # キャッチアップ送信（target_date 指定あり）は手動再送等の用途を妨げないよう
+    # 休日でも実行する。
+    if not is_catchup and is_nyse_holiday(today):
+        log.info(f"[データ収集] {date_str} は NYSE 休場日のためスキップ")
+        return
+
+    # 重複送信防止：既に送信済みならスキップ
+    if date_str in _load_sent_dates():
+        log.info(f"[データ収集] {date_str} は送信済みのためスキップ")
+        return
+
+    # ── 分散送信のためのランダム遅延 ──────────────────────────────────
+    # 定時送信（15:45 ET）は多数の受講生が同時発火するため 0〜3分の遅延。
+    # （Python 3.12+ の asyncio は executor スレッドの終了を最大 300 秒待つため
+    #   それを超えないよう上限を 180 秒に設定。分散効果は十分維持される。）
+    # キャッチアップは起動タイミングが分散しており大きな遅延は不要（0〜30秒）。
+    if is_catchup:
+        _delay_sec = _random.uniform(0, 30)
+        log.info(f"[データ収集] 対象日={date_str}  {_delay_sec:.1f}秒後に送信（キャッチアップ）")
+    else:
+        _delay_sec = _random.uniform(0, 180)   # 最大3分（asyncio 300秒制限の範囲内）
+        log.info(f"[データ収集] 対象日={date_str}  {_delay_sec/60:.1f}分後に送信（分散処理）")
+    # 5秒刻みのループで待機（Ctrl+C 時にスレッドが即解放されるよう短く分割）
+    _waited = 0.0
+    while _waited < _delay_sec:
+        _chunk = min(5.0, _delay_sec - _waited)
+        _time.sleep(_chunk)
+        _waited += _chunk
+
+    # セッション判定（ET基準）
+    SESS = {"pre":(240,570),"rth":(570,960),"ath":(960,1200)}
+    def _session(ts_str):
+        try:
+            # ★ v2.86: JST→ET 変換を ZoneInfo へ。DST 自動対応。
+            dt = (datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                  .replace(tzinfo=_JST_TZ).astimezone(_ET_TZ))
+            m  = dt.hour*60+dt.minute
+            return "pre" if SESS["pre"][0]<=m<SESS["pre"][1] else \
+                   "rth" if SESS["rth"][0]<=m<SESS["rth"][1] else \
+                   "ath" if SESS["ath"][0]<=m<SESS["ath"][1] else "ovn"
+        except (ValueError, TypeError, AttributeError):
+            return "rth"
+
+    TS  = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
+    # .env で設定された全銘柄から動的に生成（レバレッジETF固定値は使用しない）
+    SYM = r"(" + "|".join(re.escape(t) for t in sorted(ALL_TICKERS)) + r")"
+    pats = {
+        "ts":    re.compile(rf"^{TS}"),
+        "order": re.compile(rf"{TS}.*?【{SYM}】.*?\[ORDER\]\s+(?P<side>BUY|SELL).*?qty=(?P<qty>\d+).*?price=(?P<price>[\d.]+)", re.I),
+        "fill":  re.compile(rf"{TS}.*?【{SYM}】.*?\[約定確認\].*?status=(?P<status>\S+)", re.I),
+        "rpnl":  re.compile(rf"{TS}.*?【{SYM}】.*?\[確定損益\].*?realized_pnl=(?P<pnl>[+-]?[\d.]+).*?sell_avg=(?P<sell>[\d.]+).*?buy_avg=(?P<buy>[\d.]+).*?qty=(?P<qty>\d+)", re.I),
+        "risk":  re.compile(rf"{TS}.*?【{SYM}】.*?\[リスク\].*?PnL=(?P<pnl>[+-]?\$?[\d.]+)\((?P<pct>[+-]?[\d.]+)%\)", re.I),
+        "eod":   re.compile(rf"{TS}.*?(?:強制クローズ発動|EOD|close_all_for_|15:45)", re.I),
+        "err":   re.compile(rf"{TS}.*?\[(ERROR|WARN(?:ING)?)\]\s+(?P<msg>.+)", re.I),
+        "ai":    re.compile(rf"{TS}.*?(?:AI判定|\[AI\]).*?score=(?P<score>[+-]?\d).*?confidence=(?P<conf>[\d.]+)", re.I),
+    }
+
+    buy_orders=sell_orders=filled=cancelled=trade_count=0
+    rpnl_total=best_pnl=worst_pnl=0.0
+    ai_scores,ai_confs,errors=[],[],[]
+    sym_orders=defaultdict(int)
+    settings_line=eod_time=""
+    sess_stats={s:{"trades":0,"pnl":0.0,"wins":0,"losses":0} for s in ("pre","rth","ath","ovn")}
+
+    def is_today(ts_str):
+        try:
+            # ★ v2.86: JST→ET 変換を ZoneInfo へ。DST 自動対応。
+            dt = (datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                  .replace(tzinfo=_JST_TZ).astimezone(_ET_TZ))
+            return dt.date() == today
+        except (ValueError, TypeError, AttributeError):
+            return False
+
+    # ET基準の対象日に対して、JST日付は+1日ずれる可能性がある（プリマーケット等）。
+    # 文字列一致フィルター（date_str not in line）は翌JST日のログを誤排除するため廃止。
+    # 代わりにJST日付が±1日以内の行のみ is_today() に渡す軽量プレフィルターを使用する。
+    _et_date = today  # ET基準の対象日
+    _jst_dates_ok = {
+        (_et_date + datetime.timedelta(days=d)).strftime("%Y-%m-%d")
+        for d in (-1, 0, 1)
+    }
+
+    # ★ v3.9.48: 現在ログ + logbackup/ アーカイブを統合スキャン。
+    # 月曜以降の起動で前週末のデータをバックアップから拾えるようにする。
+    try:
+        for line in _iter_log_lines(log_path, today):
+            # 軽量プレフィルター: 行頭のJST日付が±1日以内かチェック
+            if len(line) < 10 or line[:10] not in _jst_dates_ok:
+                continue
+            mt=pats["ts"].match(line)
+            if not mt or not is_today(mt.group(1)): continue
+            ts_str=mt.group(1)
+            if not settings_line:
+                ms=re.search(r"moomoo_trade_v1\.py\s+(v[\d.]+)",line)
+                if ms: settings_line=_get_settings_snapshot()
+            mo=pats["order"].search(line)
+            if mo:
+                if mo.group("side").upper()=="BUY": buy_orders+=1
+                else: sell_orders+=1
+                sym_orders[mo.group(2).upper()]+=1
+                continue
+            mf=pats["fill"].search(line)
+            if mf:
+                st=mf.group("status").upper()
+                if any(x in st for x in ("CANCEL","FAIL","REJECT")): cancelled+=1
+                elif any(x in st for x in ("FILLED","DEALT")): filled+=1
+                continue
+            mr=pats["rpnl"].search(line)
+            if mr:
+                try:
+                    pv=float(mr.group("pnl"))
+                    rpnl_total+=pv; trade_count+=1
+                    sess=_session(ts_str)
+                    s=sess_stats[sess]
+                    s["trades"]+=1; s["pnl"]+=pv
+                    if pv>0: s["wins"]+=1
+                    elif pv<0: s["losses"]+=1
+                except (ValueError, AttributeError, TypeError): pass
+                continue
+            mrk=pats["risk"].search(line)
+            if mrk:
+                try:
+                    pv=float(re.sub(r"[$,]","",mrk.group("pnl")))
+                    best_pnl=max(best_pnl,pv); worst_pnl=min(worst_pnl,pv)
+                except (ValueError, AttributeError, TypeError): pass
+                continue
+            maj=pats["ai"].search(line)
+            if maj:
+                try: ai_scores.append(int(maj.group("score"))); ai_confs.append(float(maj.group("conf")))
+                except (ValueError, AttributeError, TypeError): pass
+                continue
+            if not eod_time and pats["eod"].search(line):
+                eod_time=ts_str; continue
+            me=pats["err"].search(line)
+            if me:
+                _emsg = me.group("msg").strip()
+                # ★ v3.9.87 (B-1): 情報バナー/状態通知はエラーシートへ送らない
+                #   （端末表示は維持・"エラー"件数の水増しを防ぎ真のエラーを埋もれさせない）
+                if any(_tag in _emsg for _tag in _ERROR_LOG_EXCLUDE_TAGS):
+                    continue
+                # ★ v3.9.132: 再試行で回復する一時的エラーの「途中経過」は記録しない。
+                #   再接続/再試行は設計どおりの動作。最終的に失敗した行（"再試行"を含まない
+                #   本エラーや「接続不全」等の集約警告）は従来どおり記録される。
+                if any(_tag in _emsg for _tag in _ERROR_LOG_TRANSIENT_TAGS):
+                    continue
+                errors.append({
+                    "t":   ts_str[11:19],                # HH:MM:SS
+                    "lv":  me.group(2).upper(),          # ERROR / WARNING
+                    "msg": _emsg[:150],                  # メッセージ本文
+                    "impact": _classify_error_impact(_emsg),  # ★ v3.9.111: 売買影響区分
+                })
+    except Exception as e:
+        log.warning(f"[データ収集] ログ解析エラー: {e}")
+        return
+
+    def _wr(s): return f"{round(s['wins']/s['trades']*100,1)}%" if s['trades']>0 else "N/A"
+    def _pnl(s): return round(s['pnl'],2) if s['trades']>0 else "N/A"
+
+    summary={
+        "date":date_str,"settings":settings_line or _get_settings_snapshot(),
+        "buy_orders":buy_orders,"sell_orders":sell_orders,"total_orders":buy_orders+sell_orders,
+        "filled_count":filled,"cancelled_count":cancelled,
+        "realized_pnl":round(rpnl_total,2) if trade_count>0 else "N/A",
+        "trade_count":trade_count,
+        "best_pnl_usd":round(best_pnl,2),"worst_pnl_usd":round(worst_pnl,2),
+        "avg_confidence":round(sum(ai_confs)/len(ai_confs),3) if ai_confs else "N/A",
+        "ai_bull_count":ai_scores.count(1),"ai_bear_count":ai_scores.count(-1),"ai_neutral_count":ai_scores.count(0),
+        "top_symbol":max(sym_orders,key=sym_orders.get) if sym_orders else "—",
+        "symbol_orders":_json.dumps(dict(sym_orders),ensure_ascii=False),
+        "force_close":"Yes" if eod_time else "No","force_close_time":eod_time,
+        "error_count":len(errors),
+        "errors_summary":" | ".join(e["msg"] for e in errors[:3]),
+        # ★ v3.9.96: GAS送信量とエラーログ詳細シートの肥大を抑えるため 50→25 に削減
+        #   (error_count は全件カウントのまま。詳細は端末ログ/CHANGELOG参照)。
+        "error_logs":_json.dumps(errors[:25], ensure_ascii=False),
+        # 時間帯別
+        "pre_trades":sess_stats["pre"]["trades"],"pre_pnl":_pnl(sess_stats["pre"]),
+        "pre_wins":sess_stats["pre"]["wins"],"pre_losses":sess_stats["pre"]["losses"],"pre_winrate":_wr(sess_stats["pre"]),
+        "rth_trades":sess_stats["rth"]["trades"],"rth_pnl":_pnl(sess_stats["rth"]),
+        "rth_wins":sess_stats["rth"]["wins"],"rth_losses":sess_stats["rth"]["losses"],"rth_winrate":_wr(sess_stats["rth"]),
+        "ath_trades":sess_stats["ath"]["trades"],"ath_pnl":_pnl(sess_stats["ath"]),
+        "ath_wins":sess_stats["ath"]["wins"],"ath_losses":sess_stats["ath"]["losses"],"ath_winrate":_wr(sess_stats["ath"]),
+        "ovn_trades":sess_stats["ovn"]["trades"],"ovn_pnl":_pnl(sess_stats["ovn"]),
+        "ovn_wins":sess_stats["ovn"]["wins"],"ovn_losses":sess_stats["ovn"]["losses"],"ovn_winrate":_wr(sess_stats["ovn"]),
+    }
+
+    pnl_disp=f"${summary['realized_pnl']:+.2f}" if isinstance(summary['realized_pnl'],float) else summary['realized_pnl']
+    log.info(f"[データ収集] 集計完了  名前:{cfg_name}  損益:{pnl_disp}  決済:{trade_count}回")
+
+    try:
+        import requests as _requests
+        payload = _json.dumps(
+            {"token": "algo2026secret", "student_name": cfg_name, "data": summary},
+            ensure_ascii=False
+        )
+        result = _gas_post(cfg_url, payload, timeout=60)
+        if result.get("ok"):
+            _mark_date_sent(date_str)
+            log.info(f"[データ収集] ✅ 送信完了  名前:{cfg_name}  日付:{date_str}")
+        else:
+            log.warning(f"[データ収集] 送信エラー: {result.get('error')}")
+    except Exception as e:
+        log.warning(f"[データ収集] 通信エラー: {e}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="moomoo セクター連動型アルゴトレード v1")
+    parser.add_argument("--live", action="store_true", help="実口座モード")
+    # ★ v3.9.117: Bot Station.app 互換。アプリは位置引数 demo/real を渡すため受け付ける。
+    #   demo（または省略）＝デモ / real＝実口座。従来の --live も引き続き有効（real と等価）。
+    parser.add_argument("mode", nargs="?", choices=["demo", "real"], default=None,
+                        help="起動モード: demo=デモ口座 / real=実口座（省略時は --live に従う）")
+    args = parser.parse_args()
+    _is_live = bool(args.live or args.mode == "real")
+
+    # 同じ口座へ二重に発注しないための安全装置。
+    # 実口座かデモかで別のロックにし、それぞれ1つだけ動けるようにする。
+    if not _acquire_single_instance("live" if _is_live else "demo"):
+        sys.exit(0)   # 異常ではないので 0 で終わる（監視に失敗と誤解させない）
+
+    import platform, subprocess
+    _caffeinate_proc = None
+    _os = platform.system()
+    if _os == "Darwin":
+        try:
+            _caffeinate_proc = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+            print(f"[スリープ防止] Mac: caffeinate 有効化 (pid={_caffeinate_proc.pid})")
+        except FileNotFoundError:
+            print("[スリープ防止] caffeinate が見つかりません")
+    elif _os == "Windows":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+            print("[スリープ防止] Windows: 有効化")
+        except Exception as e:
+            print(f"[スリープ防止] Windows: 失敗 ({e})")
+
+    try:
+        asyncio.run(main(live=_is_live))
+    except KeyboardInterrupt:
+        # _sigint_handler が送出した KeyboardInterrupt。トレード集計の表示は
+        # 既に main() の finally で完了済み。トレースバックは出さず静かに終了。
+        pass
+    finally:
+        if _caffeinate_proc:
+            _caffeinate_proc.terminate()
+        if _os == "Windows":
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+            except Exception:
+                pass
