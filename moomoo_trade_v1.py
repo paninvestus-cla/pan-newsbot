@@ -114,6 +114,10 @@ try:
         from moomoo import AssetCategory  # type: ignore
     except ImportError:
         AssetCategory = None  # type: ignore
+    try:
+        from moomoo import Session  # type: ignore
+    except ImportError:
+        Session = None  # type: ignore
     # moomoo 10.x では削除済み。存在すれば import、なければ None。
     try:
         from moomoo import OpenUSTradeContext  # type: ignore
@@ -147,6 +151,10 @@ except ImportError:
             TrdMarket = None  # type: ignore
             SecurityFirm = None  # type: ignore
             Currency = None  # type: ignore
+        try:
+            from futu import Session  # type: ignore
+        except ImportError:
+            Session = None  # type: ignore
     except ImportError:
         print(
             "[ERROR] moomoo-api がインストールされていません。\n"
@@ -161,7 +169,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.135"
+BOT_VERSION = "v3.9.138"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -3949,6 +3957,61 @@ try:
 except ValueError:
     CLOSE_BEFORE_INACTIVE_MIN = 5
 
+# ── ★ v3.9.136: 夜間持ち越し（OVN）─ 隠し機能 ────────────────────────────────
+# 引け際に QQQ を買い、翌営業日の寄り付きで売る。日中のニュース売買とは別物で、
+# 昼のBotが動いていない時間だけを使う。
+#
+# 既定は無効。.env に OVN_ENABLED=true と書いた人だけが動く（Wizardには出さない）。
+# 有効にした人は実際に売買したいはずなので、モードの既定は live にしている。
+#
+#   OVN_ENABLED        true で有効（既定 false）
+#   OVN_MODE           live=実際に売買 / shadow=記録だけ（既定 live）
+#   OVN_VIX_LEVEL      loose / normal / strict（買う日の厳しさ）
+#   OVN_BUDGET_USD     1回に使う金額（必須）。Bot 本体の BUDGET_USD とは独立。
+#                      未設定・0 以下なら「金額未設定」として買わない。
+#                      ★ v3.9.138: 旧仕様「0 なら1株」は直感に反するため廃止。
+#                      1株だけ試したい場合は 1株ぶんより少し多い金額を書く（例 800）。
+#   OVN_SKIP_LONG_HOLIDAY  連休の前は持ち越さない（既定 true）
+OVN_ENABLED: bool = (os.environ.get("OVN_ENABLED", "false").strip().lower() == "true")
+OVN_MODE: str = os.environ.get("OVN_MODE", "live").strip().lower()
+OVN_VIX_LEVEL: str = os.environ.get("OVN_VIX_LEVEL", "normal").strip().lower()
+_OVN_VIX_THRESH: float = {"loose": 0.0, "normal": -0.02, "strict": -0.03}.get(OVN_VIX_LEVEL, -0.02)
+try:
+    OVN_BUDGET_USD: float = float(os.environ.get("OVN_BUDGET_USD", "0") or "0")
+except ValueError:
+    OVN_BUDGET_USD = 0.0
+OVN_SKIP_LONG_HOLIDAY: bool = (os.environ.get("OVN_SKIP_LONG_HOLIDAY", "true").strip().lower() == "true")
+OVN_SYMBOL: str = "QQQ"
+OVN_SMA_DAYS: int = 200
+OVN_ENTRY_ET = (15, 55)   # 引け際に判定して買う（まだ立会中なので普通に約定する）
+OVN_RESERVE_ET = (16, 5)  # 引け後に「翌寄りで売る」注文を置く（実口座のみ有効）
+OVN_EXIT_ET  = (9, 31)    # 翌寄り。予約が無い/効かなかった場合はここで売る
+OVN_STATE_FILE: str = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "ovn_state.json")
+
+
+def _is_other_owner(symbol: str) -> bool:
+    """日中のニュース売買が手を出してはいけない銘柄か。
+
+    ★ v3.9.136: 「Bot が建てていない建玉（externally_held）」に加えて、
+    「OVN が建てた建玉（ovn_held）」も日中ロジックから切り離す。同じ QQQ を
+    両方が扱うため、これが無いと日中の時間切れ決済が OVN の建玉を売ってしまう。
+    """
+    ts = state.get(symbol)
+    return bool(getattr(ts, "externally_held", False) or getattr(ts, "ovn_held", False))
+
+
+def _ovn_state_owns_position() -> bool:
+    """永続状態上、OVN が QQQ 建玉を所有しているか。"""
+    st = _ovn_load()
+    if st.get("phase") not in ("BUY_INTENT", "BUY_PENDING", "HELD", "RESERVED", "HELD_NO_RESERVE"):
+        return False
+    # 保有後に機能を無効化／shadow化しても、決済完了までは所有権を放棄しない。
+    # 環境タグの無い旧状態は REAL/DEMO を判別できないため所有権を復元しない。
+    # 誤った口座の建玉を Bot 所有として売るより、安全側で管理対象外にする。
+    return st.get("trade_env") == _RUN_TRADE_ENV
+
+
 # ── ★ v3.9.131: ハートビート監視（型B＝イベントループ凍結の検知） ───────────────
 #   独立OSスレッドで「最後の鼓動から N 分無音」を検知し、Discord＋端末に大声警告する。
 #   凍結中は asyncio が止まっても OS スレッドは動くため、「通知ゼロ(型B)」を破れる。
@@ -5566,6 +5629,10 @@ class TickerState:
     #     ・新規エントリーもしない（決済は銘柄単位の全決済なので混ぜられない）
     #   建玉が口座から消えたら False に戻り、通常運転を再開する。
     externally_held:      bool   = False
+    # ★ v3.9.136: 夜間持ち越し(OVN)が建てた建玉。日中のニュース売買から切り離す。
+    #   同じ QQQ をニュース側も扱うため、これが無いと日中の時間切れ・損切りが
+    #   OVN の建玉を決済してしまう（建玉台帳だけでは両者を区別できない）。
+    ovn_held:             bool   = False
     pending_close_reason: str  = ""              # 決済理由（place_close_allから保存）
     pending_entry_time:   object = field(default=None)  # 決済発注時にentry_timeを保存（TRADE_RESULTのhold_min用）
     pending_avg_cost:     float  = 0.0           # 決済発注時にavg_costを保存（sync_positionsによる上書き防止用）
@@ -6261,6 +6328,7 @@ def _daily_summary_send_time(trd_env: "TrdEnv", today_et_date: "datetime.date") 
 # シャドー SHORT エグジット時と、シャドーモメンタムシグナル検知時に追記する。
 _today_shadow_short: list[dict] = []      # 決済確定したシャドー SHORT のみ集計
 _today_shadow_momentum: list[dict] = []   # シャドーモメンタム シグナル検知ログ
+_today_shadow_ovn: list[dict] = []        # ★ v3.9.137: 夜間持ち越し「記録のみ」の結果
 
 # ── ★ v3.9.115: 当日サマリ集計のディスク永続化 ─────────────────────────────
 # 認定サポーター指摘 (7/10): 上記バッファはメモリのみで、Bot 再起動でクリアされる
@@ -6562,7 +6630,7 @@ def _ext_set_held(symbol: str, held: bool, reason: str = "",
 
 def _skip_if_externally_held(symbol: str, what: str) -> bool:
     """管理対象外の銘柄なら True（＝発注を見送る）。"""
-    if not getattr(state.get(symbol), "externally_held", False):
+    if not _is_other_owner(symbol):
         return False
     log.info(f"[建玉台帳] 【{symbol}】 Bot 以外の建玉があるため {what} を見送ります")
     _key = f"_ext_entry_notified_{symbol}"
@@ -6594,12 +6662,13 @@ def _record_today_shadow_momentum(rec: dict) -> None:
 def _maybe_reset_today_trades() -> None:
     """ET 日付が変わっていれば当日バッファをリセットする。"""
     global _today_trades, _today_trades_date
-    global _today_shadow_short, _today_shadow_momentum
+    global _today_shadow_short, _today_shadow_momentum, _today_shadow_ovn
     today_et = datetime.datetime.now(_ET).date()
     if _today_trades_date != today_et:
         _today_trades = []
         _today_shadow_short = []
         _today_shadow_momentum = []
+        _today_shadow_ovn = []
         _today_trades_date = today_et
         _save_today_state()   # ★ v3.9.115: 日付跨ぎで永続ファイルも当日(空)へ更新
 
@@ -6616,7 +6685,7 @@ def _format_shadow_summary_block() -> Optional[str]:
     Discord・端末両方で使うので、_format_daily_summary 末尾に追記する形で使う。
     シャドーデータがゼロなら None を返す。
     """
-    if not _today_shadow_short and not _today_shadow_momentum:
+    if not _today_shadow_short and not _today_shadow_momentum and not _today_shadow_ovn:
         return None
     lines = []
     lines.append("")
@@ -6670,6 +6739,20 @@ def _format_shadow_summary_block() -> Optional[str]:
         lines.append("")
         lines.append("▼ シャドーモメンタム  本日のシグナルなし")
 
+    # ── ★ v3.9.137: 夜間持ち越し（記録のみ）サマリ ─────────────────
+    if _today_shadow_ovn:
+        n_total = len(_today_shadow_ovn)
+        n_w = len([o for o in _today_shadow_ovn if o.get('pnl', 0) > 0])
+        n_l = len([o for o in _today_shadow_ovn if o.get('pnl', 0) < 0])
+        total = sum(o.get('pnl', 0) for o in _today_shadow_ovn)
+        lines.append("")
+        lines.append(f"▼ 夜間持ち越し(記録のみ)  {n_total}件  {n_w}勝 {n_l}敗")
+        lines.append(f"  仮想 損益  {total:+.2f}")
+        for o in _today_shadow_ovn:
+            lines.append(f"    {o.get('symbol', '?'):6s}  {o.get('qty', 0):3d}株  "
+                         f"{o.get('entry', 0):8.2f} → {o.get('exit', 0):8.2f}  "
+                         f"{o.get('pnl', 0):+8.2f} ({o.get('pct', 0):+.2f}%)")
+
     return '\n'.join(lines)
 
 
@@ -6681,7 +6764,8 @@ def _format_daily_summary() -> Optional[str]:
     """
     _maybe_reset_today_trades()
     # 実トレードもシャドーも完全ゼロなら None
-    if not _today_trades and not _today_shadow_short and not _today_shadow_momentum:
+    if (not _today_trades and not _today_shadow_short
+            and not _today_shadow_momentum and not _today_shadow_ovn):
         return None
     # ── 実トレードゼロでシャドーだけある場合の簡易ヘッダ ──────────────
     if not _today_trades:
@@ -10666,10 +10750,13 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     _est_cost = abs(total_qty) * api_avg
                     _tracked_position_cost[sym] = _est_cost
                     _side_label = "SHORT" if total_qty < 0 else "LONG"
+                    # ★ v3.9.138: 旧文言「外部保有ポジション検出」は v3.9.134 で入れた
+                    #   建玉台帳の「Bot 以外の建玉」と紛らわしく、誤って不具合と読まれた。
+                    #   ここは予算計上額の補正のみで、自動売買の停止とは無関係。
                     log.info(
-                        f"[sync_positions] 【{sym}】 外部保有ポジション検出 ({_side_label})"
-                        f" → _tracked_position_cost=${_est_cost:,.0f} に仮設定"
-                        f"（qty={total_qty} avg=${api_avg:.2f}）"
+                        f"[sync_positions] 【{sym}】 建玉あり・予算計上が未設定 ({_side_label})"
+                        f" → 予算計上額を ${_est_cost:,.0f} に補正"
+                        f"（qty={total_qty} avg=${api_avg:.2f}／自動売買は停止しません）"
                     )
 
         # ── 起動時ポジション不明フラグの自動解除 ──────────────────────────────
@@ -10739,7 +10826,12 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 _sides_j is not None and
                 (_sides_j["LONG"]["qty"] > 0 or _sides_j["SHORT"]["qty"] > 0)
             )
-            if _held_j and not _ledger_has(_sym_j, trd_env):
+            if (_held_j and _sym_j == OVN_SYMBOL
+                    and getattr(state.get(_sym_j), "ovn_held", False)):
+                # OVN はニュース売買の建玉台帳には載せない。永続 OVN 状態を起動時に
+                # 復元済みなので、台帳に無いことだけで「外部建玉」に分類しない。
+                _ext_set_held(_sym_j, False)
+            elif _held_j and not _ledger_has(_sym_j, trd_env):
                 _q = _sides_j["LONG"]["qty"] or _sides_j["SHORT"]["qty"]
                 _sd = "ロング" if _sides_j["LONG"]["qty"] > 0 else "ショート"
                 if _ledger_first_run:
@@ -13627,7 +13719,7 @@ def _close_one_position_id(
     tag = f"【{symbol}】"
     # ★ v3.9.134: 台帳に無い建玉（Bot が建てたものではない）は決済しない。
     #   決済経路は複数あるが、実際に発注する低レベル関数を含めてすべてここで塞ぐ。
-    if getattr(state.get(symbol), "externally_held", False):
+    if _is_other_owner(symbol):
         log.warning(f"[建玉台帳] 【{symbol}】 Bot 以外の建玉のため決済しません（{reason}）")
         _k = f"_ext_close_notified_{symbol}"
         if not getattr(place_close_all, _k, False):
@@ -13843,7 +13935,7 @@ def place_close_partial(
     tag  = f"【{symbol}】"
     # ★ v3.9.134: 台帳に無い建玉（Bot が建てたものではない）は決済しない。
     #   決済経路は複数あるが、実際に発注する低レベル関数を含めてすべてここで塞ぐ。
-    if getattr(state.get(symbol), "externally_held", False):
+    if _is_other_owner(symbol):
         log.warning(f"[建玉台帳] 【{symbol}】 Bot 以外の建玉のため決済しません（{reason}）")
         _k = f"_ext_close_notified_{symbol}"
         if not getattr(place_close_all, _k, False):
@@ -14003,7 +14095,7 @@ def place_close_all(
     tag = f"【{symbol}】"
     # ★ v3.9.134: 台帳に無い建玉（Bot が建てたものではない）は決済しない。
     #   決済経路は複数あるが、実際に発注する低レベル関数を含めてすべてここで塞ぐ。
-    if getattr(state.get(symbol), "externally_held", False):
+    if _is_other_owner(symbol):
         log.warning(f"[建玉台帳] 【{symbol}】 Bot 以外の建玉のため決済しません（{reason}）")
         _k = f"_ext_close_notified_{symbol}"
         if not getattr(place_close_all, _k, False):
@@ -16247,6 +16339,615 @@ def _heartbeat_watchdog_thread() -> None:
             pass
 
 
+# ── ★ v3.9.136: 夜間持ち越し（OVN）の実装 ──────────────────────────────────
+def _ovn_load() -> dict:
+    try:
+        if os.path.isfile(OVN_STATE_FILE):
+            with open(OVN_STATE_FILE, encoding="utf-8") as f:
+                return json.load(f) or {}
+    except Exception as e:
+        log.warning(f"[OVN] 状態ファイルを読めません: {_mask_secrets(e)}")
+    return {}
+
+
+def _ovn_save(st: dict) -> bool:
+    """状態を永続化する。成功時だけ True（発注前の必須条件として使う）。"""
+    try:
+        tmp = OVN_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, OVN_STATE_FILE)
+        # replace のディレクトリエントリも可能な環境では永続化する。
+        try:
+            dir_fd = os.open(os.path.dirname(OVN_STATE_FILE), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except (AttributeError, OSError):
+            pass
+        return True
+    except Exception as e:
+        log.error(f"[OVN] 状態ファイルを保存できません（再起動で建玉を見失います）: {_mask_secrets(e)}")
+        _ovn_say("状態保存に失敗しました。新規発注を停止します。ディスク空き容量と書込権限を確認してください。", "error")
+        return False
+
+
+def _ovn_say(msg: str, level: str = "info") -> None:
+    getattr(log, level, log.info)(f"[夜間持ち越し] {msg}")
+    try:
+        _threadsafe_discord(f"🌙 【夜間持ち越し】{msg}")
+    except Exception:
+        pass
+
+
+def _ovn_daily_closes(symbol: str, n: int) -> list:
+    """日足の終値を古い順で返す（失敗は空）。ブロッキングなので to_thread 経由で呼ぶ。
+
+    ★ v3.9.136: max_count は「範囲の先頭から N 本」を返す。1回の呼び出しで
+    済ませると期間の**古い側**しか取れず、200日移動平均も「前日終値」も
+    数か月前の値で判定してしまう（実測: 最終足が 2026-04-08、実際は 08-12）。
+    続きのページを最後まで手繰り、新しい側の N 本を使う。
+    """
+    try:
+        now = datetime.datetime.now(_ET)
+        today = now.strftime("%Y-%m-%d")
+        start = (now - datetime.timedelta(days=n * 2 + 30)).strftime("%Y-%m-%d")
+        rows, key, guard = [], None, 0
+        seen_keys = set()
+        with _quote_ctx() as ctx:
+            while guard < 20:
+                guard += 1
+                ret, kl, next_key = ctx.request_history_kline(
+                    code=to_moomoo_code(symbol), start=start, end=today,
+                    ktype=KLType.K_DAY, max_count=1000, page_req_key=key)
+                # 途中ページの失敗を「取得済みの古い足だけ」で正常終了させない。
+                # それを返すと、今回修正した stale 判定が通信障害時に再発する。
+                if ret != RET_OK or kl is None:
+                    return []
+                if kl.empty:
+                    if next_key:
+                        return []
+                    break
+                rows.append(kl)
+                if not next_key:
+                    break
+                # SDK/OpenD が同じキーを返し続けても20回同じページを要求しない。
+                if next_key == key or next_key in seen_keys:
+                    return []
+                seen_keys.add(next_key)
+                key = next_key
+            else:
+                # 20ページで取り切れない場合も、不完全な古い側のデータは使わない。
+                return []
+        if not rows:
+            return []
+        import pandas as _pd
+        allk = _pd.concat(rows, ignore_index=True)
+        # 15:55 ET の当日足は未確定。「前日終値」条件へ混ぜない。
+        if "time_key" not in allk.columns or "close" not in allk.columns:
+            return []
+        allk["time_key"] = allk["time_key"].astype(str)
+        allk = allk[allk["time_key"].str.slice(0, 10) < today]
+        # APIやページごとの返却順に依存せず、呼び出し側の前提（古い→新しい）を保証する。
+        allk = allk.sort_values("time_key", kind="stable").drop_duplicates(
+            subset="time_key", keep="last")
+        closes = [float(x) for x in allk["close"].tolist()]
+        return closes[-n:] if len(closes) > n else closes
+    except Exception as e:
+        log.debug(f"[OVN] {symbol} の日足を取れません: {_mask_secrets(e)}")
+    return []
+
+
+def _ovn_long_holiday_ahead() -> bool:
+    """翌営業日までに市場が閉じている日数が長いか（連休の前は持ち越さない）。"""
+    if not OVN_SKIP_LONG_HOLIDAY:
+        return False
+    try:
+        d = datetime.datetime.now(_ET).date()
+        closed = 0
+        for i in range(1, 6):
+            nxt = d + datetime.timedelta(days=i)
+            if nxt.weekday() >= 5 or is_nyse_holiday(nxt):
+                closed += 1
+            else:
+                break
+        return closed >= 3          # 土日(2日)までは通常。3日以上＝連休
+    except Exception:
+        return False
+
+
+def _ovn_order(trd_env, side, qty: int, price: float, *, reserve: bool = False,
+               position_id=None):
+    """OVN の発注。戻り値 (order_id or None, 説明)。
+
+    reserve=True は「引け後に出して翌営業日の寄り付きで約定させる」予約。
+    実口座では session=RTH の成行注文が翌寄りまで生き残ることを実機で確認済み
+    （2026-08-07 引け後に発注 → 2026-08-10 09:30 に約定）。
+    デモ口座は当日20時ETで失効するため予約は使わず、翌朝に売る。
+    """
+    try:
+        use_market = (price <= 0)
+        kw = dict(
+            price=price if price > 0 else 0,
+            qty=qty, code=to_moomoo_code(OVN_SYMBOL), trd_side=side,
+            order_type=(OrderType.MARKET if use_market else OrderType.NORMAL),
+            trd_env=trd_env, time_in_force=TimeInForce.DAY,
+            acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0),
+            **_tokutei_kwargs(trd_env),
+        )
+        # 新規買いでは position_id 自体を送らない。JP実口座の決済時だけ、
+        # SDK の Protobuf が要求する int 型で指定する。
+        if position_id is not None:
+            kw["position_id"] = int(position_id)
+        if reserve:
+            if Session is None:
+                return None, "このSDKには Session.RTH がありません"
+            kw["session"] = Session.RTH      # 翌営業日の立会で約定させる
+            kw["fill_outside_rth"] = False
+        else:
+            # moomoo は成行注文と fill_outside_rth=True の併用を拒否する。
+            kw["fill_outside_rth"] = (not use_market)
+        with _trade_ctx() as ctx:
+            ret, data = ctx.place_order(**kw)
+        if ret != RET_OK:
+            return None, str(data)
+        return str(data["order_id"][0]), "OK"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {_mask_secrets(e)}"
+
+
+def _ovn_order_status(trd_env, order_id: str) -> tuple[str, int, str]:
+    """注文状態・約定数を返す。照会失敗は UNKNOWN。"""
+    try:
+        with _trade_ctx() as ctx:
+            ret, df = ctx.order_list_query(
+                trd_env=trd_env, order_id=str(order_id),
+                acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0))
+        if ret == RET_OK and df is not None and not df.empty:
+            row = df.iloc[0]
+            return (str(row.get("order_status", "")).upper(),
+                    int(float(row.get("dealt_qty", 0) or 0)), "OK")
+        return "UNKNOWN", 0, str(df)
+    except Exception as e:
+        return "UNKNOWN", 0, f"{type(e).__name__}: {_mask_secrets(e)}"
+
+
+_OVN_TERMINAL_STATUSES = ("FILLED_ALL", "CANCELLED", "CANCELED", "FAILED", "DELETED", "REJECTED")
+
+
+def _ovn_is_terminal(status: str) -> bool:
+    return any(x in str(status).upper() for x in _OVN_TERMINAL_STATUSES)
+
+
+def _ovn_broker_open_orders(trd_env) -> tuple[list[dict], str]:
+    """証券会社側にある QQQ の非終端注文を返す。照会失敗は安全側で区別する。"""
+    try:
+        with _trade_ctx() as ctx:
+            ret, df = ctx.order_list_query(
+                trd_env=trd_env,
+                acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0))
+        if ret != RET_OK:
+            return [], str(df)
+        found = []
+        if df is not None and not df.empty:
+            for _, row in df.iterrows():
+                code = str(row.get("code", ""))
+                status = str(row.get("order_status", "")).upper()
+                if code.endswith("." + OVN_SYMBOL) and not _ovn_is_terminal(status):
+                    found.append({
+                        "order_id": str(row.get("order_id", "")),
+                        "status": status,
+                        "side": str(row.get("trd_side", "")).upper(),
+                        "dealt_qty": int(float(row.get("dealt_qty", 0) or 0)),
+                    })
+        return found, "OK"
+    except Exception as e:
+        return [], f"{type(e).__name__}: {_mask_secrets(e)}"
+
+
+def _ovn_position(trd_env) -> tuple[int, list[dict], str]:
+    """QQQ のロング建玉数と position_id 一覧を取得。失敗時 qty=-1。"""
+    try:
+        with _trade_ctx() as ctx:
+            kwargs = dict(
+                trd_env=trd_env,
+                acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0),
+                # sync_positions と同様、頻繁な巡回でレート制限を踏まないよう
+                # キャッシュ照会を優先する。
+                refresh_cache=False,
+            )
+            asset_cat_us = getattr(AssetCategory, "US", "US") if AssetCategory else None
+            if asset_cat_us is not None:
+                kwargs["asset_category"] = asset_cat_us
+            try:
+                ret, df = ctx.position_list_query(**kwargs)
+            except TypeError as e:
+                # 旧SDKは asset_category キーワードを受け付けない。
+                if "asset_category" not in str(e) or "asset_category" not in kwargs:
+                    raise
+                kwargs.pop("asset_category", None)
+                ret, df = ctx.position_list_query(**kwargs)
+        if ret != RET_OK:
+            return -1, [], str(df)
+        rows = df[df["code"].astype(str).str.endswith("." + OVN_SYMBOL)] if df is not None and not df.empty else []
+        qty, ids = 0, []
+        for _, row in (rows.iterrows() if hasattr(rows, "iterrows") else []):
+            raw = int(float(row.get("qty", 0) or 0))
+            side = str(row.get("position_side", "") or "").upper()
+            if raw > 0 and "SHORT" not in side:
+                qty += raw
+                pid_raw = row.get("position_id", "")
+                if str(pid_raw or ""):
+                    # SDK 10.05 の Protobuf は position_id に int を要求する。
+                    ids.append({"pid": int(pid_raw), "qty": raw})
+        return qty, ids, "OK"
+    except Exception as e:
+        return -1, [], f"{type(e).__name__}: {_mask_secrets(e)}"
+
+
+def _ovn_sell_position(trd_env, qty: int, ids: list[dict], *, reserve: bool) -> tuple[list[str], str]:
+    """OVN 建玉を position_id 単位で決済する。全注文受付時だけ成功。"""
+    if qty <= 0:
+        return [], "売却数量が0です"
+    if trd_env == TrdEnv.REAL and not ids:
+        return [], "position_id を取得できません（JP実口座では決済発注を停止）"
+    targets = ids or [{"pid": None, "qty": qty}]
+    oids = []
+    remaining = qty
+    for item in targets:
+        part = min(remaining, int(item.get("qty", 0) or 0))
+        if part <= 0:
+            continue
+        oid, msg = _ovn_order(trd_env, TrdSide.SELL, part, 0.0,
+                              reserve=reserve, position_id=item.get("pid"))
+        if not oid:
+            return oids, msg
+        oids.append(oid)
+        remaining -= part
+    return (oids, "OK") if remaining == 0 else (oids, f"未発注残 {remaining}株")
+
+
+async def ovn_overnight_loop(trd_env) -> None:
+    """引け際に QQQ を買い、翌営業日の寄り付きで売る。
+
+    日中のニュース売買とは切り離して動く（ovn_held フラグ）。
+    条件: 前日終値 > 200日移動平均 かつ VIXY の前日比が閾値以下。
+    """
+    st = _ovn_load()
+    owns_persisted = (
+        st.get("phase") in ("BUY_INTENT", "BUY_PENDING", "HELD", "RESERVED", "HELD_NO_RESERVE")
+        and st.get("trade_env") == _RUN_TRADE_ENV
+    )
+    if not OVN_ENABLED and not owns_persisted:
+        return
+    # すでに実建玉を持っている場合は、設定が無効／shadowへ変わっていても
+    # 売却完了まで live の回収動作を継続する。
+    _live = (OVN_ENABLED and OVN_MODE == "live") or owns_persisted
+    log.warning(
+        f"🌙 [夜間持ち越し] 有効です  モード={'実際に売買' if _live else '記録のみ'}"
+        f"  条件={OVN_VIX_LEVEL}(VIXY {_OVN_VIX_THRESH:+.0%}以下)"
+        f"  1回の金額={'未設定(買いません)' if OVN_BUDGET_USD <= 0 else f'${OVN_BUDGET_USD:,.0f}'}"
+        f"（Bot 本体の予算とは別枠）"
+        f"  口座={'実口座' if trd_env == TrdEnv.REAL else 'デモ'}"
+    )
+    # DEMO/REAL の状態を混ぜない。環境タグ無しも判別不能なので復元しない。
+    if st and st.get("trade_env") != _RUN_TRADE_ENV:
+        if st.get("phase") in ("BUY_INTENT", "BUY_PENDING", "HELD", "RESERVED", "HELD_NO_RESERVE"):
+            _ovn_say("環境タグの無い、または別口座の旧状態は復元しません。口座建玉を手動確認してください。", "error")
+        st = {}
+    st.setdefault("trade_env", _RUN_TRADE_ENV)
+    # 再起動しても保有中なら日中ロジックから切り離した状態を復元する
+    if st.get("phase") in ("BUY_INTENT", "BUY_PENDING", "HELD", "RESERVED", "HELD_NO_RESERVE"):
+        state.get(OVN_SYMBOL).ovn_held = True
+        log.warning(f"🌙 [夜間持ち越し] 保有中の状態を復元しました（{st.get('phase')}）")
+
+    while True:
+        await asyncio.sleep(30)
+        try:
+            now = datetime.datetime.now(_ET)
+            today = now.strftime("%Y-%m-%d")
+            hm = (now.hour, now.minute)
+            phase = st.get("phase", "IDLE")
+
+            # 発注直前に BUY_INTENT を永続化しているため、発注応答前に落ちても
+            # 同じ環境の実建玉・注文から回収できる。
+            if phase == "BUY_INTENT":
+                pos, ids, pdetail = await asyncio.to_thread(_ovn_position, trd_env)
+                open_orders, odetail = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
+                buy_orders = [o for o in open_orders if "BUY" in o.get("side", "")]
+                if pos > 0:
+                    st.update(phase="BUY_PENDING" if buy_orders else "HELD", qty=pos,
+                              position_ids=ids, buy_oid=(buy_orders[0]["order_id"] if buy_orders else None))
+                    state.get(OVN_SYMBOL).ovn_held = True
+                    _ovn_save(st)
+                elif pdetail == "OK" and odetail == "OK" and not buy_orders:
+                    st["phase"] = "IDLE"
+                    state.get(OVN_SYMBOL).ovn_held = False
+                    _ovn_save(st)
+                else:
+                    _ovn_say(f"買い発注意図の復旧照会に失敗しました（position={pdetail[:80]} / order={odetail[:80]}）。", "error")
+                continue
+
+            # 部分約定を含め、買い注文は必ず取消して終端確認してから保有へ進む。
+            if phase == "BUY_PENDING":
+                status, dealt, detail = await asyncio.to_thread(
+                    _ovn_order_status, trd_env, str(st.get("buy_oid", "")))
+                pos, ids, pdetail = await asyncio.to_thread(_ovn_position, trd_env)
+                if not _ovn_is_terminal(status):
+                    cancelled = await asyncio.to_thread(
+                        _cancel_order, str(st.get("buy_oid", "")), OVN_SYMBOL, trd_env,
+                        "OVN 買い残注文の取消")
+                    status, dealt, detail = await asyncio.to_thread(
+                        _ovn_order_status, trd_env, str(st.get("buy_oid", "")))
+                    if not _ovn_is_terminal(status):
+                        _ovn_say(f"買い残注文の終端を確認できません（cancel={cancelled}, status={status}）。"
+                                 "追加約定防止のため売り予約へ進みません。", "error")
+                        continue
+                    pos, ids, pdetail = await asyncio.to_thread(_ovn_position, trd_env)
+                if pos > 0:
+                    st.update(phase="HELD", qty=pos, position_ids=ids)
+                    _ovn_save(st)
+                elif pos == 0:
+                    st.update(phase="IDLE", qty=0)
+                    state.get(OVN_SYMBOL).ovn_held = False
+                    _ovn_say(f"買い注文は建玉を残さず終了しました（{status}）。", "warning")
+                    _ovn_save(st)
+                    continue
+                else:
+                    _ovn_say(f"買い注文終端後の建玉を確認できません: {pdetail[:120]}", "error")
+                    continue
+
+            # ── ① 引け際: 条件を見て買う ──────────────────────────────────
+            if (phase in ("IDLE", "DONE") and OVN_ENTRY_ET <= hm < (16, 0)
+                    and st.get("entry_date") != today and is_trading_day(now.date())
+                    and get_early_close_time(now.date()) is None):
+                st["entry_date"] = today
+                # QQQ は銘柄単位でしか安全に所有権分離できない。ニュース側・手動の
+                # 建玉や未約定注文がある日は混在させない。
+                pre_pos, _, pre_msg = await asyncio.to_thread(_ovn_position, trd_env)
+                pre_orders, pre_order_msg = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
+                if pre_pos < 0:
+                    _ovn_say(f"QQQ 建玉を確認できないため見送ります: {pre_msg[:120]}", "error")
+                    st["phase"] = "IDLE"; _ovn_save(st); continue
+                if pre_order_msg != "OK":
+                    _ovn_say(f"証券会社側の未約定注文を確認できないため見送ります: {pre_order_msg[:120]}", "error")
+                    st["phase"] = "IDLE"; _ovn_save(st); continue
+                if pre_pos != 0 or pre_orders:
+                    _ovn_say(f"QQQ に既存建玉/証券会社側注文があるため見送ります（qty={pre_pos}, orders={len(pre_orders)}）。", "warning")
+                    st["phase"] = "IDLE"; _ovn_save(st); continue
+                qc = await asyncio.to_thread(_ovn_daily_closes, OVN_SYMBOL, OVN_SMA_DAYS + 2)
+                vy = await asyncio.to_thread(_ovn_daily_closes, "VIXY", 3)
+                if len(qc) < OVN_SMA_DAYS or len(vy) < 2:
+                    log.warning(f"[夜間持ち越し] データ不足のため見送ります（QQQ {len(qc)}本 / VIXY {len(vy)}本）")
+                    _ovn_save(st); continue
+                last = qc[-1]
+                sma = sum(qc[-OVN_SMA_DAYS:]) / OVN_SMA_DAYS
+                vchg = vy[-1] / vy[-2] - 1.0
+                trend_ok = last > sma
+                vix_ok = vchg <= _OVN_VIX_THRESH
+                holiday = _ovn_long_holiday_ahead()
+                if not (trend_ok and vix_ok) or holiday:
+                    _reason = ("連休の前" if holiday else
+                               f"条件不成立（200日線 {'○' if trend_ok else '×'} / VIXY {vchg:+.2%} {'○' if vix_ok else '×'}）")
+                    _ovn_say(f"本日は見送ります。{_reason}")
+                    st["phase"] = "IDLE"; _ovn_save(st); continue
+
+                # 予算は前日終値ではなく、実際に買う直前のask（0.5%余裕込み）で制限する。
+                # ギャップアップ日に OVN_BUDGET_USD を超過したり余力不足になるのを防ぐ。
+                entry_quote = await asyncio.to_thread(get_quote, OVN_SYMBOL)
+                entry_price = (entry_quote.get("ask", 0) or entry_quote.get("last", 0) or 0)
+                if entry_price <= 0:
+                    _ovn_say("QQQ の発注直前価格を取得できないため見送ります。", "warning")
+                    st["phase"] = "IDLE"; _ovn_save(st); continue
+                # ★ v3.9.138: 金額は必須。0（未設定）で勝手に1株買う旧仕様は廃止。
+                if OVN_BUDGET_USD <= 0:
+                    _ovn_say("1回に使う金額（OVN_BUDGET_USD）が設定されていないため買いません。"
+                             f"\n.env に金額を書いてください（QQQ は1株およそ ${last:,.0f} です）。", "warning")
+                    st["phase"] = "IDLE"; _ovn_save(st); continue
+                qty = int(OVN_BUDGET_USD // (entry_price * 1.005))
+                if qty <= 0:
+                    _ovn_say(f"1回に使う金額 ${OVN_BUDGET_USD:,.2f} が QQQ 1株 (${entry_price:,.2f}) に"
+                             "足りないため見送ります。", "warning")
+                    st["phase"] = "IDLE"; _ovn_save(st); continue
+                if not _live:
+                    # 記録のみ。実発注はしないが、翌朝の寄り付き値まで追って
+                    # 「買っていたらどうなったか」を日次レポートに載せる。
+                    st.update(phase="SHADOW_HELD", qty=qty,
+                              shadow_entry=round(entry_price, 4),
+                              shadow_date=today)
+                    _ovn_say(f"（記録のみ）買う条件がそろいました。QQQ {entry_price:.2f} × {qty}株 相当"
+                             f"\n200日線 {sma:.2f} / VIXY {vchg:+.2%}　翌朝の寄り付き値と比べて記録します。")
+                    _ovn_save(st); continue
+
+                # 注文応答前クラッシュでも口座から回収できるよう、意図を先に永続化する。
+                st.update(phase="BUY_INTENT", qty=qty, trade_env=_RUN_TRADE_ENV,
+                          ref_price=round(last, 2))
+                if not _ovn_save(st):
+                    st["phase"] = "IDLE"
+                    continue
+                oid, msg = await asyncio.to_thread(_ovn_order, trd_env, TrdSide.BUY, qty, 0.0)
+                if not oid:
+                    _ovn_say(f"買い注文が通りませんでした: {msg[:120]}", "error")
+                    st["phase"] = "IDLE"; _ovn_save(st); continue
+                state.get(OVN_SYMBOL).ovn_held = True   # 部分約定も日中ロジックから切り離す
+                st.update(phase="BUY_PENDING", qty=qty, buy_oid=oid,
+                          trade_env=_RUN_TRADE_ENV,
+                          ref_price=round(last, 2))
+                _ovn_say(f"買い注文を受け付けました。QQQ {qty}株（{last:.2f} / 200日線 {sma:.2f} / VIXY {vchg:+.2%}）"
+                         f"\n翌営業日の寄り付きで売ります。")
+                if not _ovn_save(st):
+                    # BUY_INTENT はディスクに残るので再起動時に口座照会から回収可能。
+                    _ovn_say("買い受付後の状態保存に失敗しました。再起動時は口座照会から復旧します。", "error")
+
+            # ── ② 引け後: 翌寄りで売る予約（実口座のみ）──────────────────
+            elif (phase == "HELD" and _live and trd_env == TrdEnv.REAL
+                  and OVN_RESERVE_ET <= hm < (17, 0)):
+                pos, ids, pmsg = await asyncio.to_thread(_ovn_position, trd_env)
+                open_orders, odetail = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
+                sell_orders = [o for o in open_orders if "SELL" in o.get("side", "")]
+                if odetail != "OK":
+                    _ovn_say(f"売り予約前の注文照会に失敗しました。二重発注防止のため見送ります: {odetail[:120]}", "error")
+                    continue
+                if sell_orders:
+                    st.update(phase="RESERVED", sell_oids=[o["order_id"] for o in sell_orders],
+                              qty=pos, position_ids=ids)
+                    _ovn_say("証券会社側に既存の売り注文を確認したため、その注文を監視します。", "warning")
+                    _ovn_save(st)
+                    continue
+                oids, msg = await asyncio.to_thread(
+                    _ovn_sell_position, trd_env, pos, ids, reserve=True)
+                if oids:
+                    st.update(phase="RESERVED", sell_oids=oids, qty=pos, position_ids=ids)
+                    _ovn_say("翌営業日の寄り付きで売る注文を出しました（このあとBotを止めても売れます）。"
+                             + ("" if msg == "OK" else f" 一部発注のみ: {msg[:120]}"),
+                             "info" if msg == "OK" else "error")
+                else:
+                    _ovn_say(f"売りの予約が通りませんでした。翌朝に売ります: {msg[:120]}", "warning")
+                    st["phase"] = "HELD_NO_RESERVE"
+                _ovn_save(st)
+
+            # ── ②' 記録のみ: 翌寄りの値を拾って結果を残す ────────────────
+            elif (phase == "SHADOW_HELD"
+                  and OVN_EXIT_ET <= hm < OVN_ENTRY_ET
+                  and st.get("shadow_date") != today
+                  and is_trading_day(now.date())):
+                q = await asyncio.to_thread(get_quote, OVN_SYMBOL)
+                exit_price = (q.get("bid", 0) or q.get("last", 0) or 0)
+                entry = float(st.get("shadow_entry", 0) or 0)
+                qty_s = int(st.get("qty", 0) or 0)
+                if exit_price <= 0 or entry <= 0 or qty_s <= 0:
+                    _ovn_say("（記録のみ）寄り付き値を取得できないため、この回は記録できません。", "warning")
+                    st["phase"] = "DONE"; _ovn_save(st); continue
+                pnl = (exit_price - entry) * qty_s
+                pct = (exit_price / entry - 1.0) * 100.0
+                # 日次レポート集計用の機械可読行（実発注の確定損益とは別枠で集計する）
+                log.warning(
+                    f"【{OVN_SYMBOL}】[夜間持ち越し][記録のみ] mode=shadow qty={qty_s} "
+                    f"buy={entry:.4f} sell={exit_price:.4f} "
+                    f"shadow_pnl={pnl:+.2f} shadow_pct={pct:+.2f}"
+                )
+                _ovn_say(f"（記録のみ）買っていた場合の結果: {entry:.2f} → {exit_price:.2f}"
+                         f"　{pnl:+.2f} ドル（{pct:+.2f}%）")
+                # 日次サマリ（Discord・端末）に「夜間持ち越し(記録のみ)」として出す
+                try:
+                    _maybe_reset_today_trades()
+                    _today_shadow_ovn.append({
+                        "symbol": OVN_SYMBOL, "qty": qty_s,
+                        "entry": round(entry, 2), "exit": round(exit_price, 2),
+                        "pnl": round(pnl, 2), "pct": round(pct, 2),
+                    })
+                except Exception as e:
+                    log.warning(f"[夜間持ち越し] 記録のみ結果の集計追加に失敗: {type(e).__name__}: {e}")
+                st.update(phase="DONE", shadow_exit=round(exit_price, 4))
+                _ovn_save(st)
+
+            # ── ③ 翌寄り: 予約が無ければここで売る ────────────────────────
+            elif (phase in ("HELD", "HELD_NO_RESERVE")
+                  and OVN_EXIT_ET <= hm < OVN_ENTRY_ET
+                  and is_trading_day(now.date())):
+                if not _live:
+                    st["phase"] = "DONE"; _ovn_save(st); continue
+                pos, ids, pmsg = await asyncio.to_thread(_ovn_position, trd_env)
+                if pos == 0:
+                    st["phase"] = "DONE"
+                    state.get(OVN_SYMBOL).ovn_held = False
+                    _ovn_say("建玉が無いことを確認しました。")
+                elif pos < 0:
+                    _ovn_say(f"建玉を確認できないため売りません: {pmsg[:120]}", "error")
+                else:
+                    open_orders, odetail = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
+                    sell_orders = [o for o in open_orders if "SELL" in o.get("side", "")]
+                    if odetail != "OK":
+                        _ovn_say(f"売り前の注文照会に失敗しました。二重発注防止のため再試行を待ちます: {odetail[:120]}", "error")
+                        continue
+                    if sell_orders:
+                        st.update(phase="RESERVED", sell_oids=[o["order_id"] for o in sell_orders],
+                                  qty=pos, position_ids=ids)
+                        _ovn_say("証券会社側に既存の売り注文を確認したため、その注文を監視します。", "warning")
+                        _ovn_save(st)
+                        continue
+                    oids, msg = await asyncio.to_thread(
+                        _ovn_sell_position, trd_env, pos, ids, reserve=False)
+                    if oids:
+                        st.update(phase="RESERVED", sell_oids=oids, qty=pos,
+                                  position_ids=ids, sell_fail_count=0)
+                        _ovn_say("寄り付きの売り注文を出しました。約定確認まで保護を継続します。"
+                                 + ("" if msg == "OK" else f" 一部発注のみ: {msg[:120]}"),
+                                 "info" if msg == "OK" else "error")
+                    else:
+                        failures = int(st.get("sell_fail_count", 0)) + 1
+                        st["sell_fail_count"] = failures
+                        suffix = (" moomooアプリで手動決済してください。"
+                                  if failures >= 3 else "")
+                        _ovn_say(f"売り注文が通りませんでした（{failures}回目・次の巡回で再試行）: "
+                                 f"{msg[:120]}{suffix}", "error")
+                _ovn_save(st)
+
+            # ── ④ 予約ぶんの約定確認 ──────────────────────────────────────
+            elif (phase == "RESERVED" and st.get("entry_date") != today
+                  and hm >= (9, 35) and is_trading_day(now.date())):
+                pos, ids, pmsg = await asyncio.to_thread(_ovn_position, trd_env)
+                if pos == 0:
+                    st["phase"] = "DONE"
+                    state.get(OVN_SYMBOL).ovn_held = False
+                    _ovn_say("予約していた注文が寄り付きで約定しました。")
+                    _ovn_save(st)
+                elif pos > 0:
+                    statuses = []
+                    for sell_oid in st.get("sell_oids", [st.get("sell_oid")]):
+                        if sell_oid:
+                            statuses.append(await asyncio.to_thread(
+                                _ovn_order_status, trd_env, str(sell_oid)))
+                    # ID照会が UNKNOWN の場合は全注文照会でも確認する。そこに同じIDが
+                    # 無ければ、少なくとも生存注文ではないことを確認できる。
+                    open_orders, odetail = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
+                    open_ids = {o.get("order_id") for o in open_orders} if odetail == "OK" else set()
+                    tracked_ids = [str(x) for x in st.get("sell_oids", [st.get("sell_oid")]) if x]
+                    terminal = bool(tracked_ids) and all(
+                        (_ovn_is_terminal(snap[0]) or
+                         (snap[0] == "UNKNOWN" and odetail == "OK" and oid not in open_ids))
+                        for oid, snap in zip(tracked_ids, statuses))
+                    if terminal:
+                        st["phase"] = "HELD_NO_RESERVE"
+                        st.update(qty=pos, position_ids=ids)
+                        _ovn_say("売り注文終了後も建玉が残っています。残数をあらためて売ります。", "warning")
+                        _ovn_save(st)
+                    else:
+                        log.warning(f"[OVN] 売り注文が生存中のため二重発注を抑止: {statuses}")
+                        if hm >= (10, 0):
+                            _ovn_say("10:00 ET を過ぎても売り注文が未完了です。取消後に残数を再発注します。", "error")
+                            for sell_oid, snap in zip(tracked_ids, statuses):
+                                if not _ovn_is_terminal(snap[0]):
+                                    cancelled = await asyncio.to_thread(
+                                        _cancel_order, str(sell_oid), OVN_SYMBOL, trd_env,
+                                        "OVN 10:00 ET 未完了注文の取消")
+                                    after, _, after_msg = await asyncio.to_thread(
+                                        _ovn_order_status, trd_env, str(sell_oid))
+                                    if not _ovn_is_terminal(after):
+                                        _ovn_say(f"売り注文 {sell_oid} の取消終端を確認できません"
+                                                 f"（cancel={cancelled}, status={after}, {after_msg[:80]}）。"
+                                                 "次巡回も取消・照会を継続します。", "error")
+                            # 取消直後に全件の終端を再確認できた場合だけ残建玉再発注へ戻す。
+                            final_statuses = [await asyncio.to_thread(
+                                _ovn_order_status, trd_env, oid) for oid in tracked_ids]
+                            if final_statuses and all(_ovn_is_terminal(s[0]) for s in final_statuses):
+                                st.update(phase="HELD_NO_RESERVE", qty=pos, position_ids=ids)
+                                _ovn_save(st)
+                else:
+                    _ovn_say(f"予約注文の約定確認に失敗しました: {pmsg[:120]}", "error")
+
+            # ── ⑤ 日付が変わったら次の日に備える ──────────────────────────
+            elif phase == "DONE" and hm >= (10, 30):
+                st["phase"] = "IDLE"
+                state.get(OVN_SYMBOL).ovn_held = False
+                _ovn_save(st)
+        except Exception as e:
+            log.warning(f"[夜間持ち越し] 巡回で例外（続行します）: {type(e).__name__}: {_mask_secrets(e)}")
+
+
 async def health_warning_loop() -> None:
     """5 分おきに Anthropic クレジット切れ / Alpaca News 不全を端末に再警告。"""
     _RED   = "\033[91m"
@@ -17004,7 +17705,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 # 管理対象外建玉は表示だけ行い、時間切れ・上限超過・損切り・
                 # トレールの判定へ入れない。低レベル決済ガードだけに任せると、
                 # 決済失敗カウントや再エントリーブロックが汚染される。
-                if getattr(ts, "externally_held", False):
+                if _is_other_owner(symbol):
                     _ext_q = get_quote(symbol)
                     _ext_price = _ext_q.get("last", 0) or _ext_q.get("bid", 0) or _ext_q.get("ask", 0) or 0
                     if _ext_price > 0 and ts.avg_cost > 0 and ts.position_qty != 0:
@@ -17422,7 +18123,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 #   従来は「ポジションなし」の行にだけ注意書きを足していたため、
                 #   建玉があるとき＝まさに知らせたい場面で画面に出ていなかった
                 #   （デモ実機テストで判明）。
-                if getattr(ts, "externally_held", False):
+                if _is_other_owner(symbol):
                     log.warning(
                         f"{tag} [ポジション] ${price:.2f}  PnL={pnl_colored(pnl)}({pct_colored(unr_pct)})"
                         f"  ⚠️ Bot 以外の建玉のため自動売買は停止中"
@@ -17709,6 +18410,11 @@ async def main(live: bool) -> None:
             ))
     except Exception as _e_led0:
         log.warning(f"[建玉台帳] 読込で例外: {_mask_secrets(_e_led0)}")
+
+    # 起動時の最初の sync_positions より前に OVN 所有権を復元する。
+    # 後回しにすると台帳に無い QQQ が外部建玉と誤通知される。
+    if _ovn_state_owns_position():
+        state.get(OVN_SYMBOL).ovn_held = True
 
     # ★ v3.9.73: PCT 旧表記(小数)を検出していれば起動時に1回まとめて警告
     _emit_pct_unit_warnings()
@@ -18600,7 +19306,8 @@ async def main(live: bool) -> None:
                     f" 次サイクルの sync_positions で再取得を期待します。"
                 )
             # ── ★ v3.9.134: 台帳と突き合わせて「Bot の建玉か」を判定する ────────
-            if _ledger_first_run and not _ledger_has(sym, trd_env):
+            if (_ledger_first_run and not _ledger_has(sym, trd_env)
+                    and not (sym == OVN_SYMBOL and getattr(ts, "ovn_held", False))):
                 # 台帳をこの環境で初めて作る起動。旧版は口座の建玉をすべて Bot の
                 # ものとして扱っていたので、初回だけその前提を引き継ぐ。これをしないと
                 # 建玉を持ったまま版を上げた利用者の損切りが一斉に止まる。
@@ -18617,7 +19324,11 @@ async def main(live: bool) -> None:
                     f"版を上げた時点で持っていたこの建玉は、これまでどおり Bot が管理します。\n"
                     f"手動で保有されている建玉の場合は、moomoo アプリで決済してください。"
                 ))
-            if not _ledger_has(sym, trd_env):
+            if sym == OVN_SYMBOL and getattr(ts, "ovn_held", False):
+                # OVN の永続状態で所有権を確認済み。ニュース台帳には登録せず、
+                # 外部建玉通知も立てない。
+                _ext_set_held(sym, False)
+            elif not _ledger_has(sym, trd_env):
                 _ext_set_held(
                     sym, True,
                     f"口座に {_pos_label} {abs(ts.position_qty)}株 ありますが、Bot の記録にありません。"
@@ -18783,6 +19494,7 @@ async def main(live: bool) -> None:
             _loop_guard(shadow_short_exit_loop,                  name="シャドーSHORT"),
             # ★ v3.9.31: 重大な健全性問題 (Anthropic クレジット / Alpaca 不全) の 5 分警告
             _loop_guard(health_warning_loop,                     name="健全性警告"),
+            _loop_guard(ovn_overnight_loop,      trd_env,        name="夜間持ち越し"),
         )
     except asyncio.CancelledError:
         pass
@@ -19189,6 +19901,9 @@ def run_daily_data_collect(log_path: str = "moomoo_trade_v1.log",
         "eod":   re.compile(rf"{TS}.*?(?:強制クローズ発動|EOD|close_all_for_|15:45)", re.I),
         "err":   re.compile(rf"{TS}.*?\[(ERROR|WARN(?:ING)?)\]\s+(?P<msg>.+)", re.I),
         "ai":    re.compile(rf"{TS}.*?(?:AI判定|\[AI\]).*?score=(?P<score>[+-]?\d).*?confidence=(?P<conf>[\d.]+)", re.I),
+        # ★ v3.9.137: 夜間持ち越しの「記録のみ」結果。実発注の確定損益とは別枠。
+        "ovnsh": re.compile(rf"{TS}.*?\[夜間持ち越し\]\[記録のみ\].*?qty=(?P<qty>\d+).*?"
+                            rf"shadow_pnl=(?P<pnl>[+-][\d.]+).*?shadow_pct=(?P<pct>[+-][\d.]+)", re.I),
     }
 
     buy_orders=sell_orders=filled=cancelled=trade_count=0
@@ -19197,6 +19912,7 @@ def run_daily_data_collect(log_path: str = "moomoo_trade_v1.log",
     sym_orders=defaultdict(int)
     settings_line=eod_time=""
     sess_stats={s:{"trades":0,"pnl":0.0,"wins":0,"losses":0} for s in ("pre","rth","ath","ovn")}
+    ovn_shadow={"trades":0,"pnl":0.0,"pct":0.0,"wins":0,"losses":0}
 
     def is_today(ts_str):
         try:
@@ -19260,6 +19976,15 @@ def run_daily_data_collect(log_path: str = "moomoo_trade_v1.log",
                     best_pnl=max(best_pnl,pv); worst_pnl=min(worst_pnl,pv)
                 except (ValueError, AttributeError, TypeError): pass
                 continue
+            msh=pats["ovnsh"].search(line)
+            if msh:
+                try:
+                    pv=float(msh.group("pnl")); pc=float(msh.group("pct"))
+                    ovn_shadow["trades"]+=1; ovn_shadow["pnl"]+=pv; ovn_shadow["pct"]+=pc
+                    if pv>0: ovn_shadow["wins"]+=1
+                    elif pv<0: ovn_shadow["losses"]+=1
+                except (ValueError, AttributeError, TypeError): pass
+                continue
             maj=pats["ai"].search(line)
             if maj:
                 try: ai_scores.append(int(maj.group("score"))); ai_confs.append(float(maj.group("conf")))
@@ -19318,6 +20043,10 @@ def run_daily_data_collect(log_path: str = "moomoo_trade_v1.log",
         "ath_wins":sess_stats["ath"]["wins"],"ath_losses":sess_stats["ath"]["losses"],"ath_winrate":_wr(sess_stats["ath"]),
         "ovn_trades":sess_stats["ovn"]["trades"],"ovn_pnl":_pnl(sess_stats["ovn"]),
         "ovn_wins":sess_stats["ovn"]["wins"],"ovn_losses":sess_stats["ovn"]["losses"],"ovn_winrate":_wr(sess_stats["ovn"]),
+        # ★ v3.9.137: 夜間持ち越し「記録のみ」（実発注していない仮想成績）
+        "ovnshadow_trades":ovn_shadow["trades"],"ovnshadow_pnl":round(ovn_shadow["pnl"],2),
+        "ovnshadow_pct":round(ovn_shadow["pct"],2),
+        "ovnshadow_wins":ovn_shadow["wins"],"ovnshadow_losses":ovn_shadow["losses"],
     }
 
     pnl_disp=f"${summary['realized_pnl']:+.2f}" if isinstance(summary['realized_pnl'],float) else summary['realized_pnl']
