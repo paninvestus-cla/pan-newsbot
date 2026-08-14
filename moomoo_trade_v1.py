@@ -169,7 +169,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.138"
+BOT_VERSION = "v3.9.140"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -2265,6 +2265,10 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
             "exit_reason":  exit_reason,
             "exit_code":    _exit_code_from_reason(exit_reason),  # ★ v3.9.91: 構造化決済コード
             "trade_env":    _RUN_TRADE_ENV,                       # ★ v3.9.99: REAL / DEMO（実取引/デモ判別）
+            # ★ v3.9.140: 戦略の識別。NEWS（日中のニュース売買）/ MOMENTUM / OVN（夜間持ち越し）。
+            #   OVN は建て方も決済条件もまったく別なので、勝率・損益を混ぜて集計しない。
+            "strategy":     ("OVN" if ai_category == "OVN"
+                             else ("MOMENTUM" if _is_mom else "NEWS")),
             "momentum_level": MOMENTUM_LEVEL,                     # ★ v3.9.109: L1-5（設定別レポート用）
             # ── ★ v3.9.111: 出口チューニング解析用（利用者B要望B案・決済時計算・GAS負荷増なし）──
             "realized_pnl_pct":        _realized_pct,      # 確定損益%（建玉額比・予算非依存）
@@ -16350,6 +16354,46 @@ def _ovn_load() -> dict:
     return {}
 
 
+def _ovn_report_trade(st: dict, exit_price: float, exit_reason: str) -> None:
+    """★ v3.9.140: 夜間持ち越しの1往復を、集計シート（GAS）と日次サマリへ記録する。
+
+    日中のニュース売買とは経路を分けているため、これを呼ばないと OVN の売買は
+    どこにも集計されない（Discord とログにしか残らない）。実装は
+    _send_trade_result に相乗りし、ai_category="OVN" で他の戦略と区別する。
+
+    サーキットブレーカー（モメンタムの日次/週次損失上限）には積まない。
+    ai_category が MOMENTUM ではないため自動的に対象外になる。
+    """
+    try:
+        entry = float(st.get("entry_price", 0) or st.get("ref_price", 0) or 0)
+        qty   = int(st.get("qty", 0) or 0)
+        if entry <= 0 or qty <= 0 or exit_price <= 0:
+            log.warning(f"[OVN] 記録を送れません（entry={entry} qty={qty} exit={exit_price}）")
+            return
+        realized = (exit_price - entry) * qty
+        hold_min = 0.0
+        try:
+            _t0 = st.get("entry_at")
+            if _t0:
+                hold_min = max(0.0, (datetime.datetime.now()
+                                     - datetime.datetime.fromisoformat(_t0)).total_seconds() / 60)
+        except Exception:
+            hold_min = 0.0
+        threading.Thread(
+            target=_send_trade_result,
+            args=(OVN_SYMBOL, entry, exit_price, qty, realized, hold_min,
+                  "ovn", 0, 0.0, "OVN", "", exit_reason),
+            kwargs={"trade_type": "LONG"},
+            daemon=True,
+        ).start()
+        log.info(
+            f"[夜間持ち越し] 集計へ記録しました: {entry:.2f} → {exit_price:.2f} × {qty}株 "
+            f"= {realized:+.2f}（{exit_reason}）"
+        )
+    except Exception as e:
+        log.warning(f"[OVN] 記録の送信に失敗（売買には影響しません）: {_mask_secrets(e)}")
+
+
 def _ovn_save(st: dict) -> bool:
     """状態を永続化する。成功時だけ True（発注前の必須条件として使う）。"""
     try:
@@ -16689,6 +16733,13 @@ async def ovn_overnight_loop(trd_env) -> None:
                     pos, ids, pdetail = await asyncio.to_thread(_ovn_position, trd_env)
                 if pos > 0:
                     st.update(phase="HELD", qty=pos, position_ids=ids)
+                    # ★ v3.9.140: 実際の取得単価が取れたら建値を上書きする（記録の精度）
+                    try:
+                        _ts_ovn = state.get(OVN_SYMBOL)
+                        if getattr(_ts_ovn, "avg_cost", 0) > 0:
+                            st["entry_price"] = round(float(_ts_ovn.avg_cost), 4)
+                    except Exception:
+                        pass
                     _ovn_save(st)
                 elif pos == 0:
                     st.update(phase="IDLE", qty=0)
@@ -16775,7 +16826,10 @@ async def ovn_overnight_loop(trd_env) -> None:
                 state.get(OVN_SYMBOL).ovn_held = True   # 部分約定も日中ロジックから切り離す
                 st.update(phase="BUY_PENDING", qty=qty, buy_oid=oid,
                           trade_env=_RUN_TRADE_ENV,
-                          ref_price=round(last, 2))
+                          ref_price=round(last, 2),
+                          # ★ v3.9.140: 集計へ記録するための建値と時刻
+                          entry_price=round(entry_price, 4),
+                          entry_at=datetime.datetime.now().isoformat(timespec="seconds"))
                 _ovn_say(f"買い注文を受け付けました。QQQ {qty}株（{last:.2f} / 200日線 {sma:.2f} / VIXY {vchg:+.2%}）"
                          f"\n翌営業日の寄り付きで売ります。")
                 if not _ovn_save(st):
@@ -16855,6 +16909,10 @@ async def ovn_overnight_loop(trd_env) -> None:
                     st["phase"] = "DONE"
                     state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say("建玉が無いことを確認しました。")
+                    _q_ovn2 = await asyncio.to_thread(get_quote, OVN_SYMBOL)
+                    _ovn_report_trade(
+                        st, float(_q_ovn2.get("last", 0) or _q_ovn2.get("bid", 0) or 0),
+                        "夜間持ち越し: 翌朝の売却")
                 elif pos < 0:
                     _ovn_say(f"建玉を確認できないため売りません: {pmsg[:120]}", "error")
                 else:
@@ -16894,6 +16952,10 @@ async def ovn_overnight_loop(trd_env) -> None:
                     st["phase"] = "DONE"
                     state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say("予約していた注文が寄り付きで約定しました。")
+                    _q_ovn = await asyncio.to_thread(get_quote, OVN_SYMBOL)
+                    _ovn_report_trade(
+                        st, float(_q_ovn.get("last", 0) or _q_ovn.get("bid", 0) or 0),
+                        "夜間持ち越し: 予約が寄り付きで約定")
                     _ovn_save(st)
                 elif pos > 0:
                     statuses = []
@@ -17706,6 +17768,19 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 # トレールの判定へ入れない。低レベル決済ガードだけに任せると、
                 # 決済失敗カウントや再エントリーブロックが汚染される。
                 if _is_other_owner(symbol):
+                    # ★ v3.9.140: 夜間持ち越し(OVN)の建玉と、Bot 以外の建玉を区別して表示する。
+                    #   どちらも日中ロジックの対象外だが、意味がまったく違う。
+                    #   OVN は「別の機能が正しく管理中」、Bot 以外は「手動介入が必要かも」。
+                    #   実機で OVN の建玉に「Bot 以外の建玉」と出て、不具合と誤解された。
+                    _ovn_owned = bool(getattr(ts, "ovn_held", False))
+                    if _ovn_owned:
+                        _own_note = ("  🌙 夜間持ち越しが管理中です"
+                                     "（日中の自動売買は触りません。翌朝の寄り付きで売ります）")
+                        _own_log = log.info
+                    else:
+                        _own_note = ("  ⚠️ Bot 以外の建玉のため自動売買は停止中"
+                                     "（決済しません。この建玉を決済すると再開します）")
+                        _own_log = log.warning
                     _ext_q = get_quote(symbol)
                     _ext_price = _ext_q.get("last", 0) or _ext_q.get("bid", 0) or _ext_q.get("ask", 0) or 0
                     if _ext_price > 0 and ts.avg_cost > 0 and ts.position_qty != 0:
@@ -17713,17 +17788,13 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                     if ts.position_qty > 0
                                     else (ts.avg_cost - _ext_price) * abs(ts.position_qty))
                         _ext_pct = (_ext_pnl / (ts.avg_cost * abs(ts.position_qty)) * 100)
-                        log.warning(
+                        _own_log(
                             f"{tag} [ポジション] ${_ext_price:.2f}  "
                             f"PnL={pnl_colored(_ext_pnl)}({pct_colored(_ext_pct)})"
-                            f"  ⚠️ Bot 以外の建玉のため自動売買は停止中"
-                            f"（決済しません。この建玉を決済すると再開します）"
+                            f"{_own_note}"
                         )
                     else:
-                        log.warning(
-                            f"{tag} [ポジション] ⚠️ Bot 以外の建玉のため自動売買は停止中"
-                            f"（決済しません。この建玉を決済すると再開します）"
-                        )
+                        _own_log(f"{tag} [ポジション]{_own_note}")
                     continue
 
                 # ── API未反映だが自前管理でポジションあり → P&L表示 ──────────
@@ -17911,14 +17982,33 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         f"現在評価額: ${position_value:,.0f}  上限: ${_BUDGET_USD:,.0f}\n"
                         f"超過分 {excess_qty}株（約${excess_value:,.0f}）を部分決済します"
                     ))
-                    place_close_partial(symbol, trd_env, excess_qty,
-                                        f"ポジション上限超過: ${position_value:,.0f} > ${_BUDGET_USD:,.0f}")
-                    continue
+                    # ★ v3.9.139: 部分決済が失敗した場合は continue しない。
+                    #   従来は成否に関わらず次サイクルへ飛ばしていたため、上限超過が
+                    #   続くあいだ損切り・トレール・パニックがずっと評価されなかった。
+                    #   （認定サポーターからの指摘・position-cap-bypass）
+                    _cap_ok = place_close_partial(
+                        symbol, trd_env, excess_qty,
+                        f"ポジション上限超過: ${position_value:,.0f} > ${_BUDGET_USD:,.0f}")
+                    if _cap_ok:
+                        continue   # 決済できた → 数量が変わるので次サイクルで再評価
+                    log.warning(
+                        f"{tag} ⚠ 上限超過の部分決済に失敗 → 損切り・トレールの監視は継続します"
+                    )
 
                 # ── ② 時間切れ決済チェック ────────────────────────────────────
-                if _t_timeout > 0 and ts.entry_time is not None:
+                # ★ v3.9.139: この節を抜けても、下の ③〜⑤（株価取得・損切り・トレール）
+                #   へ必ず進む。従来は見送り・クールダウンで continue しており、
+                #   トレールが有効になった建玉がタイムアウト時刻を過ぎた瞬間から
+                #   損切りもトレールも二度と評価されなかった。
+                #   （認定サポーターからの指摘・trail-timeout-bypass）
+                _skip_timeout_close = True   # 既定は「決済しない」。条件成立時だけ False にする
+                _timeout_due = (_t_timeout > 0 and ts.entry_time is not None
+                                and (datetime.datetime.now() - ts.entry_time).total_seconds() / 60
+                                >= _t_timeout)
+                if _timeout_due:
                     elapsed = (datetime.datetime.now() - ts.entry_time).total_seconds() / 60
-                    if elapsed >= _t_timeout:
+                    _skip_timeout_close = False
+                    if True:  # noqa: SIM103 （インデント維持のためのブロック）
                         # ★ v3.9.59: モメンタム + トレール ON 中はタイムアウト見送り
                         # トレール ON = 既に利益確定モードに入っている (peak が
                         # TRAIL_TRIGGER_PCT 超え)。タイムアウトで早期切るとトレールが
@@ -17937,19 +18027,24 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                     f"({elapsed:.1f}分経過・peak=${ts.peak_price:.2f}・トレールで利確待ち)"
                                 )
                                 ts._timeout_bypass_logged_at = _now_check
-                            continue   # 時間切れ決済をスキップしてループ次サイクルへ
+                            # 見送るのは「時間切れ決済」だけ。損切り・トレールは下で評価する。
+                            _skip_timeout_close = True
                         # ★ v2.99.2: 決済発注失敗時の再試行クールダウン (60秒)
                         # entry_time を維持しつつ毎ループで再発注すると過剰トラフィックになるため、
                         # 直近の発注試行から60秒以内なら今回はスキップする。
-                        _last_attempt = getattr(ts, "_last_close_attempt_at", None)
-                        if _last_attempt is not None:
-                            _elapsed_since_attempt = (datetime.datetime.now() - _last_attempt).total_seconds()
-                            if _elapsed_since_attempt < 60:
-                                log.debug(
-                                    f"{tag} ⏰ 時間切れ {elapsed:.1f}分経過だが直近発注から {_elapsed_since_attempt:.0f}秒 "
-                                    f"→ クールダウン中 (60秒待機)"
-                                )
-                                continue
+                        if not _skip_timeout_close:
+                            _last_attempt = getattr(ts, "_last_close_attempt_at", None)
+                            if _last_attempt is not None:
+                                _elapsed_since_attempt = (datetime.datetime.now() - _last_attempt).total_seconds()
+                                if _elapsed_since_attempt < 60:
+                                    log.debug(
+                                        f"{tag} ⏰ 時間切れ {elapsed:.1f}分経過だが直近発注から {_elapsed_since_attempt:.0f}秒 "
+                                        f"→ クールダウン中 (60秒待機)"
+                                    )
+                                    # ★ v3.9.139: クールダウン中も監視は続ける（下の ③〜⑤ へ）
+                                    _skip_timeout_close = True
+                if _timeout_due and not _skip_timeout_close:
+                    if True:  # noqa: SIM103 （インデント維持のためのブロック）
 
                         # ★ v3.8.5: 時間切れ決済は通常運用フロー (タイマー満了の自動決済) のため
                         # WARNING → INFO に降格。発注失敗時の error / panic ログは別経路で出力される。
