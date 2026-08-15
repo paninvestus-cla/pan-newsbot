@@ -169,7 +169,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.140"
+BOT_VERSION = "v3.9.142"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -5172,6 +5172,27 @@ class _SecretMaskingFilter(logging.Filter):
             return s[:4] + "***" + s[-2:]
         return "***"
 
+    def mask_text(self, text: str) -> str:
+        """★ v3.9.141: 任意の文字列にマスクを適用する（認定サポーターからの指摘）。
+        トレースバックや Discord 本文など、record.msg 以外にも掛けるために切り出した。
+        """
+        try:
+            for secret in self._known_secrets:
+                if secret in text:
+                    text = text.replace(secret, self._mask(secret))
+            for pat in self._patterns:
+                def _repl(m: "re.Match") -> str:
+                    if m.lastindex == 2:
+                        return f"{m.group(1)}***{m.group(2)}"
+                    if m.lastindex == 1:
+                        return f"{m.group(1)}***"
+                    s = m.group(0)
+                    return s[:8] + "***" if len(s) > 10 else "***"
+                text = pat.sub(_repl, text)
+        except Exception:
+            pass
+        return text
+
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = record.getMessage()
@@ -5199,6 +5220,17 @@ class _SecretMaskingFilter(logging.Filter):
             if modified:
                 record.msg = msg
                 record.args = ()  # フォーマット済みなので args はクリア
+            # ★ v3.9.141: トレースバックにもマスクを掛ける（認定サポーターからの指摘）。
+            #   Formatter は record.msg の後ろに exc_info を連結するため、
+            #   従来は例外の中身（口座ID・パス・資格情報）が素通りしていた。
+            #   ここで exc_text を確定させて差し替え、Formatter に再生成させない。
+            if record.exc_info:
+                import traceback as _tb
+                if not record.exc_text:
+                    record.exc_text = "".join(_tb.format_exception(*record.exc_info))
+                record.exc_text = self.mask_text(record.exc_text)
+            elif record.exc_text:
+                record.exc_text = self.mask_text(record.exc_text)
         except Exception:
             # フィルタは絶対に失敗してはいけない (ログ全体を止めるため)
             pass
@@ -6018,6 +6050,13 @@ def _get_sym_lock(sym: str) -> asyncio.Lock:
 def send_discord_message(text: str) -> None:
     if not DISCORD_WEBHOOK_URL:
         return
+    # ★ v3.9.141: 送信直前にもマスクを通す（認定サポーターからの指摘）。
+    #   本文は無加工で外へ出ていたため、例外文字列を組み立てて渡している箇所
+    #   （_loop_guard など）から資格情報・口座ID・パスが漏れうる。
+    try:
+        text = _secret_filter.mask_text(text)
+    except Exception:
+        pass
     try:
         resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": text}, timeout=10)
         if resp.status_code in (200, 204):
@@ -6248,7 +6287,7 @@ def _clear_close_retry_cooldown(symbol: str) -> None:
 
 def close_all_for_weekend(trd_env: TrdEnv,
                           reason: str = "週末前強制決済（金曜15:45 ET）",
-                          log_prefix: Optional[str] = None) -> None:
+                          log_prefix: Optional[str] = None) -> bool:
     """
     全ポジションを強制決済する同期関数。
     金曜週末クローズ / デモ口座の平日日次クローズ / 発注しない設定セッション移行
@@ -6287,7 +6326,9 @@ def close_all_for_weekend(trd_env: TrdEnv,
 
     if not targets:
         log.info(f"[{log_prefix}] 決済対象ポジションなし → スキップ")
-        return
+        # ★ v3.9.141: 決済すべきものが無い＝成功。裸の return（None=偽）のままだと、
+        #   建玉ゼロの正常な状態を呼び出し側が「失敗」と誤判定し、毎分再試行し続ける。
+        return True
 
     targets_str = ", ".join(targets)
     if is_weekly:
@@ -6300,8 +6341,23 @@ def close_all_for_weekend(trd_env: TrdEnv,
         )
     else:
         log.warning(f"[{log_prefix}] 🌙 デモ日次全決済開始  対象: {targets_str}")
-    for sym in targets:
-        place_close_all(sym, trd_env, reason)
+    # ★ v3.9.141: 各決済の成否を集約して返す（認定サポーターからの指摘）。
+    #   従来は戻り値を捨てて None を返しており、呼び出し側は「例外が出なかった＝成功」
+    #   として完了マーカーを立て、全決済が失敗していても
+    #   「保有ポジションを全決済しました」と通知していた。境界での再試行も無効化される。
+    _failed = [sym for sym in targets if not place_close_all(sym, trd_env, reason)]
+    if _failed:
+        log.error(
+            f"[{log_prefix}] 🔴 決済できなかった銘柄があります: {', '.join(_failed)}"
+            f"（{len(_failed)}/{len(targets)}件）"
+        )
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"🔴 【重要】決済しきれませんでした\n"
+            f"対象: {', '.join(_failed)}（{len(_failed)}/{len(targets)}件）\n"
+            f"moomoo アプリで建玉をご確認のうえ、必要なら手動で決済してください。"
+        ))
+    return not _failed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6440,10 +6496,96 @@ def _ledger_save() -> bool:
     """
     try:
         with _LEDGER_LOCK:
-            tmp = _LEDGER_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(_position_ledger, f, ensure_ascii=False)
-            os.replace(tmp, _LEDGER_PATH)
+            # ★ v3.9.141: REAL と DEMO を同時に動かすと、先に読んだ側の記録が
+            #   消えていた（認定サポーターからの指摘）。各プロセスは台帳全体の
+            #   スナップショットを丸ごと書き戻すため、後から保存した側が勝つ。
+            #   消えた側は再起動時に「Bot 以外の建玉」に分類され、損切り・
+            #   時間切れ決済の対象から外れる。
+            #   対策: 保存の直前にファイルを読み直し、自分の環境の部分だけを
+            #   差し替えてから書く。他環境の記録には触れない。
+            _mine = _ledger_env_key()
+            # ★ v3.9.141b: プロセス間ロック（Codexレビュー指摘）。
+            #   _LEDGER_LOCK はプロセス内の RLock でしかないため、REAL と DEMO の
+            #   2プロセスが同時に read-modify-write すると、後から replace した側が
+            #   先行の更新を消す。OS のファイルロックで read〜replace 全体を守る。
+            _lockf = None
+            _lock_kind = None   # "fcntl" / "msvcrt" / None
+            try:
+                import fcntl
+                _lockf = open(_LEDGER_PATH + ".lock", "w")
+                fcntl.flock(_lockf.fileno(), fcntl.LOCK_EX)
+                _lock_kind = "fcntl"
+            except ImportError:
+                # ★ v3.9.142: Windows には fcntl が無い（Codexレビュー指摘）。
+                #   Win365 が本番環境なので msvcrt.locking で同等の排他を張る。
+                #   LK_LOCK は約10秒粘ってから諦める。取れなければ無ロックで続行
+                #   （従来と同じ状態に戻るだけで、悪化はしない）。
+                try:
+                    import msvcrt
+                    _lockf = open(_LEDGER_PATH + ".lock", "w")
+                    msvcrt.locking(_lockf.fileno(), msvcrt.LK_LOCK, 1)
+                    _lock_kind = "msvcrt"
+                except Exception:
+                    if _lockf is not None:
+                        try:
+                            _lockf.close()
+                        except Exception:
+                            pass
+                    _lockf = None
+            except Exception:
+                # fcntl はあるがロック取得に失敗 → 無ロックで続行
+                if _lockf is not None:
+                    try:
+                        _lockf.close()
+                    except Exception:
+                        pass
+                _lockf = None
+            try:
+                _merged: dict = {}
+                _read_ok = True
+                try:
+                    if os.path.isfile(_LEDGER_PATH):
+                        with open(_LEDGER_PATH, encoding="utf-8") as _rf:
+                            _merged = json.load(_rf) or {}
+                    if not isinstance(_merged, dict):
+                        _read_ok = False
+                except Exception as _e_read:
+                    _read_ok = False
+                    log.error(f"[建玉台帳] 既存の台帳を読めません: {_mask_secrets(_e_read)}")
+                if not _read_ok and os.path.isfile(_LEDGER_PATH):
+                    # ★ v3.9.141b: 壊れた台帳を自分の環境だけで上書きすると、
+                    #   もう一方の環境の記録を巻き込んで消す（Codexレビュー指摘）。
+                    #   読めないときは書かずに失敗を返し、利用者に知らせる。
+                    log.error(
+                        "[建玉台帳] 🔴 台帳が壊れているため保存しません"
+                        "（他の口座の記録を消さないため）"
+                    )
+                    return False
+                _merged[_mine] = _position_ledger.get(_mine, {})
+                tmp = _LEDGER_PATH + f".tmp.{os.getpid()}"   # プロセスごとに分ける
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(_merged, f, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())   # ★ v3.9.141: 停電・強制終了での消失を防ぐ
+                os.replace(tmp, _LEDGER_PATH)
+                # 次回の読み込みと食い違わないよう、メモリ側も揃えておく
+                _position_ledger.update({k: v for k, v in _merged.items() if k != _mine})
+            finally:
+                if _lockf is not None:
+                    try:
+                        if _lock_kind == "fcntl":
+                            import fcntl as _fc
+                            _fc.flock(_lockf.fileno(), _fc.LOCK_UN)
+                        elif _lock_kind == "msvcrt":
+                            import msvcrt as _mv
+                            _lockf.seek(0)
+                            _mv.locking(_lockf.fileno(), _mv.LK_UNLCK, 1)
+                    except Exception:
+                        pass
+                    try:
+                        _lockf.close()
+                    except Exception:
+                        pass
         return True
     except Exception as _e:
         log.error(f"[建玉台帳] 🔴 保存失敗（次回起動で建玉を見失う恐れ）: {_mask_secrets(_e)}")
@@ -7050,7 +7192,26 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 f" → 全ポジション強制決済・ニュース停止 (理由: {close_reason})"
             )
             # 同期関数なので to_thread でブロッキングを回避
-            await asyncio.to_thread(close_all_for_weekend, trd_env, close_reason)
+            # ★ v3.9.141: 戻り値を見て、失敗時は60秒間隔で最大4回まで再試行する。
+            #   従来は戻り値を捨てており、決済に失敗しても監視を止めて
+            #   建玉を持ち越していた（認定サポーターからの指摘）。
+            _wk_ok = await asyncio.to_thread(close_all_for_weekend, trd_env, close_reason)
+            for _wk_retry in range(4):
+                if _wk_ok:
+                    break
+                log.error(f"[週末決済] 決済しきれませんでした → 60秒後に再試行（{_wk_retry + 1}/4）")
+                await asyncio.sleep(60)
+                _wk_ok = await asyncio.to_thread(
+                    close_all_for_weekend, trd_env, f"{close_reason}（再試行{_wk_retry + 1}）")
+            if not _wk_ok:
+                # 決済しきれないまま週末停止に入ると建玉が無監視で残る。
+                # 監視は止めず、通常運転のまま次のループへ（損切り・時間切れは動き続ける）。
+                log.error(
+                    "[週末決済] 🔴 再試行しても決済しきれません → ニュース・監視は止めずに続行します。"
+                    "moomoo アプリで建玉をご確認ください"
+                )
+                await asyncio.sleep(60)
+                continue
             # EOD後データ収集（DATA_COLLECT=trueの場合のみ送信）
             _threadsafe_future(asyncio.to_thread(run_daily_data_collect))
             # ニュースループ・リスク監視を停止（週末と同じ扱い）
@@ -7080,7 +7241,24 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 f"[デモ日次決済] {close_trigger_time.strftime('%H:%M')} ET 到達 "
                 f"→ デモ口座のため全ポジション決済・翌プリマーケットまで停止"
             )
-            await asyncio.to_thread(close_all_for_weekend, trd_env, f"デモ日次決済（{close_trigger_time.strftime('%H:%M')} ET）")
+            # ★ v3.9.141: 週末決済と同じく、失敗時は再試行し、駄目なら監視を止めない。
+            _dd_ok = await asyncio.to_thread(
+                close_all_for_weekend, trd_env,
+                f"デモ日次決済（{close_trigger_time.strftime('%H:%M')} ET）")
+            for _dd_retry in range(4):
+                if _dd_ok:
+                    break
+                log.error(f"[デモ日次決済] 決済しきれませんでした → 60秒後に再試行（{_dd_retry + 1}/4）")
+                await asyncio.sleep(60)
+                _dd_ok = await asyncio.to_thread(
+                    close_all_for_weekend, trd_env,
+                    f"デモ日次決済（再試行{_dd_retry + 1}）")
+            if not _dd_ok:
+                log.error(
+                    "[デモ日次決済] 🔴 再試行しても決済しきれません → 監視は止めずに続行します"
+                )
+                await asyncio.sleep(60)
+                continue
             _threadsafe_future(asyncio.to_thread(run_daily_data_collect))
             market_open_event.clear()
             wait_sec  = seconds_until_premarket()
@@ -7115,10 +7293,20 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 #   残りの猶予時間内に再試行されず、ポジションを持ったまま移行していた。
                 #   失敗時はマークせず、次の1分ポーリングで境界までの間リトライする。
                 try:
-                    await asyncio.to_thread(
+                    # ★ v3.9.141: 戻り値を見て、全銘柄の決済に成功したときだけ
+                    #   完了マークと「全決済しました」の通知を出す（認定サポーターからの指摘）。
+                    #   旧実装は例外が出なければ成功扱いで、全決済が失敗していても
+                    #   同じ通知を送り、境界までの再試行も止めていた。
+                    _pc_ok = await asyncio.to_thread(
                         close_all_for_weekend, trd_env,
                         f"移行前全決済（{_pc_reason}）", "移行前全決済",
                     )
+                    if not _pc_ok:
+                        log.error(
+                            "[移行前全決済] 決済しきれなかった銘柄があります "
+                            "→ 完了マークを付けず、1分後に再試行します"
+                        )
+                        raise RuntimeError("移行前全決済が完了しませんでした")
                     setattr(market_schedule_loop, "_preclose_done_for", _pc_key)
                     _threadsafe_future(asyncio.to_thread(
                         send_discord_message,
@@ -11384,6 +11572,25 @@ async def _check_order_filled(
                         f"{tag} [約定確認リトライ {_retry+1}/3]"
                         f" orderId={order_id}  status={status2}"
                     )
+                    # ★ v3.9.141: 部分約定を全約定として扱わない（認定サポーターからの指摘）。
+                    #   "filled" の部分文字列一致は FILLED_PART にも当たるため、
+                    #   10株中4株の約定でも pending 追跡を外し、建玉を 0 にしていた。
+                    #   主経路は v3.9.120 で厳密化済みだったが、このリトライ経路だけ
+                    #   旧判定が残っていた。部分約定は追跡に残し、watchdog に委ねる。
+                    _is_part2 = ("part" in status2)
+                    try:
+                        _dq2 = float(_get_val(data2, "dealt_qty", 0) or 0)
+                        if 0 < _dq2 < float(qty):
+                            _is_part2 = True
+                    except (TypeError, ValueError):
+                        pass
+                    if _is_part2:
+                        log.warning(
+                            f"{tag} [約定確認リトライ] 部分約定のため全約定として扱いません"
+                            f"（status={status2} dealt={_get_val(data2, 'dealt_qty', '?')}/{qty}）"
+                            f" → 追跡を維持し、残量は watchdog の取消・再発注に委ねます"
+                        )
+                        continue
                     if "filled" in status2 or "dealt" in status2:
                         # リトライで約定を確認 → 通常の約定処理に合流
                         _unregister_pending_order(order_id)
@@ -13926,10 +14133,14 @@ def place_close_partial(
     trd_env: TrdEnv,
     qty: int,
     reason: str = "",
-) -> None:
+) -> bool:
     """
     指定した株数だけ部分決済する（超過分のみ売却）。
     place_close_all と異なり qty を外部から指定できる。
+
+    戻り値: 1件でも決済注文を出せたら True、1件も出せなければ False。
+      ★ v3.9.141: 従来は常に None を返しており、呼び出し側の成否判定
+      （v3.9.139 で追加）が必ず「失敗」に倒れていた。認定サポーターからの指摘。
 
     ★ v2.98: position_id 必須化。LONG ポジション (qty>0) のみ対象。
        state.position_ids["LONG"] から先頭の建玉を1つ取り出し、その position_id
@@ -13950,24 +14161,37 @@ def place_close_partial(
                 f"発動した処理: {reason}\n"
                 f"決済する場合は moomoo アプリで操作してください。"
             ))
-        return None
+        return False
 
     mode = "【デモ】" if trd_env == TrdEnv.SIMULATE else "【実注文】"
     if qty <= 0:
-        return
+        return False
+
+    # ★ v3.9.141b: 未約定の決済注文が残っている間は重ねて出さない（Codexレビュー指摘）。
+    #   部分決済は place_close_all の二重決済ガードを通らないため、証券会社側の
+    #   建玉数が減る前に次の巡回が来ると、同じ超過分をもう一度売ってしまう。
+    #   上限を超えて売却し、最悪ショート反転になりうる。
+    _open_closes = [oid for oid, info in list(_pending_orders.items())
+                    if info.get("symbol") == symbol and info.get("is_close")]
+    if _open_closes:
+        log.info(
+            f"{tag} [部分決済] 未約定の決済注文が {len(_open_closes)} 件あるため見送ります"
+            f"（約定後の数量で next cycle に再評価）"
+        )
+        return False
 
     # ── ★ v2.98: position_id 取得 (必須) ────────────────────────────────────
     long_pids = _get_position_ids_for_close(symbol, "LONG")
     if not long_pids:
         _notify_close_failed_no_pid(symbol, "LONG", f"部分決済要求 qty={qty} ({reason})")
-        return
+        return False
 
     session, _ = get_session_info()
     quote       = get_quote(symbol)
     limit_price = calc_limit_price(quote, "SELL", symbol)  # ★ v2.99.4: シンボル別バッファ
     if limit_price <= 0:
         log.warning(f"{tag} [部分決済] 価格取得失敗: スキップ")
-        return
+        return False
 
     log.info(_fmt_order_log(
         symbol, "SELL(部分)", qty, limit_price, session,
@@ -14025,6 +14249,7 @@ def place_close_partial(
             f"発注済み: {len(placed_orders)}件  合計売却予定株数: {qty - remaining}/{qty}株\n"
             f"指値: ${limit_price:.2f}  理由: {reason}"
         ))
+        return True
     else:
         log.error(f"{tag} [部分決済] 全 position_id 発注失敗")
         _threadsafe_future(asyncio.to_thread(
@@ -14033,6 +14258,26 @@ def place_close_partial(
             f"全 {len(long_pids)} 建玉の発注に失敗しました。\n"
             f"moomoo アプリで手動確認してください。"
         ))
+        return False
+
+
+# ★ v3.9.141b: 「決済を見送った」銘柄の記録。発注失敗と区別するために使う。
+#   見送りは安全側の判断であり、連続失敗カウントを進める理由にならない。
+_close_deferred: dict = {}
+
+
+def _mark_close_deferred(symbol: str) -> None:
+    _close_deferred[symbol] = datetime.datetime.now()
+
+
+def _was_close_deferred(symbol: str, clear: bool = True) -> bool:
+    """直前の place_close_all が「見送り」で False を返したかどうか。"""
+    _t = _close_deferred.get(symbol)
+    if _t is None:
+        return False
+    if clear:
+        _close_deferred.pop(symbol, None)
+    return (datetime.datetime.now() - _t).total_seconds() < 30
 
 
 def _cancel_pending_closes_for_symbol(symbol: str, trd_env: TrdEnv, reason: str = "") -> int:
@@ -14044,12 +14289,16 @@ def _cancel_pending_closes_for_symbol(symbol: str, trd_env: TrdEnv, reason: str 
       時間外の指値 SELL(299110) が即約定せず、その間に日次決済が 2 本目(299111)を発注。
       両方が遅れて約定 → 計 16 株売り → +8 から -8 へ反転 (ネッティング口座で
       「保有を超える SELL = ショート新規」)。決済注文を常に 1 本だけに保てば防げる。
-    戻り値: キャンセルを試みた件数。
+    戻り値: ★ v3.9.141 で「取消が確定した件数」に変更（認定サポーターからの指摘）。
+      従来は len(targets)＝試みた件数を返しており、取消に失敗して生きた決済注文が
+      残っていても、呼び出し側は「取消できた」と解釈して差し替えを発注していた。
+      同じ建玉に決済が2本並ぶ起点になる。
     """
     targets = [
         oid for oid, info in list(_pending_orders.items())
         if info.get("symbol") == symbol and info.get("is_close")
     ]
+    _confirmed = 0
     for oid in targets:
         _ok = False
         try:
@@ -14064,12 +14313,18 @@ def _cancel_pending_closes_for_symbol(symbol: str, trd_env: TrdEnv, reason: str 
         #   未確定時は追跡に残置し、watchdog のタイムアウト取消に後始末を委ねる。
         if _ok:
             _pending_orders.pop(oid, None)
+            _confirmed += 1
         else:
             log.warning(
                 f"【{symbol}】[決済前キャンセル] orderId={oid} 取消が未確定 "
                 f"→ 追跡に残置（watchdogのタイムアウト取消に委譲・二重決済防止）"
             )
-    return len(targets)
+    if _confirmed < len(targets):
+        log.warning(
+            f"【{symbol}】[決済前キャンセル] {len(targets)}件中 {_confirmed}件のみ取消確定。"
+            f"残りは生存している可能性があります。"
+        )
+    return _confirmed
 
 
 def place_close_all(
@@ -14187,9 +14442,25 @@ def place_close_all(
     # これにより「時間切れ決済」と「デモ日次決済」等が同一建玉に 2 本の決済を出し、
     # 時間外指値の遅延約定で売り過ぎ → ショート反転する事故を防ぐ (常に決済 1 本)。
     _cancelled_n = _cancel_pending_closes_for_symbol(symbol, trd_env, reason)
+    # ★ v3.9.141: 取消できなかった決済注文が残っているなら、差し替えを出さない。
+    #   出すと同じ建玉に決済が2本並び、両方が遅れて約定して売り過ぎ（ショート反転）
+    #   になりうる。残注文は watchdog のタイムアウト取消に委ね、次の巡回で再挑戦する。
+    #   （認定サポーターからの指摘）
+    _still_open = [oid for oid, info in list(_pending_orders.items())
+                   if info.get("symbol") == symbol and info.get("is_close")]
+    if _still_open:
+        log.warning(
+            f"{tag} [二重決済防止] 取消できていない決済注文が {len(_still_open)} 件残っています"
+            f" → 今回は決済を見送ります（watchdog の取消後、次の巡回で再挑戦）"
+        )
+        # ★ v3.9.141b: 「安全のため見送った」は発注失敗ではない（Codexレビュー指摘）。
+        #   区別せずに False を返すと、時間切れ決済側の連続失敗カウントが進み、
+        #   誤って「決済が本当に失敗しています」の重大通知や強制同期に至る。
+        _mark_close_deferred(symbol)
+        return False
     if _cancelled_n:
         log.info(
-            f"{tag} [二重決済防止] 既存の未約定決済 {_cancelled_n} 件をキャンセル"
+            f"{tag} [二重決済防止] 既存の未約定決済 {_cancelled_n} 件の取消を確認"
             f" → ポジション再同期してから決済します"
         )
         try:
@@ -17986,6 +18257,11 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     #   従来は成否に関わらず次サイクルへ飛ばしていたため、上限超過が
                     #   続くあいだ損切り・トレール・パニックがずっと評価されなかった。
                     #   （認定サポーターからの指摘・position-cap-bypass）
+                    # ★ v3.9.141: place_close_partial が常に None を返しており、
+                    #   上の判定が必ず「失敗」に倒れていた（別の認定サポーターからの指摘）。
+                    #   成功時に continue しないと、未約定の部分決済を残したまま同じ
+                    #   サイクルで損切り・トレールが全決済を重ねて出し、売り過ぎ・
+                    #   ショート反転を起こしうる。成功時は必ず次サイクルへ送る。
                     _cap_ok = place_close_partial(
                         symbol, trd_env, excess_qty,
                         f"ポジション上限超過: ${position_value:,.0f} > ${_BUDGET_USD:,.0f}")
@@ -18069,6 +18345,14 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                             ts._last_close_attempt_at = None  # 成功時はクールダウン解除
                             ts.close_fail_count = 0          # ★ v3.9.31: 成功で失敗カウントリセット
                             _clear_failed_close(symbol)  # ★ v2.99.4
+                        elif _was_close_deferred(symbol):
+                            # ★ v3.9.141b: 「未約定の決済が残っているので見送った」場合は
+                            #   発注失敗ではない（Codexレビュー指摘）。失敗カウントを
+                            #   進めると、誤って重大通知や強制同期に至る。
+                            log.info(
+                                f"{tag} ⏰ 時間切れ決済は見送りました（既存の決済注文の処理待ち）"
+                                f" → 次の巡回で再挑戦します"
+                            )
                         else:
                             # ★ v3.9.31: 連続失敗カウント + 無限リトライ防止
                             # 5/21 利用者T事例: ショートカバーが moomoo に拒否され続け
@@ -19271,15 +19555,29 @@ async def main(live: bool) -> None:
                 if _r_chk != RET_OK:
                     log.warning(f"[起動時復元] accinfo_query ret={_r_chk} エラー: {_d_chk}")
                 elif _df_has_rows(_d_chk):
-                    _all_zero = True
+                    # ★ v3.9.141: ショート建玉の取りこぼしを直す（認定サポーターからの指摘）。
+                    #   デモ口座で実測したところ short_mv は負で返る（1株の空売りで −24.86）。
+                    #   旧実装の `_v > 0` はショートを検知できず、ショートだけの口座で
+                    #   「建玉なし」と誤判定して、確認しないまま新規発注しうる。
+                    #   あわせて、3列すべてを読めたときだけ「確定ゼロ」と見なす。
+                    #   1列でも欠落・非数値なら「確認できなかった」として扱う。
+                    _all_zero  = True
+                    _read_cols = 0
                     for _f in ("market_val", "long_mv", "short_mv"):
                         try:
                             _v = float(_d_chk[_f].iloc[0] if hasattr(_d_chk, "iloc") else _d_chk[_f][0])
-                            if _v > 0:
+                            _read_cols += 1
+                            if abs(_v) > 0:
                                 _all_zero = False
-                                break
                         except (KeyError, IndexError, TypeError, ValueError):
                             pass
+                    if _read_cols < 3:
+                        # 応答が壊れている＝建玉の有無を確認できていない。ゼロ確定にしない。
+                        _all_zero = False
+                        log.warning(
+                            f"[起動時復元] accinfo の3列のうち {_read_cols} 列しか読めませんでした"
+                            f" → 建玉ゼロとは判断しません"
+                        )
                     _mode = "デモ口座" if trd_env == TrdEnv.SIMULATE else "実口座"
                     if _all_zero:
                         log.info(f"[起動時復元] [{_mode}] accinfo $0 → ポジションなし（クリーンスタート）")
@@ -19299,6 +19597,7 @@ async def main(live: bool) -> None:
     # v2.77: デモ口座にも適用 (旧版は実口座限定で、デモは毎回80秒待ちが発生)。
     # v2.92: long_mv/short_mv/market_val 全て$0なら「ポジションなし確定」フラグ ON
     #        → 受講生に不要な「⚠️ポジション取得失敗」通知を出さない。
+    global _startup_position_unknown   # ★ v3.9.141: 建玉不明フラグを立てる
     _no_position_confirmed_by_accinfo = False
     _need_accinfo_check = not any(
         state.get(sym).position_qty != 0 for sym in ALL_TICKERS
@@ -19313,10 +19612,25 @@ async def main(live: bool) -> None:
                 )
             # ★ moomoo サポート推奨: ret != RET_OK のとき必ずエラーメッセージを出力
             if _ret_acc != RET_OK:
-                log.warning(f"[起動時復元] accinfo_query(最終確認) ret={_ret_acc} エラー: {_data_acc}")
+                # ★ v3.9.141b: 照会そのものが失敗＝建玉の有無は不明。
+                #   従来はここで警告を出すだけで、どの分岐にも入らずフラグが立たなかった。
+                #   「照会に失敗したとき」こそ止めたい経路だった（Codexレビュー指摘）。
+                _startup_position_unknown = True
+                log.error(
+                    f"[起動時復元] 🔴 accinfo_query(最終確認) ret={_ret_acc} エラー: {_data_acc}"
+                    f" → 建玉不明として実口座の新規発注を止めます"
+                )
+            elif not _df_has_rows(_data_acc):
+                # 空応答も「建玉ゼロ」ではなく「確認できなかった」
+                _startup_position_unknown = True
+                log.error(
+                    "[起動時復元] 🔴 accinfo の応答が空でした"
+                    " → 建玉不明として実口座の新規発注を止めます"
+                )
             elif _df_has_rows(_data_acc):
                 _mktval     = 0.0
                 _field_used = "（なし）"
+                _read_n     = 0   # ★ v3.9.141: 実際に読めた列数
                 for _f, _label in [
                     ("market_val", "market_val"),
                     ("long_mv",    "long_mv（ロング建玉）"),
@@ -19328,11 +19642,13 @@ async def main(live: bool) -> None:
                             if hasattr(_data_acc, "iloc")
                             else _data_acc[_f][0]
                         )
-                        if _v > 0:
-                            _mktval     = _v
+                        _read_n += 1
+                        # ★ v3.9.141: short_mv は負で返る（実測）。abs で判定する。
+                        if abs(_v) > 0:
+                            _mktval     = abs(_v)
                             _field_used = _label
                             log.info(
-                                f"[起動時復元] {_label}=${_v:,.0f} > 0"
+                                f"[起動時復元] {_label}=${_v:,.0f}"
                                 f" → ポジション残存と判断"
                             )
                             break
@@ -19367,14 +19683,35 @@ async def main(live: bool) -> None:
                         f"JP口座APIの既知の不安定さのため発注は継続します。\n"
                         f"moomooアプリでポジションをご確認ください。"
                     ))
-                else:
+                elif _read_n >= 3:
                     # market_val=$0 → 本当にポジションなし（デモ・実口座共通）
                     _mode = "デモ口座" if trd_env == TrdEnv.SIMULATE else "実口座"
                     log.info(f"[起動時復元] [{_mode}] accinfo market_val/long_mv/short_mv すべて$0 → ポジションなし（正常）")
                     # ★ v2.92: ポジションなし確定 → 後続の警告ブロックをスキップ
                     _no_position_confirmed_by_accinfo = True
+                else:
+                    # ★ v3.9.141: 3列すべてを読めたときだけ「確定ゼロ」と見なす
+                    #   （認定サポーターからの指摘）。列が欠落・非数値のときは
+                    #   「建玉なし」ではなく「確認できなかった」であり、
+                    #   応答が壊れているときほど警告が消える向きになっていた。
+                    _startup_position_unknown = True
+                    log.error(
+                        f"[起動時復元] 🔴 accinfo の3列のうち {_read_n} 列しか読めませんでした。"
+                        f"建玉の有無を確認できないため、実口座の新規発注を止めます"
+                        f"（既存建玉の損切り・時間切れ決済は通常どおり動きます）"
+                    )
+                    if trd_env == TrdEnv.REAL:
+                        _threadsafe_future(asyncio.to_thread(
+                            send_discord_message,
+                            "🔴 【重要】起動時に建玉の有無を確認できませんでした\n"
+                            "証券会社の応答が不完全なため、安全側に倒して新規発注を止めています。\n"
+                            "moomoo アプリで建玉をご確認ください。"
+                            "（既存建玉の損切り・時間切れ決済は通常どおり動きます）"
+                        ))
         except Exception as _e:
-            log.warning(f"[起動時復元] accinfo確認エラー: {_e}")
+            # ★ v3.9.141: 照会そのものが失敗＝建玉の有無は不明。ゼロ扱いにしない。
+            _startup_position_unknown = True
+            log.error(f"[起動時復元] 🔴 accinfo確認エラー → 建玉不明として新規発注を止めます: {_e}")
 
     exec_syms_list = sorted({sym for syms in EXECUTION_MAP.values() for sym in syms})
     restored = []
@@ -19991,7 +20328,17 @@ def run_daily_data_collect(log_path: str = "moomoo_trade_v1.log",
         "ts":    re.compile(rf"^{TS}"),
         "order": re.compile(rf"{TS}.*?【{SYM}】.*?\[ORDER\]\s+(?P<side>BUY|SELL).*?qty=(?P<qty>\d+).*?price=(?P<price>[\d.]+)", re.I),
         "fill":  re.compile(rf"{TS}.*?【{SYM}】.*?\[約定確認\].*?status=(?P<status>\S+)", re.I),
-        "rpnl":  re.compile(rf"{TS}.*?【{SYM}】.*?\[確定損益\].*?realized_pnl=(?P<pnl>[+-]?[\d.]+).*?sell_avg=(?P<sell>[\d.]+).*?buy_avg=(?P<buy>[\d.]+).*?qty=(?P<qty>\d+)", re.I),
+        # ★ v3.9.141: LONG / SHORT / リトライ の全形式を拾う。
+        #   旧実装は「[確定損益] + sell_avg + buy_avg」のLONG形式だけに一致し、
+        #   SHORT の「[確定損益(SC)] + cover_avg + short_avg」が1件も拾えず、
+        #   ショートだけの日は「損益N/A・決済0回」になっていた。
+        #   （認定サポーターからの指摘。実環境で再現を確認）
+        #   決済方向を問わず realized_pnl と qty だけを見る形に統一する。
+        #   実在するタグは4種類:
+        #     [確定損益] [確定損益(SC)] [確定損益(リトライ)] [確定損益(SC・リトライ)]
+        #   括弧の中身は問わず、realized_pnl と qty だけを見る。
+        "rpnl":  re.compile(rf"{TS}.*?【{SYM}】.*?\[確定損益(?:\([^\]]*\))?\]"
+                            rf".*?realized_pnl=(?P<pnl>[+-]?[\d.]+).*?qty=(?P<qty>\d+)", re.I),
         "risk":  re.compile(rf"{TS}.*?【{SYM}】.*?\[リスク\].*?PnL=(?P<pnl>[+-]?\$?[\d.]+)\((?P<pct>[+-]?[\d.]+)%\)", re.I),
         "eod":   re.compile(rf"{TS}.*?(?:強制クローズ発動|EOD|close_all_for_|15:45)", re.I),
         "err":   re.compile(rf"{TS}.*?\[(ERROR|WARN(?:ING)?)\]\s+(?P<msg>.+)", re.I),
