@@ -169,7 +169,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.143"
+BOT_VERSION = "v3.9.144"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -3985,6 +3985,10 @@ try:
 except ValueError:
     OVN_BUDGET_USD = 0.0
 OVN_SKIP_LONG_HOLIDAY: bool = (os.environ.get("OVN_SKIP_LONG_HOLIDAY", "true").strip().lower() == "true")
+# ★ v3.9.144: 週末（土日2日）の持ち越しを見送る任意設定（認定サポーターの提案）。
+#   既定 false ＝ 従来どおり週末も持ち越す（バックテスト・実口座検証済みの挙動）。
+#   Bot 本体の金曜15:45の週末前全決済とは独立した、OVN 側だけの設定。
+OVN_SKIP_WEEKEND: bool = (os.environ.get("OVN_SKIP_WEEKEND", "false").strip().lower() == "true")
 OVN_SYMBOL: str = "QQQ"
 OVN_SMA_DAYS: int = 200
 OVN_ENTRY_ET = (15, 55)   # 引け際に判定して買う（まだ立会中なので普通に約定する）
@@ -6319,10 +6323,21 @@ def close_all_for_weekend(trd_env: TrdEnv,
         | _momentum_live_symbols()
     )
     # ★ v3.9.113: 設定universe外の建玉も取りこぼさないよう、同期後に qty!=0 の全銘柄を対象化。
-    targets = sorted({
+    _cand = sorted({
         sym for sym in (exec_syms | set(state.tickers.keys()))
         if state.get(sym).position_qty != 0
     })
+    # ★ v3.9.144: 夜間持ち越し（OVN）・Bot 以外の建玉は最初から対象にしない
+    #   （認定サポーターの指摘 A-5）。従来は place_close_all の所有権ガードが
+    #   守って False を返し、それが「決済失敗」として集約されて、正常なのに
+    #   🔴通知が再試行のたびに出ていた（本物の失敗が埋もれる）。
+    _skipped_owned = [sym for sym in _cand if _is_other_owner(sym)]
+    targets = [sym for sym in _cand if not _is_other_owner(sym)]
+    if _skipped_owned:
+        log.info(
+            f"[{log_prefix}] 対象外（夜間持ち越し・Bot 以外の建玉）: "
+            f"{', '.join(_skipped_owned)} — これらは決済せず、失敗にも数えません"
+        )
 
     if not targets:
         log.info(f"[{log_prefix}] 決済対象ポジションなし → スキップ")
@@ -12408,6 +12423,17 @@ def place_short(
         )
         return False
 
+    # ★ v3.9.144: 決済失敗ロック中の新規SHORTを止める（認定サポーターの指摘 A-8）。
+    #   place_buy には v2.97 からあった検査が、SHORT 側に無かった。決済が失敗して
+    #   建玉が残っている可能性がある間に追加のショートを出さない。
+    _is_fc_locked_s, _fc_elapsed_s = _is_failed_close_locked(symbol)
+    if _is_fc_locked_s:
+        log.warning(
+            f"{tag} 🚫 [決済FAILED中] 既存ポジションの決済が失敗中 ({_fc_elapsed_s:.1f}分前) "
+            f"→ 新規SHORTをスキップ (既存ポジション解消を優先)"
+        )
+        return False
+
     # ── ★ v3.9.10: 終盤エントリーブロック (強制決済の N 分前以内なら新規禁止) ──
     # SHORT 側にも対称ガードを適用 (LONG と同じく終盤の新規エントリーは即決済リスク)。
     _late_block_s, _mins_to_close_s = _is_late_session_entry_blocked()
@@ -13941,7 +13967,9 @@ def _close_one_position_id(
                 f"発動した処理: {reason}\n"
                 f"決済する場合は moomoo アプリで操作してください。"
             ))
-        return False
+        # ★ v3.9.144: 宣言どおり tuple を返す（認定サポーターの指摘 A-6）。
+        #   裸の False は呼び出し側の2要素展開で TypeError になる。
+        return -1, "Bot 以外の建玉のため見送り"
 
     use_market = (order_type == OrderType.MARKET)
 
@@ -16756,10 +16784,8 @@ def _ovn_daily_closes(symbol: str, n: int) -> list:
     return []
 
 
-def _ovn_long_holiday_ahead() -> bool:
-    """翌営業日までに市場が閉じている日数が長いか（連休の前は持ち越さない）。"""
-    if not OVN_SKIP_LONG_HOLIDAY:
-        return False
+def _ovn_closed_days_ahead() -> int:
+    """明日から数えて、市場が閉じている日が何日連続するか（0=翌日は営業日）。"""
     try:
         d = datetime.datetime.now(_ET).date()
         closed = 0
@@ -16769,9 +16795,17 @@ def _ovn_long_holiday_ahead() -> bool:
                 closed += 1
             else:
                 break
-        return closed >= 3          # 土日(2日)までは通常。3日以上＝連休
+        return closed
     except Exception:
+        return 0
+
+
+def _ovn_long_holiday_ahead() -> bool:
+    """連休（閉場3日以上）の前か。土日2日は通常の週末で、ここでは止めない。
+    週末も見送りたい場合は OVN_SKIP_WEEKEND を使う（★ v3.9.144・関心事を分離）。"""
+    if not OVN_SKIP_LONG_HOLIDAY:
         return False
+    return _ovn_closed_days_ahead() >= 3
 
 
 def _ovn_order(trd_env, side, qty: int, price: float, *, reserve: bool = False,
@@ -16830,7 +16864,9 @@ def _ovn_order_status(trd_env, order_id: str) -> tuple[str, int, str]:
         return "UNKNOWN", 0, f"{type(e).__name__}: {_mask_secrets(e)}"
 
 
-_OVN_TERMINAL_STATUSES = ("FILLED_ALL", "CANCELLED", "CANCELED", "FAILED", "DELETED", "REJECTED")
+# ★ v3.9.144: SDK 定義の DISABLED（已失効）を追加（認定サポーターの指摘）。
+#   無いと失効した注文を生存扱いし、取消・再照会を反復し続ける。
+_OVN_TERMINAL_STATUSES = ("FILLED_ALL", "CANCELLED", "CANCELED", "FAILED", "DELETED", "REJECTED", "DISABLED")
 
 
 def _ovn_is_terminal(status: str) -> bool:
@@ -16863,8 +16899,13 @@ def _ovn_broker_open_orders(trd_env) -> tuple[list[dict], str]:
         return [], f"{type(e).__name__}: {_mask_secrets(e)}"
 
 
-def _ovn_position(trd_env) -> tuple[int, list[dict], str]:
-    """QQQ のロング建玉数と position_id 一覧を取得。失敗時 qty=-1。"""
+def _ovn_position_all(trd_env) -> tuple[int, list[dict], int, str]:
+    """QQQ のロング建玉数・position_id 一覧・ショート建玉数を取得。失敗時 long=-1。
+
+    ★ v3.9.144: ショートも数える（認定サポーターの指摘 A-1）。実口座はロングと
+    ショートが共存できるため、入口ガードがロングだけを見ると、ショートが残った
+    まま OVN が買い、銘柄単位の所有権ガードでショートまで監視から外れてしまう。
+    """
     try:
         with _trade_ctx() as ctx:
             kwargs = dict(
@@ -16886,21 +16927,30 @@ def _ovn_position(trd_env) -> tuple[int, list[dict], str]:
                 kwargs.pop("asset_category", None)
                 ret, df = ctx.position_list_query(**kwargs)
         if ret != RET_OK:
-            return -1, [], str(df)
+            return -1, [], 0, str(df)
         rows = df[df["code"].astype(str).str.endswith("." + OVN_SYMBOL)] if df is not None and not df.empty else []
-        qty, ids = 0, []
+        qty, ids, short_qty = 0, [], 0
         for _, row in (rows.iterrows() if hasattr(rows, "iterrows") else []):
             raw = int(float(row.get("qty", 0) or 0))
             side = str(row.get("position_side", "") or "").upper()
-            if raw > 0 and "SHORT" not in side:
+            if raw != 0 and "SHORT" in side:
+                # デモは qty が負・実口座の形は未確認のため、絶対値で数える
+                short_qty += abs(raw)
+            elif raw > 0:
                 qty += raw
                 pid_raw = row.get("position_id", "")
                 if str(pid_raw or ""):
                     # SDK 10.05 の Protobuf は position_id に int を要求する。
                     ids.append({"pid": int(pid_raw), "qty": raw})
-        return qty, ids, "OK"
+        return qty, ids, short_qty, "OK"
     except Exception as e:
-        return -1, [], f"{type(e).__name__}: {_mask_secrets(e)}"
+        return -1, [], 0, f"{type(e).__name__}: {_mask_secrets(e)}"
+
+
+def _ovn_position(trd_env) -> tuple[int, list[dict], str]:
+    """従来互換の3要素版（ロングのみ）。既存の呼び出し箇所はこちらを使う。"""
+    _l, _ids, _s, _msg = _ovn_position_all(trd_env)
+    return _l, _ids, _msg
 
 
 def _ovn_sell_position(trd_env, qty: int, ids: list[dict], *, reserve: bool) -> tuple[list[str], str]:
@@ -16946,6 +16996,7 @@ async def ovn_overnight_loop(trd_env) -> None:
         f"  条件={OVN_VIX_LEVEL}(VIXY {_OVN_VIX_THRESH:+.0%}以下)"
         f"  1回の金額={'未設定(買いません)' if OVN_BUDGET_USD <= 0 else f'${OVN_BUDGET_USD:,.0f}'}"
         f"（Bot 本体の予算とは別枠）"
+        f"  週末={'見送る(OVN_SKIP_WEEKEND)' if OVN_SKIP_WEEKEND else '持ち越す（金曜は週末決済のあとに建てます）'}"
         f"  口座={'実口座' if trd_env == TrdEnv.REAL else 'デモ'}"
     )
     # DEMO/REAL の状態を混ぜない。環境タグ無しも判別不能なので復元しない。
@@ -17029,21 +17080,32 @@ async def ovn_overnight_loop(trd_env) -> None:
                 st["entry_date"] = today
                 # QQQ は銘柄単位でしか安全に所有権分離できない。ニュース側・手動の
                 # 建玉や未約定注文がある日は混在させない。
-                pre_pos, _, pre_msg = await asyncio.to_thread(_ovn_position, trd_env)
+                # ★ v3.9.144: 一過性の照会失敗では entry_date を返上して、15:59 までの
+                #   残り巡回で再挑戦する（認定サポーターの指摘）。条件不成立・建玉の
+                #   混在による見送りは従来どおり1日1回で確定する。
+                pre_pos, _, pre_short, pre_msg = await asyncio.to_thread(_ovn_position_all, trd_env)
                 pre_orders, pre_order_msg = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
                 if pre_pos < 0:
-                    _ovn_say(f"QQQ 建玉を確認できないため見送ります: {pre_msg[:120]}", "error")
+                    _ovn_say(f"QQQ 建玉を確認できないため見送ります（次の巡回で再挑戦）: {pre_msg[:120]}", "error")
+                    st.pop("entry_date", None)
                     st["phase"] = "IDLE"; _ovn_save(st); continue
                 if pre_order_msg != "OK":
-                    _ovn_say(f"証券会社側の未約定注文を確認できないため見送ります: {pre_order_msg[:120]}", "error")
+                    _ovn_say(f"証券会社側の未約定注文を確認できないため見送ります（次の巡回で再挑戦）: {pre_order_msg[:120]}", "error")
+                    st.pop("entry_date", None)
                     st["phase"] = "IDLE"; _ovn_save(st); continue
-                if pre_pos != 0 or pre_orders:
-                    _ovn_say(f"QQQ に既存建玉/証券会社側注文があるため見送ります（qty={pre_pos}, orders={len(pre_orders)}）。", "warning")
+                if pre_pos != 0 or pre_short != 0 or pre_orders:
+                    # ★ v3.9.144: ショートの共存も混在として見送る（A-1）。実口座で
+                    #   ショートが残ったまま買うと、銘柄単位の所有権ガードでショートが
+                    #   監視から外れてしまう。
+                    _ovn_say(f"QQQ に既存建玉/証券会社側注文があるため見送ります"
+                             f"（long={pre_pos}, short={pre_short}, orders={len(pre_orders)}）。", "warning")
                     st["phase"] = "IDLE"; _ovn_save(st); continue
                 qc = await asyncio.to_thread(_ovn_daily_closes, OVN_SYMBOL, OVN_SMA_DAYS + 2)
                 vy = await asyncio.to_thread(_ovn_daily_closes, "VIXY", 3)
                 if len(qc) < OVN_SMA_DAYS or len(vy) < 2:
-                    log.warning(f"[夜間持ち越し] データ不足のため見送ります（QQQ {len(qc)}本 / VIXY {len(vy)}本）")
+                    log.warning(f"[夜間持ち越し] データ不足のため見送ります"
+                                f"（QQQ {len(qc)}本 / VIXY {len(vy)}本・次の巡回で再挑戦）")
+                    st.pop("entry_date", None)
                     _ovn_save(st); continue
                 last = qc[-1]
                 sma = sum(qc[-OVN_SMA_DAYS:]) / OVN_SMA_DAYS
@@ -17051,8 +17113,14 @@ async def ovn_overnight_loop(trd_env) -> None:
                 trend_ok = last > sma
                 vix_ok = vchg <= _OVN_VIX_THRESH
                 holiday = _ovn_long_holiday_ahead()
-                if not (trend_ok and vix_ok) or holiday:
+                # ★ v3.9.144: 週末（閉場ちょうど2日）を見送る任意設定。既定は従来どおり持ち越す。
+                #   >= 2 だと OVN_SKIP_LONG_HOLIDAY=false のとき連休まで週末扱いになる
+                #   （Codexレビュー指摘）。週末と連休は別の関心事なので厳密に分ける。
+                _closed_ahead = _ovn_closed_days_ahead()
+                weekend_skip = (OVN_SKIP_WEEKEND and _closed_ahead == 2 and not holiday)
+                if not (trend_ok and vix_ok) or holiday or weekend_skip:
                     _reason = ("連休の前" if holiday else
+                               "週末の前（OVN_SKIP_WEEKEND=true の設定により見送り）" if weekend_skip else
                                f"条件不成立（200日線 {'○' if trend_ok else '×'} / VIXY {vchg:+.2%} {'○' if vix_ok else '×'}）")
                     _ovn_say(f"本日は見送ります。{_reason}")
                     st["phase"] = "IDLE"; _ovn_save(st); continue
@@ -17062,7 +17130,8 @@ async def ovn_overnight_loop(trd_env) -> None:
                 entry_quote = await asyncio.to_thread(get_quote, OVN_SYMBOL)
                 entry_price = (entry_quote.get("ask", 0) or entry_quote.get("last", 0) or 0)
                 if entry_price <= 0:
-                    _ovn_say("QQQ の発注直前価格を取得できないため見送ります。", "warning")
+                    _ovn_say("QQQ の発注直前価格を取得できないため見送ります（次の巡回で再挑戦）。", "warning")
+                    st.pop("entry_date", None)
                     st["phase"] = "IDLE"; _ovn_save(st); continue
                 # ★ v3.9.138: 金額は必須。0（未設定）で勝手に1株買う旧仕様は廃止。
                 if OVN_BUDGET_USD <= 0:
@@ -17111,6 +17180,25 @@ async def ovn_overnight_loop(trd_env) -> None:
             elif (phase == "HELD" and _live and trd_env == TrdEnv.REAL
                   and OVN_RESERVE_ET <= hm < (17, 0)):
                 pos, ids, pmsg = await asyncio.to_thread(_ovn_position, trd_env)
+                # ★ v3.9.144: 翌朝の分岐③と同じく、建玉照会の失敗・ゼロをここでも検査
+                #   （認定サポーターの指摘 A-2）。失敗を数量ゼロと誤解して予約を
+                #   出し損ね、その晩の「Botを止めても売れる」保険を失っていた。
+                if pos < 0:
+                    _ovn_say(f"売り予約前の建玉照会に失敗しました（次の巡回で再試行）: {pmsg[:120]}", "error")
+                    continue
+                if pos == 0:
+                    # ★ v3.9.144: 単発のゼロ応答で所有権を手放さない（Codexレビュー指摘）。
+                    #   キャッシュ照会の同期遅延で一時的に空に見えることがあるため、
+                    #   もう一度照会して両方ゼロのときだけ確定する。
+                    pos2, _ids2, pmsg2 = await asyncio.to_thread(_ovn_position, trd_env)
+                    if pos2 != 0:
+                        log.info(f"[夜間持ち越し] 建玉ゼロは一時的な応答でした（再照会 {pos2}株）→ 続行")
+                        continue
+                    st["phase"] = "DONE"
+                    state.get(OVN_SYMBOL).ovn_held = False
+                    _ovn_say("建玉が無いことを確認しました（予約は不要です）。")
+                    _ovn_save(st)
+                    continue
                 open_orders, odetail = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
                 sell_orders = [o for o in open_orders if "SELL" in o.get("side", "")]
                 if odetail != "OK":
@@ -18752,7 +18840,7 @@ async def main(live: bool) -> None:
     market_open_event = asyncio.Event()
     # ★ v3.9.7 hotfix: Python 3.10+ で asyncio.get_event_loop() は実行中ループ外で
     # RuntimeError を投げる。本関数は async def main 内なので get_running_loop()
-    # が正解。A-saka 環境の "no current event loop in thread 'asyncio_N'" 系
+    # が正解。利用者A環境の "no current event loop in thread 'asyncio_N'" 系
     # 報告に対する根本対策 (worker thread 経由で ensure_future が呼ばれる経路で
     # _main_loop を確実に参照できるよう、main コルーチン自身のループを保持)。
     _main_loop = asyncio.get_running_loop()
@@ -20319,7 +20407,10 @@ def run_daily_data_collect(log_path: str = "moomoo_trade_v1.log",
     SYM = r"(" + "|".join(re.escape(t) for t in sorted(ALL_TICKERS)) + r")"
     pats = {
         "ts":    re.compile(rf"^{TS}"),
-        "order": re.compile(rf"{TS}.*?【{SYM}】.*?\[ORDER\]\s+(?P<side>BUY|SELL).*?qty=(?P<qty>\d+).*?price=(?P<price>[\d.]+)", re.I),
+        # ★ v3.9.144: SHORT を追加（認定サポーターの指摘）。発注ログは
+        #   [ORDER] SHORT の形式で、BUY|SELL では拾えず件数から漏れていた。
+        #   一致後の分類は「BUY 以外は売り系」なので SHORT はそのまま売り側に入る。
+        "order": re.compile(rf"{TS}.*?【{SYM}】.*?\[ORDER\]\s+(?P<side>BUY|SELL|SHORT).*?qty=(?P<qty>\d+).*?price=(?P<price>[\d.]+)", re.I),
         "fill":  re.compile(rf"{TS}.*?【{SYM}】.*?\[約定確認\].*?status=(?P<status>\S+)", re.I),
         # ★ v3.9.141: LONG / SHORT / リトライ の全形式を拾う。
         #   旧実装は「[確定損益] + sell_avg + buy_avg」のLONG形式だけに一致し、
