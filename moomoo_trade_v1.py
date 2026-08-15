@@ -169,7 +169,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.142"
+BOT_VERSION = "v3.9.143"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -17943,8 +17943,12 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         if s in _INDEX_PRICE_HISTORY:  # ★ v2.99.4: STOCK_TICKERS も自動対象
                             record_index_price(s, q["last"])
                 price_str = "  ".join(_prices) if _prices else "価格取得失敗"
+                # ★ v3.9.143: 発注が止まるのは実口座だけ。デモに「発注ブロック中」と
+                #   表示すると事実と異なる（Codexレビュー指摘）。
+                _blk = ("新規発注を停止中" if _RUN_TRADE_ENV == "REAL"
+                        else "デモのため発注は継続")
                 log.warning(
-                    f"[状況] ⚠️ ポジション詳細不明（建玉あり・発注ブロック中）"
+                    f"[状況] ⚠️ ポジション詳細不明（建玉あり・{_blk}）"
                     f"  セッション:{session_now.upper()}  {price_str}"
                     f"  ※moomooアプリで確認してください"
                 )
@@ -19655,34 +19659,23 @@ async def main(live: bool) -> None:
                     except (KeyError, IndexError, TypeError, ValueError):
                         pass
                 if _mktval > 0:
-                    _est_total = _mktval
-                    for _sym in exec_syms_list:
-                        _q = get_price_finnhub(_sym)
-                        if _q <= 0:
-                            _qq = get_quote(_sym)
-                            _q  = _qq.get("last", 0) or _qq.get("ask", 0) or 0
-                        if _q > 0 and len(exec_syms_list) == 1:
-                            _est_qty  = round(_est_total / _q)
-                            _ts_est   = state.get(_sym)
-                            if _est_qty > 0:
-                                _ts_est.position_qty = _est_qty
-                                _ts_est.avg_cost     = _q
-                                _tracked_position_cost[_sym] = _est_total
-                                log.warning(
-                                    f"[起動時復元] 【{_sym}】 {_field_used}から推定復元: "
-                                    f"約{_est_qty}株 現在値${_q:.2f} 評価額${_est_total:,.0f}"
-                                )
-                    log.warning(
-                        f"[起動時復元] ⚠ position_list_queryは空だが"
-                        f" {_field_used}=${_mktval:,.0f} → JP口座APIの既知の不安定さ（ブロックなし）"
+                    # ★ v3.9.143: 評価額からの「推定復元」を廃止（認定サポーターと外部
+                    #   レビューが独立に同じ指摘）。推定した建玉には position_id が無く
+                    #   決済すらできないため、推定を続ける利点が無い。何を持っているか
+                    #   分からないまま実口座で新規発注する穴だけが残っていた。
+                    #   建玉不明として新規発注を止める。既存建玉の監視・決済経路は
+                    #   影響を受けず、次の position_list_query が成功すれば
+                    #   sync_positions がフラグを自動解除する（:10861）。
+                    _startup_position_unknown = True
+                    log.error(
+                        f"[起動時復元] 🔴 建玉明細は空だが {_field_used}=${_mktval:,.0f}。"
+                        f"何を保有しているか確認できないため、実口座の新規発注を止めます"
+                        f"（明細が取得でき次第、自動で再開します）"
                     )
-                    _threadsafe_future(asyncio.to_thread(
-                        send_discord_message,
-                        f"⚠️ 起動時 position_list_query が空\n"
-                        f"accinfo {_field_used}: ${_mktval:,.0f}\n"
-                        f"JP口座APIの既知の不安定さのため発注は継続します。\n"
-                        f"moomooアプリでポジションをご確認ください。"
-                    ))
+                    # Discord 通知はここでは送らない（Codexレビュー指摘）。
+                    #   ①発注が止まるのは実口座だけなのに、デモにも「止めています」が届く
+                    #   ②実口座では後続の汎用通知（起動時ポジション取得失敗・実口座限定）と
+                    #     重複して2通になる。ログ＋汎用通知1本に集約する。
                 elif _read_n >= 3:
                     # market_val=$0 → 本当にポジションなし（デモ・実口座共通）
                     _mode = "デモ口座" if trd_env == TrdEnv.SIMULATE else "実口座"
