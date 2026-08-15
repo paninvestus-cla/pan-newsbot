@@ -169,7 +169,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.144"
+BOT_VERSION = "v3.9.145"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -4009,6 +4009,24 @@ def _is_other_owner(symbol: str) -> bool:
     return bool(getattr(ts, "externally_held", False) or getattr(ts, "ovn_held", False))
 
 
+def _ovn_acc_matches(st: dict) -> bool:
+    """★ v3.9.145: 状態に記録された口座IDが現在の口座と一致するか（A-10）。
+
+    記録が無い旧状態は通す（引き継ぎ扱い）。有って食い違うときだけ拒否する。
+    無条件必須にすると、この版に上げた時点で保有中の建玉が管理を失うため。
+    デモは acc_id=0 の予約値なので照合しない。
+    """
+    saved = st.get("acc_id")
+    if saved is None or _RUN_TRADE_ENV != "REAL":
+        return True
+    try:
+        return int(saved) == int(REAL_ACC_ID)
+    except (TypeError, ValueError):
+        # ★ v3.9.145: 記録が「有るのに判定できない」は拒否（Codexレビュー指摘）。
+        #   True に倒すと不正値が「記録なし」と同等に通ってしまう。
+        return False
+
+
 def _ovn_state_owns_position() -> bool:
     """永続状態上、OVN が QQQ 建玉を所有しているか。"""
     st = _ovn_load()
@@ -4017,7 +4035,8 @@ def _ovn_state_owns_position() -> bool:
     # 保有後に機能を無効化／shadow化しても、決済完了までは所有権を放棄しない。
     # 環境タグの無い旧状態は REAL/DEMO を判別できないため所有権を復元しない。
     # 誤った口座の建玉を Bot 所有として売るより、安全側で管理対象外にする。
-    return st.get("trade_env") == _RUN_TRADE_ENV
+    # ★ v3.9.145: 口座IDが記録されていて現在の口座と食い違う場合も復元しない（A-10）。
+    return st.get("trade_env") == _RUN_TRADE_ENV and _ovn_acc_matches(st)
 
 
 # ── ★ v3.9.131: ハートビート監視（型B＝イベントループ凍結の検知） ───────────────
@@ -6289,6 +6308,10 @@ def _clear_close_retry_cooldown(symbol: str) -> None:
     """決済発注成功時にクールダウンをクリア。"""
     _close_retry_cooldown.pop(symbol, None)
 
+# ★ v3.9.145: 直近の一斉決済で「対象外」にした銘柄（通知文の正確化に使う）
+_last_sweep_skipped_owned: list = []
+
+
 def close_all_for_weekend(trd_env: TrdEnv,
                           reason: str = "週末前強制決済（金曜15:45 ET）",
                           log_prefix: Optional[str] = None) -> bool:
@@ -6333,6 +6356,11 @@ def close_all_for_weekend(trd_env: TrdEnv,
     #   🔴通知が再試行のたびに出ていた（本物の失敗が埋もれる）。
     _skipped_owned = [sym for sym in _cand if _is_other_owner(sym)]
     targets = [sym for sym in _cand if not _is_other_owner(sym)]
+    # ★ v3.9.145: 呼び出し側の「全決済しました」通知が正確になるよう、対象外を公開する
+    #   （認定サポーターの指摘 A-5 訂正版）。対象外があるのに「全決済」と言うと、
+    #   口座に株が残っているのを見た利用者が矛盾を感じる。
+    global _last_sweep_skipped_owned
+    _last_sweep_skipped_owned = list(_skipped_owned)
     if _skipped_owned:
         log.info(
             f"[{log_prefix}] 対象外（夜間持ち越し・Bot 以外の建玉）: "
@@ -7323,11 +7351,17 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                         )
                         raise RuntimeError("移行前全決済が完了しませんでした")
                     setattr(market_schedule_loop, "_preclose_done_for", _pc_key)
+                    # ★ v3.9.145: 対象外（OVN等）が残っている回は「全決済」と言わない。
+                    _pc_note = (
+                        f"\n※ {', '.join(_last_sweep_skipped_owned)} は夜間持ち越し等の"
+                        f"管理下のため対象外（保有継続・予定どおりの動きです）"
+                        if _last_sweep_skipped_owned else ""
+                    )
                     _threadsafe_future(asyncio.to_thread(
                         send_discord_message,
                         f"⚡ [移行前全決済] {_pc_reason}\n"
                         f"{now_et.strftime('%Y-%m-%d %H:%M')} ET\n"
-                        f"取引不可セッションへの移行前に保有ポジションを全決済しました\n"
+                        f"取引不可セッションへの移行前に、Bot 管理の保有ポジションを全決済しました{_pc_note}\n"
                         f"(CLOSE_BEFORE_INACTIVE=true / {CLOSE_BEFORE_INACTIVE_MIN}分前決済)"
                     ))
                 except Exception as _e_pc:
@@ -13863,6 +13897,10 @@ async def pending_order_watchdog() -> None:
                         }
                         # ★ v3.8.5: 再発注「成功」は INFO に降格 (失敗ケースは log.error で別系統)
                         log.info(f"【{sym}】 🔄 損切り再発注成功 orderId={new_oid}")
+                    elif ret == RET_OWNED_SKIP:
+                        # ★ v3.9.145: 所有権が変わった建玉（OVN/手動）への再発注は見送り。
+                        #   エラーではないので失敗ログを出さず、リトライも続けない。
+                        log.info(f"【{sym}】 🛡️ 所有権が変わったため損切り再発注を見送り（新しい所有側が管理します）")
                     else:
                         log.error(f"【{sym}】 🔄 損切り再発注失敗: {oid_or_msg}")
                 continue   # ポジション管理はクリアしない（再発注したので）
@@ -13913,6 +13951,10 @@ def _get_position_ids_for_close(
     ts = state.get(symbol)
     side_key = "LONG" if side == "LONG" else "SHORT"
     return list(ts.position_ids.get(side_key, []))
+
+
+# ★ v3.9.145: 「所有権による見送り」の番兵。RET_OK(0)/RET_ERROR(-1) と衝突しない値。
+RET_OWNED_SKIP = -2
 
 
 def _close_one_position_id(
@@ -13968,8 +14010,10 @@ def _close_one_position_id(
                 f"決済する場合は moomoo アプリで操作してください。"
             ))
         # ★ v3.9.144: 宣言どおり tuple を返す（認定サポーターの指摘 A-6）。
-        #   裸の False は呼び出し側の2要素展開で TypeError になる。
-        return -1, "Bot 以外の建玉のため見送り"
+        # ★ v3.9.145: 番兵を -1 から RET_OWNED_SKIP(-2) に変更。-1 は SDK の
+        #   RET_ERROR そのもので、「所有権による見送り」が「SDKエラー」と区別
+        #   できず、watchdog・チェイサーが毎周回リトライを続けていた。
+        return RET_OWNED_SKIP, "Bot 以外の建玉のため見送り"
 
     use_market = (order_type == OrderType.MARKET)
 
@@ -16643,11 +16687,38 @@ def _heartbeat_watchdog_thread() -> None:
 
 
 # ── ★ v3.9.136: 夜間持ち越し（OVN）の実装 ──────────────────────────────────
+def _ovn_state_path() -> str:
+    """★ v3.9.145: 環境ごとにファイルを分ける（認定サポーターの指摘 A-4）。
+
+    旧実装は単一パスで、REAL と DEMO のプロセスが同じ配置先を使うと、後から
+    保存した側がもう一方の状態を丸ごと上書きした。読み直して書き戻す方式では
+    競合の窓が残るため、ファイル自体を分けて競合の余地を消す。
+    """
+    _root, _ext = os.path.splitext(OVN_STATE_FILE)
+    return f"{_root}.{'REAL' if _RUN_TRADE_ENV == 'REAL' else 'DEMO'}{_ext}"
+
+
 def _ovn_load() -> dict:
     try:
-        if os.path.isfile(OVN_STATE_FILE):
-            with open(OVN_STATE_FILE, encoding="utf-8") as f:
+        _path = _ovn_state_path()
+        if os.path.isfile(_path):
+            with open(_path, encoding="utf-8") as f:
                 return json.load(f) or {}
+        # ★ v3.9.145: 旧形式（単一ファイル）からの移行。環境タグが一致する場合
+        #   だけ、この環境で1回だけ引き継ぐ。旧ファイルは消さない（もう一方の
+        #   環境が読むかもしれない）。マーカーを置いて2回目以降は読まない
+        #   （新ファイルが後で消えたときに古い状態が蘇るのを防ぐ・Codexレビュー指摘）。
+        _mig_mark = _path + ".migrated"
+        if os.path.isfile(OVN_STATE_FILE) and not os.path.isfile(_mig_mark):
+            with open(OVN_STATE_FILE, encoding="utf-8") as f:
+                _legacy = json.load(f) or {}
+            if _legacy.get("trade_env") == _RUN_TRADE_ENV:
+                try:
+                    open(_mig_mark, "w").close()
+                except OSError:
+                    pass
+                log.info(f"[OVN] 旧形式の状態ファイルから引き継ぎました（{_RUN_TRADE_ENV}・1回のみ）")
+                return _legacy
     except Exception as e:
         log.warning(f"[OVN] 状態ファイルを読めません: {_mask_secrets(e)}")
     return {}
@@ -16696,15 +16767,23 @@ def _ovn_report_trade(st: dict, exit_price: float, exit_reason: str) -> None:
 def _ovn_save(st: dict) -> bool:
     """状態を永続化する。成功時だけ True（発注前の必須条件として使う）。"""
     try:
-        tmp = OVN_STATE_FILE + ".tmp"
+        # ★ v3.9.145: 口座IDを記録する（認定サポーターの指摘 A-10）。
+        #   照合側は「記録が無い旧状態は通し、有って食い違うときだけ拒否」なので、
+        #   この版に上げた時点で保有中の建玉が管理を失うことはない。
+        try:
+            st["acc_id"] = int(REAL_ACC_ID) if (_RUN_TRADE_ENV == "REAL" and REAL_ACC_ID) else 0
+        except (TypeError, ValueError):
+            pass
+        _path = _ovn_state_path()
+        tmp = _path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, OVN_STATE_FILE)
+        os.replace(tmp, _path)
         # replace のディレクトリエントリも可能な環境では永続化する。
         try:
-            dir_fd = os.open(os.path.dirname(OVN_STATE_FILE), os.O_RDONLY)
+            dir_fd = os.open(os.path.dirname(_path), os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
             finally:
@@ -16899,7 +16978,7 @@ def _ovn_broker_open_orders(trd_env) -> tuple[list[dict], str]:
         return [], f"{type(e).__name__}: {_mask_secrets(e)}"
 
 
-def _ovn_position_all(trd_env) -> tuple[int, list[dict], int, str]:
+def _ovn_position_all(trd_env, refresh: bool = False) -> tuple[int, list[dict], int, str]:
     """QQQ のロング建玉数・position_id 一覧・ショート建玉数を取得。失敗時 long=-1。
 
     ★ v3.9.144: ショートも数える（認定サポーターの指摘 A-1）。実口座はロングと
@@ -16912,8 +16991,9 @@ def _ovn_position_all(trd_env) -> tuple[int, list[dict], int, str]:
                 trd_env=trd_env,
                 acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0),
                 # sync_positions と同様、頻繁な巡回でレート制限を踏まないよう
-                # キャッシュ照会を優先する。
-                refresh_cache=False,
+                # キャッシュ照会を優先する。入口ガード（1日1回）だけ refresh=True で
+                # 直前に建った建玉も見る（★ v3.9.145・認定サポーターの補足）。
+                refresh_cache=refresh,
             )
             asset_cat_us = getattr(AssetCategory, "US", "US") if AssetCategory else None
             if asset_cat_us is not None:
@@ -16985,6 +17065,7 @@ async def ovn_overnight_loop(trd_env) -> None:
     owns_persisted = (
         st.get("phase") in ("BUY_INTENT", "BUY_PENDING", "HELD", "RESERVED", "HELD_NO_RESERVE")
         and st.get("trade_env") == _RUN_TRADE_ENV
+        and _ovn_acc_matches(st)   # ★ v3.9.145: 別口座の状態で稼働しない（A-10）
     )
     if not OVN_ENABLED and not owns_persisted:
         return
@@ -17000,7 +17081,10 @@ async def ovn_overnight_loop(trd_env) -> None:
         f"  口座={'実口座' if trd_env == TrdEnv.REAL else 'デモ'}"
     )
     # DEMO/REAL の状態を混ぜない。環境タグ無しも判別不能なので復元しない。
-    if st and st.get("trade_env") != _RUN_TRADE_ENV:
+    # ★ v3.9.145: 口座IDの食い違いも同じ扱い（Codexレビュー指摘）。ここを
+    #   通すと別口座の状態を ovn_held として復元し、以後の保存で由来が現在
+    #   口座に付け替わって検出不能になる。
+    if st and (st.get("trade_env") != _RUN_TRADE_ENV or not _ovn_acc_matches(st)):
         if st.get("phase") in ("BUY_INTENT", "BUY_PENDING", "HELD", "RESERVED", "HELD_NO_RESERVE"):
             _ovn_say("環境タグの無い、または別口座の旧状態は復元しません。口座建玉を手動確認してください。", "error")
         st = {}
@@ -17083,7 +17167,8 @@ async def ovn_overnight_loop(trd_env) -> None:
                 # ★ v3.9.144: 一過性の照会失敗では entry_date を返上して、15:59 までの
                 #   残り巡回で再挑戦する（認定サポーターの指摘）。条件不成立・建玉の
                 #   混在による見送りは従来どおり1日1回で確定する。
-                pre_pos, _, pre_short, pre_msg = await asyncio.to_thread(_ovn_position_all, trd_env)
+                pre_pos, _, pre_short, pre_msg = await asyncio.to_thread(
+                    lambda: _ovn_position_all(trd_env, refresh=True))
                 pre_orders, pre_order_msg = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
                 if pre_pos < 0:
                     _ovn_say(f"QQQ 建玉を確認できないため見送ります（次の巡回で再挑戦）: {pre_msg[:120]}", "error")
@@ -17808,6 +17893,9 @@ async def close_order_chaser() -> None:
                         f"[Bot] 【{sym}】 🏃 損切りチェイス\n"
                         f"急落で旧指値 ${old_price:.2f} が刺さらず → ${new_price:.2f} で再発注"
                     ))
+                elif ret == RET_OWNED_SKIP:
+                    # ★ v3.9.145: 所有権が変わった建玉への再発注は見送り（エラーにしない）。
+                    log.info(f"【{sym}】 🛡️ 所有権が変わったためチェイス再発注を見送り（新しい所有側が管理します）")
                 else:
                     log.error(f"【{sym}】 🏃 チェイス再発注失敗: {oid_or_msg}")
 
