@@ -169,7 +169,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.145"
+BOT_VERSION = "v3.9.146"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -10982,7 +10982,16 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 for info in _pending_orders.values()
             )
             if total_qty != 0 and _tracked_position_cost.get(sym, 0.0) <= 0:
-                if _has_pending_close:
+                if sym == OVN_SYMBOL and getattr(state.get(sym), "ovn_held", False):
+                    # ★ v3.9.146 (A-11): OVN が建てた建玉は日中予算 (BUDGET_USD) に
+                    #   計上しない。OVN は OVN_BUDGET_USD の別枠で管理しており、
+                    #   ここで計上すると保有中の日中新規発注枠がその分だけ狭まる。
+                    #   手動建玉 (externally_held) の計上は従来どおり残す
+                    #   （口座全体の露出を保守的に数える長年の仕様）。
+                    log.debug(
+                        f"[sync_positions] 【{sym}】 OVN 保有のため日中予算に計上しません"
+                    )
+                elif _has_pending_close:
                     log.debug(
                         f"[sync_positions] 【{sym}】 外部ポジション検出だが"
                         f" 決済注文pending中のためスキップ（API遅延対策）"
@@ -17244,11 +17253,16 @@ async def ovn_overnight_loop(trd_env) -> None:
                 if not _ovn_save(st):
                     st["phase"] = "IDLE"
                     continue
+                # ★ v3.9.146 (A-11/Codexレビュー): ovn_held は発注「前」に立てる。
+                #   発注→応答の間に sync_positions が走ると、約定済みの建玉が
+                #   日中予算に計上され、保有中ずっと残留するレースがあった。
+                #   失敗時は下で戻す（発注前なので約定は存在しない）。
+                state.get(OVN_SYMBOL).ovn_held = True   # 部分約定も日中ロジックから切り離す
                 oid, msg = await asyncio.to_thread(_ovn_order, trd_env, TrdSide.BUY, qty, 0.0)
                 if not oid:
+                    state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say(f"買い注文が通りませんでした: {msg[:120]}", "error")
                     st["phase"] = "IDLE"; _ovn_save(st); continue
-                state.get(OVN_SYMBOL).ovn_held = True   # 部分約定も日中ロジックから切り離す
                 st.update(phase="BUY_PENDING", qty=qty, buy_oid=oid,
                           trade_env=_RUN_TRADE_ENV,
                           ref_price=round(last, 2),
@@ -19893,7 +19907,20 @@ async def main(live: bool) -> None:
         if ts.position_qty != 0 and ts.avg_cost > 0:
             # コストは絶対株数 × 平均取得価格（ショートも建玉評価額として計上）
             estimated_cost = abs(ts.position_qty) * ts.avg_cost
-            _tracked_position_cost[sym] = estimated_cost
+            if sym == OVN_SYMBOL and getattr(ts, "ovn_held", False):
+                # ★ v3.9.146 (A-11): OVN が建てた建玉は日中予算 (BUDGET_USD) に
+                #   計上しない。ovn_held はこのループより前（:18975 付近）で永続
+                #   OVN 状態から復元済み。tracked=0 のままだと直後の sync_positions
+                #   冒頭ガードで日中側の state はリセットされるが、OVN は自前の
+                #   状態ファイルで管理するので問題ない（ovn_held は対象外）。
+                #   後続の position_id 警告・台帳判定・外部フラグ解除（:19928）は
+                #   従来どおり通す（continue しない）。
+                log.info(
+                    f"[起動時復元] 【{sym}】 OVN 保有 → 日中予算に計上しません"
+                    f"（OVN_BUDGET_USD の別枠で管理）"
+                )
+            else:
+                _tracked_position_cost[sym] = estimated_cost
             _pos_label = "SHORT" if ts.position_qty < 0 else "LONG"
             # ★ v2.98: position_id 数を確認 (決済時に必須となる)
             _pid_count = len(ts.position_ids.get(_pos_label, []))
