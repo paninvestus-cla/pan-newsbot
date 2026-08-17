@@ -34,7 +34,8 @@ moomoo_trade_v1.py
   金曜 15:45 ET に全ポジションを強制決済し、市場クローズ後の
   ニュース取得・発注も停止する。
   理由: 週末持越し金利（土日3日分）・地政学リスクの回避。
-  月曜プリマーケット開始時に自動的にトレード再開。
+  月曜プリマーケット開始時に自動的にトレード再開
+  （プリマーケットを「発注しない」設定にしている場合は月曜 09:30 ET）。
 
 .env 設定項目:
   ANTHROPIC_API_KEY=sk-ant-...
@@ -169,7 +170,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.148"
+BOT_VERSION = "v3.9.149"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -2050,16 +2051,14 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                                 category="MOMENTUM",
                                 news_source="MOMENTUM",
                                 headlines=[f"[MOMENTUM] {reason}"],
+                                # ★ v3.9.111: エントリー時モメンタム5分/15分%を建玉状態に記録
+                                #   （決済時に _send_trade_result がトレード行へ相乗り記録・解析用）
+                                # ★ v3.9.149: 発注後に書くと、先に走り出した約定記録が
+                                #   前回の建玉の値を読むことがあるため、引数で渡す。
+                                entry_pct_5m=pct_5,
+                                entry_pct_15m=pct_15,
                             )
                         if _mom_ok:
-                            # ★ v3.9.111: エントリー時モメンタム5分/15分%を建玉状態に記録
-                            #   （決済時に _send_trade_result がトレード行へ相乗り記録・解析用）
-                            try:
-                                _ts_mom = state.get(symbol)
-                                _ts_mom.entry_pct_5m  = pct_5
-                                _ts_mom.entry_pct_15m = pct_15
-                            except Exception:
-                                pass
                             log.info(f"[モメンタム実発注] {symbol} {side} 発注成功")
                         else:
                             log.info(
@@ -4120,6 +4119,9 @@ SESSION_AFTERHOURS = "afterhours"
 SESSION_OVERNIGHT  = "overnight"
 SESSION_WEEKEND    = "weekend"
 SESSION_HOLIDAY    = "holiday"      # ★ v2.87 追加: NYSE 完全休場日
+# ★ v3.9.149: 「週末決済を実行し、停止に入った」状態。実セッション名ではなく
+#   prev_session にだけ入る内部の値（"demo_closed" と同じ位置づけ）。
+SESSION_WEEKEND_CLOSED = "weekend_closed"
 
 # ── Ctrl+C 停止メッセージ ────────────────────────────────────────────────────
 # asyncio.run() がCtrl+Cを処理する前にSIGINTをキャッチして確実に表示する。
@@ -4169,7 +4171,9 @@ _OVERNIGHT_START = datetime.time(20, 0)
 
 # ── 週末前強制決済の設定 ──────────────────────────────────────────────────────
 # 金曜 15:45 ET（通常市場クローズ15分前）に全ポジションを強制決済する。
-# この時刻以降は新規発注も停止し、月曜プリマーケット開始まで待機する。
+# この時刻以降は新規発注も停止し、月曜プリマーケット開始まで待機する
+# （プリマーケットが「発注しない」設定なら月曜 09:30 ET まで）。
+# ★ v3.9.149: 従来はこの停止が約60秒で解除され、15:47 以降に発注が再開していた。
 _FRIDAY_CLOSE_TIME = datetime.time(15, 45)
 
 # ── ★ v3.9.10: 終盤エントリーブロック設定 ────────────────────────────────────
@@ -6380,7 +6384,8 @@ def close_all_for_weekend(trd_env: TrdEnv,
             f"[Bot] 🏁 週末前強制全決済\n"
             f"対象: {targets_str}\n"
             f"理由: 週末金利（土日3日分）・地政学リスク回避\n"
-            f"ニュース取得・発注を停止し、月曜プリマーケットまで待機します"
+            f"ニュース取得・発注を停止し、月曜プリマーケットまで待機します\n"
+            f"（プリマーケットを「発注しない」設定にしている場合は月曜 09:30 ET まで）"
         )
     else:
         log.warning(f"[{log_prefix}] 🌙 デモ日次全決済開始  対象: {targets_str}")
@@ -6395,12 +6400,18 @@ def close_all_for_weekend(trd_env: TrdEnv,
     #   "owned"   = Bot 以外の建玉 → 決済対象外。完了を妨げない
     #   "pending" = 既存の決済注文の処理待ち → まだ終わっていない。完了扱いにすると
     #               その注文が結局通らなかったとき建玉が残ったまま再試行されない
-    _failed, _deferred, _pending = [], [], []
+    # ★ v3.9.149: 戻り値（1本でも発注できたか）ではなく結果の内訳で分ける。
+    #   "partial"（一部しか決済できていない）を完了扱いにすると、再試行が回らず
+    #   建玉が残ったまま週末停止に入る（認定サポーターの指摘）。
+    _failed, _deferred, _pending, _partial = [], [], [], []
     for sym in targets:
-        if place_close_all(sym, trd_env, reason):
+        place_close_all(sym, trd_env, reason)
+        _why = _take_close_result(sym)
+        if _why == "full":
             continue
-        _why = _was_close_deferred(sym)
-        if _why == "owned":
+        elif _why == "partial":
+            _partial.append(sym)
+        elif _why == "owned":
             _deferred.append(sym)
         elif _why == "pending":
             _pending.append(sym)
@@ -6418,6 +6429,11 @@ def close_all_for_weekend(trd_env: TrdEnv,
             s for s in _deferred if s not in _skipped_owned
         ]
         globals()["_last_sweep_skipped_owned"] = _last_sweep_skipped_owned
+    if _partial:
+        log.error(
+            f"[{log_prefix}] 🔴 一部しか決済できていない銘柄: {', '.join(_partial)}"
+            f" → 完了扱いにせず、再試行します"
+        )
     if _pending:
         # ★ v3.9.148: 処理待ちは「まだ終わっていない」。重大通知は出さず（実際に
         #   失敗したわけではない）、完了扱いにもしないで境界の再試行に委ねる。
@@ -6436,7 +6452,7 @@ def close_all_for_weekend(trd_env: TrdEnv,
             f"対象: {', '.join(_failed)}（{len(_failed)}/{len(targets)}件）\n"
             f"moomoo アプリで建玉をご確認のうえ、必要なら手動で決済してください。"
         ))
-    return not (_failed or _pending)
+    return not (_failed or _pending or _partial)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6725,14 +6741,25 @@ def _ledger_touch_mark(trd_env=None) -> None:
         log.warning(f"[建玉台帳] 目印の作成に失敗: {_mask_secrets(_e)}")
 
 
-def _ledger_mark(symbol: str, trd_env=None, entry_time=None) -> None:
-    """この銘柄で Bot が建玉を持ったことを記録する。"""
+def _ledger_mark(symbol: str, trd_env=None, entry_time=None, category=None) -> None:
+    """この銘柄で Bot が建玉を持ったことを記録する。
+
+    ★ v3.9.149: どの戦略で建てたか（entry_ai_category）も残す。従来は entry_time
+    だけだったため、再起動するとモメンタム建玉が通常建玉として扱われ、時間切れが
+    60分→10分に、損切りが銘柄倍率つきの緩い値に変わっていた（認定サポーターの指摘）。
+    category を省略した呼び出しでは、既存レコードの値をそのまま残す（消さない）。
+    """
     try:
         with _LEDGER_LOCK:
             env = _ledger_env_key(trd_env)
-            _position_ledger.setdefault(env, {})[symbol] = {
+            _prev = _position_ledger.get(env, {}).get(symbol) or {}
+            _cat = category if category is not None else _prev.get("category")
+            _rec = {
                 "entry_time": (entry_time or datetime.datetime.now()).isoformat(),
             }
+            if _cat:
+                _rec["category"] = str(_cat)
+            _position_ledger.setdefault(env, {})[symbol] = _rec
         if _ledger_save() and not _ledger_first_run:
             # 初回移行中は、全既存建玉の取り込みが終わる前に完了マーカーを
             # 作らない。途中終了すると次回起動で未移行建玉を見失うため。
@@ -6768,6 +6795,20 @@ def _ledger_entry_time(symbol: str, trd_env=None):
         with _LEDGER_LOCK:
             _rec = _position_ledger.get(_ledger_env_key(trd_env), {}).get(symbol) or {}
         return datetime.datetime.fromisoformat(_rec.get("entry_time", ""))
+    except Exception:
+        return None
+
+
+def _ledger_category(symbol: str, trd_env=None):
+    """★ v3.9.149: 台帳に記録した建玉の戦略種別（無ければ None）。
+
+    旧版が書いたレコードには入っていないので、必ず None を許容すること。
+    """
+    try:
+        with _LEDGER_LOCK:
+            _rec = _position_ledger.get(_ledger_env_key(trd_env), {}).get(symbol) or {}
+        _c = _rec.get("category")
+        return str(_c) if _c else None
     except Exception:
         return None
 
@@ -7156,6 +7197,9 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
       1. 全ポジションを強制決済（close_all_for_weekend）
       2. market_open_event を clear してニュース取得・発注を停止
       3. 以降は週末判定ブロックで月曜プリマーケットまで待機
+         (★ v3.9.149: 週末決済の実行は prev_session = SESSION_WEEKEND_CLOSED で
+          表し、「本当に週末だった」と区別する。同じ値を使っていた頃は、
+          次の周回で復帰と誤判定されて発注が再開していた)
 
     追加機能②: デモ口座（SIMULATE）限定 — 毎日 15:45 ET に全決済・停止
       - デモ口座は RTH 終了後に株価が更新されないため、
@@ -7180,6 +7224,11 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
     log.info("=== セッション監視ループ 開始 ===")
     prev_session        = None
     _weekend_close_done = False  # 金曜決済を1回だけ実行するフラグ
+    # ★ v3.9.149b: 「週末決済に成功して停止に入った」状態（Codexレビュー指摘）。
+    #   _weekend_close_done は「今日その処理を走らせたか」のラッチで、決済に
+    #   失敗した回も真になる。停止の判定にそれを使うと、決済しきれず
+    #   「監視は止めずに続行します」と言っている回まで監視を止めてしまう。
+    _weekend_halt = False
     _demo_daily_close_done = False  # デモ口座：当日の日次決済実行フラグ
     _live_last_sent_date = None  # 実口座：日次データ送信済み日付（ET）
     _holiday_close_done_date: Optional[datetime.date] = None  # ★ v2.87: 連休前決済を1日1回だけ実行
@@ -7299,7 +7348,16 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
             wait_h, r = divmod(int(wait_sec), 3600)
             wait_m    = r // 60
             log.info(f"[週末決済] 次のプリマーケットまで {wait_h}h{wait_m}m 待機")
-            prev_session = SESSION_WEEKEND  # 以降の週末ブロックで重複通知しないよう設定
+            # ★ v3.9.149: ここで SESSION_WEEKEND を入れると、次の60秒周回で
+            #   「週末から復帰した」と誤判定され（_was_stopped が真になり）
+            #   market_open_event が set し直されて発注が再開していた
+            #   （認定サポーターの指摘・実口座のみ。金曜15:47〜の窓）。
+            #   「本当に週末だった」と「週末決済を実行した」を別の値に分ける。
+            prev_session = SESSION_WEEKEND_CLOSED  # 重複通知の抑止のみに使う
+            # ★ v3.9.149b: 停止の維持はこのフラグで行う。prev_session は毎周回
+            #   末尾で session に上書きされるため、それだけに頼ると停止通知が
+            #   繰り返し出る（Codexレビュー指摘）。
+            _weekend_halt = True
             await asyncio.sleep(60)
             continue
 
@@ -7429,9 +7487,18 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 _demo_daily_close_done = False
                 log.info("[日次決済] フラグリセット → 本日の取引を開始します")
 
-        # 月曜以降になったらフラグをリセット（翌週の金曜決済に備える）
-        if dow_et < 4:
+        # ★ v3.9.149: 決済を実行した日より後の営業日に入ったら解除する。
+        #   旧実装は `dow_et < 4`（月〜木）だけを見ていたため、水曜の連休前決済
+        #   （感謝祭週など）のあと木曜=休場・金曜=dow_et 4 で解除されず、
+        #   金曜を丸1日止めてしまう（Codexレビュー指摘）。
+        #   停止の維持は「決済した当日のあいだ」だけでよい。
+        if _weekend_close_done and _holiday_close_done_date and today_et > _holiday_close_done_date:
             _weekend_close_done = False
+            _weekend_halt = False
+            log.info("[週末決済] フラグリセット → 本日の取引を開始します")
+        elif dow_et < 4 and not _holiday_close_done_date:
+            _weekend_close_done = False
+            _weekend_halt = False
 
         # ── 通常のセッション管理 ─────────────────────────────────────────────
         # 停止条件：週末は全モード / オーバーナイトも全モード共通で停止 / デモ日次決済後は翌プリマーケットまで
@@ -7447,7 +7514,11 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
             (session == SESSION_WEEKEND) or
             (session == SESSION_OVERNIGHT) or
             _cur_disabled or                                  # ★ v3.9.6
-            (is_demo and _demo_daily_close_done)  # デモ日次決済後は再開まで停止を維持
+            (is_demo and _demo_daily_close_done) or  # デモ日次決済後は再開まで停止を維持
+            # ★ v3.9.149: 週末決済で停止に入ったら、実セッションがまだ RTH でも
+            #   停止を維持する（デモ日次決済と同じ扱い）。この行が無いと
+            #   15:46 に「停止条件に当たらない」と判定され、発注が再開する。
+            _weekend_halt
         )
         _was_stopped = (
             (prev_session == SESSION_WEEKEND) or
@@ -7455,6 +7526,8 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
             (prev_session == SESSION_OVERNIGHT) or
             _prev_disabled or                                 # ★ v3.9.6
             (prev_session == "demo_closed") or  # デモ日次決済後の再開検出
+            (prev_session == SESSION_WEEKEND_CLOSED) or  # ★ v3.9.149: 週末決済後の再開検出
+            _weekend_halt or  # ★ v3.9.149b: 停止通知を毎分繰り返さない
             (is_demo and _demo_daily_close_done)  # 修正(v2.63): 毎分Discord通知を防止
         )
 
@@ -7521,7 +7594,7 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                     log.debug(f"[セッション切替バックフィル] スケジュール失敗: {_e_bf2}")
                 if prev_session == SESSION_HOLIDAY:    # ★ v2.87
                     resume_reason = "休日明け営業開始"
-                elif prev_session == SESSION_WEEKEND:
+                elif prev_session in (SESSION_WEEKEND, SESSION_WEEKEND_CLOSED):
                     resume_reason = "週次営業開始"
                 elif prev_session == SESSION_OVERNIGHT:
                     resume_reason = "プリマーケット開始（オーバーナイト終了・デモ）"
@@ -12004,6 +12077,8 @@ def place_buy(
     headlines: Optional[List[str]] = None,
     beneficiaries: Optional[List[str]] = None,  # ★ v2.95: AI beneficiaries (GAS送信用)
     victims: Optional[List[str]]       = None,  # ★ v2.95: AI victims (GAS送信用)
+    entry_pct_5m: Optional[float]      = None,  # ★ v3.9.149: モメンタムのエントリー時5分%
+    entry_pct_15m: Optional[float]     = None,  # ★ v3.9.149: 同 15分%
 ) -> bool:
     """
     指値買い注文を moomoo に発行する。
@@ -12412,6 +12487,14 @@ def place_buy(
     # ── ここから API 送信成功確定 ─────────────────────────────────────────────
     # 注文は moomoo サーバへ到達済み。以降の例外は WARNING に降格し、
     # ポジション追跡 (ts_state) や risk_monitor 引継ぎを止めないようにする。
+    # ★ v3.9.149 (C-9): エントリー時の5分/15分%は、約定確認を仕掛ける前に確定させる。
+    #   後から書くと、先に走り出した約定記録が前回の建玉の値を読む
+    #   （連続したモメンタム建玉で発生・Codexレビュー指摘）。
+    try:
+        state.get(symbol).entry_pct_5m  = entry_pct_5m
+        state.get(symbol).entry_pct_15m = entry_pct_15m
+    except Exception:
+        pass
     try:
         _register_pending_order(order_id, symbol, trd_env)
         # 発注成功 → 取引ロックフラグをクリア
@@ -12444,6 +12527,8 @@ def place_buy(
     ts_state.entry_ai_score    = 1  # BUYはブル
     ts_state.entry_ai_conf     = confidence
     ts_state.entry_ai_category = category
+    # ★ v3.9.149 (C-9): entry_pct_5m / entry_pct_15m は、約定確認を仕掛ける前
+    #   （上の「API 送信成功確定」の直後）で確定済み。ここでは触らない。
     ts_state.entry_news_source = news_source
     ts_state.entry_reason      = reason
     # 自前ポジション管理に発注コストと株数を記録
@@ -12494,6 +12579,8 @@ def place_short(
     headlines: Optional[List[str]] = None,
     beneficiaries: Optional[List[str]] = None,  # ★ v2.95: AI beneficiaries (GAS送信用)
     victims: Optional[List[str]]       = None,  # ★ v2.95: AI victims (GAS送信用)
+    entry_pct_5m: Optional[float]      = None,  # ★ v3.9.149: モメンタムのエントリー時5分%
+    entry_pct_15m: Optional[float]     = None,  # ★ v3.9.149: 同 15分%
 ) -> bool:
     """空売り（新規SELL）注文を moomoo に発行する。 信用口座でベア局面時に SPY/QQQ を空売りする。 決済は place_cover（買い戻し）で行う。"""
     global _trade_locked, _trade_lock_at, _trade_lock_last_warned, _trade_lock_last_probe  # 取引ロック状態管理
@@ -12881,6 +12968,14 @@ def place_short(
     # ── ここから API 送信成功確定 ─────────────────────────────────────────────
     # 注文は moomoo サーバへ到達済み。以降の例外は WARNING に降格し、
     # ポジション追跡 (ts_state) や risk_monitor 引継ぎを止めないようにする。
+    # ★ v3.9.149 (C-9): エントリー時の5分/15分%は、約定確認を仕掛ける前に確定させる。
+    #   後から書くと、先に走り出した約定記録が前回の建玉の値を読む
+    #   （連続したモメンタム建玉で発生・Codexレビュー指摘）。
+    try:
+        state.get(symbol).entry_pct_5m  = entry_pct_5m
+        state.get(symbol).entry_pct_15m = entry_pct_15m
+    except Exception:
+        pass
     try:
         _register_pending_order(order_id, symbol, trd_env)
         _threadsafe_future(
@@ -12919,6 +13014,8 @@ def place_short(
     ts_state.entry_ai_score    = -1  # SHORTはベア
     ts_state.entry_ai_conf     = confidence
     ts_state.entry_ai_category = category
+    # ★ v3.9.149 (C-9): entry_pct_5m / entry_pct_15m は、約定確認を仕掛ける前
+    #   （上の「API 送信成功確定」の直後）で確定済み。ここでは触らない。
     ts_state.entry_news_source = news_source
     track_position_add(symbol, order_cost, qty=qty)
     _headlines_str = (
@@ -13697,7 +13794,8 @@ def track_position_add(symbol: str, order_cost: float, qty: int = 0) -> None:
     # ★ v3.9.134: この銘柄で Bot が建玉を持ったことを台帳に記録する。
     #   発注が通った時点で記録するのは意図的。約定確認前に Bot が落ちても
     #   「自分の建玉」と分かるようにするため（見失うと損切りが止まる）。
-    _ledger_mark(symbol, None, getattr(state.get(symbol), "entry_time", None))
+    _ledger_mark(symbol, None, getattr(state.get(symbol), "entry_time", None),
+                 category=getattr(state.get(symbol), "entry_ai_category", None))
     _tracked_position_cost[symbol] = _tracked_position_cost.get(symbol, 0.0) + order_cost
     if qty > 0:
         _tracked_qty[symbol] = _tracked_qty.get(symbol, 0) + qty
@@ -14446,6 +14544,17 @@ def place_close_partial(
 
 # ★ v3.9.141b: 「決済を見送った」銘柄の記録。発注失敗と区別するために使う。
 #   見送りは安全側の判断であり、連続失敗カウントを進める理由にならない。
+# ★ v3.9.149: 見送りだけでなく「どこまで決済できたか」を伝える記録に一般化した
+#   （認定サポーターの指摘）。place_close_all の戻り値 True は「1本でも発注できた」で
+#   あって「全量さばけた」ではないため、一部しか決済できなかった回に
+#   一斉決済の再試行が回らず、entry_time も消せてしまっていた。
+#   戻り値の型は変えず（呼び出し13箇所のうち8箇所は戻り値を見ない）、
+#   結果の内訳はこの記録で受け渡す。
+#     "full"    … 対象をすべて発注できた（完了扱いにしてよい）
+#     "partial" … 発注はしたが建玉が残っている（完了扱いにしない・警報も出さない）
+#     "owned"   … Bot 以外の建玉なので対象外（失敗ではない）
+#     "pending" … 既存の決済注文の処理待ち（あとで再試行が要る）
+#     "failed"  … 発注できなかった
 # ★ v3.9.148: スレッドローカルにする（Codexレビュー指摘）。
 #   この印は「いま自分が呼んだ place_close_all の結果」を意味するもので、
 #   place_close_all は呼び出し元と同じスレッドで動き、呼び出し元は直後に読む。
@@ -14464,6 +14573,26 @@ def _close_deferred_map() -> dict:
     return _m
 
 
+def _mark_close_result(symbol: str, outcome: str) -> None:
+    """★ v3.9.149: 直前の place_close_all の結果を、呼び出し元のスレッドに残す。"""
+    _close_deferred_map()[symbol] = (datetime.datetime.now(), outcome)
+
+
+def _take_close_result(symbol: str) -> str:
+    """★ v3.9.149: 直前に自分が呼んだ place_close_all の結果を取り出す（消費する）。
+
+    記録が無い／古い（30秒超）ときは空文字。呼び出し元は必ず1回だけ読むこと。
+    """
+    _m = _close_deferred_map()
+    _rec = _m.pop(symbol, None)
+    if _rec is None:
+        return ""
+    _t, _outcome = _rec
+    if (datetime.datetime.now() - _t).total_seconds() >= 30:
+        return ""
+    return _outcome
+
+
 def _mark_close_deferred(symbol: str, reason: str = "owned") -> None:
     """見送りを記録する。
 
@@ -14475,23 +14604,6 @@ def _mark_close_deferred(symbol: str, reason: str = "owned") -> None:
     """
     _close_deferred_map()[symbol] = (datetime.datetime.now(), reason)
 
-
-def _was_close_deferred(symbol: str, clear: bool = True) -> str:
-    """直前に自分が呼んだ place_close_all が「見送り」で False を返したか。
-
-    見送りなら理由（"owned" / "pending"）を、そうでなければ空文字を返す。
-    真偽値として使う既存の呼び出し側はそのまま動く。
-    """
-    _m = _close_deferred_map()
-    _rec = _m.get(symbol)
-    if _rec is None:
-        return ""
-    if clear:
-        _m.pop(symbol, None)
-    _t, _reason = _rec
-    if (datetime.datetime.now() - _t).total_seconds() >= 30:
-        return ""
-    return _reason
 
 
 def _cancel_pending_closes_for_symbol(symbol: str, trd_env: TrdEnv, reason: str = "") -> int:
@@ -14638,6 +14750,9 @@ def place_close_all(
         qty = api_qty
 
     if qty == 0:
+        # ★ v3.9.149: 決済すべき建玉が無い＝この銘柄については完了している。
+        #   従来は False を返すだけで、呼び出し元は「失敗」と読んでいた。
+        _mark_close_result(symbol, "full")
         return False  # ★ v2.99.2: 対象なし
 
     # ── 方向判定と position_id 取得 ────────────────────────────────────────────
@@ -14730,6 +14845,7 @@ def place_close_all(
         if not pids:
             # ★ v3.9.73: 取得不能 → 残留通知 (qty/環境を渡してデモSHORT残留を明示)。
             _notify_close_failed_no_pid(symbol, side, reason, trd_env=trd_env, qty=qty)
+            _mark_close_result(symbol, "failed")   # ★ v3.9.149: 記録漏れを塞ぐ
             return False  # ★ v2.99.2: position_id 取得失敗
 
     # 取得した建玉の合計 qty と要求 qty の整合性チェック
@@ -14780,6 +14896,7 @@ def place_close_all(
                 f"{tag} 価格取得失敗: {order_label} をスキップ"
                 f"（bid={quote.get('bid')}, last={quote.get('last')}, ask={quote.get('ask')}）"
             )
+            _mark_close_result(symbol, "failed")   # ★ v3.9.149: 記録漏れを塞ぐ
             return False  # ★ v2.99.2: 価格取得失敗
         log.info(_fmt_order_log(
             symbol, order_label, _req_qty, limit_price, session,
@@ -14922,6 +15039,22 @@ def place_close_all(
             + (f"\n※ {owned_skip_count}件は Bot 以外の建玉になったため対象外です"
                if owned_skip_count else "")
         )
+        # ★ v3.9.149: 「全量さばけた」と「一部だけ」を区別して呼び出し元へ渡す。
+        #   残玉が出るのは (a) 発注失敗があった (b) 要求数量より多く持っていた
+        #   (14782-14787 の _avail_total > _req_qty) の2通り。
+        #   所有権による対象外は別戦略の管理下なので残玉には数えない。
+        #   ★ v3.9.149b: 不足側（_avail_total < _req_qty）も未完了として扱う。
+        #   内部の把握より建玉照会の数量が少ないときは 14842 で「取得済建玉のみ」を
+        #   決済しており、口座側に残りがある可能性を否定できない（Codexレビュー指摘）。
+        _leftover = (failed_count > 0) or (_avail_total != _req_qty)
+        _mark_close_result(symbol, "partial" if _leftover else "full")
+        if _leftover:
+            log.warning(
+                f"{tag} [{side_label}] 一部のみ発注しました"
+                f"（発注 {len(placed_orders)} 件 / 失敗 {failed_count} 件"
+                f" / 対象建玉 {_avail_total}株 vs 要求 {_req_qty}株）"
+                f" → 完了扱いにせず、次の巡回で残りを決済します"
+            )
         return True  # ★ v2.99.2: 1件以上の発注成功
     elif owned_skip_count > 0 and failed_count == 0:
         # ★ v3.9.148: 1本も発注できず、見送りが含まれる回。
@@ -14957,6 +15090,7 @@ def place_close_all(
             ts.is_short = False
         # 実態を反映させるため非同期で再同期
         _threadsafe_future(asyncio.to_thread(sync_positions, trd_env))
+        _mark_close_result(symbol, "full")   # ★ v3.9.149: 建玉は無い＝完了
         return True
     else:
         # ★ v3.9.148: 見送りと失敗が混在した回に「全 position_id 発注失敗」と書くと
@@ -14979,6 +15113,7 @@ def place_close_all(
             f"理由: {reason}\n"
             f"moomoo アプリで手動確認してください。"
         ))
+        _mark_close_result(symbol, "failed")   # ★ v3.9.149
         return False  # ★ v2.99.2: 全 position_id 失敗 → 呼び出し側で entry_time を維持して再発動可能に
 
 # ── 緊急全決済（Panic Sell） ───────────────────────────────────────────────────────
@@ -16948,6 +17083,17 @@ def _ovn_report_trade(st: dict, exit_price: float, exit_reason: str) -> None:
             f"[夜間持ち越し] 集計へ記録しました: {entry:.2f} → {exit_price:.2f} × {qty}株 "
             f"= {realized:+.2f}（{exit_reason}）"
         )
+        # ★ v3.9.149 (C-3): 日次サマリの集計が拾える形の行も出す（認定サポーターの指摘）。
+        #   これが無いと、実際に売買した日だけ GAS の日次サマリから持ち越しが欠け、
+        #   「記録のみ」の日だけが載るという逆転が起きていた。
+        #   :21127 の rpnl 正規表現（【銘柄】…[確定損益]…realized_pnl=…qty=…）に合わせる。
+        log.info(
+            f"【{OVN_SYMBOL}】 [夜間持ち越し] [確定損益]"
+            f"  realized_pnl={realized:+.2f}"
+            f"  sell_avg={exit_price:.2f}"
+            f"  buy_avg={entry:.2f}"
+            f"  qty={qty}"
+        )
     except Exception as e:
         log.warning(f"[OVN] 記録の送信に失敗（売買には影響しません）: {_mask_secrets(e)}")
 
@@ -18323,7 +18469,8 @@ async def external_news_loop(
     while True:
         # market_open_event が clear されている間はここで待機する。
         # 金曜 15:45 ET の週末決済後も clear されるため、
-        # 月曜プリマーケット開始まで自動的にニュース取得・発注が停止する。
+        # 月曜プリマーケット開始まで自動的にニュース取得・発注が停止する
+        # (★ v3.9.149: 週末決済後の停止維持を修正。それ以前は約60秒で再開していた)。
         await market_open_event.wait()
         try:
             articles = await fetch_external_news()
@@ -18352,7 +18499,8 @@ async def global_news_loop(
     ・既存の重複排除・フィルタ・AI キャッシュ・発注ロジックはすべて流用
 
     週末決済後は market_open_event が clear されるため、
-    月曜プリマーケット開始まで自動的にループが待機状態に入る。
+    月曜プリマーケット開始まで自動的にループが待機状態に入る
+    (★ v3.9.149 で停止維持を修正。それ以前は約60秒で再開していた)。
     """
     # ★ v2.97: 起動時 DNS 事前チェックで _rss_excluded に登録されたフィードは除外
     feed_names = [f["name"] for f in _RSS_FEEDS if f["name"] not in _rss_excluded]
@@ -18370,7 +18518,8 @@ async def global_news_loop(
     while True:
         # market_open_event が clear されている間はここで待機する。
         # 金曜 15:45 ET の週末決済後も clear されるため、
-        # 月曜プリマーケット開始まで自動的にニュース取得・発注が停止する。
+        # 月曜プリマーケット開始まで自動的にニュース取得・発注が停止する
+        # (★ v3.9.149: 週末決済後の停止維持を修正。それ以前は約60秒で再開していた)。
         await market_open_event.wait()
         try:
             articles = await fetch_rss_all()
@@ -18394,7 +18543,8 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
     ④ 価格取得失敗ログの頻度抑制（20回に1回 WARNING、他は DEBUG）
 
     週末決済後は market_open_event が clear されるため、
-    月曜プリマーケット開始まで自動的にリスク監視が待機状態に入る。
+    月曜プリマーケット開始まで自動的にリスク監視が待機状態に入る
+    (★ v3.9.149 で停止維持を修正。それ以前は約60秒で再開していた)。
     """
     # SPY/QQQ等のETF対象 + 個別株（STOCK_TICKERS）+ 決算銘柄（EARNINGS）を監視する
     # ★ v3.9.61: モメンタム実発注銘柄 (_momentum_live_symbols) を必ず含める。
@@ -18450,7 +18600,8 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
     while True:
         # market_open_event が clear されている間はここで待機する。
         # 金曜 15:45 ET の週末決済後も clear されるため、
-        # 月曜プリマーケット開始まで自動的にリスク監視が停止する。
+        # 月曜プリマーケット開始まで自動的にリスク監視が停止する
+        # (★ v3.9.149: 週末決済後の停止維持を修正)。
         await market_open_event.wait()
         await asyncio.sleep(RISK_CHECK_SEC)
 
@@ -18718,11 +18869,23 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                             symbol, trd_env,
                                             f"時間切れ決済(再同期後): {_elapsed_min:.1f}分経過",
                                         )
-                                        if _close_ok2:
-                                            ts.entry_time = None  # 決済発注成功 → クリア
+                                        _res2 = _take_close_result(symbol)
+                                        if _res2 == "full":
+                                            ts.entry_time = None  # 全量決済できた → クリア
                                             ts._last_close_attempt_at = None
                                             _clear_failed_close(symbol)  # ★ v2.99.4
-                                        elif _was_close_deferred(symbol):
+                                        elif _res2 == "partial":
+                                            # ★ v3.9.149: 建玉が残っているので時計は戻さない。
+                                            #   ただし発注自体は通っているので、60秒クール
+                                            #   ダウンと決済失敗ロックは解く（Codexレビュー指摘）。
+                                            #   残したままだと残玉の再決済が遅れる。
+                                            ts._last_close_attempt_at = None
+                                            _clear_failed_close(symbol)
+                                            log.warning(
+                                                f"{tag} ⏰ 一部のみ決済しました → entry_time を維持し"
+                                                f"、次の巡回で残りを決済します"
+                                            )
+                                        elif _res2 in ("owned", "pending"):
                                             # ★ v3.9.148: 見送りは発注失敗ではない（Codexレビュー指摘）。
                                             log.info(
                                                 f"{tag} ⏰ 再同期後の時間切れ決済は見送りました"
@@ -18803,12 +18966,23 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                 ts._last_close_attempt_at = datetime.datetime.now()
                                 async with _get_sym_lock(symbol):
                                     _close_ok3 = place_close_all(symbol, trd_env, f"時間切れ決済: {elapsed:.1f}分経過")
-                                if _close_ok3:
+                                _res3 = _take_close_result(symbol)
+                                if _res3 == "full":
                                     ts.forced_exits += 1
                                     ts.entry_time = None
                                     ts._last_close_attempt_at = None
                                     _clear_failed_close(symbol)  # ★ v2.99.4
-                                elif _was_close_deferred(symbol):
+                                elif _res3 == "partial":
+                                    # ★ v3.9.149: 決済はまだ完了していないので
+                                    #   forced_exits は数えない（Codexレビュー指摘）。
+                                    #   発注は通っているのでクールダウンとロックは解く。
+                                    ts._last_close_attempt_at = None
+                                    _clear_failed_close(symbol)
+                                    log.warning(
+                                        f"{tag} ⏰ 一部のみ決済しました → entry_time を維持し"
+                                        f"、次の巡回で残りを決済します"
+                                    )
+                                elif _res3 in ("owned", "pending"):
                                     # ★ v3.9.148: 見送りは発注失敗ではない（Codexレビュー指摘）。
                                     log.info(
                                         f"{tag} ⏰ 時間切れ決済(再同期後確認)は見送りました"
@@ -18949,13 +19123,23 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         ts._last_close_attempt_at = datetime.datetime.now()
                         async with _get_sym_lock(symbol):
                             _close_ok = place_close_all(symbol, trd_env, f"時間切れ決済: {elapsed:.1f}分経過")
-                        if _close_ok:
+                        _res = _take_close_result(symbol)
+                        if _res == "full":
                             ts.forced_exits += 1
                             ts.entry_time = None
                             ts._last_close_attempt_at = None  # 成功時はクールダウン解除
                             ts.close_fail_count = 0          # ★ v3.9.31: 成功で失敗カウントリセット
                             _clear_failed_close(symbol)  # ★ v2.99.4
-                        elif _was_close_deferred(symbol):
+                        elif _res == "partial":
+                            # ★ v3.9.149: 残玉があるので時計を戻さない（次の巡回で再発動）。
+                            #   完了していないので forced_exits も数えない。
+                            ts._last_close_attempt_at = None
+                            _clear_failed_close(symbol)
+                            log.warning(
+                                f"{tag} ⏰ 一部のみ決済しました → entry_time を維持し"
+                                f"、次の巡回で残りを決済します"
+                            )
+                        elif _res in ("owned", "pending"):
                             # ★ v3.9.141b: 「未約定の決済が残っているので見送った」場合は
                             #   発注失敗ではない（Codexレビュー指摘）。失敗カウントを
                             #   進めると、誤って重大通知や強制同期に至る。
@@ -19283,11 +19467,22 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     ts._last_close_attempt_at = datetime.datetime.now()
                     async with _get_sym_lock(symbol):
                         _close_ok_lc = place_close_all(symbol, trd_env, f"{_exit_label}: ${pnl:.2f} ({loss_pct:.2f}%)")
-                    if _close_ok_lc:
-                        ts.forced_exits += 1
+                    _res_lc = _take_close_result(symbol)
+                    if _res_lc in ("full", "partial"):
                         ts._last_close_attempt_at = None
                         _clear_failed_close(symbol)  # ★ v2.99.4
-                    elif (_why_lc := _was_close_deferred(symbol)):
+                        if _res_lc == "full":
+                            ts.forced_exits += 1
+                            # ★ v3.9.149（案A）: 全量さばけた回だけ時計を返す。
+                            #   時間切れ経路と挙動が揃い、決済後に「時間切れ（建玉なし）」の
+                            #   不要な再照会と通知が出なくなる。
+                            #   "partial" では返さない——残玉の時間切れ監視を落とさないため。
+                            ts.entry_time = None
+                        else:
+                            log.warning(
+                                f"{tag} {_exit_label}は一部のみ決済しました → entry_time を維持します"
+                            )
+                    elif (_why_lc := _res_lc):
                         # ★ v3.9.148: 見送りは発注失敗ではない（Codexレビュー指摘）。
                         #   アラート音と連続失敗カウントを進めると、実害が無いのに
                         #   重大通知や強制同期に至る。理由はそのまま出す。
@@ -19348,11 +19543,19 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                 symbol, trd_env,
                                 f"トレイリングストップ: {label_peak}"
                             )
-                        if _close_ok_tr:
-                            ts.trail_exits += 1
+                        _res_tr = _take_close_result(symbol)
+                        if _res_tr in ("full", "partial"):
                             ts._last_close_attempt_at = None
                             _clear_failed_close(symbol)  # ★ v2.99.4
-                        elif (_why_tr := _was_close_deferred(symbol)):
+                            if _res_tr == "full":
+                                ts.trail_exits += 1
+                                ts.entry_time = None   # ★ v3.9.149（案A）
+                            else:
+                                log.warning(
+                                    f"{tag} ★ トレイリングストップは一部のみ決済しました"
+                                    f" → entry_time を維持します"
+                                )
+                        elif (_why_tr := _res_tr):
                             # ★ v3.9.148: 損切り経路と同じく、見送りは失敗に数えない。
                             log.info(
                                 f"{tag} ★ トレイリングストップは見送りました"
@@ -20329,7 +20532,17 @@ async def main(live: bool) -> None:
             _startup_position_unknown = True
             log.error(f"[起動時復元] 🔴 accinfo確認エラー → 建玉不明として新規発注を止めます: {_e}")
 
-    exec_syms_list = sorted({sym for syms in EXECUTION_MAP.values() for sym in syms})
+    # ★ v3.9.149: 復元対象を risk_monitor_loop（:18452 付近）と同じ式で作る。
+    #   従来は EXECUTION_MAP（= TRIGGER_TICKERS）だけを回していたため、
+    #   モメンタムで実発注される SMH のように TRIGGER_TICKERS に無い銘柄は
+    #   entry_time が復元されず、時間切れ決済が永久に発火しなかった
+    #   （時間切れ判定は entry_time is not None を必須にしている）。
+    #   v3.9.61 の原則「実発注銘柄=必ず監視対象」を、この経路にも通す。
+    _restore_etf   = {sym for syms in EXECUTION_MAP.values() for sym in syms}
+    _restore_earn  = set(dict.fromkeys(EARNINGS_PRE_TICKERS + EARNINGS_AFTER_TICKERS))
+    exec_syms_list = sorted(
+        _restore_etf | set(STOCK_TICKERS) | _restore_earn | _momentum_live_symbols()
+    )
     restored = []
     for sym in exec_syms_list:
         ts = state.get(sym)
@@ -20401,9 +20614,17 @@ async def main(live: bool) -> None:
                 _ext_set_held(sym, False)
                 if ts.entry_time is None:
                     ts.entry_time = _ledger_entry_time(sym, trd_env) or datetime.datetime.now()
+                    # ★ v3.9.149: どの戦略で建てたかも戻す。これが無いと再起動後に
+                    #   モメンタム建玉が通常建玉として扱われ、時間切れが 60分→10分に、
+                    #   損切りが銘柄倍率つきの緩い値に変わる（SMH で設計の約1.8倍）。
+                    _cat = _ledger_category(sym, trd_env)
+                    if _cat and not ts.entry_ai_category:
+                        ts.entry_ai_category = _cat
                     log.info(
                         f"[起動時復元] {sym} ({_pos_label}) entry_time="
-                        f"{ts.entry_time:%m-%d %H:%M}（時間切れ監視開始）"
+                        f"{ts.entry_time:%m-%d %H:%M}"
+                        f"{'  戦略=' + _cat if _cat else '  戦略=不明（旧版の記録）'}"
+                        f"（時間切れ監視開始）"
                     )
             # ショートの場合は is_short フラグも立てる（緊急買い戻し誤発動防止）
             if ts.position_qty < 0:
