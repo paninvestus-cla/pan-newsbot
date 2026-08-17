@@ -169,7 +169,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.146"
+BOT_VERSION = "v3.9.148"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -6388,7 +6388,43 @@ def close_all_for_weekend(trd_env: TrdEnv,
     #   従来は戻り値を捨てて None を返しており、呼び出し側は「例外が出なかった＝成功」
     #   として完了マーカーを立て、全決済が失敗していても
     #   「保有ポジションを全決済しました」と通知していた。境界での再試行も無効化される。
-    _failed = [sym for sym in targets if not place_close_all(sym, trd_env, reason)]
+    # ★ v3.9.148: 「Bot 以外の建玉になったので見送った」は決済失敗ではない
+    #   （Codexレビュー指摘）。失敗に数えると「決済しきれませんでした」の重大通知が
+    #   実害のない回にも出る。見送りは _skipped_owned と同じく対象外として扱う。
+    # ★ v3.9.148: 見送りの理由で扱いを分ける（Codexレビュー指摘）。
+    #   "owned"   = Bot 以外の建玉 → 決済対象外。完了を妨げない
+    #   "pending" = 既存の決済注文の処理待ち → まだ終わっていない。完了扱いにすると
+    #               その注文が結局通らなかったとき建玉が残ったまま再試行されない
+    _failed, _deferred, _pending = [], [], []
+    for sym in targets:
+        if place_close_all(sym, trd_env, reason):
+            continue
+        _why = _was_close_deferred(sym)
+        if _why == "owned":
+            _deferred.append(sym)
+        elif _why == "pending":
+            _pending.append(sym)
+        else:
+            _failed.append(sym)
+    if _deferred:
+        log.info(
+            f"[{log_prefix}] 決済の対象外: {', '.join(_deferred)}"
+            f"（Bot 以外の建玉／失敗には数えません）"
+        )
+        # ★ v3.9.148: 完了通知の注記にはループ内で見送った分も載せる（Codexレビュー指摘）。
+        #   従来は「はじめから対象外にした分」(_skipped_owned) しか載らず、
+        #   全件が途中で見送りになった回に「全決済しました」とだけ届いていた。
+        _last_sweep_skipped_owned = list(_skipped_owned) + [
+            s for s in _deferred if s not in _skipped_owned
+        ]
+        globals()["_last_sweep_skipped_owned"] = _last_sweep_skipped_owned
+    if _pending:
+        # ★ v3.9.148: 処理待ちは「まだ終わっていない」。重大通知は出さず（実際に
+        #   失敗したわけではない）、完了扱いにもしないで境界の再試行に委ねる。
+        log.warning(
+            f"[{log_prefix}] 既存の決済注文の処理待ちで見送った銘柄: {', '.join(_pending)}"
+            f" → 完了扱いにせず、次の巡回で再試行します"
+        )
     if _failed:
         log.error(
             f"[{log_prefix}] 🔴 決済できなかった銘柄があります: {', '.join(_failed)}"
@@ -6400,7 +6436,7 @@ def close_all_for_weekend(trd_env: TrdEnv,
             f"対象: {', '.join(_failed)}（{len(_failed)}/{len(targets)}件）\n"
             f"moomoo アプリで建玉をご確認のうえ、必要なら手動で決済してください。"
         ))
-    return not _failed
+    return not (_failed or _pending)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -10328,6 +10364,68 @@ def _quote_ctx():
             pass
 
 
+def _opend_state_line(timeout_sec: float = 10.0) -> str:
+    """★ v3.9.147: OpenD の版数とログイン状態を1行で返す（起動バナー用）。
+
+    不具合の相談で「OpenD が古い」「相場サーバーに繋がっていない」が原因の
+    ケースが繰り返し起きているため、ログだけで切り分けられるようにする。
+
+    【重要】OpenD が起動していないと SDK の OpenQuoteContext コンストラクタは
+    接続を無限に再試行してブロックする（v3.9.129 の
+    set_sync_query_connect_timeout はクエリ側にしか効かず、ここは救えない）。
+    しかも SDK が張る再接続スレッドは daemon ではないため、放置するとプロセスの
+    終了まで妨げる（実測で確認）。そこで
+      ① 先に素の TCP 接続で当たりを取り、繋がらなければ SDK を触らない
+      ② 繋がっても応答しない場合に備え、別スレッドで期限を切る
+    の二段構えにする。表示のためだけの機能で起動や停止を止めない。
+
+    server_ver は数値のビルド番号で、OpenD アプリの画面表示（9.x.xxxx 形式）
+    とは表記が異なる。ここでは加工せず生の値を出す。
+    """
+    # ① ポートが開いているかだけを先に確かめる（SDK オブジェクトは作らない）
+    import socket as _socket
+    try:
+        with _socket.create_connection((MOOMOO_HOST, MOOMOO_PORT), timeout=3):
+            pass
+    except Exception:
+        return (
+            f"OpenD: 接続できません（{MOOMOO_HOST}:{MOOMOO_PORT}）"
+            f"／OpenD が起動していない可能性があります"
+        )
+
+    _result: list = []
+
+    def _probe() -> None:
+        try:
+            with _quote_ctx() as _q:
+                ret, data = _q.get_global_state()
+            if ret != RET_OK:
+                _result.append(f"OpenD: 状態を取得できませんでした（{str(data)[:60]}）")
+                return
+
+            def _yn(v) -> str:
+                # SDK は版によって True/False と '1'/'0' の両方を返す。
+                return "OK" if str(v).strip().lower() in ("true", "1") else "未ログイン"
+
+            _result.append(
+                f"OpenD: ver={data.get('server_ver', '不明')}"
+                f"  取引ログイン={_yn(data.get('trd_logined'))}"
+                f"  相場ログイン={_yn(data.get('qot_logined'))}"
+            )
+        except Exception as _e:
+            _result.append(f"OpenD: 状態を取得できませんでした（{_mask_secrets(_e)[:60]}）")
+
+    _th = threading.Thread(target=_probe, name="opend-state", daemon=True)
+    _th.start()
+    _th.join(timeout_sec)
+    if _result:
+        return _result[0]
+    return (
+        f"OpenD: 状態を確認できませんでした（{timeout_sec:.0f}秒以内に応答なし"
+        f"／OpenD が起動していない可能性があります）"
+    )
+
+
 def _tokutei_kwargs(trd_env: TrdEnv, is_short: bool = False) -> dict:
     """
     place_order に jp_acc_type を追加するための kwargs を返す。
@@ -13962,8 +14060,12 @@ def _get_position_ids_for_close(
     return list(ts.position_ids.get(side_key, []))
 
 
-# ★ v3.9.145: 「所有権による見送り」の番兵。RET_OK(0)/RET_ERROR(-1) と衝突しない値。
-RET_OWNED_SKIP = -2
+# ★ v3.9.145: 「所有権による見送り」の番兵。
+# ★ v3.9.148: -2 は同ファイルの _RET_ALREADY_CLOSED(:3535・v3.9.63〜) と衝突していた。
+#   同じ _close_one_position_id が両方を返すため、place_close_all が見送りを
+#   「既に決済済み」と読み、1本も発注していない回に成功(True)を返していた。
+#   RET_OK(0) / RET_ERROR(-1) / _RET_ALREADY_CLOSED(-2) のいずれとも重ならない値にする。
+RET_OWNED_SKIP = -3
 
 
 def _close_one_position_id(
@@ -14019,7 +14121,7 @@ def _close_one_position_id(
                 f"決済する場合は moomoo アプリで操作してください。"
             ))
         # ★ v3.9.144: 宣言どおり tuple を返す（認定サポーターの指摘 A-6）。
-        # ★ v3.9.145: 番兵を -1 から RET_OWNED_SKIP(-2) に変更。-1 は SDK の
+        # ★ v3.9.145: 番兵を -1 から RET_OWNED_SKIP に変更。-1 は SDK の
         #   RET_ERROR そのもので、「所有権による見送り」が「SDKエラー」と区別
         #   できず、watchdog・チェイサーが毎周回リトライを続けていた。
         return RET_OWNED_SKIP, "Bot 以外の建玉のため見送り"
@@ -14344,21 +14446,52 @@ def place_close_partial(
 
 # ★ v3.9.141b: 「決済を見送った」銘柄の記録。発注失敗と区別するために使う。
 #   見送りは安全側の判断であり、連続失敗カウントを進める理由にならない。
-_close_deferred: dict = {}
+# ★ v3.9.148: スレッドローカルにする（Codexレビュー指摘）。
+#   この印は「いま自分が呼んだ place_close_all の結果」を意味するもので、
+#   place_close_all は呼び出し元と同じスレッドで動き、呼び出し元は直後に読む。
+#   グローバルな辞書のままだと、週末の一斉決済（ワーカースレッド）と
+#   リスク監視が同じ銘柄を同時に扱ったときに互いの印を消し合い、
+#   本当の失敗が見送り扱いで握り潰される。スレッドごとに分ければこの窓は消える。
+#   30秒の期限は、印を消し忘れた経路の保険として残す。
+_close_deferred_tls = threading.local()
 
 
-def _mark_close_deferred(symbol: str) -> None:
-    _close_deferred[symbol] = datetime.datetime.now()
+def _close_deferred_map() -> dict:
+    _m = getattr(_close_deferred_tls, "m", None)
+    if _m is None:
+        _m = {}
+        _close_deferred_tls.m = _m
+    return _m
 
 
-def _was_close_deferred(symbol: str, clear: bool = True) -> bool:
-    """直前の place_close_all が「見送り」で False を返したかどうか。"""
-    _t = _close_deferred.get(symbol)
-    if _t is None:
-        return False
+def _mark_close_deferred(symbol: str, reason: str = "owned") -> None:
+    """見送りを記録する。
+
+    ★ v3.9.148: 理由を持たせる（Codexレビュー指摘）。見送りには性質の違う2種類がある。
+      - "owned"   : Bot 以外の建玉になった → こちらが決済してはいけない。再試行も不要
+      - "pending" : 既存の決済注文の処理待ち → あとで再試行しないと建玉が残る
+    まとめて「失敗ではない」と扱うと、後者のとき境界の一斉決済が完了扱いになり、
+    未約定注文が結局通らなかった場合に建玉が残ったまま再試行されない。
+    """
+    _close_deferred_map()[symbol] = (datetime.datetime.now(), reason)
+
+
+def _was_close_deferred(symbol: str, clear: bool = True) -> str:
+    """直前に自分が呼んだ place_close_all が「見送り」で False を返したか。
+
+    見送りなら理由（"owned" / "pending"）を、そうでなければ空文字を返す。
+    真偽値として使う既存の呼び出し側はそのまま動く。
+    """
+    _m = _close_deferred_map()
+    _rec = _m.get(symbol)
+    if _rec is None:
+        return ""
     if clear:
-        _close_deferred.pop(symbol, None)
-    return (datetime.datetime.now() - _t).total_seconds() < 30
+        _m.pop(symbol, None)
+    _t, _reason = _rec
+    if (datetime.datetime.now() - _t).total_seconds() >= 30:
+        return ""
+    return _reason
 
 
 def _cancel_pending_closes_for_symbol(symbol: str, trd_env: TrdEnv, reason: str = "") -> int:
@@ -14433,10 +14566,17 @@ def place_close_all(
        次のリスク監視ループで再発動できるようにする。
     """
     tag = f"【{symbol}】"
+    # ★ v3.9.148: 見送りの印は「直前の1回」だけを表すべきもの。前回の見送りが
+    #   30秒以内に残っていると、今回の本当の失敗をそれで打ち消してしまう
+    #   （Codexレビュー指摘）。呼ばれた時点で必ず消し、今回の結果だけを残す。
+    _close_deferred_map().pop(symbol, None)
     # ★ v3.9.134: 台帳に無い建玉（Bot が建てたものではない）は決済しない。
     #   決済経路は複数あるが、実際に発注する低レベル関数を含めてすべてここで塞ぐ。
     if _is_other_owner(symbol):
         log.warning(f"[建玉台帳] 【{symbol}】 Bot 以外の建玉のため決済しません（{reason}）")
+        # ★ v3.9.148: これは発注失敗ではなく「対象外」。印を付けて、呼び出し側が
+        #   決済失敗の連続カウントやアラートに数えないようにする。
+        _mark_close_deferred(symbol, "owned")
         _k = f"_ext_close_notified_{symbol}"
         if not getattr(place_close_all, _k, False):
             setattr(place_close_all, _k, True)
@@ -14537,7 +14677,8 @@ def place_close_all(
         # ★ v3.9.141b: 「安全のため見送った」は発注失敗ではない（Codexレビュー指摘）。
         #   区別せずに False を返すと、時間切れ決済側の連続失敗カウントが進み、
         #   誤って「決済が本当に失敗しています」の重大通知や強制同期に至る。
-        _mark_close_deferred(symbol)
+        #   ★ v3.9.148: ただしこれは「あとで再試行が要る」側の見送り。
+        _mark_close_deferred(symbol, "pending")
         return False
     if _cancelled_n:
         log.info(
@@ -14657,6 +14798,7 @@ def place_close_all(
     placed_orders: list[tuple[str, int]] = []   # (order_id, qty)
     failed_count = 0
     already_closed_count = 0   # ★ v3.9.63: Not enough positions = 既決済 pid 数
+    owned_skip_count = 0       # ★ v3.9.148: 所有権が途中で変わり見送った pid 数
     remaining = _req_qty
     for entry in pids:
         if remaining <= 0:
@@ -14721,6 +14863,16 @@ def place_close_all(
             }
             log.info(f"{tag} [注文管理] {side_label}注文を監視登録 orderId={oid_or_msg}")
             remaining -= order_qty
+        elif ret == RET_OWNED_SKIP:
+            # ★ v3.9.148: 入口(:14500 付近)の所有権チェック以降に、並行する
+            #   sync_positions が externally_held を立てて所有権が反転した。
+            #   建玉は口座に残っているので remaining を消化してはいけない
+            #   （消化すると「全部さばいた」形になり完了扱いへ倒れる）。
+            #   失敗でもないので failed_count にも数えず、下で見送りとして返す。
+            owned_skip_count += 1
+            log.info(
+                f"{tag} [{side_label}] pid={pid[:12]}... は Bot 以外の建玉になったため見送ります"
+            )
         elif ret == _RET_ALREADY_CLOSED:
             # ★ v3.9.63: この建玉は既に決済済み → 失敗扱いにせず残数を消化。
             already_closed_count += 1
@@ -14767,14 +14919,32 @@ def place_close_all(
             f"{_summary}  {order_desc}\n"
             f"理由: {reason}"
             + (f"\n⚠ 一部建玉の発注に失敗 ({failed_count}件)" if failed_count else "")
+            + (f"\n※ {owned_skip_count}件は Bot 以外の建玉になったため対象外です"
+               if owned_skip_count else "")
         )
         return True  # ★ v2.99.2: 1件以上の発注成功
+    elif owned_skip_count > 0 and failed_count == 0:
+        # ★ v3.9.148: 1本も発注できず、見送りが含まれる回。
+        #   建玉は口座に残っているので「完了」に倒してはいけない。既存の
+        #   見送り機構（_mark_close_deferred）に載せて False を返し、呼び出し側が
+        #   決済失敗の連続カウントを進めないようにする（:18604 付近）。
+        log.info(
+            f"{tag} [{side_label}] 対象建玉 {owned_skip_count} 件は Bot 以外の建玉に"
+            f"なったため決済の対象外です（既決済 {already_closed_count} 件 / 失敗 {failed_count} 件）"
+            f" — これらは別の戦略が管理しているため、こちらでは決済しません"
+        )
+        _mark_close_deferred(symbol, "owned")
+        return False
     elif already_closed_count > 0 and failed_count == 0:
         # ★ v3.9.63: 対象建玉がすべて「既に決済済み (Not enough positions)」だった。
         # 実害なし → 内部状態をクリーンにして成功扱いで返し、無限リトライを止める。
+        # ★ v3.9.148: 旧文言は「(entry_time クリア)」と書いていたが、この分岐は
+        #   entry_count / トレール / 台帳しか触らない。entry_time を消すかどうかは
+        #   True を受け取った呼び出し側の判断で、損切り・トレール経路から呼ばれた
+        #   場合はどこでも消えない。実態に合わせて書き換える。
         log.info(
             f"{tag} [{side_label}] 対象建玉 {already_closed_count} 件はすべて既に決済済み "
-            f"→ state をクリアして完了扱い (entry_time クリア)"
+            f"→ 建玉の内部状態をクリアして完了扱い"
         )
         ts.entry_count = 0
         ts.reset_trail()
@@ -14789,14 +14959,23 @@ def place_close_all(
         _threadsafe_future(asyncio.to_thread(sync_positions, trd_env))
         return True
     else:
-        log.error(f"{tag} [{side_label}] 全 position_id 発注失敗")
+        # ★ v3.9.148: 見送りと失敗が混在した回に「全 position_id 発注失敗」と書くと
+        #   実態とずれる（Codexレビュー指摘）。内訳を出す。
+        # ★ v3.9.148: 数量ゼロの建玉レコードは黙って飛ばしているので、どのカウンタも
+        #   立たないままここへ来ることがある。「0件失敗」と書かないよう内訳を出す。
+        _skip_note = (
+            f"（発注失敗 {failed_count} 件 / 対象外 {owned_skip_count} 件"
+            f" / 既決済 {already_closed_count} 件 / 全 {len(pids)} 建玉）"
+        )
+        log.error(f"{tag} [{side_label}] 決済の発注ができませんでした{_skip_note}")
         # ★ v3.9.19: ショートカバー全失敗時のみアラート音 (損失拡大リスク大)
         if side == "SHORT":
             _play_alert_sound("short_cover_all_failed")
         _threadsafe_future(asyncio.to_thread(
             send_discord_message,
-            f"❌ {tag} {side_label} 全失敗\n"
-            f"全 {len(pids)} 建玉の発注に失敗しました。\n"
+            f"❌ {tag} {side_label} 決済の発注ができませんでした\n"
+            f"対象 {len(pids)} 建玉のうち、発注失敗 {failed_count} 件"
+            f"／対象外 {owned_skip_count} 件／既に決済済み {already_closed_count} 件\n"
             f"理由: {reason}\n"
             f"moomoo アプリで手動確認してください。"
         ))
@@ -16802,7 +16981,17 @@ def _ovn_save(st: dict) -> bool:
         return True
     except Exception as e:
         log.error(f"[OVN] 状態ファイルを保存できません（再起動で建玉を見失います）: {_mask_secrets(e)}")
-        _ovn_say("状態保存に失敗しました。新規発注を停止します。ディスク空き容量と書込権限を確認してください。", "error")
+        # ★ v3.9.148: 通知を間引く（Codexレビュー指摘）。この版で、口座の状態が
+        #   読めないときに毎周回 _ovn_save を呼ぶ経路を8か所増やした。書込みが
+        #   継続的に失敗する環境では30秒ごとに通知が飛ぶことになる。
+        #   初回は即時、以後は30分ごとに繰り返す（止めてしまうと気づけないため）。
+        _now_sf = datetime.datetime.now()
+        _last_sf = getattr(_ovn_save, "_last_fail_notice", None)
+        if _last_sf is None or (_now_sf - _last_sf).total_seconds() >= 1800:
+            _ovn_save._last_fail_notice = _now_sf
+            _ovn_say(
+                "状態保存に失敗しました。新規発注を停止します。"
+                "ディスク空き容量と書込権限を確認してください。", "error")
         return False
 
 
@@ -16812,6 +17001,57 @@ def _ovn_say(msg: str, level: str = "info") -> None:
         _threadsafe_discord(f"🌙 【夜間持ち越し】{msg}")
     except Exception:
         pass
+
+
+def _ovn_note_ambiguous(st: dict, what: str) -> None:
+    """★ v3.9.148: 口座の状態が読めず確定を保留し続けている状況を可視化する。
+
+    建玉照会が空を返し続ける・売り注文が終端にならない、といった曖昧な状態では
+    安全側に倒して確定を保留する（誤って建玉を手放さないため）。ただし黙って
+    保留し続けると、翌日以降の夜間持ち越しも動かないまま気づかれない
+    （新規に入れるのは phase が IDLE/DONE のときだけ）。
+    保留が1時間続いたら知らせ、以後も続くかぎり6時間ごとに繰り返し知らせる。
+    「1回だけ」にすると、マーカーの消し忘れが起きたときに以後の通知が永久に
+    止まってしまう（Codexレビュー指摘）。繰り返しにしておけば、消し忘れの影響は
+    「通知が少し早い／遅い」だけで、気づけなくなることはない。
+    """
+    _now = datetime.datetime.now()
+
+    def _parse(v):
+        try:
+            _t = datetime.datetime.fromisoformat(str(v))
+        except (TypeError, ValueError):
+            return None
+        # 未来の時刻（時計のずれ・壊れた保存値）は無効として扱う。
+        return _t if (_now - _t).total_seconds() >= 0 else None
+
+    _first = _parse(st.get("ambiguous_since"))
+    if _first is None:
+        st["ambiguous_since"] = _now.isoformat(timespec="seconds")
+        st.pop("ambiguous_notified_at", None)
+        return
+    if (_now - _first).total_seconds() < 3600:
+        return
+    _last = _parse(st.get("ambiguous_notified_at"))
+    if _last is not None and (_now - _last).total_seconds() < 6 * 3600:
+        return
+    st["ambiguous_notified_at"] = _now.isoformat(timespec="seconds")
+    _ovn_say(
+        f"口座の状態を確認できない時間が続いています（{what}）。\n"
+        "誤って建玉を手放さないよう、夜間持ち越しは判断を保留しています。"
+        "この間は新しい持ち越しも行いません。\n"
+        "moomoo アプリで QQQ の建玉と注文の状態をご確認ください。",
+        "error")
+
+
+def _ovn_clear_ambiguous(st: dict) -> None:
+    """★ v3.9.148: 状態を確認できたら曖昧マーカーを消す。
+
+    消し漏れがあっても害が出ないよう、通知側は6時間ごとの繰り返しにしてある。
+    """
+    st.pop("ambiguous_since", None)
+    st.pop("ambiguous_notified", None)      # 旧版が書いた値の掃除
+    st.pop("ambiguous_notified_at", None)
 
 
 def _ovn_daily_closes(symbol: str, n: int) -> list:
@@ -17157,6 +17397,32 @@ async def ovn_overnight_loop(trd_env) -> None:
                         pass
                     _ovn_save(st)
                 elif pos == 0:
+                    # ★ v3.9.148 (A-3): 建玉照会は「本当にゼロ」と「空応答」を同じ 0 で
+                    #   返す。約定株数(dealt)が立っているのに 0 が返るのは矛盾なので、
+                    #   ここで所有権を手放すと、約定済みの建玉が OVN の管理外に出る
+                    #   （②の予約も③の売却も走らなくなる）。再照会で裏を取り、
+                    #   それでも食い違うなら所有権を保ったまま次の巡回に回す。
+                    if dealt and dealt > 0:
+                        pos2, ids2, pdetail2 = await asyncio.to_thread(_ovn_position, trd_env)
+                        if pos2 > 0:
+                            st.update(phase="HELD", qty=pos2, position_ids=ids2)
+                            log.info(
+                                f"[夜間持ち越し] 建玉ゼロは一時的な応答でした"
+                                f"（再照会 {pos2}株・約定 {dealt}株）→ 保有として続行"
+                            )
+                            _ovn_save(st)
+                            continue
+                        # ★ v3.9.148: ここは30秒ごとに再入する。Discord へ直接出すと
+                        #   不調が続いた日に数千通になるため、通知は
+                        #   _ovn_note_ambiguous の間引き（1時間後＋以後6時間ごと）に任せる。
+                        log.warning(
+                            f"[夜間持ち越し] 買い注文は {dealt}株 約定していますが、建玉が"
+                            f"確認できません（{status} / {pdetail2[:80]}）→ 管理を続けたまま"
+                            "次の巡回で再確認します"
+                        )
+                        _ovn_note_ambiguous(st, "約定はあるが建玉が見えない")
+                        _ovn_save(st)
+                        continue
                     st.update(phase="IDLE", qty=0)
                     state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say(f"買い注文は建玉を残さず終了しました（{status}）。", "warning")
@@ -17363,15 +17629,71 @@ async def ovn_overnight_loop(trd_env) -> None:
                 if not _live:
                     st["phase"] = "DONE"; _ovn_save(st); continue
                 pos, ids, pmsg = await asyncio.to_thread(_ovn_position, trd_env)
+                if pos > 0:
+                    # ★ v3.9.148: 建玉が見えた＝口座の状態を読めた。曖昧マーカーを
+                    #   ここで一本化して消す（個別の解決経路に散らすと消し漏れる）。
+                    _ovn_clear_ambiguous(st)
                 if pos == 0:
-                    st["phase"] = "DONE"
-                    state.get(OVN_SYMBOL).ovn_held = False
-                    _ovn_say("建玉が無いことを確認しました。")
-                    _q_ovn2 = await asyncio.to_thread(get_quote, OVN_SYMBOL)
-                    _ovn_report_trade(
-                        st, float(_q_ovn2.get("last", 0) or _q_ovn2.get("bid", 0) or 0),
-                        "夜間持ち越し: 翌朝の売却")
-                elif pos < 0:
+                    # ★ v3.9.148 (A-3): 空応答も 0 で返るため、単発のゼロで確定しない
+                    #   （②・BUY_PENDING と同じ形に揃える）。ここで即断すると、売り注文を
+                    #   1本も出していないのに実在しない往復の確定損益が集計へ送られる。
+                    pos2, ids2, pmsg2 = await asyncio.to_thread(_ovn_position, trd_env)
+                    if pos2 > 0:
+                        log.info(
+                            f"[夜間持ち越し] 建玉ゼロは一時的な応答でした（再照会 {pos2}株）→ 売却へ進みます"
+                        )
+                        pos, ids, pmsg = pos2, ids2, pmsg2
+                        _ovn_clear_ambiguous(st)
+                    elif pos2 < 0:
+                        # ★ v3.9.148: 毎周回 Discord に出さない（上と同じ理由）。
+                        log.warning(
+                            f"[夜間持ち越し] 建玉ゼロの裏取りに失敗しました → 次の巡回で再試行: {pmsg2[:120]}"
+                        )
+                        _ovn_note_ambiguous(st, "建玉を照会できない")
+                        _ovn_save(st)
+                        continue
+                    else:
+                        # ★ v3.9.148: 続けて2回ゼロでも、証券会社側の同じ不調が2回
+                        #   続いただけの可能性がある（独立した確認になっていない）。
+                        #   建玉照会とは別系統の注文照会が生きていることを確かめてから
+                        #   確定する。照会自体が失敗するなら「口座の状態が読めない」
+                        #   ということなので、確定させず次の巡回に回す。
+                        _oo, _oo_detail = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
+                        if _oo_detail != "OK":
+                            # ★ v3.9.148: ここは30秒ごとに再入するので Discord へは
+                            #   出さない（Codexレビュー指摘・24時間で数千通になる）。
+                            #   利用者への通知は _ovn_note_ambiguous が
+                            #   「1時間後＋以後6時間ごと」に間引いて出す。
+                            log.warning(
+                                f"[夜間持ち越し] 建玉が見えませんが、注文照会も失敗しています"
+                                f"（{_oo_detail[:80]}）→ 確定させず次の巡回で再確認します"
+                            )
+                            _ovn_note_ambiguous(st, "建玉・注文とも照会できない")
+                            _ovn_save(st)
+                            continue
+                        _live_sells = [o for o in _oo if "SELL" in str(o.get("side", ""))]
+                        if _live_sells:
+                            # ★ v3.9.148: 生きている売り注文があるなら、決済はまだ
+                            #   終わっていない。建玉照会が空でも DONE にしてはいけない
+                            #   （Codexレビュー指摘）。
+                            log.warning(
+                                f"[夜間持ち越し] 建玉は見えませんが売り注文が {len(_live_sells)} 件"
+                                "生きています → 確定させず次の巡回で再確認します"
+                            )
+                            _ovn_note_ambiguous(st, "建玉は見えないが売り注文が残っている")
+                            _ovn_save(st)
+                            continue
+                        st["phase"] = "DONE"
+                        state.get(OVN_SYMBOL).ovn_held = False
+                        _ovn_clear_ambiguous(st)
+                        _ovn_say("建玉が無いことを確認しました。")
+                        _q_ovn2 = await asyncio.to_thread(get_quote, OVN_SYMBOL)
+                        _ovn_report_trade(
+                            st, float(_q_ovn2.get("last", 0) or _q_ovn2.get("bid", 0) or 0),
+                            "夜間持ち越し: 翌朝の売却")
+                        _ovn_save(st)
+                        continue
+                if pos < 0:
                     _ovn_say(f"建玉を確認できないため売りません: {pmsg[:120]}", "error")
                 else:
                     open_orders, odetail = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
@@ -17406,9 +17728,83 @@ async def ovn_overnight_loop(trd_env) -> None:
             elif (phase == "RESERVED" and st.get("entry_date") != today
                   and hm >= (9, 35) and is_trading_day(now.date())):
                 pos, ids, pmsg = await asyncio.to_thread(_ovn_position, trd_env)
+                if pos > 0:
+                    # ★ v3.9.148: 建玉が見えた＝口座の状態を読めた（③と同じ扱い）。
+                    _ovn_clear_ambiguous(st)
                 if pos == 0:
+                    # ★ v3.9.148 (A-3): 空応答も 0 で返る。ここで即断すると、売れて
+                    #   いないのに「約定しました」と告知し、実在しない往復の確定損益が
+                    #   集計へ送られる（予約注文は生きているので建玉自体は後から売れる）。
+                    #   再照会で裏を取ってから確定する。
+                    pos2, ids2, pmsg2 = await asyncio.to_thread(_ovn_position, trd_env)
+                    if pos2 > 0:
+                        log.info(
+                            f"[夜間持ち越し] 建玉ゼロは一時的な応答でした（再照会 {pos2}株）→ 次の巡回で再確認します"
+                        )
+                        _ovn_clear_ambiguous(st)
+                        _ovn_save(st)
+                        continue
+                    if pos2 < 0:
+                        # ★ v3.9.148: -1 は照会失敗の番兵で、株数ではない（Codexレビュー指摘）。
+                        #   建玉ありと同じ扱いにすると、口座が読めない状態が
+                        #   いつまでも「一時的な応答」として記録されない。
+                        log.warning(
+                            f"[夜間持ち越し] 建玉ゼロの裏取りに失敗しました → 次の巡回で再試行: {pmsg2[:120]}"
+                        )
+                        _ovn_note_ambiguous(st, "建玉を照会できない（予約の約定確認）")
+                        _ovn_save(st)
+                        continue
+                    # ★ v3.9.148: ここは「予約が約定した」と断言する唯一の場所なので、
+                    #   建玉ゼロ（＝空応答と区別できない）だけを根拠にしない。
+                    #   売り注文そのものの状態で裏を取り、終端に達していなければ
+                    #   確定させず次の巡回に回す（Codexレビュー指摘）。
+                    _sell_terminal = False
+                    _sell_snaps = []
+                    for _soid in [x for x in st.get("sell_oids", [st.get("sell_oid")]) if x]:
+                        _sell_snaps.append(await asyncio.to_thread(
+                            _ovn_order_status, trd_env, str(_soid)))
+                    if _sell_snaps:
+                        _sell_terminal = all(_ovn_is_terminal(s[0]) for s in _sell_snaps)
+                    else:
+                        # ★ v3.9.148: 旧版が書いた状態には sell_oids が無いことがある。
+                        #   個別の注文IDで裏取りできないので、代わりに全注文照会で
+                        #   「生きている売り注文が無い」ことを確かめる。照会が失敗する
+                        #   なら口座の状態が読めないということなので確定させない。
+                        #   （ここで単に待ち続けると DONE に到達できず巡回が終わらない）
+                        _oo_r, _oo_r_detail = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
+                        if _oo_r_detail != "OK":
+                            log.warning(
+                                f"[夜間持ち越し] 売り注文の記録が無く、全注文照会も失敗しました"
+                                f"（{_oo_r_detail[:80]}）→ 確定させず次の巡回で再確認します"
+                            )
+                            _ovn_note_ambiguous(st, "建玉も注文も照会できない（売り注文の記録なし）")
+                            _ovn_save(st)
+                            continue
+                        _live_sells_r = [o for o in _oo_r if "SELL" in str(o.get("side", ""))]
+                        if _live_sells_r:
+                            log.warning(
+                                f"[夜間持ち越し] 売り注文の記録はありませんが、生きている売り注文が"
+                                f" {len(_live_sells_r)} 件あります → 確定させず次の巡回で再確認します"
+                            )
+                            _ovn_note_ambiguous(st, "建玉は見えないが売り注文が残っている（記録なし）")
+                            _ovn_save(st)
+                            continue
+                        log.warning(
+                            "[夜間持ち越し] 売り注文の記録が無いため、建玉ゼロと"
+                            "「生きている売り注文なし」の2点で確定します（旧版で保存された状態の可能性）"
+                        )
+                        _sell_terminal = True
+                    if not _sell_terminal:
+                        log.warning(
+                            f"[夜間持ち越し] 建玉は見えませんが売り注文が終端ではありません"
+                            f"（{[s[0] for s in _sell_snaps]}）→ 確定させず次の巡回で再確認します"
+                        )
+                        _ovn_note_ambiguous(st, "建玉は見えないが売り注文が終端でない")
+                        _ovn_save(st)
+                        continue
                     st["phase"] = "DONE"
                     state.get(OVN_SYMBOL).ovn_held = False
+                    _ovn_clear_ambiguous(st)
                     _ovn_say("予約していた注文が寄り付きで約定しました。")
                     _q_ovn = await asyncio.to_thread(get_quote, OVN_SYMBOL)
                     _ovn_report_trade(
@@ -18326,6 +18722,13 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                             ts.entry_time = None  # 決済発注成功 → クリア
                                             ts._last_close_attempt_at = None
                                             _clear_failed_close(symbol)  # ★ v2.99.4
+                                        elif _was_close_deferred(symbol):
+                                            # ★ v3.9.148: 見送りは発注失敗ではない（Codexレビュー指摘）。
+                                            log.info(
+                                                f"{tag} ⏰ 再同期後の時間切れ決済は見送りました"
+                                                f"（既存の決済注文の処理待ち、または Bot 以外の建玉）"
+                                                f" → 次の巡回で再挑戦します"
+                                            )
                                         else:
                                             log.error(
                                                 f"{tag} ⏰ 再同期後の時間切れ決済が全失敗 → "
@@ -18405,6 +18808,13 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                     ts.entry_time = None
                                     ts._last_close_attempt_at = None
                                     _clear_failed_close(symbol)  # ★ v2.99.4
+                                elif _was_close_deferred(symbol):
+                                    # ★ v3.9.148: 見送りは発注失敗ではない（Codexレビュー指摘）。
+                                    log.info(
+                                        f"{tag} ⏰ 時間切れ決済(再同期後確認)は見送りました"
+                                        f"（既存の決済注文の処理待ち、または Bot 以外の建玉）"
+                                        f" → 次の巡回で再挑戦します"
+                                    )
                                 else:
                                     log.error(
                                         f"{tag} ⏰ 時間切れ決済(再同期後確認)が全失敗 → "
@@ -18412,7 +18822,11 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                     )
                                     _mark_failed_close(symbol)  # ★ v2.99.4
                             else:
-                                # 再同期後もポジションなし → 未約定とみなしリセット
+                                # ★ v3.9.148: 建玉が無い理由は「注文が通らなかった」
+                                #   だけでなく「損切り・トレールで既に決済済み」でも
+                                #   起きる（損切り経路は entry_time を消さないため、
+                                #   決済後もここへ来る）。旧文言の「未約定とみなし
+                                #   リセット」は後者のとき誤解を招くので、断定しない。
                                 log.warning(
                                     f"{tag} ⏰ 時間切れ（再同期後もポジションなし）: エントリから {elapsed:.1f}分経過"
                                     f" → entry_timeをリセット"
@@ -18421,9 +18835,11 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                 ts.entry_time  = None
                                 _threadsafe_future(asyncio.to_thread(
                                     send_discord_message,
-                                    f"[Bot] {tag} ⏰ 時間切れ（ポジション未確認）\n"
+                                    f"[Bot] {tag} ⏰ 時間切れの確認（建玉なし）\n"
                                     f"エントリから {elapsed:.1f}分経過  上限: {_t_timeout}分\n"
-                                    f"再同期後もポジションなし → 未約定とみなしリセット"
+                                    f"口座に建玉が無いため、内部の時刻管理をリセットしました。\n"
+                                    f"（既に決済済み、または注文が成立しなかったケースです。"
+                                    f"新たな決済は行っていません）"
                                 ))
                     continue
 
@@ -18871,6 +19287,15 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         ts.forced_exits += 1
                         ts._last_close_attempt_at = None
                         _clear_failed_close(symbol)  # ★ v2.99.4
+                    elif (_why_lc := _was_close_deferred(symbol)):
+                        # ★ v3.9.148: 見送りは発注失敗ではない（Codexレビュー指摘）。
+                        #   アラート音と連続失敗カウントを進めると、実害が無いのに
+                        #   重大通知や強制同期に至る。理由はそのまま出す。
+                        log.info(
+                            f"{tag} {_exit_label}は見送りました"
+                            f"（{'Bot 以外の建玉' if _why_lc == 'owned' else '既存の決済注文の処理待ち'}）"
+                            f" → 次の巡回で再評価します"
+                        )
                     else:
                         log.error(
                             f"{tag} ⚠ {_exit_label}の発注が全失敗 → 60秒後に再試行します"
@@ -18927,6 +19352,13 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                             ts.trail_exits += 1
                             ts._last_close_attempt_at = None
                             _clear_failed_close(symbol)  # ★ v2.99.4
+                        elif (_why_tr := _was_close_deferred(symbol)):
+                            # ★ v3.9.148: 損切り経路と同じく、見送りは失敗に数えない。
+                            log.info(
+                                f"{tag} ★ トレイリングストップは見送りました"
+                                f"（{'Bot 以外の建玉' if _why_tr == 'owned' else '既存の決済注文の処理待ち'}）"
+                                f" → 次の巡回で再評価します"
+                            )
                         else:
                             log.error(
                                 f"{tag} ★ トレイリングストップの発注が全失敗 → 60秒後に再試行します"
@@ -19421,6 +19853,7 @@ async def main(live: bool) -> None:
     log.info("=" * 60)
     log.info(f"  moomoo_trade_v1.py  {BOT_VERSION}  {mode_label}")
     log.info(f"  OpenD: {MOOMOO_HOST}:{MOOMOO_PORT}")
+    log.info(f"  {_opend_state_line()}")
 
     # ── ★ v3.9.18: 過去 24 時間のクレジット切れ警告 (起動時) ──────────────────
     # 5/13-5/14 で受講生 10-15 名がクレジット切れに気づかず Bot が中立スキップ状態の
