@@ -170,7 +170,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.149"
+BOT_VERSION = "v3.9.150"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -2700,8 +2700,11 @@ else:
 #   そのため SPY/QQQ:SELL_SHORT を有効化しても実際に約定する実発注は QQQ:BUY のみに
 #   なり、QQQ:BUY は観察で最悪サイド (6/1: WR22.8%/-1.72%, Phase 1 実発注 WR14.3%)。
 #   一方デモで約定可能かつ観察で好調な SMH-BUY (6/1: +3.30%/WR80.2%) はシャドー止まり
-#   だった。SMH は TRIGGER_TICKERS(標準 SPY,QQQ,SMH) に含まれ監視対象のため、
-#   v3.9.61 原則「実発注銘柄=必ず監視対象」に適合し orphan の懸念なし。
+#   だった。★ v3.9.150 訂正: ここに「SMH は TRIGGER_TICKERS(標準 SPY,QQQ,SMH)
+#   に含まれるので orphan の懸念なし」と書いていたが、Wizard の標準設定は
+#   SPY,QQQ であり誤りだった（認定サポーターの指摘）。SMH は
+#   _momentum_live_symbols() 経由で監視対象に入る。起動時復元も v3.9.149 で
+#   同じ和集合に揃えた。
 #   QQQ:BUY は実発注継続だが要観察 (上昇トレンド日は機能・往来/下落日は不振)。
 #   env MOMENTUM_ENABLED_SIDES で上書き可 (QQQ:BUY を外す等は受講生/講師判断)。
 # ★ v3.9.66: 勝ち筋の SHORT 側を実発注対象に追加 (ブレークスルー施策A)。
@@ -2709,8 +2712,9 @@ else:
 #   SMH-SHORT +3.34%, QQQ-SHORT +2.97%(WR100%), IWM-SHORT +1.56%(WR100%),
 #   DRAM-SHORT +0.73%(WR98%)。v3.9.65 のデモ・ネッティング空売り (DEMO_SHORT_ENABLED=true)
 #   と組み合わせることで、デモ生も勝ち筋ショートを実発注化できる。
-#   監視整合性: SMH は TRIGGER_TICKERS、IWM は _momentum_live_symbols() 経由で
-#   risk_monitor/週末決済/パニック/sync に自動取込済 (v3.9.61 原則) のため orphan 懸念なし。
+#   監視整合性: SMH・IWM とも _momentum_live_symbols() 経由で
+#   risk_monitor/週末決済/パニック/sync に自動取込済 (v3.9.61 原則)。
+#   ★ v3.9.150 訂正: 旧記述の「SMH は TRIGGER_TICKERS」は誤り（標準は SPY,QQQ）。
 # ★ v3.9.70: DRAM:SELL_SHORT を既定から除外 (実績浅く、自動実発注化が想定外だったため)。
 #   DRAM は MOMENTUM_SYMBOLS でシャドー観察を継続 (実発注はしない)。
 #   実発注対象サイドは Wizard で明示選択し MOMENTUM_ENABLED_SIDES に書き出す方針へ。
@@ -6409,7 +6413,9 @@ def close_all_for_weekend(trd_env: TrdEnv,
         _why = _take_close_result(sym)
         if _why == "full":
             continue
-        elif _why == "partial":
+        elif _why in ("partial", "unknown"):
+            # ★ v3.9.150: "unknown"（内部数量ゼロ・照会の応答が欠けている疑い）も
+            #   完了扱いにしない。残玉ごと週末停止に入る経路を塞ぐ。
             _partial.append(sym)
         elif _why == "owned":
             _deferred.append(sym)
@@ -6431,8 +6437,8 @@ def close_all_for_weekend(trd_env: TrdEnv,
         globals()["_last_sweep_skipped_owned"] = _last_sweep_skipped_owned
     if _partial:
         log.error(
-            f"[{log_prefix}] 🔴 一部しか決済できていない銘柄: {', '.join(_partial)}"
-            f" → 完了扱いにせず、再試行します"
+            f"[{log_prefix}] 🔴 決済を確認できていない銘柄: {', '.join(_partial)}"
+            f"（一部のみ発注／建玉照会の応答が不完全）→ 完了扱いにせず、再試行します"
         )
     if _pending:
         # ★ v3.9.148: 処理待ちは「まだ終わっていない」。重大通知は出さず（実際に
@@ -6797,6 +6803,7 @@ def _ledger_entry_time(symbol: str, trd_env=None):
         return datetime.datetime.fromisoformat(_rec.get("entry_time", ""))
     except Exception:
         return None
+
 
 
 def _ledger_category(symbol: str, trd_env=None):
@@ -7495,7 +7502,10 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
         if _weekend_close_done and _holiday_close_done_date and today_et > _holiday_close_done_date:
             _weekend_close_done = False
             _weekend_halt = False
-            log.info("[週末決済] フラグリセット → 本日の取引を開始します")
+            log.info(
+                "[週末決済] 週末決済フラグをリセットしました"
+                "（実際の取引再開はセッション判定に従います）"
+            )
         elif dow_et < 4 and not _holiday_close_done_date:
             _weekend_close_done = False
             _weekend_halt = False
@@ -7531,9 +7541,20 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
             (is_demo and _demo_daily_close_done)  # 修正(v2.63): 毎分Discord通知を防止
         )
 
+        # ★ v3.9.150 (認定サポーターの指摘 1-1): イベントの操作を毎周回の
+        #   「レベル駆動」にする。従来は clear()/set() を立ち上がり判定の中でしか
+        #   行っていなかったため、停止中にプロセスが一時停止（スリープ等）して
+        #   状態の遷移を跨いで再開すると、どちらの立ち上がりも起きず
+        #   market_open_event が clear のまま翌営業日いっぱい復帰しなかった。
+        #   v3.9.149 で停止を強めたことで、この経路が現実に踏めるようになっていた。
+        #   通知（ログ・Discord）は従来どおり立ち上がりのときだけ出す。
+        if _should_stop:
+            market_open_event.clear()
+        else:
+            market_open_event.set()
+
         if _should_stop:
             if not _was_stopped:
-                market_open_event.clear()
                 if session == SESSION_WEEKEND:
                     wait_sec  = seconds_until_premarket()
                     wait_h, r = divmod(int(wait_sec), 3600)
@@ -10841,6 +10862,15 @@ _sync_health: dict = {
 }
 
 
+# ★ v3.9.150b: 直近の建玉照会で「口座に実在した」銘柄。設定の絞り込みより前に
+#   集めるので、TRIGGER_TICKERS 等から外れた銘柄も入る。起動時の整合性検査で使う。
+_account_symbols_seen: set = set()
+# ★ v3.9.150c: 上の集合が「走査を完走した結果」かどうか（Codexレビュー指摘）。
+#   空集合は「建玉なし」と「照会できていない」の両方でありうるため、
+#   有効性を別に持たないと、検査が黙って成功したふりをする。
+_account_scan_valid: bool = False
+
+
 def sync_positions(trd_env: TrdEnv) -> None:
     """moomoo からポジションを取得して state に同期する。
     ret=-1 が返ってきた場合、パラメータを変えながら最大4パターンを試みる。
@@ -10996,12 +11026,23 @@ def sync_positions(trd_env: TrdEnv) -> None:
         # _agg 構造: {sym: {"LONG":{qty,cost_sum,ids:[{pid,qty,cost},..]}, "SHORT":{同}}}
         # ids は決済時に建玉ごとに個別 place_order で閉じるため (1注文1建玉)。
         _agg: dict = {}
+        # ★ v3.9.150b: この回の照会で口座に実在した銘柄。走査後にまとめて確定させる
+        #   （途中で足すと、照会が途中で壊れた回に不完全な集合が残る）。
+        _seen_this_sync: set = set()
         for _, row in (data.iterrows() if _df_has_rows(data) else []):
             row_qty_raw = int(float(row.get("qty", 0) or 0))
             if row_qty_raw == 0:
                 # qty=0 は決済済み残骸 (moomoo JP 仕様) → スキップ
                 continue
             sym = from_moomoo_code(str(row["code"]))
+            # ★ v3.9.150b: 設定で絞り込む前に、口座にあった銘柄を控えておく
+            #   （認定サポーターの指摘 2-2）。ここで捨ててしまうと、設定を変えた
+            #   あとに残った建玉が「監視から外れている」ことを誰も検出できない。
+            try:
+                if row_qty_raw != 0:
+                    _seen_this_sync.add(sym)
+            except Exception:
+                pass
             if sym not in ALL_TICKERS:
                 continue
             # position_side 判別 (大文字統一)。取得できない場合は qty 符号でフォールバック。
@@ -11028,6 +11069,13 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     "qty":  eff_qty,   # 当該建玉の株数 (常に絶対値)
                     "cost": cost,
                 })
+
+        # ★ v3.9.150b: 走査を完走できたのでここで確定させる。
+        # ★ v3.9.150c: data が None（照会は成功扱いだが中身が無い）は「0件の走査」
+        #   であって「建玉ゼロの確認」ではない（Codexレビュー指摘）。有効にしない。
+        if data is not None and hasattr(data, "empty"):
+            globals()["_account_symbols_seen"] = _seen_this_sync
+            globals()["_account_scan_valid"] = True
 
         # ── 各銘柄を state に反映 ─────────────────────────────────────────────────
         for sym, sides in _agg.items():
@@ -11261,7 +11309,11 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     #   これをしないと、起動時復元より先にこの sync が走ったときに
                     #   「停止します」→「再開します」の紛らわしい通知が2通飛ぶ
                     #   （実機で確認済み。全利用者の初回起動で毎回起きる）。
-                    _ledger_mark(_sym_j, trd_env, state.get(_sym_j).entry_time)
+                    _ledger_mark(
+                        _sym_j, trd_env, state.get(_sym_j).entry_time,
+                        # ★ v3.9.150: 由来が分かるとき（メモリ上の値があるとき）だけ
+                        #   種別を記録する。銘柄からの推定はしない（誤確信になる）。
+                        category=getattr(state.get(_sym_j), "entry_ai_category", None) or None)
                     log.info(
                         f"[建玉台帳] 【{_sym_j}】 台帳の初回作成: 既存の建玉"
                         f"（{_sd} {int(abs(_q))}株）を Bot の建玉として登録しました"
@@ -11283,6 +11335,47 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     _ext_set_held(_sym_j, False)
                     if _sym_j in _absence_confirmed:
                         _ledger_unmark(_sym_j, trd_env)
+
+        # ★ v3.9.150 (認定サポーターの指摘 1-4): 建玉があるのに entry_time が
+        #   無い状態を、ここで自己修復する。
+        #   決済は「注文を出せた」時点で完了扱いにして entry_time を消すため、
+        #   その注文が後から未約定・取消・拒否になると、建玉が残っているのに
+        #   時間切れ監視だけが外れたままになる。戻す経路は起動時復元しか無く、
+        #   再起動しない限り復帰しなかった。毎回の同期で見て、必要なら戻す。
+        for _sym_h in ALL_TICKERS:
+            try:
+                _ts_h = state.get(_sym_h)
+                # ★ v3.9.150b: 決済注文が処理待ちの間は戻さない（Codexレビュー指摘）。
+                #   受付済みの指値が約定する前に時計を戻すと、次のリスク監視で
+                #   時間切れが再発火し、生きている決済注文を自分で取り消して
+                #   出し直す循環に入る（時間外の指値ほど当たりやすい）。
+                _pending_close_h = any(
+                    _i.get("is_close") and _i.get("symbol") == _sym_h
+                    for _i in _pending_orders.values()
+                )
+                if (_ts_h.position_qty != 0 and _ts_h.entry_time is None
+                        and not _pending_close_h
+                        and not _is_other_owner(_sym_h)
+                        and _ledger_has(_sym_h, trd_env)):
+                    # ★ v3.9.150c: _pending_orders はプロセスの記憶なので、再起動を
+                    #   またいだ決済注文を知らない（Codexレビュー指摘）。復元候補に
+                    #   なったときだけ（毎回の同期ではない）、証券会社側に生きている
+                    #   注文が無いかを確かめ、有れば復元を見送る（照会失敗も見送り）。
+                    if _has_live_broker_order(_sym_h, trd_env):
+                        log.info(
+                            f"[ポジション同期] 【{_sym_h}】 生きている注文があるため"
+                            f"時計の復元を見送ります（決済の処理待ちの可能性）"
+                        )
+                        continue
+                    _ts_h.entry_time = (_ledger_entry_time(_sym_h, trd_env)
+                                        or datetime.datetime.now())
+                    log.warning(
+                        f"[ポジション同期] 【{_sym_h}】 建玉が残っているのに時間切れの"
+                        f"時計が止まっていました → {_ts_h.entry_time:%m-%d %H:%M} で再開します"
+                        f"（決済注文が通らなかった可能性）"
+                    )
+            except Exception:
+                pass
         _ext_remind_if_due()
     except Exception as e:
         # ★ v3.9.130: 例外失敗も consecutive_fail に計上する。
@@ -11807,6 +11900,7 @@ async def _check_order_filled(
                     #   主経路は v3.9.120 で厳密化済みだったが、このリトライ経路だけ
                     #   旧判定が残っていた。部分約定は追跡に残し、watchdog に委ねる。
                     _is_part2 = ("part" in status2)
+                    _dq2 = 0.0   # ★ v3.9.150c: 変換失敗時の未定義参照を防ぐ（Codexレビュー指摘）
                     try:
                         _dq2 = float(_get_val(data2, "dealt_qty", 0) or 0)
                         if 0 < _dq2 < float(qty):
@@ -11814,6 +11908,19 @@ async def _check_order_filled(
                     except (TypeError, ValueError):
                         pass
                     if _is_part2:
+                        # ★ v3.9.150c: 追跡に残すだけでなく、残数も更新する
+                        #   （Codexレビュー指摘）。主経路（:11531 付近）は残数を
+                        #   書き戻すが、この経路は書いていなかったため、watchdog の
+                        #   再発注が元の株数（約定済みぶんを含む）で出て、
+                        #   売りすぎ・ドテンの恐れがあった。
+                        #   qty は発注時の株数のまま変わらないので、
+                        #   「qty - 約定済み」の上書きは何度通っても二重に引かない。
+                        try:
+                            if 0 < _dq2 < float(qty) and order_id in _pending_orders:
+                                _rem2 = max(0, int(round(float(qty) - _dq2)))
+                                _pending_orders[order_id]["qty"] = _rem2
+                        except (TypeError, ValueError):
+                            pass
                         log.warning(
                             f"{tag} [約定確認リトライ] 部分約定のため全約定として扱いません"
                             f"（status={status2} dealt={_get_val(data2, 'dealt_qty', '?')}/{qty}）"
@@ -13970,7 +14077,26 @@ async def pending_order_watchdog() -> None:
                         )
                     if ret == RET_OK and not data.empty:
                         status_str = str(data["order_status"].iloc[0]).upper()
-                        if any(s in status_str for s in ("FAILED", "CANCELLED", "DELETED", "REJECTED")):
+                        # ★ v3.9.150c: CANCELED（一L綴り）と DISABLED（失効）が漏れて
+                        #   いた（Codexレビュー指摘）。漏れると失効済みの注文が管理表に
+                        #   残り続け、その銘柄の時計復元（1-4 の自己修復）が永久に
+                        #   見送られる。共通ヘルパーで判定する。
+                        #   ただし FILLED（約定済み）は「取消済み」と同じに扱わない。
+                        #   ok=True で下の再発注ブロックに入ると、position 同期が
+                        #   追いつく前に残数があるように見えて二重決済しうる
+                        #   （Codexレビュー指摘・4回目）。約定済みは管理から外すだけ。
+                        if "FILLED_ALL" in status_str:
+                            # ★ v3.9.150c: 全約定だけを外す。FILLED_PART（部分約定）を
+                            #   ここで外すと、残数の決済がどの機構からも見えなくなる
+                            #   （Codexレビュー指摘・5回目）。部分約定は従来どおり
+                            #   管理に残し、タイムアウト時の既存機構で残数を扱う。
+                            log.info(
+                                f"【{sym}】 [watchdog] 注文は全約定済みでした → 管理から外します"
+                                f"（決済の反映は次の同期に任せます）: {order_id}"
+                            )
+                            _pending_orders.pop(order_id, None)
+                            continue
+                        if _is_terminal_order_status(status_str):
                             log.info(f"【{sym}】 [watchdog] {status_str}注文をリストから除去: {order_id}")
                             _pending_orders.pop(order_id, None)
                             ok = True  # 後続のis_close処理をスキップ
@@ -14673,7 +14799,10 @@ def place_close_all(
     ★ v2.99.2: 戻り値を bool に変更。
        True  = 1件以上の position_id で発注成功 (placed_orders >= 1)
        False = 全 position_id で発注失敗 / 対象ポジションなし / 早期 return
-       呼び出し側 (タイムアウト・損切り・トレール) はこの戻り値を見て
+       ★ v3.9.149/150: 呼び出し側は戻り値ではなく _take_close_result() の結果
+       （full / partial / unknown / owned / pending / failed）で判断する。
+       戻り値は後方互換のために残しているだけで、参照している箇所は無い。
+       旧記述: 呼び出し側 (タイムアウト・損切り・トレール) はこの戻り値を見て
        entry_time のクリア可否を判断する。失敗時に entry_time を残すことで
        次のリスク監視ループで再発動できるようにする。
     """
@@ -14750,9 +14879,17 @@ def place_close_all(
         qty = api_qty
 
     if qty == 0:
-        # ★ v3.9.149: 決済すべき建玉が無い＝この銘柄については完了している。
-        #   従来は False を返すだけで、呼び出し元は「失敗」と読んでいた。
-        _mark_close_result(symbol, "full")
+        # ★ v3.9.150: ここを "full" と名乗らせない（認定サポーターの指摘 1-2）。
+        #   証券会社の建玉照会は「本当に無い」と「今回は返ってこなかった」を
+        #   どちらも空で返すため、内部数量が 0 でも建玉が残っている場合がある。
+        #   v3.9.149 で "full" にしたせいで、一斉決済が残玉ごと完了扱いになり
+        #   週末停止へ進む（しかもログも通知も出ない）経路を作ってしまった。
+        #   "unknown" として、完了にも失敗にも倒さず呼び出し元に判断させる。
+        log.warning(
+            f"{tag} 決済対象の数量が 0 です。建玉照会の応答が欠けている可能性が"
+            f"あるため、完了扱いにしません（次の巡回で再確認します）"
+        )
+        _mark_close_result(symbol, "unknown")
         return False  # ★ v2.99.2: 対象なし
 
     # ── 方向判定と position_id 取得 ────────────────────────────────────────────
@@ -17322,6 +17459,71 @@ def _ovn_order(trd_env, side, qty: int, price: float, *, reserve: bool = False,
         return None, f"{type(e).__name__}: {_mask_secrets(e)}"
 
 
+def _has_live_broker_order(symbol: str, trd_env) -> bool:
+    """★ v3.9.150c: その銘柄に非終端の注文が証券会社側に残っているか。
+
+    entry_time（時間切れの時計）を復元する前の裏取りに使う。生きている決済注文が
+    あるのに時計を戻すと、時間切れが再発火してその注文を取り消して出し直す循環に
+    入る。照会に失敗したときは True（ある扱い）を返して復元を見送らせる（安全側・
+    次の同期で再挑戦できる）。
+    """
+    try:
+        with _trade_ctx() as _ctx_lo:
+            _r_lo, _df_lo = _ctx_lo.order_list_query(
+                trd_env=trd_env,
+                acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0))
+        if _r_lo != RET_OK:
+            return True
+        if _df_lo is None or _df_lo.empty:
+            return False
+        for _, _row_lo in _df_lo.iterrows():
+            _code_lo = str(_row_lo.get("code", ""))
+            if not _code_lo.endswith("." + symbol) and _code_lo != symbol:
+                continue
+            if not _is_terminal_order_status(_row_lo.get("order_status", "")):
+                return True
+        return False
+    except Exception:
+        return True
+
+
+def _order_status_snapshot(order_id: str, symbol: str, trd_env) -> tuple[str, int, str]:
+    """★ v3.9.150c: 任意の注文の状態・約定数を返す。照会失敗は UNKNOWN。
+
+    チェイサーが「取消失敗＝注文消滅」と誤認して管理表から落とさないための
+    裏取りに使う（Codexレビュー指摘）。実装は _ovn_order_status と同じ。
+    """
+    try:
+        with _trade_ctx() as ctx:
+            ret, df = ctx.order_list_query(
+                trd_env=trd_env, order_id=str(order_id),
+                acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0))
+        if ret == RET_OK and df is not None and not df.empty:
+            row = df.iloc[0]
+            return (str(row.get("order_status", "")).upper(),
+                    int(float(row.get("dealt_qty", 0) or 0)), "OK")
+        return "UNKNOWN", 0, str(df)
+    except Exception as e:
+        return "UNKNOWN", 0, f"{type(e).__name__}: {_mask_secrets(e)}"
+
+
+# ★ v3.9.150c: SDK (moomoo/common/constant.py OrderStatus) の語彙と突き合わせた終端集合。
+#   部分一致だと想定外の複合文字列を誤って終端扱いにして追跡から落とす恐れがある
+#   （Codexレビュー指摘）ため、完全一致にする。未知の値は非終端＝追跡を続ける安全側。
+#   FILLED_PART / CANCELLING_* / TIMEOUT は非終端（まだ動きうる・残数がある）。
+_TERMINAL_ORDER_STATUSES = frozenset({
+    "FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FILL_CANCELLED",
+    "SUBMIT_FAILED", "FAILED", "DELETED", "DISABLED",
+    # 旧版・環境差の表記ゆれも受ける（完全一致のまま語彙を足す）
+    "CANCELLED", "CANCELED", "REJECTED",
+})
+
+
+def _is_terminal_order_status(status: str) -> bool:
+    """★ v3.9.150c: 終端（取消済み・失敗・全約定・失効）か。UNKNOWN・未知は非終端扱い。"""
+    return str(status).strip().upper() in _TERMINAL_ORDER_STATUSES
+
+
 def _ovn_order_status(trd_env, order_id: str) -> tuple[str, int, str]:
     """注文状態・約定数を返す。照会失敗は UNKNOWN。"""
     try:
@@ -18357,8 +18559,23 @@ async def close_order_chaser() -> None:
                 # キャンセル
                 ok = _cancel_order(order_id, sym, trd_env, f"チェイス（旧${old_price:.2f}→新${new_price:.2f}）")
                 if not ok:
-                    # FAILEDならリストから除去するだけ
-                    _pending_orders.pop(order_id, None)
+                    # ★ v3.9.150c: 取消が失敗した＝注文が消えた、ではない
+                    #   （Codexレビュー指摘）。通信エラーや OpenD 側の失敗でも False が
+                    #   返るため、生きている決済注文を管理表から落としてしまい、
+                    #   「決済注文は無い」と誤認した監視が二重に決済を出しうる。
+                    #   終端（取消済み・失敗・約定）を照会で確認できたときだけ外す。
+                    _st_chk, _dealt_chk, _detail_chk = _order_status_snapshot(order_id, sym, trd_env)
+                    if _is_terminal_order_status(_st_chk):
+                        log.info(
+                            f"【{sym}】 🏃 取消は失敗しましたが、注文は終端です"
+                            f"（{_st_chk}）→ 管理から外します"
+                        )
+                        _pending_orders.pop(order_id, None)
+                    else:
+                        log.warning(
+                            f"【{sym}】 🏃 取消に失敗しました（状態={_st_chk}）→ 管理に残したまま"
+                            f"次の巡回で再確認します（二重決済の防止）"
+                        )
                     continue
 
                 # ★ v3.9.130: 軽い緩和 — 取消の「受付」を「完了」と即断せず、1回だけ
@@ -18367,7 +18584,10 @@ async def close_order_chaser() -> None:
                 #   「生きた決済2本 → 売りすぎ(5/27型ショート反転)」の恐れがある。
                 #   ・取消/失敗を確認     → 再発注（安全）
                 #   ・まだ生存 or 約定済み → 再発注しない（既存注文が有効 / 既に決済済み）
-                #   ・照会自体が失敗/不明 → 従来どおり再発注（現行動作と同等・悪化させない）
+                #   ・照会自体が失敗/不明 → ★ v3.9.150c: 再発注しない（Codexレビュー指摘）。
+                #     旧挙動の「不明なら再発注」は、取消が実際には通っていない注文と
+                #     新しい注文の2本が同時に生きる（5/27型の売りすぎ）方向に倒れていた。
+                #     不明のときは追跡に残したまま次の巡回で再確認する。
                 #   本格対応（非同期でのポーリング確認）は別途。ここは同期1回照会の軽量ガード。
                 _confirmed_gone = None
                 try:
@@ -18379,18 +18599,24 @@ async def close_order_chaser() -> None:
                         )
                     if _ret_cf == RET_OK and _data_cf is not None and not _data_cf.empty:
                         _st_cf = str(_data_cf["order_status"].iloc[0]).upper()
-                        if any(s in _st_cf for s in ("CANCELLED", "FAILED", "DELETED", "REJECTED")):
+                        # ★ v3.9.150c: CANCELED（一L）・DISABLED を追加（Codexレビュー指摘）。
+                        #   FILLED は入れない——約定済みに再発注したら二重決済になる。
+                        if any(s in _st_cf for s in
+                               ("CANCELLED", "CANCELED", "FAILED", "DELETED", "REJECTED", "DISABLED")):
                             _confirmed_gone = True   # 取消確定 → 再発注OK
                         else:
                             _confirmed_gone = False  # SUBMITTED/WAITING/FILLED等 → 再発注しない
                 except Exception as _e_cf:
-                    log.debug(f"【{sym}】 [チェイス] 取消確認の照会失敗（従来どおり再発注）: {_e_cf}")
+                    log.debug(f"【{sym}】 [チェイス] 取消確認の照会失敗（再発注せず次サイクルで再確認）: {_e_cf}")
 
-                if _confirmed_gone is False:
-                    # まだ生きている/約定済みを確認 → 二重決済回避のため今回は再発注を見送り。
-                    #   追跡には残置（pop しない）＝次の5秒サイクル/watchdogが引き続き扱える。
+                if _confirmed_gone is not True:
+                    # まだ生きている/約定済み、または照会が不明 → 二重決済回避のため
+                    # 今回は再発注を見送り。追跡には残置（pop しない）＝次の5秒サイクル/
+                    # watchdog が引き続き扱える。
+                    _why_cf = ("旧注文の取消が未完了/約定済みを確認" if _confirmed_gone is False
+                               else "旧注文の状態を確認できず")
                     log.warning(
-                        f"【{sym}】 🏃 チェイス: 旧注文の取消が未完了/約定済みを確認 "
+                        f"【{sym}】 🏃 チェイス: {_why_cf} "
                         f"→ 今回は再発注を見送り（二重決済防止・次サイクルで再評価）"
                     )
                     continue
@@ -18874,7 +19100,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                             ts.entry_time = None  # 全量決済できた → クリア
                                             ts._last_close_attempt_at = None
                                             _clear_failed_close(symbol)  # ★ v2.99.4
-                                        elif _res2 == "partial":
+                                        elif _res2 in ("partial", "unknown"):
                                             # ★ v3.9.149: 建玉が残っているので時計は戻さない。
                                             #   ただし発注自体は通っているので、60秒クール
                                             #   ダウンと決済失敗ロックは解く（Codexレビュー指摘）。
@@ -18972,7 +19198,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                     ts.entry_time = None
                                     ts._last_close_attempt_at = None
                                     _clear_failed_close(symbol)  # ★ v2.99.4
-                                elif _res3 == "partial":
+                                elif _res3 in ("partial", "unknown"):
                                     # ★ v3.9.149: 決済はまだ完了していないので
                                     #   forced_exits は数えない（Codexレビュー指摘）。
                                     #   発注は通っているのでクールダウンとロックは解く。
@@ -19130,7 +19356,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                             ts._last_close_attempt_at = None  # 成功時はクールダウン解除
                             ts.close_fail_count = 0          # ★ v3.9.31: 成功で失敗カウントリセット
                             _clear_failed_close(symbol)  # ★ v2.99.4
-                        elif _res == "partial":
+                        elif _res in ("partial", "unknown"):
                             # ★ v3.9.149: 残玉があるので時計を戻さない（次の巡回で再発動）。
                             #   完了していないので forced_exits も数えない。
                             ts._last_close_attempt_at = None
@@ -19468,7 +19694,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     async with _get_sym_lock(symbol):
                         _close_ok_lc = place_close_all(symbol, trd_env, f"{_exit_label}: ${pnl:.2f} ({loss_pct:.2f}%)")
                     _res_lc = _take_close_result(symbol)
-                    if _res_lc in ("full", "partial"):
+                    if _res_lc in ("full", "partial", "unknown"):
                         ts._last_close_attempt_at = None
                         _clear_failed_close(symbol)  # ★ v2.99.4
                         if _res_lc == "full":
@@ -19482,7 +19708,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                             log.warning(
                                 f"{tag} {_exit_label}は一部のみ決済しました → entry_time を維持します"
                             )
-                    elif (_why_lc := _res_lc):
+                    elif (_why_lc := _res_lc) in ("owned", "pending"):
                         # ★ v3.9.148: 見送りは発注失敗ではない（Codexレビュー指摘）。
                         #   アラート音と連続失敗カウントを進めると、実害が無いのに
                         #   重大通知や強制同期に至る。理由はそのまま出す。
@@ -19544,7 +19770,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                 f"トレイリングストップ: {label_peak}"
                             )
                         _res_tr = _take_close_result(symbol)
-                        if _res_tr in ("full", "partial"):
+                        if _res_tr in ("full", "partial", "unknown"):
                             ts._last_close_attempt_at = None
                             _clear_failed_close(symbol)  # ★ v2.99.4
                             if _res_tr == "full":
@@ -19555,7 +19781,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                     f"{tag} ★ トレイリングストップは一部のみ決済しました"
                                     f" → entry_time を維持します"
                                 )
-                        elif (_why_tr := _res_tr):
+                        elif (_why_tr := _res_tr) in ("owned", "pending"):
                             # ★ v3.9.148: 損切り経路と同じく、見送りは失敗に数えない。
                             log.info(
                                 f"{tag} ★ トレイリングストップは見送りました"
@@ -20148,33 +20374,12 @@ async def main(live: bool) -> None:
             f"最大発注額: {MOMENTUM_ORDER_SIZE_PCT}% (=${_BUDGET_USD * MOMENTUM_ORDER_SIZE_PCT / 100:.0f})"
             f"  ※シグナル強度で 50/75/100% に山型配分"
         )
-        # ── ★ v3.9.61: 実発注対象とリスク監視対象のズレ検証 ──────────────────
-        # 実発注される銘柄が監視系統 (risk_monitor / 週末決済 / panic) に
-        # 含まれていないと、損切り・タイムアウト・週末決済が効かない裸の
-        # ポジションが発生する (5/29 IWM orphan 事象)。起動時に検証して警告。
-        if MOMENTUM_LIVE_TRADING:
-            _monitored = (
-                {sym for syms in EXECUTION_MAP.values() for sym in syms}
-                | set(STOCK_TICKERS)
-                | set(EARNINGS_PRE_TICKERS) | set(EARNINGS_AFTER_TICKERS)
-                | _momentum_live_symbols()   # v3.9.61 で監視対象に自動取込済
-            )
-            _live_syms = _momentum_live_symbols()
-            _orphan = sorted(_live_syms - _monitored)
-            if _orphan:
-                # _momentum_live_symbols() を監視対象に含めているため通常ここには
-                # 到達しないが、将来のリファクタで漏れた場合の最終防衛線。
-                log.warning(
-                    f"  ⚠️ [整合性警告] モメンタム実発注対象 {_orphan} が"
-                    f" リスク監視対象に含まれていません。"
-                    f" 損切り/週末決済が効かない可能性 → .env の"
-                    f" MOMENTUM_ENABLED_SIDES か TRIGGER_TICKERS を確認してください。"
-                )
-            else:
-                log.info(
-                    f"  ✅ [整合性] モメンタム実発注対象 {sorted(_live_syms)} は"
-                    f" すべてリスク監視・週末決済の対象に含まれています。"
-                )
+        # ── ★ v3.9.61 / v3.9.150b: 実発注対象とリスク監視対象のズレ検証 ──────
+        # ここにあった検査は、監視集合に _momentum_live_symbols() を含めたうえで
+        # その同じ集合との差を取っていたため、設定の内容に関わらず必ず空集合に
+        # なっていた（A - (B ∪ A) = ∅・認定サポーターの指摘 2-2）。
+        # 「必ず成功する検査」は、守れていないことを隠す方向にしか働かないので撤去し、
+        # 起動時復元のあと（口座の実際の建玉が分かる地点）で検査する形に移した。
     else:
         log.info(f"  モメンタム機能: 無効")
     # ★ v2.99: 発注クールダウン設定の表示
@@ -20585,7 +20790,9 @@ async def main(live: bool) -> None:
                 # 台帳をこの環境で初めて作る起動。旧版は口座の建玉をすべて Bot の
                 # ものとして扱っていたので、初回だけその前提を引き継ぐ。これをしないと
                 # 建玉を持ったまま版を上げた利用者の損切りが一斉に止まる。
-                _ledger_mark(sym, trd_env, ts.entry_time)
+                _ledger_mark(
+                    sym, trd_env, ts.entry_time,
+                    category=getattr(ts, "entry_ai_category", None) or None)
                 log.warning(
                     f"[建玉台帳] 【{sym}】 台帳を新しく作りました: いま持っている建玉 "
                     f"({_pos_label} {abs(ts.position_qty)}株) は Bot の建玉として扱います"
@@ -20612,7 +20819,17 @@ async def main(live: bool) -> None:
                 # （従来は再起動のたびに現在時刻へリセットされ、時間切れの
                 #   時計が巻き戻っていた）。
                 _ext_set_held(sym, False)
-                if ts.entry_time is None:
+                # ★ v3.9.150c: 再起動をまたいで決済注文が生きていることがある
+                #   （_pending_orders はプロセスの記憶なので再起動で消える）。
+                #   同期側の自己修復と同じく、生きている注文がある間は時計を
+                #   戻さない（Codexレビュー指摘）。戻すのは注文が片付いてから
+                #   （自己修復が次の同期で拾う）。
+                if ts.entry_time is None and _has_live_broker_order(sym, trd_env):
+                    log.info(
+                        f"[起動時復元] {sym} に生きている注文があるため、時間切れの"
+                        f"時計はまだ戻しません（注文が片付き次第、同期が自動で戻します）"
+                    )
+                elif ts.entry_time is None:
                     ts.entry_time = _ledger_entry_time(sym, trd_env) or datetime.datetime.now()
                     # ★ v3.9.149: どの戦略で建てたかも戻す。これが無いと再起動後に
                     #   モメンタム建玉が通常建玉として扱われ、時間切れが 60分→10分に、
@@ -20648,6 +20865,43 @@ async def main(live: bool) -> None:
         # このあと利用者が手で建てた建玉まで Bot 建玉として取り込んでしまう。
         # 永続化失敗は上の ERROR/Discord で通知し、次回起動時は安全側に倒す。
         globals()["_ledger_first_run"] = False
+    # ── ★ v3.9.150b: 監視から外れている建玉が口座に無いかを検査する
+    #   （認定サポーターの指摘 2-2）。設定同士を比べる旧検査は必ず成功していた。
+    #   ここでは「直前の同期で口座に実在した銘柄」と「監視対象」を比べる。
+    #   照会は sync_positions が済ませているので、ここで再照会はしない。
+    try:
+        if not _account_scan_valid:
+            # ★ v3.9.150c: 照会が一度も完走していない＝検査できていない。
+            #   黙って通すと「検査済み」と誤読されるので、明示する（Codexレビュー指摘）。
+            log.warning(
+                "  ⚠️ [整合性] 建玉照会が完走していないため、監視対象の検査が"
+                "できていません（照会が回復し次第、次回の起動時に再検査されます）"
+            )
+        else:
+            _mon_syms = set(ALL_TICKERS) | _momentum_live_symbols()
+            _orphan_real = sorted(_account_symbols_seen - _mon_syms)
+            if _orphan_real:
+                log.warning(
+                    f"  ⚠️ [整合性警告] 口座の建玉 {_orphan_real} が監視対象に含まれていません。"
+                    f" 損切り・時間切れ・週末決済のいずれも効きません。"
+                    f" .env の TRIGGER_TICKERS / MOMENTUM_ENABLED_SIDES をご確認ください"
+                    f"（設定を変えたあとも建玉が残っている場合に起きます）"
+                )
+                _threadsafe_future(asyncio.to_thread(
+                    send_discord_message,
+                    f"⚠️ 【重要】監視されていない建玉があります: {', '.join(_orphan_real)}\n"
+                    f"損切り・時間切れ・週末決済のいずれも効きません。\n"
+                    f"設定（TRIGGER_TICKERS・モメンタムの実発注対象）を戻すか、"
+                    f"moomoo アプリで決済してください。"
+                ))
+            else:
+                log.info(
+                    f"  ✅ [整合性] 口座の建玉はすべて監視対象です"
+                    f"（{len(_account_symbols_seen)}銘柄・建玉なしも確認済み）"
+                )
+    except Exception as _e_chk:
+        log.debug(f"[整合性検査] スキップ: {_mask_secrets(_e_chk)}")
+
     if restored:
         total = get_tracked_portfolio_total()
         log.info(f"[起動時復元] 既存ポジションを検出・復元: {', '.join(restored)}")
@@ -21173,7 +21427,10 @@ def run_daily_data_collect(log_path: str = "moomoo_trade_v1.log",
 
     TS  = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
     # .env で設定された全銘柄から動的に生成（レバレッジETF固定値は使用しない）
-    SYM = r"(" + "|".join(re.escape(t) for t in sorted(ALL_TICKERS)) + r")"
+    # ★ v3.9.150: 夜間持ち越しの確定損益行は OVN_SYMBOL（固定）で出るため、
+    #   TRIGGER_TICKERS に QQQ が無い設定だと拾えなかった（認定サポーターの指摘）。
+    _sym_pool = sorted(set(ALL_TICKERS) | ({OVN_SYMBOL} if OVN_ENABLED else set()))
+    SYM = r"(" + "|".join(re.escape(t) for t in _sym_pool) + r")"
     pats = {
         "ts":    re.compile(rf"^{TS}"),
         # ★ v3.9.144: SHORT を追加（認定サポーターの指摘）。発注ログは
