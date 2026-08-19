@@ -170,7 +170,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.150"
+BOT_VERSION = "v3.9.151"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -4647,7 +4647,9 @@ def _notify_alert_discord(event_key: str) -> None:
     クールダウン判定もロックで排他（同時発火時の二重送信防止）。外部AIレビュー指摘。"""
     if not DISCORD_WEBHOOK_URL:
         return
-    now = datetime.datetime.now()
+    # ★ v3.9.151: 表示に「JST」と付けるので、実体も JST にする（認定サポーターの指摘）。
+    #   従来はマシンのローカル時刻で、日本以外の環境では表示がずれていた。
+    now = datetime.datetime.now(JST)
     with _ALERT_DISCORD_LOCK:
         last = _alert_discord_last_sent.get(event_key)
         if last is not None and (now - last).total_seconds() < _ALERT_DISCORD_COOLDOWN_SEC:
@@ -4670,10 +4672,14 @@ def _notify_alert_discord(event_key: str) -> None:
         pass
 
 
-def _play_alert_sound(event_key: str) -> None:
+def _play_alert_sound(event_key: str, notify_discord: bool = True) -> None:
     """重大イベント時にアラート音を再生する。 デフォルト無効 / クールダウン / 夜間ミュート対応。
-    ★ v3.9.119: 同じ6条件で Discord 通知も送る（音設定と独立・上の _notify_alert_discord）。"""
-    _notify_alert_discord(event_key)   # ★ v3.9.119: 音が無効でも Discord には通知
+    ★ v3.9.119: 同じ条件で Discord 通知も送る（音設定と独立・上の _notify_alert_discord）。
+    ★ v3.9.151: notify_discord=False で音だけにできる（認定サポーターの指摘）。
+    401 認証エラーは専用の正しい文面を別途送っているのに、ここが event_key の
+    「クレジット切れ検知」ラベルでもう1通送り、実態と食い違う通知が届いていた。"""
+    if notify_discord:
+        _notify_alert_discord(event_key)   # ★ v3.9.119: 音が無効でも Discord には通知
     if not ENABLE_ALERT_SOUND:
         return
     if _is_alert_quiet_hours():
@@ -7757,6 +7763,85 @@ def _is_auth_error(exc: Exception) -> bool:
         return False
 
 
+def _is_billing_error(exc: Exception) -> bool:
+    """★ v3.9.151: 支払い情報の問題（402 billing_error）判定（認定サポーターの指摘）。
+
+    「前払いクレジットの残高切れ（400・文字列で検知済み）」とは別物で、
+    自動チャージのカード失効・決済失敗などで起きる。SDK に専用の例外クラスが
+    無いため（anthropic 0.102.0 で確認）、status_code で判定する。
+    """
+    try:
+        if getattr(exc, "status_code", None) == 402:
+            return True
+        return "billing_error" in str(exc).lower()
+    except Exception:
+        return False
+
+
+_anthropic_billing_last_discord_at: Optional["datetime.datetime"] = None
+
+
+def _handle_anthropic_billing_error(exc: Exception) -> None:
+    """★ v3.9.151: 402（支払い情報の問題）の通知。初回は即時・以後30分おき。
+
+    従来はどの分岐にも掛からず log.error のみで、AI 判定が止まっているのに
+    利用者が気づけなかった（認定サポーターの指摘）。
+    """
+    # ★ v3.9.151b: 「初回は即時」の判定をやめ、30分クールダウン一本にする
+    #   （Codexレビュー指摘）。成功と失敗が交互に起きる状態で「初回」が毎回
+    #   立て直され、クールダウンを素通しして通知が氾濫するため。
+    #   一度も通知していなければ即時に送られる（last が None のため）。
+    global _anthropic_billing_last_discord_at
+    now = datetime.datetime.now()
+    log.error(f"[Anthropic] 支払い情報エラー(402)を検知: {_mask_secrets(exc)}")
+    due = (_anthropic_billing_last_discord_at is None
+           or (now - _anthropic_billing_last_discord_at).total_seconds() >= 1800)
+    if due:
+        _anthropic_billing_last_discord_at = now
+        try:
+            _threadsafe_discord(
+                "🚨 【緊急】 Anthropic API 支払いエラー(402) を検知しました。\n"
+                "AI（ニュース）判定が停止中です。クレジット残高ではなく、"
+                "お支払い情報（カードの失効・決済失敗など）が原因の可能性があります。\n\n"
+                "▼ 対応\n"
+                "　1. https://console.anthropic.com/settings/billing でお支払い情報を確認\n"
+                "　2. カードの更新・再決済のうえ、しばらく待つと自動で再開します\n\n"
+                "※ 損切り/トレール/時間切れ決済は通常どおり動作しています。"
+            )
+        except Exception as _e:
+            log.debug(f"[支払いエラー] Discord 通知失敗: {_e}")
+
+
+# ★ v3.9.151: 分類できない AI 判定エラーの連続失敗カウンタ（認定サポーターの提案）。
+#   既知の形（残高・401・400・402）の列挙は、Anthropic 側が文言やステータスを
+#   変えると穴が開く。「知らないものが来たら鳴る」形を health_warning_loop に足す。
+#   429/5xx/接続エラー（SDK が自動再試行する一時的なもの）は数えない。
+_ai_unclassified_fail: dict = {
+    "consecutive": 0,
+    "last_error": "",
+    "last_status": None,
+    "last_discord_at": None,
+}
+
+
+def _note_ai_unclassified_failure(exc: Exception) -> None:
+    _status = getattr(exc, "status_code", None)
+    # 一時的・再試行対象は数えない: 429 / 5xx / 接続エラー（status を持たない APIError）。
+    # ★ 解析エラー（JSONDecodeError 等・APIError ではない）は status が無くても数える
+    #   —— 応答は返っているのに使えない＝「AI 判定が機能していない」状態のため。
+    if _status == 429 or (isinstance(_status, int) and _status >= 500):
+        return
+    if _status is None and isinstance(exc, anthropic.APIError):
+        return  # 接続断など。SDK が再試行する
+    _ai_unclassified_fail["consecutive"] = int(_ai_unclassified_fail.get("consecutive", 0)) + 1
+    _ai_unclassified_fail["last_status"] = _status
+    _ai_unclassified_fail["last_error"] = _mask_secrets(exc)[:120]
+
+
+def _reset_ai_unclassified_failure() -> None:
+    _ai_unclassified_fail["consecutive"] = 0
+
+
 def _handle_anthropic_auth_error(exc: Exception) -> None:
     """★ v3.9.113: 認証エラー(401)を検知→初回に端末バナー＋Discord、継続中は30分おきに再通知。"""
     global _anthropic_auth_failed, _anthropic_auth_last_discord_at
@@ -7792,7 +7877,9 @@ def _handle_anthropic_auth_error(exc: Exception) -> None:
         except Exception as _e:
             log.debug(f"[認証エラー] Discord 通知失敗: {_e}")
         try:
-            _play_alert_sound("credit_exhausted")
+            # ★ v3.9.151: 音だけ鳴らす。Discord は上の 401 専用文面 1 通に集約
+            #   （credit_exhausted のラベルで送ると「クレジット切れ」と誤読される）。
+            _play_alert_sound("credit_exhausted", notify_discord=False)
         except Exception:
             pass
 
@@ -10293,12 +10380,24 @@ async def analyze_news(
             global _anthropic_credit_last_probe_at
             _anthropic_credit_last_probe_at = None
         _handle_anthropic_auth_recovery()   # ★ v3.9.113: 認証エラーからの回復を通知
+        _reset_ai_unclassified_failure()    # ★ v3.9.151: 成功で連続失敗カウンタを戻す
         return result
     except (json.JSONDecodeError, KeyError, AssertionError) as e:
+        # ★ v3.9.151: 解析エラーも「AI 判定が機能していない」状態なので数える
+        #   （Codexレビュー指摘）。応答形式の変更などで続けて失敗したら鳴る。
+        _note_ai_unclassified_failure(e)
         log.warning(f"[{trigger_symbol}] AI レスポンス解析エラー: {e}  raw={raw!r}")
         return {"score": 0, "confidence": 0.0, "horizon": "unknown",
                 "reason": "解析エラー（中立扱い）", "beneficiaries": [], "victims": []}
     except anthropic.APIError as e:
+        # ★ v3.9.151: 402（支払い情報の問題）は最初に見る（Codexレビュー指摘）。
+        #   下の残高判定は文字列一致なので、402 の本文が同じ語を含むと誤routeされる。
+        #   status_code による判定を文字列判定より先に置く。
+        if _is_billing_error(e):
+            _handle_anthropic_billing_error(e)
+            return {"score": 0, "confidence": 0.0, "horizon": "unknown",
+                    "reason": "Anthropic API 支払いエラー402（中立スキップ）",
+                    "beneficiaries": [], "victims": []}
         # ★ v3.3.0: クレジット切れを文字列マッチで検知 (BadRequestError も APIError 配下)
         if _is_credit_exhausted_error(e):
             _handle_credit_exhausted(e)
@@ -10338,6 +10437,9 @@ async def analyze_news(
                     "reason": "Anthropic API 認証エラー401（中立スキップ）",
                     "beneficiaries": [], "victims": []}
         # クレジット切れ・認証エラー以外の API エラーは従来通り
+        # ★ v3.9.151: どの分岐にも当たらなかった＝分類できない失敗として数える。
+        #   連続すると health_warning_loop が原因を問わず警告する。
+        _note_ai_unclassified_failure(e)
         log.error(f"[{trigger_symbol}] Anthropic API エラー: {e}")
         return {"score": 0, "confidence": 0.0, "horizon": "unknown",
                 "reason": f"APIエラー: {e}", "beneficiaries": [], "victims": []}
@@ -15260,7 +15362,13 @@ async def panic_sell_all(
     reason: str,
 ) -> None:
     # ★ v3.9.61: モメンタム実発注銘柄も panic sell 対象に含める (LONG 監視漏れ防止)
-    exec_syms = {sym for syms in EXECUTION_MAP.values() for sym in syms} | _momentum_live_symbols()
+    # ★ v3.9.151: 個別株・決算銘柄も含める（認定サポーターの指摘）。従来この関数だけが
+    #   STOCK_TICKERS / EARNINGS_* を含んでおらず、急落時に個別株・決算銘柄のロング
+    #   だけが逃げ遅れる形だった（意図的でないことを確認済み）。
+    exec_syms = ({sym for syms in EXECUTION_MAP.values() for sym in syms}
+                 | set(STOCK_TICKERS)
+                 | set(EARNINGS_PRE_TICKERS) | set(EARNINGS_AFTER_TICKERS)
+                 | _momentum_live_symbols())
     # ★ v3.9.15: LONG (position_qty > 0) のみを panic sell 対象にする。
     # 旧 v2.98 では SHORT (qty<0) も対象にしていたが、5/13 認定サポーター環境で
     # 「高 conf ネガニュース → 新規 SHORT 発注 → 直後に panic_sell_all で自分の
@@ -15268,6 +15376,16 @@ async def panic_sell_all(
     # 本来 panic_sell の意図は「悪材料で LONG を急いで切る」ことなので、SHORT は
     # 既にネガティブシグナルへの応答ポジションのため panic で閉じる必要なし。
     targets = [sym for sym in exec_syms if state.get(sym).position_qty > 0]
+    # ★ v3.9.151: Bot 以外の建玉（OVN・手動）は place_close_all が入口で見送るため、
+    #   通知を組む前にここで除いておく（Codexレビュー指摘）。除かないと
+    #   「決済します」と告知した銘柄に実際は手を出さない食い違いが起きる。
+    _skipped_owned_ps = [sym for sym in targets if _is_other_owner(sym)]
+    targets = [sym for sym in targets if not _is_other_owner(sym)]
+    if _skipped_owned_ps:
+        log.info(
+            f"[パニックセル] 対象外（Bot 以外の建玉）: {', '.join(_skipped_owned_ps)}"
+            f" — これらは決済しません"
+        )
 
     if not targets:
         log.info(f"[パニックセル] {trigger_symbol} → 決済対象 LONG ポジションなし")
@@ -18342,10 +18460,42 @@ async def health_warning_loop() -> None:
                         )
                     except Exception as _e_ds:
                         log.debug(f"[sync_positions] 30分Discord通知失敗: {_e_ds}")
+            # ── ④ ★ v3.9.151: 分類できない AI 判定エラーの連続失敗（認定サポーターの提案）─
+            #   既知の形（残高400・認証401・支払い402）の列挙は、Anthropic 側の変更で
+            #   穴が開く。原因が分からなくても「続けて失敗している」こと自体で鳴らす。
+            #   一時的なもの（429/5xx/接続エラー）はカウンタ側で除外済み。
+            _ai_fail_n = int(_ai_unclassified_fail.get("consecutive", 0))
+            if _ai_fail_n >= 3:
+                _ai_st = _ai_unclassified_fail.get("last_status")
+                _ai_msg = _ai_unclassified_fail.get("last_error", "")
+                log.error(
+                    f"⚠️ [AI判定] 分類できないエラーが {_ai_fail_n} 回連続しています"
+                    f"（status={_ai_st} / 直近: {_ai_msg}）"
+                    f" → AI 判定が止まっている可能性があります"
+                )
+                _ai_last_disc = _ai_unclassified_fail.get("last_discord_at")
+                if (_ai_last_disc is None
+                        or (datetime.datetime.now() - _ai_last_disc).total_seconds() >= 1800):
+                    _ai_unclassified_fail["last_discord_at"] = datetime.datetime.now()
+                    try:
+                        _threadsafe_discord(
+                            f"⚠️ 【要確認】AI（ニュース）判定が続けて失敗しています"
+                            f"（{_ai_fail_n} 回連続）\n"
+                            f"原因を特定できないエラーです（status={_ai_st}）\n"
+                            f"直近のエラー: {_ai_msg}\n"
+                            f"AI 判定が止まっている間、ニュース起点の発注は行われません。\n"
+                            f"（損切り/トレール/時間切れ決済は通常どおり動作しています・"
+                            f"本通知は30分おき）"
+                        )   # ★ v3.9.151: ①〜③と同じ fire-and-forget（Codexレビュー指摘）
+                    except Exception as _e_ai_ds:
+                        log.debug(f"[AI判定] 30分Discord通知失敗: {_e_ai_ds}")
         except asyncio.CancelledError:
             raise
         except Exception as _e:
-            log.debug(f"[health_warning] ループ例外 (継続): {_mask_secrets(_e)}")
+            # ★ v3.9.151 (1b-3): debug だと端末に一切出ず、この周回の後続チェックが
+            #   飛んだことにも気づけない（認定サポーターの指摘）。「気づかせるための
+            #   ループ」が同じ形で気づけなくなる構造だったので、warning に上げる。
+            log.warning(f"[health_warning] ループ例外 (継続): {_mask_secrets(_e)}")
         await asyncio.sleep(300)  # 5 分間隔
 
 
