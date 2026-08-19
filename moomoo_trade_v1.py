@@ -170,7 +170,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.151"
+BOT_VERSION = "v3.9.152"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -672,10 +672,18 @@ _obs_buffer_lock = threading.Lock()
 # env `OBS_NEWS_SAMPLE_PCT`（0〜100・既定30）で調整可。100で従来どおり全件。
 def _parse_pct_env(key: str, default: float) -> float:
     try:
-        return max(0.0, min(100.0, float(os.environ.get(key, "").strip())))
+        _v = float(os.environ.get(key, "").strip())
+        if not math.isfinite(_v):   # ★ v3.9.152: NaN が clamp を素通りする（Codexレビュー指摘）
+            return default
+        return max(0.0, min(100.0, _v))
     except (ValueError, TypeError):
         return default
 OBS_NEWS_SAMPLE_PCT = _parse_pct_env("OBS_NEWS_SAMPLE_PCT", 30.0)
+# ★ v3.9.152: 仮想損切り 狭/広 の計測サンプリング率（認定サポーターNの提案）。
+#   v3.9.110 で撤去した仮想列を、損切り幅プロファイルの実発注適用（P1-1）の
+#   判断根拠を作るために期間限定で復活させる。GAS 負荷を抑えるため既定30%。
+#   0 で停止・100 で全件。列は GAS 側に残っているので受け皿はそのまま。
+OBS_VEXIT_SAMPLE_PCT = _parse_pct_env("OBS_VEXIT_SAMPLE_PCT", 30.0)
 # 常に全件記録する（サンプリング対象外の）シャドー段階。
 _OBS_FULL_STAGES = {
     "momentum_shadow", "trend_filter_ab", "premarket_filter_ab", "forced_stop_ab",
@@ -1004,7 +1012,8 @@ def _vexit_trail_drop(mfe_pct: float) -> Optional[float]:
 
 
 def _compute_virtual_exits(entry_price: float, side_sign: int,
-                           decision_time_et: "datetime.datetime", bars: list) -> dict:
+                           decision_time_et: "datetime.datetime", bars: list,
+                           symbol: str = "", is_momentum: bool = False) -> dict:
     """仮想exit算出（観測ログ専用・実決済は不変）。bars=[{"ts":datetime(ET naive),"close":float}]。
     ★ v3.9.110: シャドー軽量化（RSI反転/損切り狭・広/金曜フラグ/計測メモ等を撤去）。
     ★ v3.9.116: 「③15分撤退」も計測終了（5週集計で最下位＝不採用と結論）。
@@ -1018,6 +1027,22 @@ def _compute_virtual_exits(entry_price: float, side_sign: int,
         "mfe_trail_pnl_pct": None,   # ① MFE可変トレール適用後 PnL%（★ v3.9.116 復活）
         "mfe_trail_min":     None,   # ① 決済までの保有分（トレール未発火なら窓末=60分）
     }
+    # ★ v3.9.152: 仮想損切り 狭/広 を復活（サンプリング付き・認定サポーターNの提案）。
+    #   狭 = 現行のモメンタム実発注と同じ幅（MOMENTUM_STOP_LOSS_PCT・全銘柄共通）
+    #   広 = 同じ基準値に銘柄別倍率を掛けた幅（Wizard [5b] が意図していた幅）
+    #   これで「SMH の損切りを広げていたらどうなっていたか」を実データで比較できる。
+    #   v3.9.110 が撤去した際の根拠（v3.9.32 で実装済＝検証完了）は、モメンタム
+    #   実発注については成立していなかった（P1-1）。判断根拠を作り直す。
+    _vexit_sampled = False
+    try:
+        import random as _rnd_vx   # ファイル全体の流儀に合わせて関数内 import
+        if is_momentum and symbol and OBS_VEXIT_SAMPLE_PCT > 0 and (
+                OBS_VEXIT_SAMPLE_PCT >= 100 or _rnd_vx.random() * 100.0 < OBS_VEXIT_SAMPLE_PCT):
+            _vexit_sampled = True
+            out["stop_narrow_pnl_pct"] = None
+            out["stop_wide_pnl_pct"] = None
+    except Exception:
+        _vexit_sampled = False
     try:
         if not entry_price or entry_price <= 0:
             return out
@@ -1030,8 +1055,37 @@ def _compute_virtual_exits(entry_price: float, side_sign: int,
         if not fwd:
             return out
 
-        # ── ① MFE可変トレール（含み益ピークから段階幅で追従・60分窓）★ v3.9.116 復活 ──
+        # ── ★ v3.9.152: 仮想損切り 狭/広（60分窓・発火しなければ窓末決済）──────
         bars60 = [b for b in fwd if (b["ts"] - decision_time_et).total_seconds() <= 60 * 60]
+        if _vexit_sampled and bars60:
+            _stop_narrow = float(MOMENTUM_STOP_LOSS_PCT)                       # 例 0.50
+            # ★ v3.9.152b: 広は「標準プロファイルの倍率」に固定する（Codexレビュー指摘）。
+            #   _symbol_loss_mult() は利用者が選んだプロファイルに依存するため、
+            #   narrow を選んだ人の「広」列が狭めの倍率になり、フリート横断の
+            #   比較（46-47列の集計）が壊れる。全員同じ定義で測る。
+            _stop_wide = float(MOMENTUM_STOP_LOSS_PCT) * float(
+                _MOMENTUM_STOP_MULT.get("standard", {}).get(symbol, 1.0))  # 例 SMH 1.50
+            # ★ v3.9.152b: 窓末の採用は「60分近くまでデータがある」ときだけ
+            #   （Codexレビュー指摘）。足が途中で切れているのに最後の足を
+            #   「60分保有の結果」として記録すると、実質数分の値が混ざる。
+            _window_ok = (bars60[-1]["ts"] - decision_time_et).total_seconds() >= 55 * 60
+            for _key, _stop in (("stop_narrow_pnl_pct", _stop_narrow),
+                                ("stop_wide_pnl_pct", _stop_wide)):
+                _res = None
+                for b in bars60:
+                    # ★ v3.9.152b: 到達判定は足の中の最悪値で見る（Codexレビュー指摘）。
+                    #   LONG は安値・SHORT は高値。終値だけだと足中の到達を見逃す。
+                    _worst = b["low"] if side_sign > 0 else b["high"]
+                    if ret_pct(_worst) <= -_stop:
+                        _res = round(-_stop, 4)   # 約定はしきい値で近似（実運用の指値相当）
+                        break
+                if _res is None:
+                    if _window_ok:
+                        _res = round(ret_pct(bars60[-1]["close"]), 4)   # 窓末（≒60分保有）
+                    # 窓が不完全なら None のまま（発火も窓末も確定できない）
+                out[_key] = _res
+
+        # ── ① MFE可変トレール（含み益ピークから段階幅で追従・60分窓）★ v3.9.116 復活 ──
         if bars60:
             _peak = -999.0
             for b in bars60:
@@ -1046,9 +1100,13 @@ def _compute_virtual_exits(entry_price: float, side_sign: int,
                     break
             else:
                 # トレール未発火（未起動含む）→ 窓末で決済（≒60分保有）
-                out["mfe_trail_pnl_pct"] = round(ret_pct(bars60[-1]["close"]), 4)
-                out["mfe_trail_min"] = round(
-                    (bars60[-1]["ts"] - decision_time_et).total_seconds() / 60.0, 1)
+                # ★ v3.9.152b: 窓が55分に届いていない（データが途中で切れている）
+                #   ときは記録しない（Codexレビュー指摘）。数分ぶんの値を
+                #   「60分保有の結果」として混ぜない。狭/広の窓ガードと同じ扱い。
+                if (bars60[-1]["ts"] - decision_time_et).total_seconds() >= 55 * 60:
+                    out["mfe_trail_pnl_pct"] = round(ret_pct(bars60[-1]["close"]), 4)
+                    out["mfe_trail_min"] = round(
+                        (bars60[-1]["ts"] - decision_time_et).total_seconds() / 60.0, 1)
     except Exception:
         pass
     return out
@@ -1106,9 +1164,24 @@ def _compute_and_send_observation_pnl(obs_id: str, info: dict) -> None:
                 price = float(row["close"])
             except (KeyError, ValueError, TypeError):
                 continue
-            if price <= 0:
+            if price <= 0 or not math.isfinite(price):
+                # ★ v3.9.152b: NaN は `<= 0` をすり抜ける（比較が常に偽・Codexレビュー指摘）
                 continue
-            _bars.append({"ts": ts_et, "close": price})
+            # ★ v3.9.152b: 仮想損切りの判定用に高値/安値も持つ（Codexレビュー指摘）。
+            #   終値だけだと足の中での到達を見逃す。取れない足は close で代用（従来同等）。
+            try:
+                _hi = float(row.get("high", price) or price)
+                _lo = float(row.get("low", price) or price)
+            except (ValueError, TypeError):
+                _hi = _lo = price
+            if not math.isfinite(_hi) or _hi <= 0:
+                _hi = price
+            if not math.isfinite(_lo) or _lo <= 0:
+                _lo = price
+            # 壊れた OHLC（高値<終値など）は終値で挟んで整合させる
+            _hi = max(_hi, price)
+            _lo = min(_lo, price)
+            _bars.append({"ts": ts_et, "close": price, "high": _hi, "low": _lo})
             for m, target in targets.items():
                 cur = nearest[m]
                 if cur is None or abs((ts_et - target).total_seconds()) < abs((cur["ts"] - target).total_seconds()):
@@ -1143,6 +1216,13 @@ def _compute_and_send_observation_pnl(obs_id: str, info: dict) -> None:
         #   v3.9.110で下流未使用の反実仮想列を撤去し、継続計測の「15分撤退」のみ算出。
         _vexit = _compute_virtual_exits(
             float(price_at_decision), int(side_sign), decision_time_et, _bars,
+            symbol=symbol,
+            # ★ v3.9.152b: 狭/広の計測はモメンタム観察に限定（Codexレビュー指摘）。
+            #   ニュース観察に混ぜると 46-47 列の分析が汚れる。
+            # block_stage は pending の top-level ではなく entry の中に入っている
+            # （:951 で payload に積まれ、それが entry として保持される）。
+            is_momentum=(str(((info.get("entry") or {}).get("block_stage", ""))
+                             or info.get("block_stage", "")) == "momentum_shadow"),
         )
 
         # ── GAS 送信 ──
@@ -1166,6 +1246,13 @@ def _compute_and_send_observation_pnl(obs_id: str, info: dict) -> None:
                 # ★ v3.9.110: 5分/15分PnLは下流未使用のため送信停止（60分のみ）
                 "pnl_60min":      pnl_results.get("pnl_60min"),
             }
+            # ★ v3.9.152b: 旧式更新経路には仮想exit（mfe_trail_* / 狭・広）を載せない。
+            #   GAS の更新経路（_applyObsPnlToRow_）はゲートを開くと 31-39 列を
+            #   まとめて書き直し、欠けている項目を空文字で「消して」しまうため
+            #   （Codexレビュー指摘）。旧pending（再起動前の残り）はごく少数なので、
+            #   狭/広の計測は統合経路（エントリあり）だけで行う。
+            for _k_vx in ("stop_narrow_pnl_pct", "stop_wide_pnl_pct"):
+                _vexit.pop(_k_vx, None)
             _pnl_data.update(_vexit)
             _buffer_obs_pnl(_pnl_data)   # 旧pending(entryなし)のみ更新送信
             log.debug(f"[観察PnL] {obs_id} バッファ追加(更新・旧式) {symbol} 60m={pnl_results.get('pnl_60min')}")
@@ -3907,6 +3994,11 @@ except ValueError:
 #   高ボラ銘柄ほど手数料に勝ちやすくエッジの主力（SMH SHORT）のため、サイズを削らない。
 #   1トレード損失の総量は日次/週次サーキットブレーカーで管理する。
 #   ※ ニュース系（qty自動計算）の place_buy/short 内 ÷_symbol_loss_mult は従来どおり維持。
+#   ★ v3.9.152 訂正: この倍率がモメンタム実発注の損切りに効くという記述が方針文書・
+#     Wizard に残っていたが、実装ではモメンタム実発注は MOMENTUM_STOP_LOSS_PCT
+#     （全銘柄共通）のみで動作しており、倍率はシャドー計測・ニュース系にしか
+#     効いていない（認定サポーターNの指摘・シートの実発火分布でも確認済み）。
+#     実発注への適用可否は 46-47 列（仮想損切り 狭/広）の計測結果で判断する。
 _MOMENTUM_STOP_MULT = {
     "narrow":   {"SMH": 2.0, "QQQ": 1.4, "SPY": 1.0, "DRAM": 1.4, "IWM": 0.7},
     "standard": {"SMH": 3.0, "QQQ": 2.0, "SPY": 1.3, "DRAM": 2.0, "IWM": 1.0},
