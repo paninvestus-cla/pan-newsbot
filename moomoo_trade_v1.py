@@ -170,7 +170,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.154"
+BOT_VERSION = "v3.9.155"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -1690,6 +1690,13 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
             "デモはネッティング空売り有効 (DEMO_SHORT_ENABLED=true)" if DEMO_SHORT_ENABLED
             else "デモ口座では SHORT は約定不可 (DEMO_SHORT_ENABLED=false) のため BUY サイドのみ実発注"
         )
+        # ★ v3.9.155: select_v1（SHORTのみ）×デモSHORT無効では「BUYサイドのみ実発注」が
+        #   誤りになる（BUY は live-eligible に無い＝実発注ゼロ）。:20899 と同じ注記に揃える。
+        if MOMENTUM_PROFILE_SELECT and not DEMO_SHORT_ENABLED:
+            _demo_short_note = (
+                "デモ口座では SHORT は約定不可 (DEMO_SHORT_ENABLED=false)。"
+                "select_v1 は SHORT のみ実発注のため、この組み合わせでは実発注は発生しません"
+            )
         # ★ v3.9.154: ここも絞り込み後の実効サイドを出す（認定サポーターの指摘§4）。
         #   v3.9.153 で直したのは log.info 側（:20775）だけで、田中さんが引用された
         #   この log.warning は env の生値のまま＝直前の「SPY除外」の行と矛盾していた。
@@ -9686,7 +9693,8 @@ def _build_skip_regex(keywords, ignorecase: bool) -> "re.Pattern":
             #   同じ判断が AI_FORCE_KEYWORDS 側（:5857 の v2.88 コメント）にもある。
             #   ★ 子音+y で終わる語は y→ies（celebrity→celebrities・Codexレビュー指摘）。
             if len(kw) >= 2 and kw[-1] == "y" and kw[-2] not in "aeiou":
-                pat = pat[:-len(re.escape("y"))] + r"(?:y|ies)\b"
+                # ★ v3.9.155: 固有名詞は -ys 複数（Grammys/Emmys）になるため両方許す
+                pat = pat[:-len(re.escape("y"))] + r"(?:y|ys|ies)\b"
             else:
                 pat = pat + r"(?:e?s)?\b"
         else:
@@ -11035,6 +11043,11 @@ def get_quote(symbol: str) -> dict:
     #   代替に使った場合は False にして、ログと呼び出し側で区別できるようにする
     #   （認定サポーターの指摘§5）。
     _quote_from_book = True
+    # ★ v3.9.155: ask/bid が「独立に観測された両側の気配」か（新規Claudeレビュアーの指摘）。
+    #   スプレッド検査の適用軸はこちら。板でなくても LV1・Alpaca の ask/bid は実在の
+    #   気配なので検査対象に残す。last で片側でも埋めた合成値だけを検査対象外にする
+    #   （合成値は ask==bid で spread が必ず 0 になり、検査が意味を持たないため）。
+    _quote_two_sided = True
     try:
         # ★ v2.90: with _quote_ctx() による自動 close。早期 return / 例外でも
         # __exit__ が呼ばれて ctx.close() が確実に実行される。
@@ -11166,9 +11179,11 @@ def get_quote(symbol: str) -> dict:
                 if ask <= 0:
                     ask = last
                     _quote_from_book = False
+                    _quote_two_sided = False   # ★ v3.9.155: 合成値
                 if bid <= 0:
                     bid = last
                     _quote_from_book = False
+                    _quote_two_sided = False
 
         # ★ v2.90: with ブロックを抜けた時点で ctx.close() 済み
         # 以降の return は ctx を使わないため with の外に配置（フォールバック含む）
@@ -11182,17 +11197,21 @@ def get_quote(symbol: str) -> dict:
                 # ★ v3.9.154: 板が取れなかった回。文面を分けて集計できるようにする。
                 #   （LV1 の ask/bid で埋めた場合と last で埋めた場合の両方を含む）
                 log.debug(f"[get_quote] {symbol}: 板なし→LV1/last代替 ask=${ask:.2f} bid=${bid:.2f} → ${last:.2f}")
-            return {"ask": ask, "bid": bid, "last": last, "from_book": _quote_from_book}
+            return {"ask": ask, "bid": bid, "last": last,
+                    "from_book": _quote_from_book, "two_sided": _quote_two_sided}
 
         # ── ORDER_BOOK が取れなかった場合: get_stock_quote の値 ──────────────
         if last > 0:
             if ask <= 0:
                 ask = last
                 _quote_from_book = False
+                _quote_two_sided = False   # ★ v3.9.155: 合成値
             if bid <= 0:
                 bid = last
                 _quote_from_book = False
-            return {"ask": ask, "bid": bid, "last": last, "from_book": _quote_from_book}
+                _quote_two_sided = False
+            return {"ask": ask, "bid": bid, "last": last,
+                    "from_book": _quote_from_book, "two_sided": _quote_two_sided}
 
         # ── Alpaca にフォールバック ───────────────────────────────────────────
         if ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY:
@@ -11202,8 +11221,11 @@ def get_quote(symbol: str) -> dict:
                 _quote_from_book = False   # ★ v3.9.154: Alpaca 由来は板ではない
                 log.debug(f"[get_quote] {symbol}: OpenD取得失敗 → Alpaca ${last:.2f}")
                 # ★ v3.9.154: 板由来ではないので spread 検査の対象外にする
+                # ★ v3.9.155: Alpaca の ask/bid は実在の両側気配。板ではないが
+                #   スプレッド検査の対象に残す（新規Claudeレビュアーの指摘——
+                #   OpenD 不調時こそ板薄ガードが要る場面なのに外れていた）。
                 return {"ask": _alp["ask"], "bid": _alp["bid"], "last": last,
-                        "from_book": False}
+                        "from_book": False, "two_sided": True}
 
         # ── 最終フォールバック: Finnhub ──────────────────────────────────────
         if FINNHUB_API_KEY:
@@ -11212,15 +11234,23 @@ def get_quote(symbol: str) -> dict:
                 log.debug(f"[get_quote] {symbol}: OpenD/Alpaca失敗 → Finnhub ${finn_price:.2f}")
                 # ★ v3.9.154: ask=bid=last の合成値。spread 検査は意味を持たない
                 return {"ask": finn_price, "bid": finn_price, "last": finn_price,
-                        "from_book": False}
+                        "from_book": False, "two_sided": False}
 
-        return {"ask": ask, "bid": bid, "last": last, "from_book": _quote_from_book}
+        # ★ v3.9.155b: ここに来るのは全ソース枯渇（または片側だけの板）のとき。
+        #   初期値 True のままだと「有効な両側気配」という偽の契約を返す
+        #   （Codexレビュー指摘）。値の実態からフラグを作り直す。
+        if not (ask > 0 and bid > 0):
+            _quote_from_book = False
+            _quote_two_sided = False
+        return {"ask": ask, "bid": bid, "last": last,
+                "from_book": _quote_from_book, "two_sided": _quote_two_sided}
 
     except Exception as e:
         # ★ v2.90: with _quote_ctx() が __exit__ で ctx.close() を保証するため、
         # 旧コードにあった「except 内での明示的な ctx.close()」は不要になった。
         log.warning(f"[価格取得] {symbol}: {e}")
-        return {"ask": 0.0, "bid": 0.0, "last": 0.0, "from_book": False}
+        return {"ask": 0.0, "bid": 0.0, "last": 0.0,
+                "from_book": False, "two_sided": False}
 
 
 def unlock_trade_if_needed(trd_env: TrdEnv) -> bool:
@@ -13644,21 +13674,22 @@ def _quote_sanity_ok(symbol: str, quote: dict):
             if dev > QUOTE_SANITY_DEVIATION_PCT:
                 return False, (f"現値 ${price:.2f} が直近基準 ${ref:.2f} から "
                                f"{dev:.1f}% 乖離 (上限 {QUOTE_SANITY_DEVIATION_PCT:.0f}%)")
-        # ★ v3.9.154: スプレッド検査は板（ORDER_BOOK）由来のときだけ意味を持つ
-        #   （認定サポーターの指摘§5-2）。板が空で last を ask/bid の代替に使った回は
-        #   ask == bid になり spread が必ず 0 ＝ 検査が素通りする。
-        #   「広くないから安全」ではなく「測れていない」ので、そう記録する。
-        _from_book = bool(quote.get("from_book", True))
-        if QUOTE_SANITY_SPREAD_PCT > 0 and ask > 0 and bid > 0 and _from_book:
+        # ★ v3.9.154/155: スプレッド検査は「両側が独立に観測された気配」のときだけ
+        #   意味を持つ（認定サポーターの指摘§5-2＋新規Claudeレビュアーの指摘）。
+        #   last で埋めた合成値は ask == bid になり spread が必ず 0 ＝ 素通りする。
+        #   逆に、板でなくても LV1・Alpaca の ask/bid は実在の気配なので検査に残す
+        #   （v3.9.154 は from_book を軸にしており、Alpaca 経由の板薄を見逃していた）。
+        _two_sided = bool(quote.get("two_sided", quote.get("from_book", True)))
+        if QUOTE_SANITY_SPREAD_PCT > 0 and ask > 0 and bid > 0 and _two_sided:
             mid = (ask + bid) / 2.0
             spread = (ask - bid) / mid * 100.0 if mid > 0 else 0.0
             if spread > QUOTE_SANITY_SPREAD_PCT:
                 return False, (f"スプレッド過大 {spread:.2f}% > {QUOTE_SANITY_SPREAD_PCT:.2f}% "
                                f"(板薄の可能性 bid ${bid:.2f}/ask ${ask:.2f})")
-        elif QUOTE_SANITY_SPREAD_PCT > 0 and not _from_book:
+        elif QUOTE_SANITY_SPREAD_PCT > 0 and not _two_sided:
             log.debug(
-                f"[気配値検査] 板が取れていないためスプレッド判定を省略"
-                f"（ask=${ask:.2f} bid=${bid:.2f}・板由来でないため判定不能）"
+                f"[気配値検査] 両側の気配が観測できていないためスプレッド判定を省略"
+                f"（ask=${ask:.2f} bid=${bid:.2f}・合成値のため判定不能）"
             )
         return True, ""
     except Exception:
@@ -15815,6 +15846,12 @@ async def process_headlines(
                             client, trd_env_real, _rsym, [_h],
                             bypass_filter=True,
                             already_deduped=True,   # ★ v3.9.154: 上の new で判定済み
+                            # ★ v3.9.155: 決算銘柄は決算用しきい値（既定0.80）で判定する
+                            #   （新規Claudeレビュアーの指摘）。渡さないと通常の0.75で
+                            #   判定されるうえ、このルートが scope 付き既読を先に付ける
+                            #   ため、決算監視ループの0.80判定が二度と走らなくなる。
+                            thresh_override=(EARNINGS_CONFIDENCE
+                                             if _rsym in _all_earnings else None),
                         )
                     )
                     break  # 1ニュースにつき最初にマッチした1銘柄のみルーティング
@@ -20869,6 +20906,11 @@ async def main(live: bool) -> None:
                 )
                 _prof_note = "（select_v1 絞り込み後）"
             _mom_note = f"実発注対象サイド={_eff_sides}{_prof_note} (それ以外はシャドー記録のみ)"
+            # ★ v3.9.155: select_v1（SHORTのみ）×デモのSHORT無効 の組み合わせでは
+            #   実発注が発生しない。表示が食い違って見える件（新規Claudeレビュアーの指摘）。
+            if (MOMENTUM_PROFILE_SELECT and not DEMO_SHORT_ENABLED
+                    and trd_env == TrdEnv.SIMULATE):
+                _mom_note += "（※この組み合わせでは実発注は発生しません: SHORT無効のデモ）"
         else:
             _mom_hdr = "モメンタム: シャドー観察モード (Phase 0・実発注なし)"
             _mom_note = "全シグナルを観察ログに記録 (実発注なし)"
