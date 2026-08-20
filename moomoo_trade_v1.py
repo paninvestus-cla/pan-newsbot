@@ -170,7 +170,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.153"
+BOT_VERSION = "v3.9.154"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -1690,8 +1690,21 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
             "デモはネッティング空売り有効 (DEMO_SHORT_ENABLED=true)" if DEMO_SHORT_ENABLED
             else "デモ口座では SHORT は約定不可 (DEMO_SHORT_ENABLED=false) のため BUY サイドのみ実発注"
         )
+        # ★ v3.9.154: ここも絞り込み後の実効サイドを出す（認定サポーターの指摘§4）。
+        #   v3.9.153 で直したのは log.info 側（:20775）だけで、田中さんが引用された
+        #   この log.warning は env の生値のまま＝直前の「SPY除外」の行と矛盾していた。
+        _live_sides_disp = sorted(MOMENTUM_ENABLED_SIDES)
+        _live_sides_note = ""
+        if MOMENTUM_PROFILE_SELECT:
+            _live_sides_disp = sorted(
+                sd for sd in MOMENTUM_ENABLED_SIDES
+                if sd.endswith(":SELL_SHORT")
+                and sd.split(":", 1)[0] not in _SELECT_V1_EXCLUDED_SYMBOLS
+            )
+            _live_sides_note = "（select_v1 絞り込み後）"
         log.warning(
-            f"[モメンタム] ⚡ 実発注モード有効: live-eligible サイド {sorted(MOMENTUM_ENABLED_SIDES)} "
+            f"[モメンタム] ⚡ 実発注モード有効: live-eligible サイド {_live_sides_disp}"
+            f"{_live_sides_note} "
             f"を実発注します (上記以外のサイド・銘柄はシャドー記録のみ。{_demo_short_note})"
         )
         # ★ v3.9.67: 実発注対象 vs リスク監視対象を起動時に明示 (認定サポーター指摘対応)
@@ -9666,7 +9679,18 @@ def _build_skip_regex(keywords, ignorecase: bool) -> "re.Pattern":
         if kw[:1].isalnum():
             pat = r"\b" + pat
         if kw[-1:].isalnum():
-            pat = pat + r"\b"
+            # ★ v3.9.154: 複数形も落とす（認定サポーターの指摘§2）。
+            #   キーワード表は olympic / esport / movie のように単数形で登録されており、
+            #   旧実装（部分一致）は複数形を自動的に拾えていた。\b を付けた時点で
+            #   その前提が外れ、Olympics / esports / movies が通るようになっていた。
+            #   同じ判断が AI_FORCE_KEYWORDS 側（:5857 の v2.88 コメント）にもある。
+            #   ★ 子音+y で終わる語は y→ies（celebrity→celebrities・Codexレビュー指摘）。
+            if len(kw) >= 2 and kw[-1] == "y" and kw[-2] not in "aeiou":
+                pat = pat[:-len(re.escape("y"))] + r"(?:y|ies)\b"
+            else:
+                pat = pat + r"(?:e?s)?\b"
+        else:
+            pat = pat + ""
         parts.append(pat)
     return re.compile("|".join(parts), re.IGNORECASE if ignorecase else 0)
 
@@ -11007,6 +11031,10 @@ def get_quote(symbol: str) -> dict:
     整合させて可読性を向上。挙動は完全に同一。
     """
     code = to_moomoo_code(symbol)
+    # ★ v3.9.154: 返した ask/bid が板（ORDER_BOOK）由来かどうか。板が空で last を
+    #   代替に使った場合は False にして、ログと呼び出し側で区別できるようにする
+    #   （認定サポーターの指摘§5）。
+    _quote_from_book = True
     try:
         # ★ v2.90: with _quote_ctx() による自動 close。早期 return / 例外でも
         # __exit__ が呼ばれて ctx.close() が確実に実行される。
@@ -11119,19 +11147,28 @@ def get_quote(symbol: str) -> dict:
                         last = cur
 
                     # ask_price / bid_price が ORDER_BOOK より精度が高い場合は補完
+                    # ★ v3.9.154: get_stock_quote で補完した側は板由来ではない
+                    #   （Codexレビュー指摘）。片側でも補完したらフラグを落とす。
                     if ask <= 0 and ask_sq > 0:
                         ask = ask_sq
+                        _quote_from_book = False
                     if bid <= 0 and bid_sq > 0:
                         bid = bid_sq
+                        _quote_from_book = False
                 except (KeyError, IndexError, TypeError, AttributeError, ValueError) as ex:
                     # ValueError も明示的に捕捉（float('N/A') 対策）
                     log.warning(f"[get_quote] {symbol}: get_stock_quote パース失敗 ({type(ex).__name__}: {ex})")
                     last = 0.0
                 # OrderBook が空だった場合は last を ask/bid の代替に使う
+                # ★ v3.9.154: 代替で埋めたことを記録する（認定サポーターの指摘§5）。
+                #   従来はここで ask=bid=last になり、返却ログも板由来と同じ文面
+                #   だったため、ログから板の取得可否を判定できなかった。
                 if ask <= 0:
                     ask = last
+                    _quote_from_book = False
                 if bid <= 0:
                     bid = last
+                    _quote_from_book = False
 
         # ★ v2.90: with ブロックを抜けた時点で ctx.close() 済み
         # 以降の return は ctx を使わないため with の外に配置（フォールバック含む）
@@ -11139,37 +11176,51 @@ def get_quote(symbol: str) -> dict:
         # ── OpenD ORDER_BOOK が有効なら即リターン（最優先）────────────────────
         if ask > 0 and bid > 0:
             last = (ask + bid) / 2.0
-            log.debug(f"[get_quote] {symbol}: OpenD ORDER_BOOK ask=${ask:.2f} bid=${bid:.2f} → ${last:.2f}")
-            return {"ask": ask, "bid": bid, "last": last}
+            if _quote_from_book:
+                log.debug(f"[get_quote] {symbol}: OpenD ORDER_BOOK ask=${ask:.2f} bid=${bid:.2f} → ${last:.2f}")
+            else:
+                # ★ v3.9.154: 板が取れなかった回。文面を分けて集計できるようにする。
+                #   （LV1 の ask/bid で埋めた場合と last で埋めた場合の両方を含む）
+                log.debug(f"[get_quote] {symbol}: 板なし→LV1/last代替 ask=${ask:.2f} bid=${bid:.2f} → ${last:.2f}")
+            return {"ask": ask, "bid": bid, "last": last, "from_book": _quote_from_book}
 
         # ── ORDER_BOOK が取れなかった場合: get_stock_quote の値 ──────────────
         if last > 0:
-            if ask <= 0: ask = last
-            if bid <= 0: bid = last
-            return {"ask": ask, "bid": bid, "last": last}
+            if ask <= 0:
+                ask = last
+                _quote_from_book = False
+            if bid <= 0:
+                bid = last
+                _quote_from_book = False
+            return {"ask": ask, "bid": bid, "last": last, "from_book": _quote_from_book}
 
         # ── Alpaca にフォールバック ───────────────────────────────────────────
         if ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY:
             _alp = get_quote_alpaca(symbol)
             if _alp["ask"] > 0 and _alp["bid"] > 0:
                 last = (_alp["ask"] + _alp["bid"]) / 2.0
+                _quote_from_book = False   # ★ v3.9.154: Alpaca 由来は板ではない
                 log.debug(f"[get_quote] {symbol}: OpenD取得失敗 → Alpaca ${last:.2f}")
-                return {"ask": _alp["ask"], "bid": _alp["bid"], "last": last}
+                # ★ v3.9.154: 板由来ではないので spread 検査の対象外にする
+                return {"ask": _alp["ask"], "bid": _alp["bid"], "last": last,
+                        "from_book": False}
 
         # ── 最終フォールバック: Finnhub ──────────────────────────────────────
         if FINNHUB_API_KEY:
             finn_price = get_price_finnhub(symbol)
             if finn_price > 0:
                 log.debug(f"[get_quote] {symbol}: OpenD/Alpaca失敗 → Finnhub ${finn_price:.2f}")
-                return {"ask": finn_price, "bid": finn_price, "last": finn_price}
+                # ★ v3.9.154: ask=bid=last の合成値。spread 検査は意味を持たない
+                return {"ask": finn_price, "bid": finn_price, "last": finn_price,
+                        "from_book": False}
 
-        return {"ask": ask, "bid": bid, "last": last}
+        return {"ask": ask, "bid": bid, "last": last, "from_book": _quote_from_book}
 
     except Exception as e:
         # ★ v2.90: with _quote_ctx() が __exit__ で ctx.close() を保証するため、
         # 旧コードにあった「except 内での明示的な ctx.close()」は不要になった。
         log.warning(f"[価格取得] {symbol}: {e}")
-        return {"ask": 0.0, "bid": 0.0, "last": 0.0}
+        return {"ask": 0.0, "bid": 0.0, "last": 0.0, "from_book": False}
 
 
 def unlock_trade_if_needed(trd_env: TrdEnv) -> bool:
@@ -13593,12 +13644,22 @@ def _quote_sanity_ok(symbol: str, quote: dict):
             if dev > QUOTE_SANITY_DEVIATION_PCT:
                 return False, (f"現値 ${price:.2f} が直近基準 ${ref:.2f} から "
                                f"{dev:.1f}% 乖離 (上限 {QUOTE_SANITY_DEVIATION_PCT:.0f}%)")
-        if QUOTE_SANITY_SPREAD_PCT > 0 and ask > 0 and bid > 0:
+        # ★ v3.9.154: スプレッド検査は板（ORDER_BOOK）由来のときだけ意味を持つ
+        #   （認定サポーターの指摘§5-2）。板が空で last を ask/bid の代替に使った回は
+        #   ask == bid になり spread が必ず 0 ＝ 検査が素通りする。
+        #   「広くないから安全」ではなく「測れていない」ので、そう記録する。
+        _from_book = bool(quote.get("from_book", True))
+        if QUOTE_SANITY_SPREAD_PCT > 0 and ask > 0 and bid > 0 and _from_book:
             mid = (ask + bid) / 2.0
             spread = (ask - bid) / mid * 100.0 if mid > 0 else 0.0
             if spread > QUOTE_SANITY_SPREAD_PCT:
                 return False, (f"スプレッド過大 {spread:.2f}% > {QUOTE_SANITY_SPREAD_PCT:.2f}% "
                                f"(板薄の可能性 bid ${bid:.2f}/ask ${ask:.2f})")
+        elif QUOTE_SANITY_SPREAD_PCT > 0 and not _from_book:
+            log.debug(
+                f"[気配値検査] 板が取れていないためスプレッド判定を省略"
+                f"（ask=${ask:.2f} bid=${bid:.2f}・板由来でないため判定不能）"
+            )
         return True, ""
     except Exception:
         return True, ""   # ガード自体の例外で発注を止めない（fail-open）
@@ -15753,6 +15814,7 @@ async def process_headlines(
                         process_stock_news(
                             client, trd_env_real, _rsym, [_h],
                             bypass_filter=True,
+                            already_deduped=True,   # ★ v3.9.154: 上の new で判定済み
                         )
                     )
                     break  # 1ニュースにつき最初にマッチした1銘柄のみルーティング
@@ -15812,16 +15874,31 @@ async def process_headlines(
     # ── ★ v3.9.8: ③' 正規化ヘッドライン重複チェック ────────────────────────
     # TOPIC_KEYWORDS では拾えない「同一ヘッドラインの繰り返し配信」を 60 分 dedup。
     # Yahoo Finance が GUID 更新で同一記事を 5 分おきに再配信するパターン等を吸収。
-    # 1 件目のヘッドラインが新規かを判定し、既出ならバッチ全体をスキップ。
+    # ★ v3.9.154: 1件ずつ選別する（認定サポーターの指摘§3）。
+    #   旧実装は先頭1件が既出ならバッチ全体を捨てており、同じバッチに入っていた
+    #   新規の見出しも巻き添えで失われていた。個別株側（v3.9.153）と同じ形に揃える。
+    #   記録側も先頭しか mark していなかったため、2件目以降は dedup 辞書に
+    #   一度も入っていなかった（この層が守れていたのは実質「先頭の見出し」だけ）。
     if texts:
-        _hl_seen, _hl_elapsed, _hl_hits = state.check_headline_seen(texts[0])
-        if _hl_seen:
-            log.info(
-                f"[正規化重複] {_hl_elapsed // 60}分前と同一ヘッドライン (累計 {_hl_hits + 1} 件目) "
-                f"→ AI 呼出スキップ: {texts[0][:120]!r}"
-            )
-            state.mark_headline_seen(texts[0])  # hit_count をインクリメント
+        _fresh_h, _fresh_t = [], []
+        for _h_i, _t_i in zip(new, texts):
+            _hl_seen, _hl_elapsed, _hl_hits = state.check_headline_seen(_t_i)
+            if _hl_seen:
+                log.info(
+                    f"[正規化重複] {_hl_elapsed // 60}分前と同一ヘッドライン (累計 {_hl_hits + 1} 件目) "
+                    f"→ AI 呼出スキップ: {_t_i[:120]!r}"
+                )
+                state.mark_headline_seen(_t_i)  # hit_count をインクリメント
+                continue
+            # ★ v3.9.154: 印は判定と同時に付ける（Codexレビュー指摘・個別株側と同型）。
+            #   AI 呼出（await）の後に付けると、その間に別フィードの同一見出しが
+            #   「未見」と判定され、二重に AI へ回る。
+            state.mark_headline_seen(_t_i)
+            _fresh_h.append(_h_i)
+            _fresh_t.append(_t_i)
+        if not _fresh_t:
             return
+        new, texts = _fresh_h, _fresh_t
 
     # ── AI判定：トリガーに関係なく1回だけ実行（コスト1/3）────────────────────
     # カテゴリ（SEMI/TECH/MACRO）で発注対象ETFを決めるため、トリガー銘柄は不要
@@ -15837,12 +15914,19 @@ async def process_headlines(
         _mkt_ctx = build_market_context()
         if _mkt_ctx:
             log.debug(f"[市場文脈] AI に文脈付与: {_mkt_ctx[:120]}...")
-        result = await analyze_news(client, texts, "SHARED", market_context=_mkt_ctx)
+        # ★ v3.9.154: 既読の印は上の選別時に付与済み（reserve）。AI 呼出が例外で
+        #   落ちたら戻す（個別株側と同じ形・Codexレビュー指摘）。
+        try:
+            result = await analyze_news(client, texts, "SHARED", market_context=_mkt_ctx)
+        except BaseException:
+            for _t_r in texts:
+                try:
+                    state.unmark_headline_seen(_t_r)
+                except Exception:
+                    pass
+            raise
         state.set_ai_cache("SHARED", result, texts)
         state.mark_topic_seen(texts)  # ③ 判定後にトピックを記録
-        # ★ v3.9.8: 正規化ヘッドラインも記録 (次回以降の同一テキスト判定で dedup される)
-        if texts:
-            state.mark_headline_seen(texts[0])
 
     score         = result["score"]
     confidence    = result["confidence"]
@@ -16416,6 +16500,7 @@ async def process_stock_news(
     articles: List[SimpleNamespace],
     thresh_override: Optional[float] = None,
     bypass_filter: bool = False,
+    already_deduped: bool = False,
 ) -> None:
     """
     個別株のニュースをAIに送り、その銘柄を直接売買する。
@@ -16470,7 +16555,17 @@ async def process_stock_news(
     # 重複排除
     # bypass_filter=True（決算監視経由）はheadline prefixフィルタをスキップ。
     # process_headlinesが先読みしてprefixを"既読"にしても個別株AIを止めない。
-    if bypass_filter:
+    if already_deduped:
+        # ★ v3.9.154: 呼び出し元が同じ記事で既に is_new_article を通している場合だけ、
+        #   ここでの articleId 判定を飛ばす（認定サポーターの指摘§1）。
+        #   is_new_article は「判定と同時に既読へ記録する」副作用を持つため、
+        #   直行ルート（process_headlines →ここ）では必ず False になり、
+        #   個別株AIに一度も到達していなかった。
+        #   ★ 決算監視ループ（:17023/:17038）は毎回フィードから取り直すため
+        #   この引数は渡さない。渡すと同じ記事を毎ポーリング再判定してしまう
+        #   （Codexレビュー指摘・重複発注の恐れ）。
+        new = list(articles)
+    elif bypass_filter:
         new = [a for a in articles if state.is_new_article(a.articleId)]
     else:
         new = [a for a in articles if state.is_new_article(a.articleId)
