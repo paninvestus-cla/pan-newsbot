@@ -170,7 +170,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.152"
+BOT_VERSION = "v3.9.153"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -2120,7 +2120,7 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     _mom_qty = max(1, int(hypothetical_order_usd / price))
                     log.warning(
                         f"[モメンタム実発注] {symbol} {side} {_mom_qty}株 "
-                        f"(想定 ${hypothetical_order_usd:,.0f}) → 発注実行"
+                        f"(想定 ${hypothetical_order_usd:,.0f}) → 発注試行"
                     )
                     try:
                         _place_fn = place_buy if side == "BUY" else place_short
@@ -6104,17 +6104,23 @@ class GlobalState:
         h = _re.sub(r'\s+', ' ', h.lower().strip())
         return hashlib.sha1(h.encode('utf-8')).hexdigest()[:16]
 
-    def check_headline_seen(self, headline: str) -> tuple[bool, int, int]:
+    def check_headline_seen(self, headline: str, scope: str = "SHARED") -> tuple[bool, int, int]:
         """正規化ヘッドラインが TTL 以内に既出か判定。
 
         戻り値: (is_duplicate, elapsed_seconds, total_seen_count)
           - is_duplicate: True なら 60 分以内に同一正規化キーを判定済み
           - elapsed_seconds: 前回判定からの経過秒数 (新規時は 0)
           - total_seen_count: このキーで今まで何回 dedup されたか (新規時は 0)
+
+        ★ v3.9.153 (B-1): scope でルート別に既読を分ける（認定サポーターNの指摘）。
+        通常News（SPY/QQQ/SMH に効くか）と個別株（この銘柄に直接関係するか）は
+        AI への問いが違うのに既読を共有していたため、先着する通常News側の印で
+        個別株側が全滅していた（受講生実測: 新着8件→AI判定0件）。
+        既定 "SHARED" なので既存の呼び出しはそのまま動く。
         """
         if not headline:
             return False, 0, 0
-        key = self._normalize_headline_key(headline)
+        key = scope + ":" + self._normalize_headline_key(headline)
         now = datetime.datetime.now()
         cutoff = now - datetime.timedelta(seconds=self.HEADLINE_DEDUP_TTL_SEC)
         # 期限切れエントリーを削除 (メモリリーク対策)
@@ -6128,11 +6134,18 @@ class GlobalState:
             return True, elapsed, entry.get("hit_count", 0)
         return False, 0, 0
 
-    def mark_headline_seen(self, headline: str) -> None:
+    def unmark_headline_seen(self, headline: str, scope: str = "SHARED") -> None:
+        """★ v3.9.153: 付けた既読の印を取り消す（AI 呼出が例外で落ちた時の巻き戻し用）。"""
+        if not headline:
+            return
+        key = scope + ":" + self._normalize_headline_key(headline)
+        self.seen_normalized_headlines.pop(key, None)
+
+    def mark_headline_seen(self, headline: str, scope: str = "SHARED") -> None:
         """ヘッドラインを正規化して dedup 辞書に記録 (or hit_count をインクリメント)。"""
         if not headline:
             return
-        key = self._normalize_headline_key(headline)
+        key = scope + ":" + self._normalize_headline_key(headline)
         now = datetime.datetime.now()
         entry = self.seen_normalized_headlines.get(key)
         if entry is None:
@@ -6149,9 +6162,13 @@ class GlobalState:
         lines = []
         for sym, ts in self.tickers.items():
             if ts.total_orders > 0:
+                # ★ v3.9.153: forced_exits は強制損切りと時間切れの合算カウンタで、
+                #   total_orders は新規と決済の両方を数える。旧ラベル（発注=・損切=）は
+                #   実際より悪い決済ミックスに見えた（認定サポーターの指摘）。
                 lines.append(
-                    f"  {sym}: 発注={ts.total_orders} "
-                    f"損切={ts.forced_exits} トレール={ts.trail_exits} パニック={ts.panic_exits}"
+                    f"  {sym}: 注文数(新規+決済)={ts.total_orders} "
+                    f"強制決済(損切+時間切れ)={ts.forced_exits} "
+                    f"トレール={ts.trail_exits} パニック={ts.panic_exits}"
                 )
         return "\n".join(lines) if lines else "  (取引なし)"
 
@@ -9594,6 +9611,113 @@ def _check_noise_pattern(headline: str) -> Optional[str]:
     return None
 
 
+# ── ★ v3.9.153: ニュース除外キーワード（単語境界つき・認定サポーターNの指摘A）──
+# 旧実装は関数内 set の部分一致（kw in lower）だったため、
+#   i[nfl]ation / f[actor]y / up[dating] など13語で市場ニュースを誤って除外していた。
+# Win365 の実測（8/17-19・約40時間）では 'nfl' 165件のうち75%が
+# inflation/inflow/conflict 系＝FOMC・CPI・中東情勢の見出しだった。
+# 方針（PAN決定 2026-08-20）:
+#   ・全語を単語境界つきの正規表現に（"disney+" "f1 race" は境界を付けない側を自動判定）
+#   ・スポーツ略号（NFL等）は大文字完全一致のみ（"NFL"は落ち"inflation"は通る）
+#   ・director / beauty / oscar / diet はフレーズ化（Oscar Health・e.l.f. Beauty 等の
+#     実在ティッカー材料と、取締役（director）関連の開示を誤って落とさない）
+_SKIP_KEYWORDS_CI = {
+    # スポーツ（略号以外）
+    "soccer", "tennis", "golf", "olympic", "super bowl", "world cup",
+    "basketball", "baseball", "football", "hockey", "esport",
+    "formula 1", "f1 race", "boxing",
+    # エンタメ・メディア
+    "hollywood", "movie", "film", "box office", "celebrity",
+    "oscar nomination", "oscar award", "oscars ceremony",
+    "grammy", "emmy", "billboard", "album", "concert", "tour", "singer",
+    "actor", "actress", "film director", "movie director",
+    "entertainment", "streaming show", "netflix show", "disney+", "tv show",
+    "podcast host",
+    # ライフスタイル・個人向け
+    "lifestyle", "music", "fashion", "beauty pageant", "beauty influencer",
+    "wellness", "diet plan", "weight loss",
+    "gen z", "millennial", "baby boomer", "student loan", "university",
+    "college tuition", "retirement planning", "saving tips", "career advice",
+    "personal finance", "home buying tips", "dating", "relationship",
+    # ノイズ人物・コメンテーター
+    "jim cramer", "elon musk twitter", "celebrity investor",
+    # 政治・社会（市場無関係のもの）
+    "abortion", "immigration policy", "gun control", "lgbtq",
+    "protest march", "local election", "mayor", "governor race",
+    "school board", "city council",
+    # その他ノイズ
+    "horoscope", "lottery", "casino jackpot", "weather forecast",
+    "traffic report", "recipe", "travel tips", "vacation",
+}
+# 大文字完全一致のみで落とす略号（IGNORECASE を使わない）
+_SKIP_ACRONYMS_CS = {"NFL", "NBA", "MLB", "NHL", "UFC", "FIFA"}
+
+
+def _build_skip_regex(keywords, ignorecase: bool) -> "re.Pattern":
+    """除外キーワードを単語境界つきの1本の正規表現にまとめる。
+
+    先頭/末尾が英数字のときだけ \b を付ける（"disney+" を壊さないため）。
+    長い順に並べ、複数該当時にログへ出る語を最長一致で安定させる
+    （旧実装は set 反復のため実行ごとに変わり得た）。実装は認定サポーターNの案。
+    """
+    parts = []
+    for kw in sorted(keywords, key=len, reverse=True):
+        pat = re.escape(kw)
+        if kw[:1].isalnum():
+            pat = r"\b" + pat
+        if kw[-1:].isalnum():
+            pat = pat + r"\b"
+        parts.append(pat)
+    return re.compile("|".join(parts), re.IGNORECASE if ignorecase else 0)
+
+
+_SKIP_REGEX_CI = _build_skip_regex(_SKIP_KEYWORDS_CI, ignorecase=True)
+_SKIP_REGEX_CS = _build_skip_regex(_SKIP_ACRONYMS_CS, ignorecase=False)
+
+
+def _match_skip_keyword(headline: str) -> "Optional[str]":
+    """除外キーワードに当たれば当たった語を返す（当たらなければ None）。"""
+    m = _SKIP_REGEX_CI.search(headline)
+    if m:
+        return m.group(0).lower()
+    m = _SKIP_REGEX_CS.search(headline)
+    if m:
+        return m.group(0)
+    return None
+
+
+# ★ v3.9.153 (B-3): ティッカー直行ルート用の社名エイリアス（認定サポーターNの指摘）。
+#   見出しは "Nvidia" のような社名表記が大半で、"NVDA" では拾えなかった。
+#   ここに無い銘柄はティッカーそのもので照合する（従来どおり）。
+# ★ v3.9.153b: 一般名詞と衝突する社名は入れない（Codexレビュー指摘）。
+#   "ORACLE"（Oracle of Omaha＝バフェット記事で頻出）・"APPLE"（Big Apple）・
+#   "AMAZON"（熱帯雨林）・"ALPHABET"（alphabet soup）は誤ルーティングの温床。
+#   これらの銘柄はティッカーそのもの（従来どおり）でのみ照合する。
+#   誤ルーティングしても個別株AIが「直接関係するか」で弾くため実害は出ないが、
+#   AI 呼出の無駄と直行ログの汚れを避ける。
+_TICKER_ALIASES: dict = {
+    "NVDA": ("NVDA", "NVIDIA"),
+    "MSFT": ("MSFT", "MICROSOFT"),
+    "GOOGL": ("GOOGL", "GOOG", "GOOGLE"),
+    "TSLA": ("TSLA", "TESLA"),
+    "AVGO": ("AVGO", "BROADCOM"),
+    "MU":   ("MU", "MICRON"),
+    "TSM":  ("TSM", "TSMC", "TAIWAN SEMICONDUCTOR"),
+    "NFLX": ("NFLX", "NETFLIX"),
+    "INTC": ("INTC", "INTEL"),
+    "QCOM": ("QCOM", "QUALCOMM"),
+    "CRM":  ("CRM", "SALESFORCE"),
+}
+
+
+# ★ v3.9.153 (A-2): 除外語別のヒット数（修正前後の比較用・日次サマリで出力）
+_skip_keyword_hits: dict = {}
+
+
+def _record_skip_keyword_hit(kw: str) -> None:
+    _skip_keyword_hits[kw] = _skip_keyword_hits.get(kw, 0) + 1
+
+
 def _record_noise_filter_hit(label: str) -> None:
     """ノイズフィルタヒット時の統計記録 (1日サマリ用)。"""
     global _noise_filter_total_count
@@ -9626,6 +9750,17 @@ def _maybe_log_noise_filter_summary() -> None:
             f"{_noise_filter_total_count}件ブロック (推定削減 ${_saved_cost:.2f}) "
             f"内訳上位5: {_top_str}"
         )
+    # ★ v3.9.153 (A-2): 除外キーワード別のヒット数も同じ日次サイクルで出す。
+    #   単語境界化（v3.9.153）の前後で「AI 判定に回る件数」を比較するための計測。
+    if _skip_keyword_hits:
+        _kw_total = sum(_skip_keyword_hits.values())
+        _kw_top = sorted(_skip_keyword_hits.items(), key=lambda kv: -kv[1])[:8]
+        _kw_str = ", ".join(f"{k}={v}" for k, v in _kw_top)
+        log.info(
+            f"[除外キーワード統計] 前日 {_noise_filter_last_summary_date}: "
+            f"{_kw_total}件スキップ 内訳上位: {_kw_str}"
+        )
+        _skip_keyword_hits.clear()
     _noise_filter_last_summary_date = today_et
     _noise_filter_total_count = 0
     _noise_filter_label_counts.clear()
@@ -10934,7 +11069,7 @@ def get_quote(symbol: str) -> dict:
                 # 多発したため WARNING → DEBUG に降格 (ファイルログには引き続き記録)。
                 # ★ v3.9.77 (B-3): この銘柄は当セッション中スキップ対象として記憶。
                 _orderbook_fail_symbols.add(symbol)
-                log.debug(f"[get_quote] {symbol}: get_order_book ret={ret_ob} 失敗 → 当セッションは以降スキップ (get_stock_quote 直行)")
+                log.debug(f"[get_quote] {symbol}: get_order_book ret={ret_ob} 失敗 → このセッション中は get_stock_quote へフォールバック（セッション切替後に再試行）")
 
             # ── 基本株価（last / ask・bid の補完）─────────────────────────────────
             ret_sq, data_sq = ctx.get_stock_quote([code])
@@ -15600,7 +15735,20 @@ async def process_headlines(
         for _h in new:
             _hl_upper = _h.headline.upper()
             for _rsym in _env_route_syms:
-                if _re_env.search(rf"\b{_re_env.escape(_rsym)}\b", _hl_upper):
+                # ★ v3.9.153 (B-3): ティッカーに加えて社名でも拾う。見出しは
+                #   "Nvidia" 表記が大半で、"NVDA" だけでは直行ルートが空振りしていた。
+                _hit_alias = None
+                for _alias in _TICKER_ALIASES.get(_rsym, (_rsym,)):
+                    if _re_env.search(rf"\b{_re_env.escape(_alias)}\b", _hl_upper):
+                        _hit_alias = _alias
+                        break
+                if _hit_alias:
+                    # ★ v3.9.153 (B-4): この経路は従来ログが無く、回ったかどうかを
+                    #   切り分けられなかった。INFO で残す。
+                    log.info(
+                        f"[個別株ルーティング] {_rsym} ← \"{_hit_alias}\" で一致: "
+                        f"{_h.headline[:80]}"
+                    )
                     _threadsafe_future(
                         process_stock_news(
                             client, trd_env_real, _rsym, [_h],
@@ -15610,31 +15758,9 @@ async def process_headlines(
                     break  # 1ニュースにつき最初にマッチした1銘柄のみルーティング
 
     # ── 無関係ニュースの事前フィルタリング ────────────────────────────────────
-    _SKIP_KEYWORDS = {
-        # スポーツ
-        "fifa", "soccer", "nba", "nfl", "mlb", "nhl", "tennis", "golf",
-        "olympic", "super bowl", "world cup", "basketball", "baseball",
-        "football", "hockey", "esport", "formula 1", "f1 race", "ufc", "boxing",
-        # エンタメ・メディア
-        "hollywood", "movie", "film", "box office", "celebrity", "oscar",
-        "grammy", "emmy", "billboard", "album", "concert", "tour", "singer",
-        "actor", "actress", "director", "entertainment", "streaming show",
-        "netflix show", "disney+", "tv show", "podcast host",
-        # ライフスタイル・個人向け
-        "lifestyle", "music", "fashion", "beauty", "wellness", "diet",
-        "gen z", "millennial", "baby boomer", "student loan", "university",
-        "college tuition", "retirement planning", "saving tips", "career advice",
-        "personal finance", "home buying tips", "dating", "relationship",
-        # ノイズ人物・コメンテーター
-        "jim cramer", "elon musk twitter", "celebrity investor",
-        # 政治・社会（市場無関係のもの）
-        "abortion", "immigration policy", "gun control", "lgbtq",
-        "protest march", "local election", "mayor", "governor race",
-        "school board", "city council",
-        # その他ノイズ
-        "horoscope", "lottery", "casino jackpot", "weather forecast",
-        "traffic report", "recipe", "travel tips", "vacation",
-    }
+    # ★ v3.9.153: キーワード表と判定はモジュールスコープの
+    #   _SKIP_KEYWORDS_CI / _SKIP_ACRONYMS_CS / _match_skip_keyword に移設
+    #   （単語境界つき正規表現・認定サポーターNの指摘A）。
     # ── ★ v3.8.3: 1 日 1 回ノイズフィルタ統計を出力 (日付変わり時のみ実行) ──
     _maybe_log_noise_filter_summary()
 
@@ -15646,9 +15772,10 @@ async def process_headlines(
             log.debug(f"[フィルタ] 短文スキップ({word_count}語): {h.headline}")
             continue
         # ② キーワードフィルタ
-        lower   = h.headline.lower()
-        matched = next((kw for kw in _SKIP_KEYWORDS if kw in lower), None)
+        # ★ v3.9.153: 単語境界つき正規表現で判定（旧: 部分一致で inflation 等を誤除外）
+        matched = _match_skip_keyword(h.headline)
         if matched:
+            _record_skip_keyword_hit(matched)
             log.debug(f"[フィルタ] キーワードスキップ({matched!r}): {h.headline}")
             continue
         # ②.5 ★ v3.8.3: 高信頼度ノイズパターン (常に score=0 確実 → AI 呼出を節約)
@@ -15923,6 +16050,11 @@ async def process_headlines(
                 async with _get_sym_lock(sym):
                     if state.get(sym).position_qty > 0:
                         place_close_all(sym, trd_env_real, f"ショートシグナルのためロング決済: {reason}")
+                        # ★ v3.9.153: 全量さばけた回は時間切れの時計を返す
+                        #   （認定サポーターの指摘④）。残さないと、決済の数分後に
+                        #   「時間切れ（建玉なし）」の不要な再照会と通知が出る。
+                        if _take_close_result(sym) == "full":
+                            state.get(sym).entry_time = None
                         sold.append(sym)
             if sold:
                 log.info(f"{tag} 既存ロング決済: {', '.join(sold)}")
@@ -16074,6 +16206,9 @@ async def process_headlines(
             if state.get(sym).position_qty < 0:
                 log.info(f"{tag} 既存ショートを買い戻し → {sym}")
                 place_close_all(sym, trd_env_real, f"ロングシグナルのためショート決済: {reason}")
+                # ★ v3.9.153: 全量さばけた回は時間切れの時計を返す（指摘④・上と同じ）
+                if _take_close_result(sym) == "full":
+                    state.get(sym).entry_time = None
                 await asyncio.sleep(1)
             ok = place_buy(sym, trd_env_real, confidence=confidence,
                            trigger=trigger_sym, reason=reason,
@@ -16361,7 +16496,7 @@ async def process_stock_news(
     new = _noise_survived
 
     texts = [a.headline for a in new]
-    log.info(f"{tag} [個別株ニュース] 新着{len(texts)}件 → AI判定")
+    log.info(f"{tag} [個別株ニュース] 新着{len(texts)}件 → 重複確認のうえAI判定")
     for a in new:
         # ★ v2.99: ニュースソース二段表示
         log.info(f"  ・[{_format_news_source(a)}] {a.headline}")
@@ -16370,34 +16505,59 @@ async def process_stock_news(
     # _fetch_stock_news_alpaca_batch は source=f"Alpaca({sym})"
     # _fetch_stock_news（Finnhub）      は source=f"Finnhub({symbol})"
     # を各記事に付与しているため、呼び出し元を変更せずに正確なソースを記録できる。
+    # ── ★ v3.9.8/v3.9.153: 正規化ヘッドライン重複チェック (個別株モード) ────────
+    # ★ v3.9.153 (B-1/B-2・認定サポーターNの指摘):
+    #   ①scope=銘柄で判定する。通常News（市場全体への影響を判定）と既読を共有すると、
+    #     先着する通常News側の印で個別株側が全滅していた（AI への問いが違う）。
+    #   ②バッチ先頭1件ではなく1件ずつ判定する。先頭が既出なだけでバッチ全体を
+    #     捨てると、2件目以降の未見記事が失われる。
+    if texts:
+        _fresh_arts, _fresh_texts = [], []
+        for _art, _txt in zip(new, texts):
+            _hl_seen, _hl_elapsed, _hl_hits = state.check_headline_seen(_txt, scope=symbol)
+            if _hl_seen:
+                log.info(
+                    f"{tag} [正規化重複] {_hl_elapsed // 60}分前と同一ヘッドライン "
+                    f"(累計 {_hl_hits + 1} 件目) → AI 呼出スキップ: {_txt[:120]!r}"
+                )
+                state.mark_headline_seen(_txt, scope=symbol)
+                continue
+            # ★ v3.9.153b: 印は判定と同時に付ける（Codexレビュー指摘）。
+            #   AI 呼出（await）の後に付けると、同じ正規化見出しを持つ別記事の
+            #   タスクが await の間に「未見」と判定し、二重に AI へ回る。
+            #   このループ内には await が無いので、ここで付ければ原子的。
+            state.mark_headline_seen(_txt, scope=symbol)
+            _fresh_arts.append(_art)
+            _fresh_texts.append(_txt)
+        if not _fresh_texts:
+            return
+        new, texts = _fresh_arts, _fresh_texts
+
+    # ★ v3.9.153b: ソースの特定は dedup の後で行う（Codexレビュー指摘）。
+    #   前に置くと、重複で除かれた先頭記事のソースが残りの記事に付いてしまう。
     _detected_source = (
         new[0].source
         if new and hasattr(new[0], "source") and new[0].source
         else f"Finnhub({symbol})"
     )
 
-    # ── ★ v3.9.8: 正規化ヘッドライン重複チェック (個別株モード) ───────────────
-    # process_headlines と同じ層を個別株ニュースにも適用。Finnhub/Alpaca の同一銘柄
-    # 記事が複数フィード経由で再到来するケース (例: AAPL の同一決算記事を
-    # Alpaca と Finnhub で別 articleId で受信) を 60 分 dedup する。
-    if texts:
-        _hl_seen, _hl_elapsed, _hl_hits = state.check_headline_seen(texts[0])
-        if _hl_seen:
-            log.info(
-                f"{tag} [正規化重複] {_hl_elapsed // 60}分前と同一ヘッドライン "
-                f"(累計 {_hl_hits + 1} 件目) → AI 呼出スキップ: {texts[0][:120]!r}"
-            )
-            state.mark_headline_seen(texts[0])
-            return
-
     # AI判定（個別株モード）
     # 市場全体モードを使うとGS→"Big Tech好調"のような誤判定が起きるため
     # 「このニュースは {symbol} に直接関係するか」を厳密に判定させる
     # v1.3.0: target_symbol で個別株モードを指定。SYSTEM_PROMPT は統合版で共通。
-    result = await analyze_news(client, texts, symbol, target_symbol=symbol)
-    # ★ v3.9.8: AI 呼出後にヘッドラインを記録 (次回以降の同一テキスト判定で dedup される)
-    if texts:
-        state.mark_headline_seen(texts[0])
+    # ★ v3.9.153b: 既読の印は判定時に付与済み（reserve）。AI 呼出が例外で落ちたら
+    #   印を戻す（Codexレビュー指摘）。戻さないと、一時的な失敗で同じ見出しが
+    #   60分間ずっと再判定されない。なお API エラー・解析エラーは analyze_news が
+    #   中で握って中立を返すため、ここに来る例外は稀（Cancel・想定外のみ）。
+    try:
+        result = await analyze_news(client, texts, symbol, target_symbol=symbol)
+    except BaseException:
+        for _txt in texts:
+            try:
+                state.unmark_headline_seen(_txt, scope=symbol)
+            except Exception:
+                pass
+        raise
     score      = result["score"]
     confidence = result["confidence"]
     reason     = result.get("reason", "")
@@ -20599,7 +20759,21 @@ async def main(live: bool) -> None:
         _level_name = _MOMENTUM_LEVEL_NAMES.get(MOMENTUM_LEVEL, "?")
         if MOMENTUM_LIVE_TRADING:
             _mom_hdr = "モメンタム: ⚡ 実発注モード (Phase 1)"
-            _mom_note = f"実発注対象サイド={sorted(MOMENTUM_ENABLED_SIDES)} (それ以外はシャドー記録のみ)"
+            # ★ v3.9.153: select_v1 有効時は「プロファイル絞り込み後」の実効サイドを
+            #   表示する（認定サポーターの指摘）。従来は env の生値を出しており、
+            #   すぐ上の「SPY除外」の行と食い違って見えた。
+            _eff_sides = sorted(MOMENTUM_ENABLED_SIDES)
+            _prof_note = ""
+            if MOMENTUM_PROFILE_SELECT:
+                # 実行時の絞り込み（:1941 付近）と同じ変数から作る。除外銘柄を
+                # ここに直書きすると、集合を変えたとき表示だけ古くなる（Codexレビュー指摘）。
+                _eff_sides = sorted(
+                    sd for sd in MOMENTUM_ENABLED_SIDES
+                    if sd.endswith(":SELL_SHORT")
+                    and sd.split(":", 1)[0] not in _SELECT_V1_EXCLUDED_SYMBOLS
+                )
+                _prof_note = "（select_v1 絞り込み後）"
+            _mom_note = f"実発注対象サイド={_eff_sides}{_prof_note} (それ以外はシャドー記録のみ)"
         else:
             _mom_hdr = "モメンタム: シャドー観察モード (Phase 0・実発注なし)"
             _mom_note = "全シグナルを観察ログに記録 (実発注なし)"
