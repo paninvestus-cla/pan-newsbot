@@ -170,7 +170,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.159"
+BOT_VERSION = "v3.9.160"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -4149,8 +4149,86 @@ OVN_SMA_DAYS: int = 200
 OVN_ENTRY_ET = (15, 55)   # 引け際に判定して買う（まだ立会中なので普通に約定する）
 OVN_RESERVE_ET = (16, 5)  # 引け後に「翌寄りで売る」注文を置く（実口座のみ有効）
 OVN_EXIT_ET  = (9, 31)    # 翌寄り。予約が無い/効かなかった場合はここで売る
-OVN_STATE_FILE: str = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "ovn_state.json")
+# ★ v3.9.160: 状態の保存先を「本体スクリプトと同じフォルダ」から独立させる。
+#   認定サポーターの実機事故（OVN保有中の再起動で建玉が日中ロジックに吸収され、
+#   トレールで約5時間半早く決済）を再現テストで追い込んだ結果、症状が出る条件の
+#   最有力が「状態ファイルが読めない／見つからない」だった。本体の置き場所が
+#   変わる運用（版の更新でフォルダごと差し替える等）では、状態だけが旧フォルダに
+#   取り残されて建玉との紐づけが切れる。ホーム直下の固定フォルダへ移し、旧パスに
+#   ファイルがあれば自動で引き継ぐ（下の _ovn_migrate_legacy_dir）。
+#   環境変数 BOT_STATE_DIR で明示指定も可能。
+def _bot_state_dir() -> str:
+    _d = (os.environ.get("BOT_STATE_DIR", "") or "").strip()
+    if not _d:
+        _d = os.path.join(os.path.expanduser("~"), ".moomoo_bot")
+    try:
+        os.makedirs(_d, exist_ok=True)
+        # 書けるかを実地で確かめる（書けなければ従来どおり本体と同じ場所を使う）
+        # ★ v3.9.160b: 固定名だと REAL/DEMO 同時起動で互いの残骸を消し合い、
+        #   片方が誤って旧保存先へフォールバックする（Codex指摘）。PID固有名にする。
+        _probe = os.path.join(_d, f".write_test.{os.getpid()}")
+        with open(_probe, "w", encoding="utf-8") as _f:
+            _f.write("ok")
+        os.remove(_probe)
+        return _d
+    except Exception as _e_dir:
+        # ★ v3.9.160c: 無言でフォールバックすると、古いスナップショットを正として
+        #   読む状態に気づけない（新規Claudeレビュアーの指摘）。必ず記録する。
+        _fb = os.path.dirname(os.path.abspath(__file__))
+        try:
+            print(f"[起動] 状態の保存先 {_d} に書けないため {_fb} を使います: {_e_dir}", flush=True)
+        except Exception:
+            pass
+        return _fb
+
+
+_OVN_LEGACY_DIR: str = os.path.dirname(os.path.abspath(__file__))
+OVN_STATE_DIR: str = _bot_state_dir()
+OVN_STATE_FILE: str = os.path.join(OVN_STATE_DIR, "ovn_state.json")
+
+
+def _ovn_migrate_legacy_dir() -> None:
+    """★ v3.9.160: 旧パス（本体と同じフォルダ）の状態・台帳を新パスへ引き継ぐ。
+
+    新パスに既にファイルがあるときは触らない（新しい方が正）。移行は起動時に1回。
+    失敗しても起動は止めない（旧パスの読み取りにフォールバックする経路は持たない
+    ——移行できないほど壊れた環境では、下の「口座の建玉からの保護」が受け止める）。
+    """
+    if os.path.abspath(OVN_STATE_DIR) == os.path.abspath(_OVN_LEGACY_DIR):
+        return
+    try:
+        _names = sorted(os.listdir(_OVN_LEGACY_DIR))
+    except Exception as _e_ls:
+        log.warning(f"[夜間持ち越し] 旧フォルダを読めません（続行）: {_mask_secrets(_e_ls)}")
+        return
+    for _name in _names:
+        # ★ v3.9.160b: 対象は状態本体だけ（.tmp / .migrated / 派生は運ばない）。
+        #   ファイル単位の try にして、1件の失敗で後続（REAL/DEMO の片方）が
+        #   移行されないのを防ぐ（Codex指摘）。
+        if not (_name == "ovn_state.json"
+                or _name in ("ovn_state.REAL.json", "ovn_state.DEMO.json",
+                             "bot_position_ledger.json")
+                or _name.startswith("bot_position_ledger.json.initialized")):
+            continue
+        _src = os.path.join(_OVN_LEGACY_DIR, _name)
+        _dst = os.path.join(OVN_STATE_DIR, _name)
+        try:
+            if not os.path.isfile(_src) or os.path.exists(_dst):
+                continue
+            # ★ v3.9.160b: 直接コピーだと、書いている途中を他プロセスが読んで
+            #   壊れたJSONを掴む（＝状態不明＝まさに事故の入口）。一時ファイルへ
+            #   コピーしてから原子的に置換する。
+            _tmp = _dst + f".mig.{os.getpid()}"
+            shutil.copy2(_src, _tmp)
+            os.replace(_tmp, _dst)
+            log.info(f"[夜間持ち越し] 旧フォルダの状態ファイルを引き継ぎました: {_name}")
+        except Exception as _e_mig:
+            log.warning(f"[夜間持ち越し] {_name} の引き継ぎに失敗（続行）: {_mask_secrets(_e_mig)}")
+            try:
+                if os.path.exists(_tmp):
+                    os.remove(_tmp)
+            except Exception:
+                pass
 
 
 # ★ 初回抑制バグ回避（:4211 の HEARTBEAT と同じ教訓）: monotonic は環境により
@@ -4205,6 +4283,77 @@ def _ovn_owns_now() -> bool:
     return _v_cached
 
 
+_ovn_unknown_guard = {"active": False, "noted": False, "since": None}
+
+
+def _ovn_state_readable() -> bool:
+    """★ v3.9.160: OVN の状態ファイルが「この環境の状態として読める」か。
+
+    ファイル不在・破損・環境タグ違いはすべて False（＝状態不明）。
+    所有権の判定（保有フェーズか）とは別の問い——「そもそも判断材料があるか」。
+    """
+    try:
+        _path = _ovn_state_path()
+        if not os.path.isfile(_path) and not os.path.isfile(OVN_STATE_FILE):
+            return False
+        _st = _ovn_load()
+        if not _st:
+            return False
+        return _st.get("trade_env") == _RUN_TRADE_ENV and _ovn_acc_matches(_st)
+    except Exception:
+        return False
+
+
+def _ovn_unknown_state_guard(symbol: str) -> bool:
+    """★ v3.9.160: 状態が読めないときに OVN 建玉を日中ロジックから守る安全網。
+
+    認定サポーターの事故（OVN保有中の再起動で建玉が吸収され、トレールで
+    約5時間半早く決済）を再現テストで追い込んだところ、「状態ファイルが
+    読めない／無い」ケースは v3.9.159 の二重ソースでも救えないと分かった
+    （二重ソースの片方が存在しないため）。そこで最後の砦として、
+      ・OVN が有効な設定である
+      ・対象銘柄（QQQ）の建玉が口座にある
+      ・その建玉が Bot の建玉台帳に無い（＝日中ロジックが建てたものではない）
+      ・OVN の状態が読めない（＝OVN のものか断定できない）
+    が揃うときは「触らない」側に倒す。誤って日中の建玉を保護してしまう害
+    （その建玉の損切り・時間切れが効かない）より、OVN 建玉を早期決済する害の
+    方が大きい——前者は台帳に載るため実際には成立しにくい。
+    保護に入ったら1回だけ警告し、利用者が状況を把握できるようにする。
+    """
+    if symbol != OVN_SYMBOL or not OVN_ENABLED:
+        return False
+    try:
+        if _ledger_has(symbol):   # 環境は _ledger_env_key が現在値から解決する
+            return False   # Bot（日中）の建玉として台帳にある → 保護しない
+        if state.get(symbol).position_qty == 0:
+            return False   # 建玉が無ければ守る対象がない
+        if _ovn_state_readable():
+            # ★ v3.9.160b: 復旧したら保護を解除し、通知も再武装する（Codex指摘——
+            #   noted が立ちっぱなしだと2度目の障害が無通知になる）。
+            if _ovn_unknown_guard.get("active") or _ovn_unknown_guard.get("noted"):
+                log.info("[夜間持ち越し] 記録が読めるようになったため、建玉の保護を解除しました")
+            _ovn_unknown_guard.update({"active": False, "noted": False, "since": None})
+            return False   # 状態が読める＝二重ソース判定に任せる
+    except Exception:
+        return False
+    _ovn_unknown_guard["active"] = True
+    _ovn_unknown_guard["since"] = _ovn_unknown_guard.get("since") or time.monotonic()
+    if not _ovn_unknown_guard["noted"]:
+        _ovn_unknown_guard["noted"] = True
+        _msg = (
+            f"🛡 【{symbol}】 夜間持ち越しの記録が読めないため、この建玉には触りません"
+            f"（日中の損切り・時間切れ・トレールを適用しません）。"
+            f"記録の置き場所: {OVN_STATE_DIR}。"
+            f"翌朝の寄り付きでも売られない場合は moomoo アプリでご確認ください"
+        )
+        log.warning(f"[夜間持ち越し] {_msg}")
+        try:
+            _threadsafe_future(asyncio.to_thread(send_discord_message, f"[Bot] {_msg}"))
+        except Exception:
+            pass
+    return True
+
+
 def _is_other_owner(symbol: str) -> bool:
     """日中のニュース売買が手を出してはいけない銘柄か。
 
@@ -4217,7 +4366,9 @@ def _is_other_owner(symbol: str) -> bool:
     if getattr(ts, "externally_held", False) or getattr(ts, "ovn_held", False):
         return True
     if symbol == OVN_SYMBOL:
-        return _ovn_owns_now()
+        # ★ v3.9.160: 二重ソース（フラグ＋状態ファイル）で判断できないときは、
+        #   口座の建玉と台帳から「触らない」側に倒す最後の砦を通す。
+        return _ovn_owns_now() or _ovn_unknown_state_guard(symbol)
     return False
 
 
@@ -7029,9 +7180,10 @@ def _load_today_state() -> int:
 #
 # 残る限界: Bot がすでにその銘柄を持っている最中に手で買い増された分は
 # 巻き込まれる。ただしこれは v3.9.133 以前と同じ挙動で、悪化はしない。
-_LEDGER_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "bot_position_ledger.json"
-)
+# ★ v3.9.160c: 台帳も状態ファイルと同じ固定フォルダへ（新規Claudeレビュアーの指摘——
+#   本体フォルダ差し替えでは台帳も同時に消え、初回移行が全建玉を Bot 建玉として
+#   取り込む。これが OVN 事故の増幅要因だった）。旧フォルダにあれば起動時に引き継ぐ。
+_LEDGER_PATH = os.path.join(OVN_STATE_DIR, "bot_position_ledger.json")
 # 「台帳をこの環境で一度でも作ったか」の目印。台帳ファイルが消えたときに
 # 「アップグレード直後の初回」と区別するために使う（初回だけ既存建玉を取り込む）。
 _LEDGER_INIT_MARK = _LEDGER_PATH + ".initialized"
@@ -12352,7 +12504,11 @@ def sync_positions(trd_env: TrdEnv) -> None:
             elif _held_j and not _ledger_has(_sym_j, trd_env):
                 _q = _sides_j["LONG"]["qty"] or _sides_j["SHORT"]["qty"]
                 _sd = "ロング" if _sides_j["LONG"]["qty"] > 0 else "ショート"
-                if _ledger_first_run:
+                # ★ v3.9.160c: 状態が読めない OVN 銘柄は初回移行で取り込まない
+                #   （取り込むと安全網の「台帳に無い」条件が崩れる）
+                if _sym_j == OVN_SYMBOL and not _ovn_state_readable():
+                    _ext_set_held(_sym_j, False)
+                elif _ledger_first_run:
                     # ★ v3.9.134: 台帳を作る最初の起動。旧版は口座の建玉をすべて
                     #   Bot のものとして扱っていたので、ここでも取り込む。
                     #   これをしないと、起動時復元より先にこの sync が走ったときに
@@ -19080,6 +19236,54 @@ async def ovn_overnight_loop(trd_env) -> None:
             hm = (now.hour, now.minute)
             phase = st.get("phase", "IDLE")
 
+            # ★ v3.9.160b: 記録が読めず安全網（_ovn_unknown_state_guard）が
+            #   建玉を守っている状態は、放っておくと「誰も決済しない孤児」になる
+            #   （日中ロジックは触らず、OVN も状態が無いので売らない・週末決済や
+            #   パニックセルも対象外——Codex指摘）。ここで口座の建玉を採用して
+            #   HELD として引き受け、通常の「翌寄りで売る」流れに戻す。
+            if phase == "IDLE" and _ovn_unknown_guard.get("active"):
+                # ★ v3.9.160c: フラグは「候補の合図」に留め、判断は毎回やり直す
+                #   （新規Claudeレビュアーの指摘——粘着フラグだけを根拠に発注すると、
+                #   手動保有の建玉や日中ロジックの建玉を OVN として引き受けてしまう）。
+                #   ・記録が読めるようになった／台帳に載った／Bot以外の建玉と分かった
+                #     場合は引き受けない
+                #   ・記録のみ(shadow)モードでは引き受けない（売る主体がいないため
+                #     引き受けると永久に決済されない建玉になる）
+                if (not _live or _ovn_state_readable() or _ledger_has(OVN_SYMBOL)
+                        or getattr(state.get(OVN_SYMBOL), "externally_held", False)):
+                    _ovn_unknown_guard["active"] = False
+                    _ovn_unknown_guard["noted"] = False
+                    log.info("[夜間持ち越し] 引き受けの条件を満たさなくなったため保護を解除しました")
+                    continue
+                _pos_o, _ids_o, _dt_o = await asyncio.to_thread(_ovn_position, trd_env)
+                if _pos_o > 0:
+                    st.update(phase="HELD", qty=_pos_o, position_ids=_ids_o,
+                              trade_env=_RUN_TRADE_ENV,
+                              entry_date=(st.get("entry_date")
+                                          or (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")))
+                    _ts_o = state.get(OVN_SYMBOL)
+                    if getattr(_ts_o, "avg_cost", 0) > 0:
+                        st.setdefault("entry_price", round(float(_ts_o.avg_cost), 4))
+                    if _ovn_save(st):
+                        state.get(OVN_SYMBOL).ovn_held = True
+                        _ovn_unknown_guard["active"] = False
+                        _ovn_unknown_guard["noted"] = False
+                        _ovn_say(
+                            f"記録が読めない状態で残っていた QQQ {_pos_o}株 を"
+                            f"夜間持ち越しとして引き受けました（翌営業日の寄り付きで売ります）。",
+                            "warning")
+                    else:
+                        # ★ v3.9.160c: phase を IDLE に戻さないと、次の巡回の
+                        #   入口条件（phase=="IDLE"）を自分で塞いでしまう
+                        #   （BUY_INTENT 側と同じロールバック作法に揃える）。
+                        st["phase"] = "IDLE"
+                        log.warning("[夜間持ち越し] 孤児建玉の引き受けを保存できません → 次の巡回で再試行します")
+                    continue
+                elif _dt_o == "OK" and _pos_o == 0:
+                    # 建玉が無くなった＝保護の必要も消えた（手動決済など）
+                    _ovn_unknown_guard["active"] = False
+                    _ovn_unknown_guard["noted"] = False
+
             # 発注直前に BUY_INTENT を永続化しているため、発注応答前に落ちても
             # 同じ環境の実建玉・注文から回収できる。
             if phase == "BUY_INTENT":
@@ -19367,7 +19571,13 @@ async def ovn_overnight_loop(trd_env) -> None:
                   and OVN_EXIT_ET <= hm < OVN_ENTRY_ET
                   and is_trading_day(now.date())):
                 if not _live:
-                    st["phase"] = "DONE"; _ovn_save(st); continue
+                    # ★ v3.9.160c: 記録のみモードで HELD に到達した場合（孤児の
+                    #   引き受け等）、フラグを落とさないと誰も触れない建玉になる
+                    #   （新規Claudeレビュアーの指摘）。保存→解除の順は v3.9.159b。
+                    st["phase"] = "DONE"
+                    _ovn_save(st)
+                    state.get(OVN_SYMBOL).ovn_held = False
+                    continue
                 pos, ids, pmsg = await asyncio.to_thread(_ovn_position, trd_env)
                 if pos > 0:
                     # ★ v3.9.148: 建玉が見えた＝口座の状態を読めた。曖昧マーカーを
@@ -21327,6 +21537,7 @@ async def main(live: bool) -> None:
     # ★ v3.9.159: 判定結果に関わらず永続状態の中身を必ず1行残す（実機の早期決済
     #   事故では「復元しました」の不在という否定証拠しか無く、原因特定が難航した）。
     try:
+        _ovn_migrate_legacy_dir()   # ★ v3.9.160: 旧フォルダの状態を引き継ぐ
         _ovn_dbg = _ovn_load()
         _ovn_boot_owns = _ovn_state_owns_position(_ovn_dbg)
         with _ovn_owns_lock:   # ★ v3.9.159b: 起動判定をキャッシュへプライム（読み直し不要に）
@@ -21338,6 +21549,7 @@ async def main(live: bool) -> None:
             f"  env={_ovn_dbg.get('trade_env', '-')}"
             f"  所有権={'あり（日中ロジックから切り離します）' if _ovn_boot_owns else 'なし'}"
             f"  file={os.path.basename(_ovn_state_path())}"
+            f"  dir={OVN_STATE_DIR}"
         )
     except Exception as _e_ovnb:
         _ovn_boot_owns = False
@@ -22326,8 +22538,13 @@ async def main(live: bool) -> None:
                     f" 次サイクルの sync_positions で再取得を期待します。"
                 )
             # ── ★ v3.9.134: 台帳と突き合わせて「Bot の建玉か」を判定する ────────
+            # ★ v3.9.160c: 状態が読めない OVN 銘柄も初回移行から除外する
+            #   （新規Claudeレビュアーの指摘——事故の経路では台帳も同時に消えるため
+            #   初回移行が走り、QQQ を Bot 建玉として取り込む。すると安全網の
+            #   「台帳に無い」条件が崩れ、v3.9.160 の砦が一度も発動しない）。
             if (_ledger_first_run and not _ledger_has(sym, trd_env)
-                    and not (sym == OVN_SYMBOL and _ovn_owns_now())):
+                    and not (sym == OVN_SYMBOL
+                             and (_ovn_owns_now() or not _ovn_state_readable()))):
                 # 台帳をこの環境で初めて作る起動。旧版は口座の建玉をすべて Bot の
                 # ものとして扱っていたので、初回だけその前提を引き継ぐ。これをしないと
                 # 建玉を持ったまま版を上げた利用者の損切りが一斉に止まる。
