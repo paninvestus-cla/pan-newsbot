@@ -170,7 +170,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.157"
+BOT_VERSION = "v3.9.159"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -4153,15 +4153,72 @@ OVN_STATE_FILE: str = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "ovn_state.json")
 
 
+# ★ 初回抑制バグ回避（:4211 の HEARTBEAT と同じ教訓）: monotonic は環境により
+#   「プロセス起動からの経過秒」になり、0.0 との差分だと起動直後の約30秒間
+#   （まさに吸収事故が起きる窓）はキャッシュが更新されない。None=未取得で管理する。
+_ovn_file_owns_cache = {"t": None, "v": False}
+_ovn_owns_lock = threading.Lock()   # ★ v3.9.159b: 破れ読み（tだけ新しくvが古い）防止
+
+
+def _ovn_owns_now() -> bool:
+    """★ v3.9.159: OVN の所有権を「メモリのフラグ」と「永続状態ファイル」の
+    二重ソースで判定し、ファイル側が所有しているのにフラグが落ちていれば
+    自己修復する（認定サポーターの実機報告——再起動後に何らかの理由で
+    フラグが復元されず、OVN 建玉が台帳へ吸収されて日中ロジックのトレールで
+    早期決済された。フラグ1本に依存しない防御に変える）。
+    ファイル読取は30秒キャッシュ（リスク監視の周期から呼ばれるため）。
+    """
+    ts = state.get(OVN_SYMBOL)
+    if getattr(ts, "ovn_held", False):
+        return True
+    # ★ v3.9.159c: ファイル読取はロックの外で行う（Codex指摘——旧形式からの移行では
+    #   _ovn_load → _ovn_save → キャッシュ無効化 が同じロックを再取得してデッドロック
+    #   していた）。ロックはキャッシュの t/v を対で読む・書くときだけ持つ。
+    #   競合時に読取が重複しても、小さなJSONの再読で害はない。
+    with _ovn_owns_lock:
+        _nowm = time.monotonic()
+        _need_refresh = (_ovn_file_owns_cache["t"] is None
+                         or _nowm - _ovn_file_owns_cache["t"] > 30)
+        _v_cached = _ovn_file_owns_cache["v"]
+    if _need_refresh:
+        try:
+            _v_new = _ovn_state_owns_position()
+            with _ovn_owns_lock:
+                _ovn_file_owns_cache["v"] = _v_new
+                _ovn_file_owns_cache["t"] = time.monotonic()
+            _v_cached = _v_new
+        except Exception as _e_own:
+            # ★ v3.9.159b: 読取失敗を「非保有」として30秒キャッシュすると、
+            #   まさに事故の起きる起動直後の窓で誤答を固定する（レビュー指摘）。
+            #   今回は False を返すが、次の呼び出しで必ず再試行する。無音にしない。
+            log.warning(f"[夜間持ち越し] 所有権の永続状態を読めません（再試行します）: {_mask_secrets(_e_own)}")
+            with _ovn_owns_lock:
+                _ovn_file_owns_cache["v"] = False
+                _ovn_file_owns_cache["t"] = None
+            _v_cached = False
+    if _v_cached:
+        ts.ovn_held = True
+        log.warning(
+            "[夜間持ち越し] 🛡 所有権フラグが落ちていたため、永続状態から自己修復しました"
+            "（この建玉は日中ロジックの決済対象になりません）"
+        )
+    return _v_cached
+
+
 def _is_other_owner(symbol: str) -> bool:
     """日中のニュース売買が手を出してはいけない銘柄か。
 
     ★ v3.9.136: 「Bot が建てていない建玉（externally_held）」に加えて、
     「OVN が建てた建玉（ovn_held）」も日中ロジックから切り離す。同じ QQQ を
     両方が扱うため、これが無いと日中の時間切れ決済が OVN の建玉を売ってしまう。
+    ★ v3.9.159: OVN はフラグ単独でなく永続状態との二重ソースで判定（自己修復つき）。
     """
     ts = state.get(symbol)
-    return bool(getattr(ts, "externally_held", False) or getattr(ts, "ovn_held", False))
+    if getattr(ts, "externally_held", False) or getattr(ts, "ovn_held", False):
+        return True
+    if symbol == OVN_SYMBOL:
+        return _ovn_owns_now()
+    return False
 
 
 def _ovn_acc_matches(st: dict) -> bool:
@@ -4182,9 +4239,13 @@ def _ovn_acc_matches(st: dict) -> bool:
         return False
 
 
-def _ovn_state_owns_position() -> bool:
-    """永続状態上、OVN が QQQ 建玉を所有しているか。"""
-    st = _ovn_load()
+def _ovn_state_owns_position(st: dict = None) -> bool:
+    """永続状態上、OVN が QQQ 建玉を所有しているか。
+
+    ★ v3.9.159b: 読み込み済みの dict を渡せる（起動診断との二重読み・
+    表示と判定のスナップショット不一致を避ける）。"""
+    if st is None:
+        st = _ovn_load()
     if st.get("phase") not in ("BUY_INTENT", "BUY_PENDING", "HELD", "RESERVED", "HELD_NO_RESERVE"):
         return False
     # 保有後に機能を無効化／shadow化しても、決済完了までは所有権を放棄しない。
@@ -4460,7 +4521,7 @@ def _threadsafe_discord(text: str) -> None:
         # ★ v3.9.63: 通知失敗が呼び出し元 (発注経路等) に伝播しないよう必ず握りつぶす
         log.debug(f"[スレッド] Discord 送信スキップ (例外): {_e}")
 
-def _threadsafe_future(coro) -> None:
+def _threadsafe_future(coro):
     """スレッド安全なコルーチン実行。 同期関数からasyncio.ensure_futureの代わりに使用する。
 
     ★ v3.9.63: ループ未起動/終了間際でも例外を発注経路へ伝播させない。
@@ -4470,8 +4531,7 @@ def _threadsafe_future(coro) -> None:
     """
     try:
         if _main_loop and _main_loop.is_running():
-            asyncio.run_coroutine_threadsafe(coro, _main_loop)
-            return
+            return asyncio.run_coroutine_threadsafe(coro, _main_loop)   # ★ v3.9.159b: 成否を返す
         log.warning("[スレッド] イベントループ未起動のためコルーチンをスキップ")
     except Exception as _e:
         log.warning(f"[スレッド] コルーチン投入に失敗 (スキップ): {_e}")
@@ -4480,6 +4540,7 @@ def _threadsafe_future(coro) -> None:
         coro.close()
     except Exception:
         pass
+    return None
 
 
 # ── ★ v3.9.42: API キー / Webhook URL の非ASCII文字サニタイザ ────────────────
@@ -11038,7 +11099,9 @@ try:
     MOOMOO_CTX_BUILD_TIMEOUT_SEC: float = float(os.environ.get("MOOMOO_CTX_BUILD_TIMEOUT_SEC", "15") or 15)
 except (TypeError, ValueError):
     MOOMOO_CTX_BUILD_TIMEOUT_SEC = 15.0
-_opend_down_last_note_mono: float = 0.0
+# ★ 初回抑制バグ回避: 0.0 起点だと起動直後の約120秒（OpenD 起動順の問題が
+#   まさに起きる窓）は通知が間引かれてしまう。None=未送信で管理する。
+_opend_down_last_note_mono = None
 # ★ v3.9.157b: 半死状態（TCPは通るがSDK生成が返らない）でのスレッド堆積対策。
 #   生成スレッドの同時実行に上限を設け、タイムアウト直後は短時間ブレーカーで
 #   即例外にする（4レーンレビューの一致指摘——上限なしだと数時間で数百本の
@@ -11081,7 +11144,8 @@ def _note_opend_down(what: str, detail: str) -> None:
     global _opend_down_last_note_mono
     with _ctx_build_lock:   # ★ v3.9.157b: check-then-set のレースで通知が連打される穴を塞ぐ
         _nowm = time.monotonic()
-        if _nowm - _opend_down_last_note_mono < 120:
+        if (_opend_down_last_note_mono is not None
+                and _nowm - _opend_down_last_note_mono < 120):
             return
         _opend_down_last_note_mono = _nowm
     _msg = (f"🔴 OpenD に接続できません／応答がありません（{detail}・呼出元={what}）。"
@@ -12171,7 +12235,7 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 for info in _pending_orders.values()
             )
             if total_qty != 0 and _tracked_position_cost.get(sym, 0.0) <= 0:
-                if sym == OVN_SYMBOL and getattr(state.get(sym), "ovn_held", False):
+                if sym == OVN_SYMBOL and _ovn_owns_now():   # ★ v3.9.159b: 二重ソース判定
                     # ★ v3.9.146 (A-11): OVN が建てた建玉は日中予算 (BUDGET_USD) に
                     #   計上しない。OVN は OVN_BUDGET_USD の別枠で管理しており、
                     #   ここで計上すると保有中の日中新規発注枠がその分だけ狭まる。
@@ -12281,8 +12345,7 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 _sides_j is not None and
                 (_sides_j["LONG"]["qty"] > 0 or _sides_j["SHORT"]["qty"] > 0)
             )
-            if (_held_j and _sym_j == OVN_SYMBOL
-                    and getattr(state.get(_sym_j), "ovn_held", False)):
+            if _held_j and _sym_j == OVN_SYMBOL and _ovn_owns_now():
                 # OVN はニュース売買の建玉台帳には載せない。永続 OVN 状態を起動時に
                 # 復元済みなので、台帳に無いことだけで「外部建玉」に分類しない。
                 _ext_set_held(_sym_j, False)
@@ -17544,7 +17607,9 @@ async def _earnings_momentum_check(
     client: anthropic.Anthropic,
     trd_env: TrdEnv,
     sym: str,
-    earn_art: SimpleNamespace,
+    earn_art,
+    wait_if_busy: bool = False,
+    wait_sec_override=None,
 ) -> None:
     """
     決算後モメンタム戦略（アイデアB）:
@@ -17565,24 +17630,46 @@ async def _earnings_momentum_check(
     """
     global _earnings_momentum_in_progress
     tag = f"【{sym}】"
+    # ★ v3.9.159: 複数記事の一括判定に対応（2秒ポーリング委譲用）。単一記事の
+    #   呼び出し（WebSocket側）は従来どおり動く。
+    earn_arts = earn_art if isinstance(earn_art, list) else [earn_art]
+    if not earn_arts:
+        return
 
     if _earnings_momentum_in_progress.get(sym):
-        log.info(f"[決算モメンタム] {tag} すでに監視中 → スキップ")
-        return
+        if not wait_if_busy:
+            log.info(f"[決算モメンタム] {tag} すでに監視中 → スキップ")
+            return
+        # ★ v3.9.159: ポーリング委譲では記事のIDを消費済みのため、ここで捨てると
+        #   フェッチ層の既読化により二度と回収できない（新規Claudeレビュアーの指摘）。
+        #   監視終了を待ってから判定する（in_progress は try/finally で必ず解放される
+        #   ため有限。上限は保険）。
+        # ★ v3.9.159b: 120秒では実運用の連鎖（30秒待機＋AI判定＋発注リトライが複数本）で
+        #   容易に超過し、消費済み記事が失われる（レビュー指摘）。in_progress は
+        #   try/finally で必ず解放されるため待機は有限——上限は純粋な保険として大きく取る。
+        _busy_deadline = time.monotonic() + max(900, EARNINGS_MOMENTUM_WAIT_SEC * 2 + 300)
+        while _earnings_momentum_in_progress.get(sym):
+            if time.monotonic() > _busy_deadline:
+                log.warning(f"[決算モメンタム] {tag} 監視中のまま待機上限 → 今回の記事は判定せず終了")
+                return
+            await asyncio.sleep(2)
     _earnings_momentum_in_progress[sym] = True
 
     try:
-        # モメンタム待機なし（EARNINGS_MOMENTUM_WAIT_SEC=0）→ 即AI判定
-        if EARNINGS_MOMENTUM_WAIT_SEC <= 0:
+        # ★ v3.9.159b: 窓の終端が近い委譲は待機を省く（override=0）。
+        _wait_sec = (EARNINGS_MOMENTUM_WAIT_SEC if wait_sec_override is None
+                     else int(wait_sec_override))
+        # モメンタム待機なし（EARNINGS_MOMENTUM_WAIT_SEC=0 または override=0）→ 即AI判定
+        if _wait_sec <= 0:
             await process_stock_news(
-                client, trd_env, sym, [earn_art],
+                client, trd_env, sym, earn_arts,
                 thresh_override=EARNINGS_CONFIDENCE,
                 bypass_filter=True,
             )
             return
 
         # ── 検知時点の株価を記録 ────────────────────────────────────────────
-        _q_before  = get_quote(sym)
+        _q_before  = await asyncio.to_thread(get_quote, sym)   # ★ v3.9.159b: ループを塞がない
         price_before = _q_before.get("last") or _q_before.get("bid") or 0.0
         if price_before <= 0:
             log.warning(
@@ -17590,7 +17677,7 @@ async def _earnings_momentum_check(
                 f" → フォールバック（即AI判定）"
             )
             await process_stock_news(
-                client, trd_env, sym, [earn_art],
+                client, trd_env, sym, earn_arts,
                 thresh_override=EARNINGS_CONFIDENCE,
                 bypass_filter=True,
             )
@@ -17598,20 +17685,20 @@ async def _earnings_momentum_check(
 
         log.info(
             f"[決算モメンタム] {tag} 検知時点 ${price_before:.2f}"
-            f" → {EARNINGS_MOMENTUM_WAIT_SEC}秒待機（方向確認中）..."
+            f" → {_wait_sec}秒待機（方向確認中）..."
         )
         _threadsafe_future(asyncio.to_thread(
             send_discord_message,
             f"[Bot] ⏳ [決算モメンタム] {sym}\n"
             f"ニュース検知: ${price_before:.2f}\n"
-            f"{EARNINGS_MOMENTUM_WAIT_SEC}秒後に方向確認します"
+            f"{_wait_sec}秒後に方向確認します"
         ))
 
         # ── EARNINGS_MOMENTUM_WAIT_SEC 秒待機 ───────────────────────────────
-        await asyncio.sleep(EARNINGS_MOMENTUM_WAIT_SEC)
+        await asyncio.sleep(_wait_sec)
 
         # ── 待機後の株価を取得 ─────────────────────────────────────────────
-        _q_after   = get_quote(sym)
+        _q_after   = await asyncio.to_thread(get_quote, sym)   # ★ v3.9.159b: ループを塞がない
         price_after = _q_after.get("last") or _q_after.get("bid") or 0.0
         if price_after <= 0:
             log.warning(f"[決算モメンタム] {tag} 待機後の株価取得失敗 → スキップ")
@@ -17657,7 +17744,7 @@ async def _earnings_momentum_check(
         ))
 
         await process_stock_news(
-            client, trd_env, sym, [earn_art],
+            client, trd_env, sym, earn_arts,
             thresh_override=EARNINGS_CONFIDENCE,
             bypass_filter=True,
         )
@@ -17667,6 +17754,116 @@ async def _earnings_momentum_check(
     finally:
         _earnings_momentum_in_progress[sym] = False
 # ─────────────────────────────────────────────────────────────────────────────
+def _earn_window_remaining_sec(sym: str):
+    """★ v3.9.159b: 決算監視ウィンドウ（PRE 04:00-09:30 / AFTER 16:00-20:00 ET）の
+    残り秒数。対象外なら None。窓の終端間際は待機を省いて即時判定するために使う。"""
+    try:
+        _now = datetime.datetime.now(ZoneInfo("America/New_York"))
+        _secs = _now.hour * 3600 + _now.minute * 60 + _now.second
+        _rems = []
+        if sym in EARNINGS_PRE_TICKERS and 4 * 3600 <= _secs < 9 * 3600 + 30 * 60:
+            _rems.append(9 * 3600 + 30 * 60 - _secs)
+        if sym in EARNINGS_AFTER_TICKERS and 16 * 3600 <= _secs < 20 * 3600:
+            _rems.append(20 * 3600 - _secs)
+        return min(_rems) if _rems else None
+    except Exception:
+        return None
+
+
+_EARN_PENDING_MAX = 5      # 銘柄ごとの保留上限（AIが実際に見るのは先頭5件のため・新しい方を残す）
+_EARN_PENDING_TTL_SEC = 600  # ★ v3.9.159b: 保留の鮮度上限。窓の終端で残った記事が翌日の
+                             #   窓で「新着」として委譲される事故（3レーン一致の指摘——
+                             #   前日の決算見出しで発注し得る・WS側と別IDのため二重判定
+                             #   にもなり得る）を根治する。超過分は破棄してログに残す。
+
+
+def _poll_dispatch_earn(client, trd_env, sym: str, articles: list, pending: dict) -> None:
+    """★ v3.9.159: 2秒ポーリングの記事を保留バッファへ集約し、監視が空いていれば
+    未消費分を一括で「30秒待機→方向確認」（_earnings_momentum_check）へ委譲する。
+
+    - 監視中は消費せずバッファに保持（フェッチ層の既読化で再取得できないため、
+      ここで捨てると永久消失する）
+    - 委譲時に元記事IDを消費し、別ID（earnpoll-）のラッパー群を渡す
+      （方向未確定スキップの記事を2秒ごとに再監視しないため。WS側の earn- と同型）
+    - 委譲先は wait_if_busy=True（投入直後にWS側が監視を始めても、記事を捨てずに
+      監視終了を待って判定する）
+    """
+    _bucket = pending.setdefault(sym, {})
+    _nowm = time.monotonic()
+    for _art in articles or []:
+        _oid = str(getattr(_art, "articleId", "") or "")
+        if not _oid:
+            log.debug(f"[決算監視] {sym}: articleId の無い記事を保留せずスキップ")
+            continue
+        if _oid not in _bucket:
+            _bucket[_oid] = {"art": _art, "ts": _nowm}
+    # 鮮度切れを破棄（無音にしない）
+    _stale = [k for k, v in _bucket.items()
+              if _nowm - float(v.get("ts", 0) or 0) > _EARN_PENDING_TTL_SEC]
+    for _k in _stale:
+        _bucket.pop(_k, None)
+    if _stale:
+        log.warning(f"[決算監視] {sym}: 保留が鮮度上限({_EARN_PENDING_TTL_SEC}秒)を超えたため {len(_stale)}件を破棄しました")
+    # 新しい順に上限まで残す
+    if len(_bucket) > _EARN_PENDING_MAX:
+        _drop = sorted(_bucket.items(), key=lambda kv: kv[1]["ts"])[:len(_bucket) - _EARN_PENDING_MAX]
+        for _k, _ in _drop:
+            _bucket.pop(_k, None)
+        log.warning(f"[決算監視] {sym}: 保留が上限を超えたため古い {len(_drop)}件を破棄しました")
+    if not _bucket or _earnings_momentum_in_progress.get(sym):
+        return
+    # 新しい順のラッパー列（AIは先頭5件を見る）。pop はスケジュール成功後に行う
+    #   （★ v3.9.159b: _threadsafe_future がループ停止間際に失敗すると coroutine ごと
+    #   閉じられ、先に pop していると記事が消える——レビュー指摘）。
+    _items = sorted(_bucket.items(), key=lambda kv: kv[1]["ts"], reverse=True)
+    _wraps, _dispatch_keys, _consume_keys = [], [], []
+    for _oid, _ent in _items:
+        # ★ v3.9.159c: ここでは「非破壊の既読確認」だけを行う（Codex指摘——
+        #   is_new_article は判定と同時に既読登録するため、スケジュール失敗の
+        #   再試行時に自分の登録を「他経路で判定済み」と誤読して破棄していた）。
+        #   実際の消費（既読登録）はスケジュール成功後に行う。
+        _seen_at = state.seen_articles.get(_oid)
+        if (_seen_at is not None
+                and (datetime.datetime.now() - _seen_at).total_seconds() < NEWS_DEDUP_SEC):
+            _dispatch_keys.append(_oid)   # 他経路で判定済み → 破棄だけする
+            continue
+        _art = _ent["art"]
+        _wraps.append(SimpleNamespace(
+            articleId=f"earnpoll-{_oid}",
+            headline=str(getattr(_art, "headline", "") or ""),
+            source=getattr(_art, "source", "Earnings-Poll"),
+            source_detail=str(getattr(_art, "source_detail", "") or ""),
+        ))
+        _dispatch_keys.append(_oid)
+        _consume_keys.append(_oid)
+    if not _wraps:
+        for _k in _dispatch_keys:
+            _bucket.pop(_k, None)
+        return
+    # ★ v3.9.159b: 窓の終端が近いときは待機を省いて即時判定（旧挙動）。
+    #   30秒待つとセッションゲートで捨てられ、消費済み記事だけが残る（レビュー指摘）。
+    _wait_sec = None
+    _rem = _earn_window_remaining_sec(sym)
+    if _rem is not None and _rem < EARNINGS_MOMENTUM_WAIT_SEC + 15:
+        _wait_sec = 0
+    log.info(
+        f"[決算監視] 🔔 {sym} のニュース検知（2秒ポーリング・{len(_wraps)}件）"
+        f"→ モメンタム確認（待機{_wait_sec if _wait_sec is not None else EARNINGS_MOMENTUM_WAIT_SEC}秒）: "
+        f"{_wraps[0].headline[:80]}"
+    )
+    _fut = _threadsafe_future(
+        _earnings_momentum_check(client, trd_env, sym, _wraps,
+                                 wait_if_busy=True, wait_sec_override=_wait_sec)
+    )
+    if _fut is None:
+        log.warning(f"[決算監視] {sym}: 委譲のスケジュールに失敗 → 保留のまま次の周回で再試行します")
+        return
+    for _k in _consume_keys:
+        state.is_new_article(_k)   # ★ v3.9.159c: 消費（既読登録）は成功後
+    for _k in _dispatch_keys:
+        _bucket.pop(_k, None)
+
+
 async def earnings_monitor_loop(
     client: anthropic.Anthropic,
     trd_env: TrdEnv,
@@ -17697,6 +17894,12 @@ async def earnings_monitor_loop(
     if not _all_earn:
         log.info("[決算監視] EARNINGS_PRE/AFTER 未設定 → スキップ")
         return
+    # ★ v3.9.159: 銘柄ごとの保留バッファ（{sym: {orig_id: article}}）。
+    #   フェッチ層は取得時点で記事を既読化するため（_STOCK_NEWS_CACHE）、
+    #   「見送って次の周回で拾う」は成立しない（新規Claudeレビュアーの指摘——
+    #   v3.9.158 初版は監視中の見送り・2件目以降の記事が無音で永久消失していた）。
+    #   取得した記事はまずここへ貯め、監視が空いたら未消費分を一括で委譲する。
+    _earn_pending: Dict[str, dict] = {}
 
     _alpaca_key = ALPACA_API_KEY_ID  # v3.9.42: サニタイズ済み
     _use_alpaca = bool(_alpaca_key)
@@ -17739,15 +17942,8 @@ async def earnings_monitor_loop(
             try:
                 _batch_results = await asyncio.to_thread(_fetch_stock_news_alpaca_batch, _active, 1)
                 for _sym in _active:
-                    _articles = _batch_results.get(_sym, [])
-                    if _articles:
-                        _threadsafe_future(
-                            process_stock_news(
-                                client, trd_env, _sym, _articles,
-                                thresh_override=EARNINGS_CONFIDENCE,
-                                bypass_filter=True,
-                            )
-                        )
+                    _poll_dispatch_earn(client, trd_env, _sym,
+                                        _batch_results.get(_sym, []), _earn_pending)
             except Exception as e:
                 log.error(f"[決算監視] Alpacaバッチエラー: {e}", exc_info=True)
         else:
@@ -17755,14 +17951,7 @@ async def earnings_monitor_loop(
             for _sym in _active:
                 try:
                     _articles = await asyncio.to_thread(_fetch_stock_news, _sym)
-                    if _articles:
-                        _threadsafe_future(
-                            process_stock_news(
-                                client, trd_env, _sym, _articles,
-                                thresh_override=EARNINGS_CONFIDENCE,
-                                bypass_filter=True,
-                            )
-                        )
+                    _poll_dispatch_earn(client, trd_env, _sym, _articles or [], _earn_pending)
                 except Exception as e:
                     log.error(f"[決算監視] {_sym}: エラー: {e}", exc_info=True)
 
@@ -18157,6 +18346,7 @@ async def alpaca_news_loop(
                                         _threadsafe_future(
                                             _earnings_momentum_check(
                                                 client, trd_env, _sym, _earn_art,
+                                                wait_if_busy=True,   # ★ v3.9.159b: busy時に記事を捨てない
                                             )
                                         )
                     # ── 通常の SPY/QQQ ルーティング ──────────────────────────
@@ -18409,6 +18599,13 @@ def _ovn_report_trade(st: dict, exit_price: float, exit_reason: str) -> None:
         log.warning(f"[OVN] 記録の送信に失敗（売買には影響しません）: {_mask_secrets(e)}")
 
 
+def _ovn_invalidate_owns_cache() -> None:
+    """★ v3.9.159b: 所有権キャッシュを無効化（保存＝phase遷移の直後に呼ぶ）。"""
+    with _ovn_owns_lock:
+        _ovn_file_owns_cache["t"] = None
+        _ovn_file_owns_cache["v"] = False
+
+
 def _ovn_save(st: dict) -> bool:
     """状態を永続化する。成功時だけ True（発注前の必須条件として使う）。"""
     try:
@@ -18435,6 +18632,7 @@ def _ovn_save(st: dict) -> bool:
                 os.close(dir_fd)
         except (AttributeError, OSError):
             pass
+        _ovn_invalidate_owns_cache()   # ★ v3.9.159b: phase遷移を即キャッシュへ反映
         return True
     except Exception as e:
         log.error(f"[OVN] 状態ファイルを保存できません（再起動で建玉を見失います）: {_mask_secrets(e)}")
@@ -18870,6 +19068,9 @@ async def ovn_overnight_loop(trd_env) -> None:
     if st.get("phase") in ("BUY_INTENT", "BUY_PENDING", "HELD", "RESERVED", "HELD_NO_RESERVE"):
         state.get(OVN_SYMBOL).ovn_held = True
         log.warning(f"🌙 [夜間持ち越し] 保有中の状態を復元しました（{st.get('phase')}）")
+    else:
+        # ★ v3.9.159: 非保有でも読めた中身を明示する（診断可能化）
+        log.info(f"🌙 [夜間持ち越し] 永続状態に保有なし（phase={st.get('phase', 'なし')}）")
 
     while True:
         await asyncio.sleep(30)
@@ -18892,8 +19093,8 @@ async def ovn_overnight_loop(trd_env) -> None:
                     _ovn_save(st)
                 elif pdetail == "OK" and odetail == "OK" and not buy_orders:
                     st["phase"] = "IDLE"
+                    _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
                     state.get(OVN_SYMBOL).ovn_held = False
-                    _ovn_save(st)
                 else:
                     _ovn_say(f"買い発注意図の復旧照会に失敗しました（position={pdetail[:80]} / order={odetail[:80]}）。", "error")
                 continue
@@ -18957,9 +19158,9 @@ async def ovn_overnight_loop(trd_env) -> None:
                         _ovn_save(st)
                         continue
                     st.update(phase="IDLE", qty=0)
+                    _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
                     state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say(f"買い注文は建玉を残さず終了しました（{status}）。", "warning")
-                    _ovn_save(st)
                     continue
                 else:
                     _ovn_say(f"買い注文終端後の建玉を確認できません: {pdetail[:120]}", "error")
@@ -19061,9 +19262,11 @@ async def ovn_overnight_loop(trd_env) -> None:
                 state.get(OVN_SYMBOL).ovn_held = True   # 部分約定も日中ロジックから切り離す
                 oid, msg = await asyncio.to_thread(_ovn_order, trd_env, TrdSide.BUY, qty, 0.0)
                 if not oid:
+                    st["phase"] = "IDLE"
+                    _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
                     state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say(f"買い注文が通りませんでした: {msg[:120]}", "error")
-                    st["phase"] = "IDLE"; _ovn_save(st); continue
+                    continue
                 st.update(phase="BUY_PENDING", qty=qty, buy_oid=oid,
                           trade_env=_RUN_TRADE_ENV,
                           ref_price=round(last, 2),
@@ -19097,9 +19300,9 @@ async def ovn_overnight_loop(trd_env) -> None:
                         log.info(f"[夜間持ち越し] 建玉ゼロは一時的な応答でした（再照会 {pos2}株）→ 続行")
                         continue
                     st["phase"] = "DONE"
+                    _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
                     state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say("建玉が無いことを確認しました（予約は不要です）。")
-                    _ovn_save(st)
                     continue
                 open_orders, odetail = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
                 sell_orders = [o for o in open_orders if "SELL" in o.get("side", "")]
@@ -19221,8 +19424,9 @@ async def ovn_overnight_loop(trd_env) -> None:
                             _ovn_save(st)
                             continue
                         st["phase"] = "DONE"
-                        state.get(OVN_SYMBOL).ovn_held = False
                         _ovn_clear_ambiguous(st)
+                        _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
+                        state.get(OVN_SYMBOL).ovn_held = False
                         _ovn_say("建玉が無いことを確認しました。")
                         _q_ovn2 = await asyncio.to_thread(get_quote, OVN_SYMBOL)
                         _ovn_report_trade(
@@ -19365,8 +19569,9 @@ async def ovn_overnight_loop(trd_env) -> None:
                         # 偽の「約定しました」と、実在しない往復の損益記録は送らない。
                         st["phase"] = "DONE"
                         st.pop("zero_unfilled_count", None)
-                        state.get(OVN_SYMBOL).ovn_held = False
                         _ovn_clear_ambiguous(st)
+                        _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順
+                        state.get(OVN_SYMBOL).ovn_held = False
                         if _dealt_total > 0:
                             _q_ovn_p = await asyncio.to_thread(get_quote, OVN_SYMBOL)
                             _ovn_say(
@@ -19387,8 +19592,12 @@ async def ovn_overnight_loop(trd_env) -> None:
                         continue
                     st["phase"] = "DONE"
                     st.pop("zero_unfilled_count", None)
-                    state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_clear_ambiguous(st)
+                    # ★ v3.9.159b: フラグ解除はファイル保存の「後」（レビュー2レーンの
+                    #   一致指摘——解除→保存の間の await 中に自己修復がファイルの
+                    #   旧phaseを読み、ovn_held を誤って再ラッチする）。
+                    _ovn_save(st)
+                    state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say("予約していた注文が寄り付きで約定しました。")
                     _q_ovn = await asyncio.to_thread(get_quote, OVN_SYMBOL)
                     _ovn_report_trade(
@@ -19442,8 +19651,8 @@ async def ovn_overnight_loop(trd_env) -> None:
             # ── ⑤ 日付が変わったら次の日に備える ──────────────────────────
             elif phase == "DONE" and hm >= (10, 30):
                 st["phase"] = "IDLE"
+                _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
                 state.get(OVN_SYMBOL).ovn_held = False
-                _ovn_save(st)
         except Exception as e:
             log.warning(f"[夜間持ち越し] 巡回で例外（続行します）: {type(e).__name__}: {_mask_secrets(e)}")
 
@@ -21115,7 +21324,25 @@ async def main(live: bool) -> None:
 
     # 起動時の最初の sync_positions より前に OVN 所有権を復元する。
     # 後回しにすると台帳に無い QQQ が外部建玉と誤通知される。
-    if _ovn_state_owns_position():
+    # ★ v3.9.159: 判定結果に関わらず永続状態の中身を必ず1行残す（実機の早期決済
+    #   事故では「復元しました」の不在という否定証拠しか無く、原因特定が難航した）。
+    try:
+        _ovn_dbg = _ovn_load()
+        _ovn_boot_owns = _ovn_state_owns_position(_ovn_dbg)
+        with _ovn_owns_lock:   # ★ v3.9.159b: 起動判定をキャッシュへプライム（読み直し不要に）
+            _ovn_file_owns_cache["v"] = _ovn_boot_owns
+            _ovn_file_owns_cache["t"] = time.monotonic()
+        log.info(
+            f"[夜間持ち越し] 起動時の永続状態: phase={_ovn_dbg.get('phase', 'なし')}"
+            f"  entry_date={_ovn_dbg.get('entry_date', '-')}"
+            f"  env={_ovn_dbg.get('trade_env', '-')}"
+            f"  所有権={'あり（日中ロジックから切り離します）' if _ovn_boot_owns else 'なし'}"
+            f"  file={os.path.basename(_ovn_state_path())}"
+        )
+    except Exception as _e_ovnb:
+        _ovn_boot_owns = False
+        log.warning(f"[夜間持ち越し] 起動時の永続状態を確認できません: {_mask_secrets(_e_ovnb)}")
+    if _ovn_boot_owns:
         state.get(OVN_SYMBOL).ovn_held = True
 
     # ★ v3.9.73: PCT 旧表記(小数)を検出していれば起動時に1回まとめて警告
@@ -21602,7 +21829,10 @@ async def main(live: bool) -> None:
     log.info(f"  時間切れ決済: {timeout_str}  トレール発動: +{TRAIL_TRIGGER_PCT*100:.1f}%  トレール幅: {TRAIL_DROP_PCT*100:.1f}%")
     log.info(f"  AIしきい値: confidence>{STRONG_BUY_CONFIDENCE}（ベース）  パニックしきい値: confidence>{PANIC_CONFIDENCE}")
     if any([_CONF_RTH, _CONF_PREMARKET, _CONF_AFTERHOURS, _CONF_OVERNIGHT]):
-        log.info(f"  　時間帯別しきい値: RTH={_CONF_RTH or '-'}  Pre={_CONF_PREMARKET or '-'}  After={_CONF_AFTERHOURS or '-'}  OVN={_CONF_OVERNIGHT or '-'}")
+        # ★ v3.9.159: 旧表示「OVN=」は夜間持ち越し機能（OVN_ENABLED）と紛らわしい
+        #   （認定サポーターの指摘）。これは moomoo のオーバーナイト・セッション
+        #   （時間帯区分）の AI しきい値。
+        log.info(f"  　時間帯別しきい値: RTH={_CONF_RTH or '-'}  Pre={_CONF_PREMARKET or '-'}  After={_CONF_AFTERHOURS or '-'}  Overnight時間帯={_CONF_OVERNIGHT or '-'}")
     # ★ v3.9.6: 「発注しない」設定セッションの一覧 (CONFIDENCE_*=2.00 sentinel)
     _disabled_sess_list = [
         (name, flag) for name, flag in [
@@ -22069,7 +22299,7 @@ async def main(live: bool) -> None:
         if ts.position_qty != 0 and ts.avg_cost > 0:
             # コストは絶対株数 × 平均取得価格（ショートも建玉評価額として計上）
             estimated_cost = abs(ts.position_qty) * ts.avg_cost
-            if sym == OVN_SYMBOL and getattr(ts, "ovn_held", False):
+            if sym == OVN_SYMBOL and _ovn_owns_now():   # ★ v3.9.159b: 二重ソース判定
                 # ★ v3.9.146 (A-11): OVN が建てた建玉は日中予算 (BUDGET_USD) に
                 #   計上しない。ovn_held はこのループより前（:18975 付近）で永続
                 #   OVN 状態から復元済み。tracked=0 のままだと直後の sync_positions
@@ -22097,7 +22327,7 @@ async def main(live: bool) -> None:
                 )
             # ── ★ v3.9.134: 台帳と突き合わせて「Bot の建玉か」を判定する ────────
             if (_ledger_first_run and not _ledger_has(sym, trd_env)
-                    and not (sym == OVN_SYMBOL and getattr(ts, "ovn_held", False))):
+                    and not (sym == OVN_SYMBOL and _ovn_owns_now())):
                 # 台帳をこの環境で初めて作る起動。旧版は口座の建玉をすべて Bot の
                 # ものとして扱っていたので、初回だけその前提を引き継ぐ。これをしないと
                 # 建玉を持ったまま版を上げた利用者の損切りが一斉に止まる。
@@ -22116,7 +22346,7 @@ async def main(live: bool) -> None:
                     f"版を上げた時点で持っていたこの建玉は、これまでどおり Bot が管理します。\n"
                     f"手動で保有されている建玉の場合は、moomoo アプリで決済してください。"
                 ))
-            if sym == OVN_SYMBOL and getattr(ts, "ovn_held", False):
+            if sym == OVN_SYMBOL and _ovn_owns_now():
                 # OVN の永続状態で所有権を確認済み。ニュース台帳には登録せず、
                 # 外部建玉通知も立てない。
                 _ext_set_held(sym, False)
@@ -22193,7 +22423,7 @@ async def main(live: bool) -> None:
             # ★ v3.9.156: OVN が所有する建玉は OVN 巡回が監視・決済する。ここで
             #   「監視されていない→手動決済して」と誤警報すると、案内に従った操作が
             #   翌朝の OVN 売却と衝突する（5日分レビュー）。
-            if getattr(state.get(OVN_SYMBOL), "ovn_held", False):
+            if _ovn_owns_now():   # ★ v3.9.159b: 二重ソース判定
                 _mon_syms.add(OVN_SYMBOL)
             _orphan_real = sorted(_account_symbols_seen - _mon_syms)
             if _orphan_real:
