@@ -170,7 +170,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.156"
+BOT_VERSION = "v3.9.157"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -1615,34 +1615,58 @@ async def shadow_short_exit_loop() -> None:
 
 
 # ── ★ v3.9.12: モメンタムシャドー観察ループ (Phase 0) ──────────────────────────
-def _select_v1_live_sides_disp() -> list:
-    """select_v1 絞り込み後の実発注対象サイド（表示用）。
+def _momentum_effective_live_sides(trd_env: TrdEnv) -> list:
+    """口座別ゲートまで適用した「実際に実発注され得るサイド」の一覧（表示用の正）。
 
-    ★ v3.9.156: 同じ式が momentum_shadow_loop と main() に複製され、片方だけ直して
-    もう片方が古い表示のまま残る事故が3版連続で起きたため一本化（5日分レビュー）。
-    実行時の絞り込み（:1963 付近）と同じ変数から作る。
+    ★ v3.9.156: プロファイル絞り込みの式が2箇所に複製され版ずれ事故が続いたため一本化。
+    ★ v3.9.157 (A-2): さらに口座別ゲートを適用する（認定サポーターの指摘）。
+      v3.9.156 のヘルパーは REAL_SHORT_ENABLED を見ておらず、実口座＋買い専用設定で
+      「SHORT も実発注対象です」という偽の注記と、ゲート適用前のサイド一覧を出していた。
+      実発注を実際に止めるゲート（:13327 実口座買い専用 / :13145 デモSHORT不可）と
+      同じ条件から作る。
     """
-    return sorted(
-        sd for sd in MOMENTUM_ENABLED_SIDES
-        if sd.endswith(":SELL_SHORT")
-        and sd.split(":", 1)[0] not in _SELECT_V1_EXCLUDED_SYMBOLS
-    )
+    sides = sorted(MOMENTUM_ENABLED_SIDES)
+    if MOMENTUM_PROFILE_SELECT:
+        sides = [sd for sd in sides
+                 if sd.endswith(":SELL_SHORT")
+                 and sd.split(":", 1)[0] not in _SELECT_V1_EXCLUDED_SYMBOLS]
+    if trd_env == TrdEnv.REAL and not REAL_SHORT_ENABLED:
+        sides = [sd for sd in sides if not sd.endswith(":SELL_SHORT")]
+    if trd_env == TrdEnv.SIMULATE and not DEMO_SHORT_ENABLED:
+        sides = [sd for sd in sides if not sd.endswith(":SELL_SHORT")]
+    return sides
+
+
+def _select_v1_live_sides_disp(trd_env: TrdEnv) -> list:
+    """互換名。実体は _momentum_effective_live_sides（口座別ゲート適用後）。"""
+    return _momentum_effective_live_sides(trd_env)
 
 
 def _momentum_demo_short_note(trd_env: TrdEnv) -> str:
     """SHORT の実発注可否についての起動時注記（環境で内容が変わる）。
 
-    ★ v3.9.156: DEMO_SHORT_ENABLED はデモ（SIMULATE）専用のゲート（:13145 参照）。
-    実口座に「実発注は発生しません」と表示していた v3.9.155 の退行を、環境で
-    分岐する1関数に集約して塞ぐ（5日分レビューで4レビュアーが独立に指摘）。
+    ★ v3.9.156: 環境で分岐する1関数に集約（v3.9.155 の偽表示の再発防止）。
+    ★ v3.9.157 (A-2): REAL_SHORT_ENABLED を反映。実口座＋買い専用設定で
+      「SHORT も実発注対象」と出す矛盾を解消し、実発注ゼロになる組み合わせは
+      口座種別を問わず明記する。
     """
     if trd_env != TrdEnv.SIMULATE:
+        if not REAL_SHORT_ENABLED:
+            base = "実口座は買い専用 (REAL_SHORT_ENABLED=false)。SHORT はシャドー記録のみ"
+            if not _momentum_effective_live_sides(trd_env):
+                # ★ v3.9.157b: select_v1 が無効の構成では理由に挙げない（レビュー指摘）
+                _why = ("select_v1 は SHORT のみ実発注のため" if MOMENTUM_PROFILE_SELECT
+                        else "有効な BUY サイドが無いため")
+                base += f"。{_why}、この組み合わせでは実発注は発生しません"
+            return base
         return "実口座のため SHORT も実発注対象です（DEMO_SHORT_ENABLED はデモ専用設定）"
     if DEMO_SHORT_ENABLED:
         return "デモはネッティング空売り有効 (DEMO_SHORT_ENABLED=true)"
-    if MOMENTUM_PROFILE_SELECT:
-        return ("デモ口座では SHORT は約定不可 (DEMO_SHORT_ENABLED=false)。"
-                "select_v1 は SHORT のみ実発注のため、この組み合わせでは実発注は発生しません")
+    if not _momentum_effective_live_sides(trd_env):
+        _why_d = ("select_v1 は SHORT のみ実発注のため" if MOMENTUM_PROFILE_SELECT
+                  else "有効な BUY サイドが無いため")
+        return (f"デモ口座では SHORT は約定不可 (DEMO_SHORT_ENABLED=false)。"
+                f"{_why_d}、この組み合わせでは実発注は発生しません")
     return "デモ口座では SHORT は約定不可 (DEMO_SHORT_ENABLED=false) のため BUY サイドのみ実発注"
 
 
@@ -1722,11 +1746,8 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
         #   「実発注は発生しません」と偽の表示を出していた（5日分レビュー）。
         _demo_short_note = _momentum_demo_short_note(trd_env)
         # ★ v3.9.154: ここも絞り込み後の実効サイドを出す（認定サポーターの指摘§4）。
-        _live_sides_disp = sorted(MOMENTUM_ENABLED_SIDES)
-        _live_sides_note = ""
-        if MOMENTUM_PROFILE_SELECT:
-            _live_sides_disp = _select_v1_live_sides_disp()
-            _live_sides_note = "（select_v1 絞り込み後）"
+        _live_sides_disp = _momentum_effective_live_sides(trd_env)
+        _live_sides_note = "（select_v1 絞り込み後・口座別ゲート適用後）" if MOMENTUM_PROFILE_SELECT else "（口座別ゲート適用後）"
         log.warning(
             f"[モメンタム] ⚡ 実発注モード有効: live-eligible サイド {_live_sides_disp}"
             f"{_live_sides_note} "
@@ -5877,6 +5898,25 @@ class TickerState:
         self.trail_active = False
 
 
+# ★ v3.9.157b: 既読を二層に分ける（4レーンレビューの裁定）。
+#   ・正規化一致（数値を # に置換したキー）……従来どおり 60 分。ここを 180 分に
+#     すると「25bp→50bp」「$1B→$4B」のような数値だけ違う続報まで3時間落ちる
+#     （Codex指摘——数値正規化と長TTLの組み合わせが判断材料を潰す）。
+#   ・完全一致（同一文字列）……180 分・スライディング更新。5分おきに再配信され
+#     続ける同一見出しが「ちょうど60分」で再判定に到達する機序（実測で二重発注）
+#     は、初見時刻固定では延命にしかならないため、見るたびに時刻を更新する。
+try:
+    _HEADLINE_DEDUP_TTL_SEC_DEFAULT: int = max(1, int(
+        os.environ.get("HEADLINE_DEDUP_TTL_MIN", "60") or "60")) * 60
+except (TypeError, ValueError):
+    _HEADLINE_DEDUP_TTL_SEC_DEFAULT = 60 * 60
+try:
+    _HEADLINE_EXACT_TTL_SEC_DEFAULT: int = max(1, int(
+        os.environ.get("HEADLINE_EXACT_TTL_MIN", "180") or "180")) * 60
+except (TypeError, ValueError):
+    _HEADLINE_EXACT_TTL_SEC_DEFAULT = 180 * 60
+
+
 @dataclass
 class GlobalState:
     seen_articles:   dict = field(default_factory=dict)  # {articleId: datetime}
@@ -6110,7 +6150,13 @@ class GlobalState:
     # Yahoo Finance の GUID 更新で URL dedup を素通りする問題への対策。
     seen_normalized_headlines: dict = field(default_factory=dict, init=False, repr=False)
     # {正規化キー (sha1[:16]): {time: datetime, original: str (最初に見た原文)}}
-    HEADLINE_DEDUP_TTL_SEC: int = field(default=3600, init=False, repr=False)  # 60分
+    # ★ v3.9.157/157b: 正規化一致の TTL（既定60分・HEADLINE_DEDUP_TTL_MIN で変更可）。
+    #   同一文字列の二重発注対策は HEADLINE_EXACT_TTL_SEC（180分・スライディング）が担う。
+    HEADLINE_DEDUP_TTL_SEC: int = field(
+        default=_HEADLINE_DEDUP_TTL_SEC_DEFAULT, init=False, repr=False)
+    HEADLINE_EXACT_TTL_SEC: int = field(
+        default=_HEADLINE_EXACT_TTL_SEC_DEFAULT, init=False, repr=False)
+    seen_exact_headlines: Dict[str, dict] = field(default_factory=dict, repr=False)
 
     @staticmethod
     def _normalize_headline_key(headline: str) -> str:
@@ -6143,6 +6189,13 @@ class GlobalState:
         h = _re.sub(r'\s+', ' ', h.lower().strip())
         return hashlib.sha1(h.encode('utf-8')).hexdigest()[:16]
 
+    def _exact_headline_key(self, headline: str, scope: str) -> str:
+        """★ v3.9.157b: 数値を残した同一文字列キー（小文字化＋空白圧縮のみ）。"""
+        import hashlib, html as _html, re as _re
+        h = _html.unescape(headline or "")
+        h = _re.sub(r"\s+", " ", h.lower().strip())
+        return scope + ":x:" + hashlib.sha1(h.encode("utf-8")).hexdigest()[:16]
+
     def check_headline_seen(self, headline: str, scope: str = "SHARED") -> tuple[bool, int, int]:
         """正規化ヘッドラインが TTL 以内に既出か判定。
 
@@ -6167,6 +6220,18 @@ class GlobalState:
             k: v for k, v in self.seen_normalized_headlines.items()
             if v.get("time", now) > cutoff
         }
+        # ★ v3.9.157b: 完全一致層（180分・スライディング）。同一文字列の再配信は
+        #   mark のたびに時刻が更新されるため、配信が続くかぎり再判定されない。
+        _xkey = self._exact_headline_key(headline, scope)
+        _xcut = now - datetime.timedelta(seconds=self.HEADLINE_EXACT_TTL_SEC)
+        self.seen_exact_headlines = {
+            k: v for k, v in self.seen_exact_headlines.items()
+            if v.get("time", now) > _xcut
+        }
+        _xentry = self.seen_exact_headlines.get(_xkey)
+        if _xentry is not None:
+            elapsed = int((now - _xentry.get("first", _xentry["time"])).total_seconds())
+            return True, elapsed, _xentry.get("hit_count", 0)
         entry = self.seen_normalized_headlines.get(key)
         if entry is not None:
             elapsed = int((now - entry["time"]).total_seconds())
@@ -6179,6 +6244,7 @@ class GlobalState:
             return
         key = scope + ":" + self._normalize_headline_key(headline)
         self.seen_normalized_headlines.pop(key, None)
+        self.seen_exact_headlines.pop(self._exact_headline_key(headline, scope), None)
 
     def mark_headline_seen(self, headline: str, scope: str = "SHARED") -> None:
         """ヘッドラインを正規化して dedup 辞書に記録 (or hit_count をインクリメント)。"""
@@ -6196,6 +6262,17 @@ class GlobalState:
         else:
             entry["hit_count"] = entry.get("hit_count", 0) + 1
             # time は最初に見た時刻を保持 (= 経過時間が正しく計算される)
+        # ★ v3.9.157b: 完全一致層はスライディング（見るたびに time を更新）。
+        _xkey = self._exact_headline_key(headline, scope)
+        _xentry = self.seen_exact_headlines.get(_xkey)
+        if _xentry is None:
+            self.seen_exact_headlines[_xkey] = {
+                "time": now, "first": now,
+                "original": (headline or "")[:200], "hit_count": 0,
+            }
+        else:
+            _xentry["time"] = now
+            _xentry["hit_count"] = _xentry.get("hit_count", 0) + 1
 
     def total_summary(self) -> str:
         lines = []
@@ -6475,6 +6552,22 @@ _last_sweep_skipped_owned: list = []
 
 
 _SWEEP_VERIFY_WAIT_SEC: int = 10    # 成行の約定反映を待つ秒数（テストで0に差し替え可）
+# ★ v3.9.157 (A-1): スイープ（週末/デモ日次決済）中に出した決済注文の記録。
+#   建玉照会の空応答（moomoo JP で実在が確認されている現象）だけを根拠に
+#   「建玉ゼロ確認」と確定しないため、注文の側（終端＋約定数）でも裏を取る。
+_sweep_oid_ctx = threading.local()
+_last_sweep_close_orders: list = []
+# ★ v3.9.157b: 記録の鮮度上限。これより古い注文記録は裏取りの照合対象から外す
+#   （4レーンレビューの一致指摘——前日の記録が残ったままだと、フラットな日の
+#   スイープが「照会不能な古い注文」を審査し続け、停止に入れず誤警報を出す。
+#   moomoo の order_list_query(order_id) は当日の注文しか返さない）。
+_SWEEP_ORDER_FRESH_SEC: float = 300.0
+
+
+def _fresh_sweep_orders(entries: list) -> list:
+    _nowm = time.monotonic()
+    return [e for e in (entries or [])
+            if (_nowm - float(e.get("ts", 0) or 0)) <= _SWEEP_ORDER_FRESH_SEC]
 _SWEEP_VERIFY_ATTEMPTS: int = 3     # ★ v3.9.156b: 裏取りの試行回数
 # ★ v3.9.156c: 20秒×2回（初回10秒と合わせ最大50秒）。60秒間隔だと、注文拒否等で
 #   本当に決済できていない場合の再決済が1巡あたり最大130秒遅れ、15:45 ET 起点の
@@ -6519,13 +6612,71 @@ def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> 
             if state.get(sym).position_qty != 0 and not _is_other_owner(sym)
         )
         if not _left:
-            log.info(f"[{log_prefix}] ✅ 決済後の裏取り: Bot 所有の建玉ゼロを確認しました")
+            # ★ v3.9.157 (A-1): 建玉の不在だけでは確定しない（認定サポーターの指摘）。
+            #   moomoo JP の position_list_query は建玉があっても空を返すことがあり、
+            #   決済注文の直後は追跡コストのゼロクリアと重なって「1回の空応答＝
+            #   建玉ゼロ確認」に化けていた。このスイープで出した決済注文の側でも
+            #   裏を取り、全注文が FILLED_ALL（または約定数が目標到達）のときだけ
+            #   確定する。UNKNOWN・生存中は未確定として次の試行へ回す。
+            # ★ v3.9.157c: 審査は銘柄ごとに集約する（Codex指摘）。再発注で同一銘柄に
+            #   新旧の注文が並ぶとき、「どれか1本が全量約定」していればその銘柄は充足。
+            #   充足が無く UNKNOWN/生存中が残るなら未解決（再確認）。全て終端かつ
+            #   未約定なら不成立（再決済へ）。
+            _by_sym: dict = {}
+            for _co in _fresh_sweep_orders(_last_sweep_close_orders):
+                _st_o, _dealt_o, _det_o = _order_status_snapshot(
+                    _co["oid"], _co["symbol"], trd_env)
+                _by_sym.setdefault(_co["symbol"], []).append((_co, _st_o, _dealt_o))
+            _unfilled, _unresolved = [], []
+            for _sym_o, _entries in _by_sym.items():
+                # ★ v3.9.157c2: 充足は「最新の注文」を基準に判定する（Codex指摘——
+                #   旧注文 qty=5 の約定だけで、数量が増えた新注文 qty=10 の取消を
+                #   見逃してはならない）。最新注文が約定しているか、全注文の約定数
+                #   合計が最新注文の数量に達していれば充足。
+                _latest = max(_entries, key=lambda x: float(x[0].get("ts", 0) or 0))
+                _lc, _lst, _ld = _latest
+                _dealt_sum = sum(_d for _c, _st, _d in _entries)
+                _satisfied = (
+                    ("FILLED_ALL" in _lst) or (_lc["qty"] > 0 and _ld >= _lc["qty"])
+                    or (_lc["qty"] > 0 and _dealt_sum >= _lc["qty"])
+                )
+                if _satisfied:
+                    continue
+                _open_like = [(_c, _st) for _c, _st, _d in _entries
+                              if _st not in _TERMINAL_ORDER_STATUSES]
+                if _open_like:
+                    _unresolved.extend(f"{_sym_o}:{_c['oid']}={_st}" for _c, _st in _open_like)
+                else:
+                    _unfilled.extend(
+                        f"{_sym_o}:{_c['oid']}={_st}({_d}/{_c['qty']})"
+                        for _c, _st, _d in _entries)
+            if _unfilled:
+                log.error(
+                    f"[{log_prefix}] 🔴 決済注文が約定せずに終端しています: "
+                    f"{', '.join(_unfilled)} → 完了扱いにせず再決済へ回します"
+                )
+                return False
+            if _unresolved:
+                log.warning(
+                    f"[{log_prefix}] 決済注文の約定を確認できていません（{', '.join(_unresolved)}）"
+                    f" → 確定させず再確認します（{_v_try + 1}/{_SWEEP_VERIFY_ATTEMPTS}回目）"
+                )
+                continue
+            log.info(
+                f"[{log_prefix}] ✅ 決済後の裏取り: Bot 所有の建玉ゼロ＋"
+                f"決済注文の約定（{len(_last_sweep_close_orders)}件）を確認しました"
+            )
             return True
         log.warning(
             f"[{log_prefix}] 発注後も建玉が見えます（{_v_try + 1}/{_SWEEP_VERIFY_ATTEMPTS}回目・"
             f"{', '.join(_left)}）→ 反映遅延の可能性があるため間隔を置いて再確認します"
         )
-    log.error(f"[{log_prefix}] 🔴 再確認しても建玉が残っています → 完了扱いにせず再試行します")
+    # ★ v3.9.157b: 「建玉が残っている」とは限らない（注文照会だけが不能のケースも
+    #   ここへ来る）。切り分けを誤らせない文言にする（レビュー指摘）。
+    log.error(
+        f"[{log_prefix}] 🔴 決済完了を確認できませんでした（建玉の残存または注文照会の不能）"
+        f" → 完了扱いにせず再試行します"
+    )
     return False
 
 
@@ -6585,6 +6736,10 @@ def close_all_for_weekend(trd_env: TrdEnv,
         )
 
     if not targets:
+        # ★ v3.9.157b: ここで返る前に、前回スイープの古い注文記録を掃除する
+        #   （4レーンレビューの一致指摘——掃除しないと、フラットな日の裏取りが
+        #   前日の注文を照会し続けて UNKNOWN → 停止に入れず偽の🔴警報になる）。
+        globals()["_last_sweep_close_orders"] = _fresh_sweep_orders(_last_sweep_close_orders)
         log.info(f"[{log_prefix}] 決済対象ポジションなし → スキップ")
         # ★ v3.9.141: 決済すべきものが無い＝成功。裸の return（None=偽）のままだと、
         #   建玉ゼロの正常な状態を呼び出し側が「失敗」と誤判定し、毎分再試行し続ける。
@@ -6617,56 +6772,85 @@ def close_all_for_weekend(trd_env: TrdEnv,
     #   "partial"（一部しか決済できていない）を完了扱いにすると、再試行が回らず
     #   建玉が残ったまま週末停止に入る（認定サポーターの指摘）。
     _failed, _deferred, _pending, _partial = [], [], [], []
-    for sym in targets:
-        place_close_all(sym, trd_env, reason)
-        _why = _take_close_result(sym)
-        if _why == "full":
-            continue
-        elif _why in ("partial", "unknown"):
-            # ★ v3.9.150: "unknown"（内部数量ゼロ・照会の応答が欠けている疑い）も
-            #   完了扱いにしない。残玉ごと週末停止に入る経路を塞ぐ。
-            _partial.append(sym)
-        elif _why == "owned":
-            _deferred.append(sym)
-        elif _why == "pending":
-            _pending.append(sym)
-        else:
-            _failed.append(sym)
-    if _deferred:
-        log.info(
-            f"[{log_prefix}] 決済の対象外: {', '.join(_deferred)}"
-            f"（Bot 以外の建玉／失敗には数えません）"
-        )
-        # ★ v3.9.148: 完了通知の注記にはループ内で見送った分も載せる（Codexレビュー指摘）。
-        #   従来は「はじめから対象外にした分」(_skipped_owned) しか載らず、
-        #   全件が途中で見送りになった回に「全決済しました」とだけ届いていた。
-        _last_sweep_skipped_owned = list(_skipped_owned) + [
-            s for s in _deferred if s not in _skipped_owned
-        ]
-        globals()["_last_sweep_skipped_owned"] = _last_sweep_skipped_owned
-    if _partial:
-        log.error(
-            f"[{log_prefix}] 🔴 決済を確認できていない銘柄: {', '.join(_partial)}"
-            f"（一部のみ発注／建玉照会の応答が不完全）→ 完了扱いにせず、再試行します"
-        )
-    if _pending:
-        # ★ v3.9.148: 処理待ちは「まだ終わっていない」。重大通知は出さず（実際に
-        #   失敗したわけではない）、完了扱いにもしないで境界の再試行に委ねる。
-        log.warning(
-            f"[{log_prefix}] 既存の決済注文の処理待ちで見送った銘柄: {', '.join(_pending)}"
-            f" → 完了扱いにせず、次の巡回で再試行します"
-        )
-    if _failed:
-        log.error(
-            f"[{log_prefix}] 🔴 決済できなかった銘柄があります: {', '.join(_failed)}"
-            f"（{len(_failed)}/{len(targets)}件）"
-        )
-        _threadsafe_future(asyncio.to_thread(
-            send_discord_message,
-            f"🔴 【重要】決済しきれませんでした\n"
-            f"対象: {', '.join(_failed)}（{len(_failed)}/{len(targets)}件）\n"
-            f"moomoo アプリで建玉をご確認のうえ、必要なら手動で決済してください。"
-        ))
+    _sweep_oid_ctx.oids = []   # ★ v3.9.157 (A-1): このスイープで出す注文の収集を開始
+    try:
+        for sym in targets:
+            try:
+                place_close_all(sym, trd_env, reason)
+            except Exception as _e_pc:
+                # ★ v3.9.157 (C-2): 1銘柄の例外で後続銘柄が未処理のままループごと
+                #   落ちていた（認定サポーターの実験で確認・_loop_guard 再起動で
+                #   同じ地点を繰り返す）。失敗に数えて次の銘柄へ進む。
+                log.error(
+                    f"[{log_prefix}] 🔴 {sym} の決済処理で例外: "
+                    f"{type(_e_pc).__name__}: {_mask_secrets(_e_pc)} → 失敗に数えて次の銘柄へ進みます"
+                )
+                _failed.append(sym)
+                continue
+            _why = _take_close_result(sym)
+            if _why == "full":
+                continue
+            elif _why in ("partial", "unknown"):
+                # ★ v3.9.150: "unknown"（内部数量ゼロ・照会の応答が欠けている疑い）も
+                #   完了扱いにしない。残玉ごと週末停止に入る経路を塞ぐ。
+                _partial.append(sym)
+            elif _why == "owned":
+                _deferred.append(sym)
+            elif _why == "pending":
+                _pending.append(sym)
+            else:
+                _failed.append(sym)
+        if _deferred:
+            log.info(
+                f"[{log_prefix}] 決済の対象外: {', '.join(_deferred)}"
+                f"（Bot 以外の建玉／失敗には数えません）"
+            )
+            # ★ v3.9.148: 完了通知の注記にはループ内で見送った分も載せる（Codexレビュー指摘）。
+            #   従来は「はじめから対象外にした分」(_skipped_owned) しか載らず、
+            #   全件が途中で見送りになった回に「全決済しました」とだけ届いていた。
+            _last_sweep_skipped_owned = list(_skipped_owned) + [
+                s for s in _deferred if s not in _skipped_owned
+            ]
+            globals()["_last_sweep_skipped_owned"] = _last_sweep_skipped_owned
+        if _partial:
+            log.error(
+                f"[{log_prefix}] 🔴 決済を確認できていない銘柄: {', '.join(_partial)}"
+                f"（一部のみ発注／建玉照会の応答が不完全）→ 完了扱いにせず、再試行します"
+            )
+        if _pending:
+            # ★ v3.9.148: 処理待ちは「まだ終わっていない」。重大通知は出さず（実際に
+            #   失敗したわけではない）、完了扱いにもしないで境界の再試行に委ねる。
+            log.warning(
+                f"[{log_prefix}] 既存の決済注文の処理待ちで見送った銘柄: {', '.join(_pending)}"
+                f" → 完了扱いにせず、次の巡回で再試行します"
+            )
+        if _failed:
+            log.error(
+                f"[{log_prefix}] 🔴 決済できなかった銘柄があります: {', '.join(_failed)}"
+                f"（{len(_failed)}/{len(targets)}件）"
+            )
+            _threadsafe_future(asyncio.to_thread(
+                send_discord_message,
+                f"🔴 【重要】決済しきれませんでした\n"
+                f"対象: {', '.join(_failed)}（{len(_failed)}/{len(targets)}件）\n"
+                f"moomoo アプリで建玉をご確認のうえ、必要なら手動で決済してください。"
+            ))
+    finally:
+        # ★ v3.9.157 (A-1/157b): 出した注文のスナップショットを裏取りへ渡す。
+        #   例外時も finally で必ず公開・収集器を畳む（プールスレッドの再利用で
+        #   無関係な決済呼び出しに記録が漏れる穴を塞ぐ）。前回分の未解決の証拠
+        #   （鮮度内・今回の再発注で置き換わっていない注文）はマージして残す
+        #   ——再試行で対象銘柄が照会の空応答に隠れたとき、取消済み注文の証拠を
+        #   上書きで失う穴（レビュー指摘）を塞ぐ。
+        _cur = list(getattr(_sweep_oid_ctx, "oids", []) or [])
+        # ★ v3.9.157c: 同一銘柄でも旧注文の証拠は落とさない（Codex指摘——
+        #   旧注文が遅れて約定した二重決済や、取消の失敗証拠を検知できなくなる）。
+        #   重複排除は oid 単位のみ。新旧の裁定は裏取り側が銘柄ごとに行う。
+        _cur_oids = {e["oid"] for e in _cur}
+        _carry = [e for e in _fresh_sweep_orders(_last_sweep_close_orders)
+                  if e["oid"] not in _cur_oids]
+        globals()["_last_sweep_close_orders"] = _cur + _carry
+        _sweep_oid_ctx.oids = None
     return not (_failed or _pending or _partial)
 
 
@@ -6712,6 +6896,18 @@ _TODAY_STATE_PATH = os.path.join(
 _TODAY_STATE_LOCK = threading.Lock()
 
 
+def _today_state_path() -> str:
+    """★ v3.9.157 (案B): 当日サマリの保存先を口座別に分ける（認定サポーターの提案）。
+
+    同一 ET 日付内で実口座⇄デモを切り替えると、前の口座の当日トレードが
+    復元で合算され、Discord の日次集計に両口座の損益が混ざっていた。
+    OVN 状態ファイル（v3.9.145）と同じ REAL/DEMO 分割方式。旧単一ファイルは
+    読み戻さない（表示専用のため、更新初日の同日復元だけが対象外になる）。
+    """
+    _root, _ext = os.path.splitext(_TODAY_STATE_PATH)
+    return f"{_root}.{'REAL' if _RUN_TRADE_ENV == 'REAL' else 'DEMO'}{_ext}"
+
+
 def _save_today_state() -> None:
     """当日サマリ3バッファをファイルへ保存 (原子的置換)。失敗は黙殺 (表示専用のため)。"""
     try:
@@ -6722,10 +6918,11 @@ def _save_today_state() -> None:
             "shadow_momentum": _today_shadow_momentum,
         }
         with _TODAY_STATE_LOCK:
-            tmp = _TODAY_STATE_PATH + ".tmp"
+            _path_ts = _today_state_path()
+            tmp = _path_ts + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False)
-            os.replace(tmp, _TODAY_STATE_PATH)
+            os.replace(tmp, _path_ts)
     except Exception as _e:
         log.debug(f"[当日サマリ永続化] 保存失敗(黙殺): {_mask_secrets(_e)}")
 
@@ -6735,10 +6932,11 @@ def _load_today_state() -> int:
     global _today_trades, _today_trades_date
     global _today_shadow_short, _today_shadow_momentum
     try:
-        if not os.path.exists(_TODAY_STATE_PATH):
+        _path_ts = _today_state_path()
+        if not os.path.exists(_path_ts):
             return 0
         with _TODAY_STATE_LOCK:
-            with open(_TODAY_STATE_PATH, "r", encoding="utf-8") as f:
+            with open(_path_ts, "r", encoding="utf-8") as f:
                 state = json.load(f)
         today_et = datetime.datetime.now(_ET).date()
         saved = state.get("date")
@@ -7253,7 +7451,7 @@ def _format_daily_summary() -> Optional[str]:
     if not _today_trades:
         today_et = datetime.datetime.now(_ET)
         header = []
-        header.append(f"📊 本日のトレード集計  {today_et.strftime('%Y-%m-%d (%a) %H:%M ET')}")
+        header.append(f"📊 本日のトレード集計 {'🔴 実口座' if _RUN_TRADE_ENV == 'REAL' else '🟡 デモ口座'}  {today_et.strftime('%Y-%m-%d (%a) %H:%M ET')}")
         header.append('=' * 56)
         header.append(f"🎛 戦略プロファイル: {_PROFILE_DISPLAY}")   # ★ v3.9.116
         header.append("本日の実トレードはありません")
@@ -7304,7 +7502,7 @@ def _format_daily_summary() -> Optional[str]:
         c['pnl'] += t['pnl']
 
     lines = []
-    lines.append(f"📊 本日のトレード集計  {today_et.strftime('%Y-%m-%d (%a) %H:%M ET')}")
+    lines.append(f"📊 本日のトレード集計 {'🔴 実口座' if _RUN_TRADE_ENV == 'REAL' else '🟡 デモ口座'}  {today_et.strftime('%Y-%m-%d (%a) %H:%M ET')}")
     lines.append('=' * 56)
     lines.append(f"🎛 戦略プロファイル: {_PROFILE_DISPLAY}")   # ★ v3.9.116
     lines.append(f"合計 {n_total}件   勝率 {win_rate:.0f}% ({n_w}勝 {n_l}敗)")
@@ -7380,7 +7578,8 @@ def _print_daily_summary_to_terminal() -> None:
         # 取引ゼロでも「本日トレードなし」を明示
         try:
             sys.stderr.write("\n" + "─" * 56 + "\n")
-            sys.stderr.write("📊 本日のトレード集計  (本日のトレードなし)\n")
+            sys.stderr.write(
+                f"📊 本日のトレード集計 {'🔴 実口座' if _RUN_TRADE_ENV == 'REAL' else '🟡 デモ口座'}  (本日のトレードなし)\n")
             sys.stderr.write("─" * 56 + "\n\n")
             sys.stderr.flush()
         except Exception:
@@ -9780,7 +9979,11 @@ def _build_skip_regex(keywords, ignorecase: bool) -> "re.Pattern":
                 # ★ v3.9.155: 固有名詞は -ys 複数（Grammys/Emmys）になるため両方許す
                 pat = pat[:-len(re.escape("y"))] + r"(?:y|ys|ies)\b"
             else:
-                pat = pat + r"(?:e?s)?\b"
+                # ★ v3.9.157 (B-1): -er(s)/-ing も落とす（golfers/footballers/filming/
+                #   touring・認定サポーターの辞書234,289語での巻き添え測定に基づく。
+                #   -ed は "concerted effort"/"old-fashioned" が金融文で頻出のため
+                #   足さない——同測定の結論を採用）。
+                pat = pat + r"(?:e?s|ers?|ing)?\b"
         else:
             pat = pat + ""
         parts.append(pat)
@@ -9791,8 +9994,31 @@ _SKIP_REGEX_CI = _build_skip_regex(_SKIP_KEYWORDS_CI, ignorecase=True)
 _SKIP_REGEX_CS = _build_skip_regex(_SKIP_ACRONYMS_CS, ignorecase=False)
 
 
+# ★ v3.9.157: 個人の資産運用Q&A見出しの上流パターン（認定サポーター2名の指摘）。
+#   "Can I Retire at 62 With $2.5M in a Roth IRA...?" のような個人向け相談記事が
+#   ノイズフィルタを通過して判定バッチに混ざり、META疑問形ガードが無関係の
+#   実シグナル（Samsung値上げ等）まで巻き込んで中立化していた。
+#   META ガード本体は現状維持（根拠見出しの特定は応答スキーマ変更が必要で、
+#   ガードが守った損失も実在する）が正しく、上流で落とすのが安全という裁定。
+#   誤爆を避けるため「疑問形の書き出し＋個人文脈」に限定した保守的なパターンにする。
+# ★ v3.9.157b: レビューで2点を絞り込み——(1) "we" を外す（"Should We Expect More
+#   Fed Rate Cuts?" のような市場エディトリアルまで落ちる）(2) 素の "roth ira" を
+#   外す（"Robinhood launches Roth IRA match" のような商品ニュースが実在する。
+#   個人相談の見出しは疑問形の書き出しパターンで既に拾える）。
+_SKIP_PERSONAL_QA_PATTERNS = [
+    re.compile(r"^(can|should|how can|how should) i \b", re.I),
+    re.compile(r"^how much (do|does|should|will) (i|you) need", re.I),
+    re.compile(r"^should you (buy|sell|invest|own|claim)\b", re.I),
+    re.compile(r"^is it (too late|smart|worth it) to\b", re.I),
+]
+
+
 def _match_skip_keyword(headline: str) -> "Optional[str]":
     """除外キーワードに当たれば当たった語を返す（当たらなければ None）。"""
+    for _qa_pat in _SKIP_PERSONAL_QA_PATTERNS:
+        _qa_m = _qa_pat.search(headline)
+        if _qa_m:
+            return f"personal-qa:{_qa_m.group(0).lower().strip()}"
     m = _SKIP_REGEX_CI.search(headline)
     if m:
         return m.group(0).lower()
@@ -10808,6 +11034,142 @@ def resolve_execution_symbols(
     return EXECUTION_MAP.get(trigger_symbol, [])
 
 # ── moomoo API ヘルパー ─────────────────────────────────────────────────────────
+try:
+    MOOMOO_CTX_BUILD_TIMEOUT_SEC: float = float(os.environ.get("MOOMOO_CTX_BUILD_TIMEOUT_SEC", "15") or 15)
+except (TypeError, ValueError):
+    MOOMOO_CTX_BUILD_TIMEOUT_SEC = 15.0
+_opend_down_last_note_mono: float = 0.0
+# ★ v3.9.157b: 半死状態（TCPは通るがSDK生成が返らない）でのスレッド堆積対策。
+#   生成スレッドの同時実行に上限を設け、タイムアウト直後は短時間ブレーカーで
+#   即例外にする（4レーンレビューの一致指摘——上限なしだと数時間で数百本の
+#   ハングスレッド＋SDKの非daemon再接続スレッドが積もる）。
+_ctx_build_lock = threading.Lock()
+_ctx_build_inflight: int = 0
+_CTX_BUILD_MAX_INFLIGHT: int = 3
+_ctx_build_backoff_until: float = 0.0
+_CTX_BUILD_BACKOFF_SEC: float = 20.0
+
+
+class OpenDUnavailableError(RuntimeError):
+    """★ v3.9.157: OpenD に接続できない／応答しないときに投げる。
+
+    SDK のコンテキストコンストラクタは OpenD と繋がるまで例外もタイムアウトも
+    無しに6秒間隔で無限に再試行する。これがイベントループ上で起きると、
+    心拍・損切り・時間切れ・トレール・パニックが同時に止まる
+    （実測: 4時間23分の全凍結・認定サポーター2名の報告と機序特定より）。
+    無限ブロックの代わりにこの例外を投げ、既存の except 節（各ループの
+    「失敗しても続行」）に拾わせて、監視を生かしたまま再試行させる。
+    """
+
+
+def _opend_tcp_ok(timeout_sec: float = 3.0) -> bool:
+    """OpenD のポートに素の TCP で当たりを取る（SDK オブジェクトは作らない）。"""
+    import socket as _socket
+    try:
+        with _socket.create_connection((MOOMOO_HOST, MOOMOO_PORT), timeout=timeout_sec):
+            return True
+    except Exception:
+        return False
+
+
+def _note_opend_down(what: str, detail: str) -> None:
+    """OpenD 不達の明示通知（120秒に1回へ間引き・イベントループ非依存）。
+
+    従来は「Bot応答なし」という間接情報しか届かなかった（HEARTBEAT のみ）。
+    原因を名指しする通知を、ループの状態に関係なく出せる使い捨てスレッドで送る。
+    """
+    global _opend_down_last_note_mono
+    with _ctx_build_lock:   # ★ v3.9.157b: check-then-set のレースで通知が連打される穴を塞ぐ
+        _nowm = time.monotonic()
+        if _nowm - _opend_down_last_note_mono < 120:
+            return
+        _opend_down_last_note_mono = _nowm
+    _msg = (f"🔴 OpenD に接続できません／応答がありません（{detail}・呼出元={what}）。"
+            f"OpenD の起動・再起動をご確認ください（Bot 側からの自動再起動はしません）")
+    log.error(f"[OpenD] {_msg}")
+    try:
+        threading.Thread(target=send_discord_message, args=(f"[Bot] {_msg}",),
+                         daemon=True, name="opend-down-note").start()
+    except Exception:
+        pass
+
+
+def _make_ctx_bounded(factory, what: str):
+    """★ v3.9.157: SDK コンテキストを「二段構え」で生成する（v3.9.147 の
+    _opend_state_line と同じ型を、実際に毎回使う生成経路へ展開）。
+      ① 素の TCP で当たりを取り、繋がらなければ SDK を触らない
+      ② 繋がっても応答しない場合に備え、別スレッドで期限を切る
+    期限内に返らなければ OpenDUnavailableError（無限ブロックの代替）。
+    期限後に遅れて生成が成功した場合は、その場で close して資源を漏らさない。
+    """
+    global _ctx_build_inflight, _ctx_build_backoff_until
+    # ★ v3.9.157b/c: 直近のタイムアウト直後はスレッドを起こさず即例外（ブレーカー）。
+    #   上限の確認と予約は同一ロック区間で原子的に行い、カウンタは「生存中の
+    #   生成スレッド数」として生成スレッド自身の finally で減算する（Codex指摘——
+    #   呼出元の15秒で減算するとハング中のスレッドが数に入らず、35秒ごとに
+    #   堆積し続ける。生存数で数えれば上限3本で頭打ちになり、OpenD 復帰で
+    #   ハングが解けた時に自然に枠が戻る）。
+    with _ctx_build_lock:
+        if time.monotonic() < _ctx_build_backoff_until:
+            raise OpenDUnavailableError(f"OpenD 応答なし（直前のタイムアウトから待機中・{what}）")
+        if _ctx_build_inflight >= _CTX_BUILD_MAX_INFLIGHT:
+            raise OpenDUnavailableError(f"OpenD 応答なし（生成が滞留中 {_ctx_build_inflight}件・{what}）")
+        _ctx_build_inflight += 1
+    if not _opend_tcp_ok():
+        with _ctx_build_lock:
+            _ctx_build_inflight -= 1   # スレッドを起こさないので予約を返す
+        _note_opend_down(what, "TCP接続不可")
+        raise OpenDUnavailableError(f"OpenD 接続不可 ({MOOMOO_HOST}:{MOOMOO_PORT})")
+    _res: dict = {}
+    _done = threading.Event()
+    _late = threading.Event()
+    def _build():
+        global _ctx_build_inflight
+        _ctx = None
+        try:
+            try:
+                _ctx = factory()
+            except Exception as _e_b:
+                with _ctx_build_lock:
+                    _res["err"] = _e_b
+                    _done.set()
+                return
+        # ★ v3.9.157b: 公開かcloseかの判断はロック下で原子的に行う（レビュー3レーンの
+        #   一致指摘——is_set() 確認と格納の間に main 側の set が割り込むと、生成済み
+        #   ctx が誰にも close されずに漏れていた）。
+            with _ctx_build_lock:
+                if _late.is_set():
+                    _should_close = True
+                else:
+                    _res["ctx"] = _ctx
+                    _should_close = False
+                _done.set()
+            if _should_close:
+                try:
+                    _ctx.close()
+                except Exception:
+                    pass
+        finally:
+            with _ctx_build_lock:
+                _ctx_build_inflight -= 1   # ★ v3.9.157c: 生存数はスレッド終了で減る
+    _th = threading.Thread(target=_build, daemon=True, name=f"ctx-build-{what}")
+    _th.start()
+    _th.join(MOOMOO_CTX_BUILD_TIMEOUT_SEC)
+    with _ctx_build_lock:
+        if not _done.is_set():
+            _late.set()
+            _ctx_build_backoff_until = time.monotonic() + _CTX_BUILD_BACKOFF_SEC
+            _timed_out = True
+        else:
+            _timed_out = False
+    if _timed_out:
+        _note_opend_down(what, f"生成が{MOOMOO_CTX_BUILD_TIMEOUT_SEC:.0f}秒以内に完了せず")
+        raise OpenDUnavailableError(f"OpenD 応答なし（コンテキスト生成タイムアウト・{what}）")
+    if "err" in _res:
+        raise _res["err"]
+    return _res["ctx"]
+
+
 def _apply_ctx_timeout(ctx):
     """★ v3.9.129: 接続READY待ちの無限待ちを有限化する（OpenD無応答ハング対策）。
     SDKに set_sync_query_connect_timeout が無い旧版でも壊れないよう getattr で防御。"""
@@ -10821,13 +11183,15 @@ def _apply_ctx_timeout(ctx):
 
 
 def _make_quote_ctx() -> OpenQuoteContext:
-    """OpenQuoteContext を生成して返す。 MOOMOO_RSA_KEY が空・None・存在しないファイルの場合は security_data_path を渡さず「暗号化なし」で接続する。"""
+    """OpenQuoteContext を生成して返す。 MOOMOO_RSA_KEY が空・None・存在しないファイルの場合は security_data_path を渡さず「暗号化なし」で接続する。
+    ★ v3.9.157: 生成は _make_ctx_bounded 経由（OpenD 停止時の無限ブロック対策）。"""
     if MOOMOO_RSA_KEY and isinstance(MOOMOO_RSA_KEY, str) and os.path.isfile(MOOMOO_RSA_KEY):
-        return _apply_ctx_timeout(OpenQuoteContext(
+        return _apply_ctx_timeout(_make_ctx_bounded(lambda: OpenQuoteContext(
             host=MOOMOO_HOST, port=MOOMOO_PORT,
             security_data_path=MOOMOO_RSA_KEY,
-        ))
-    return _apply_ctx_timeout(OpenQuoteContext(host=MOOMOO_HOST, port=MOOMOO_PORT))
+        ), "quote"))
+    return _apply_ctx_timeout(_make_ctx_bounded(
+        lambda: OpenQuoteContext(host=MOOMOO_HOST, port=MOOMOO_PORT), "quote"))
 
 
 def _make_trade_ctx() -> OpenSecTradeContext:
@@ -10835,11 +11199,11 @@ def _make_trade_ctx() -> OpenSecTradeContext:
     base_kwargs = dict(host=MOOMOO_HOST, port=MOOMOO_PORT)
     if MOOMOO_RSA_KEY and isinstance(MOOMOO_RSA_KEY, str) and os.path.isfile(MOOMOO_RSA_KEY):
         base_kwargs["security_data_path"] = MOOMOO_RSA_KEY
-    return _apply_ctx_timeout(OpenSecTradeContext(
+    return _apply_ctx_timeout(_make_ctx_bounded(lambda: OpenSecTradeContext(
         filter_trdmarket=TrdMarket.US,
         security_firm=SecurityFirm.FUTUJP,
         **base_kwargs,
-    ))
+    ), "trade"))
 
 
 # ★ v2.86: ctx リソースリーク対策の context manager
@@ -11093,12 +11457,20 @@ def _alpaca_quote_age_ok(t_raw) -> bool:
         t_str = str(t_raw or "").strip()
         if not t_str:
             return True   # フィールド無し → 判定不能は従来挙動
-        # 例: 2026-08-20T15:59:59.123456789Z（ナノ秒9桁は fromisoformat 非対応）
-        t_str = t_str.rstrip("Z")
-        if "." in t_str:
-            _head, _frac = t_str.split(".", 1)
-            t_str = _head + "." + _frac[:6]
-        _ts = datetime.datetime.fromisoformat(t_str).replace(tzinfo=datetime.timezone.utc)
+        # ★ v3.9.157 (A-3): 小数秒の「超過桁だけ」を削り、オフセットは保持する
+        #   （認定サポーターの指摘・修正案どおり）。旧実装は "." で分割して先頭6桁
+        #   だけ残すため -04:00 等のオフセットごと落ち、さらに無条件の
+        #   replace(tzinfo=UTC) が解釈を捨てて時刻の数字を UTC として読み、
+        #   オフセット付き表記では逆の判定になっていた（-04:00 の新しい気配を
+        #   「古い」と誤判定・実測で再現）。現行 Alpaca は Z 表記のため実害は
+        #   未発生だが、仕様上はオフセット付き RFC3339 も許容される。
+        t_str = re.sub(r"(\.\d{6})\d+", r"\1", t_str)
+        if t_str.endswith("Z"):
+            t_str = t_str[:-1] + "+00:00"
+        _ts = datetime.datetime.fromisoformat(t_str)
+        if _ts.tzinfo is None:
+            _ts = _ts.replace(tzinfo=datetime.timezone.utc)
+        _ts = _ts.astimezone(datetime.timezone.utc)
         _age = (datetime.datetime.now(datetime.timezone.utc) - _ts).total_seconds()
         return _age <= ALPACA_QUOTE_MAX_AGE_SEC
     except Exception:
@@ -11202,129 +11574,138 @@ def get_quote(symbol: str) -> dict:
             _orderbook_fail_session = _cur_sess
         _skip_ob = symbol in _orderbook_fail_symbols
 
-        with _quote_ctx() as ctx:
-            # ── 購読処理（データ取得前に必須）──────────────────────────────────────
-            # QUOTE と ORDER_BOOK を個別に subscribe してどちらが失敗するか明確化する
-            _r_quote, _e_quote = ctx.subscribe([code], [SubType.QUOTE], subscribe_push=False)
-            if _r_quote != RET_OK:
-                log.debug(f"[subscribe] {symbol} QUOTE: {_e_quote}（取得は続行）")
-            # ★ v3.9.77 (B-3): 当セッションで get_order_book 失敗実績がある銘柄は
-            #   ORDER_BOOK 購読/取得をスキップし get_stock_quote に直行（無駄呼出削減）。
-            if not _skip_ob:
-                _r_ob, _e_ob = ctx.subscribe([code], [SubType.ORDER_BOOK], subscribe_push=False)
-                if _r_ob != RET_OK:
-                    log.debug(f"[subscribe] {symbol} ORDER_BOOK: {_e_ob}（取得は続行）")
+        try:
+            with _quote_ctx() as ctx:
+                # ── 購読処理（データ取得前に必須）──────────────────────────────────────
+                # QUOTE と ORDER_BOOK を個別に subscribe してどちらが失敗するか明確化する
+                _r_quote, _e_quote = ctx.subscribe([code], [SubType.QUOTE], subscribe_push=False)
+                if _r_quote != RET_OK:
+                    log.debug(f"[subscribe] {symbol} QUOTE: {_e_quote}（取得は続行）")
+                # ★ v3.9.77 (B-3): 当セッションで get_order_book 失敗実績がある銘柄は
+                #   ORDER_BOOK 購読/取得をスキップし get_stock_quote に直行（無駄呼出削減）。
+                if not _skip_ob:
+                    _r_ob, _e_ob = ctx.subscribe([code], [SubType.ORDER_BOOK], subscribe_push=False)
+                    if _r_ob != RET_OK:
+                        log.debug(f"[subscribe] {symbol} ORDER_BOOK: {_e_ob}（取得は続行）")
 
-            # ── LV1 板情報（OrderBook）から ask/bid を取得 ─────────────────────────
-            ask  = 0.0
-            bid  = 0.0
-            last = 0.0
+                # ── LV1 板情報（OrderBook）から ask/bid を取得 ─────────────────────────
+                ask  = 0.0
+                bid  = 0.0
+                last = 0.0
 
-            if _skip_ob:
-                ret_ob, data_ob = -1, None
-                log.debug(f"[get_quote] {symbol}: ORDER_BOOK は当セッション失敗済 → スキップ (get_stock_quote 直行)")
-            else:
-                ret_ob, data_ob = ctx.get_order_book(code, num=1)
-            if ret_ob == RET_OK and data_ob is not None:
-                try:
-                    # get_order_book は dict を返す: {"Ask": [(price, vol, cnt, detail), ...], "Bid": [...]}
-                    # DataFrame 形式の場合（レガシー互換）
-                    if hasattr(data_ob, "iloc"):
-                        ask_list = data_ob["Ask"].iloc[0] if "Ask" in data_ob.columns else []
-                        bid_list = data_ob["Bid"].iloc[0] if "Bid" in data_ob.columns else []
-                        ask = float(ask_list[0][0]) if ask_list else 0.0
-                        bid = float(bid_list[0][0]) if bid_list else 0.0
-                    # dict 形式（通常パス）: Ask/Bid は (price, volume, count, detail) のタプルリスト
-                    else:
-                        ask_list = data_ob.get("Ask", [])
-                        bid_list = data_ob.get("Bid", [])
-                        # タプルの最初の要素 [0] が価格
-                        ask = float(ask_list[0][0]) if ask_list else 0.0
-                        bid = float(bid_list[0][0]) if bid_list else 0.0
-                    log.debug(f"[get_quote] {symbol}: ORDER_BOOK ask=${ask:.2f} bid=${bid:.2f}")
-                except (IndexError, TypeError, KeyError, AttributeError) as ex:
-                    log.warning(f"[get_quote] {symbol}: OrderBook パース失敗（{ex}）→ get_stock_quote にフォールバック")
-            elif not _skip_ob:
-                # ★ v3.9.31: get_order_book ret=-1 は get_stock_quote フォールバックが
-                # 正常動作するため実害なし。受講生が誤ってエラーと認識する問い合わせが
-                # 多発したため WARNING → DEBUG に降格 (ファイルログには引き続き記録)。
-                # ★ v3.9.77 (B-3): この銘柄は当セッション中スキップ対象として記憶。
-                _orderbook_fail_symbols.add(symbol)
-                log.debug(f"[get_quote] {symbol}: get_order_book ret={ret_ob} 失敗 → このセッション中は get_stock_quote へフォールバック（セッション切替後に再試行）")
-
-            # ── 基本株価（last / ask・bid の補完）─────────────────────────────────
-            ret_sq, data_sq = ctx.get_stock_quote([code])
-            if ret_sq == RET_OK and _df_has_rows(data_sq):
-                # ★ v2.75: moomoo が 'N/A' 文字列を返すフィールドを安全に変換するヘルパー
-                # float('N/A') は ValueError を出し、get_quote 全体がクラッシュしていた問題を修正。
-                def _sf(v, d=0.0):
-                    """'N/A'・None・非数値を安全に float へ変換"""
+                if _skip_ob:
+                    ret_ob, data_ob = -1, None
+                    log.debug(f"[get_quote] {symbol}: ORDER_BOOK は当セッション失敗済 → スキップ (get_stock_quote 直行)")
+                else:
+                    ret_ob, data_ob = ctx.get_order_book(code, num=1)
+                if ret_ob == RET_OK and data_ob is not None:
                     try:
-                        return float(v) if v is not None and str(v).strip() not in ('N/A','nan','') else d
-                    except (ValueError, TypeError):
-                        return d
+                        # get_order_book は dict を返す: {"Ask": [(price, vol, cnt, detail), ...], "Bid": [...]}
+                        # DataFrame 形式の場合（レガシー互換）
+                        if hasattr(data_ob, "iloc"):
+                            ask_list = data_ob["Ask"].iloc[0] if "Ask" in data_ob.columns else []
+                            bid_list = data_ob["Bid"].iloc[0] if "Bid" in data_ob.columns else []
+                            ask = float(ask_list[0][0]) if ask_list else 0.0
+                            bid = float(bid_list[0][0]) if bid_list else 0.0
+                        # dict 形式（通常パス）: Ask/Bid は (price, volume, count, detail) のタプルリスト
+                        else:
+                            ask_list = data_ob.get("Ask", [])
+                            bid_list = data_ob.get("Bid", [])
+                            # タプルの最初の要素 [0] が価格
+                            ask = float(ask_list[0][0]) if ask_list else 0.0
+                            bid = float(bid_list[0][0]) if bid_list else 0.0
+                        log.debug(f"[get_quote] {symbol}: ORDER_BOOK ask=${ask:.2f} bid=${bid:.2f}")
+                    except (IndexError, TypeError, KeyError, AttributeError) as ex:
+                        log.warning(f"[get_quote] {symbol}: OrderBook パース失敗（{ex}）→ get_stock_quote にフォールバック")
+                elif not _skip_ob:
+                    # ★ v3.9.31: get_order_book ret=-1 は get_stock_quote フォールバックが
+                    # 正常動作するため実害なし。受講生が誤ってエラーと認識する問い合わせが
+                    # 多発したため WARNING → DEBUG に降格 (ファイルログには引き続き記録)。
+                    # ★ v3.9.77 (B-3): この銘柄は当セッション中スキップ対象として記憶。
+                    _orderbook_fail_symbols.add(symbol)
+                    log.debug(f"[get_quote] {symbol}: get_order_book ret={ret_ob} 失敗 → このセッション中は get_stock_quote へフォールバック（セッション切替後に再試行）")
 
-                try:
-                    if hasattr(data_sq, "iloc"):
-                        row          = data_sq.iloc[0]
-                        last         = _sf(row.get("last_price"))
-                        cur          = _sf(row.get("cur_price"))
-                        pre_price    = _sf(row.get("pre_price"))
-                        after_price  = _sf(row.get("after_price"))
-                        ovn_price    = _sf(row.get("overnight_price"))
-                        ask_sq       = _sf(row.get("ask_price"))
-                        bid_sq       = _sf(row.get("bid_price"))
-                    else:
-                        last        = _sf((data_sq.get("last_price",     [None]) or [None])[0])
-                        cur         = _sf((data_sq.get("cur_price",      [None]) or [None])[0])
-                        pre_price   = _sf((data_sq.get("pre_price",      [None]) or [None])[0])
-                        after_price = _sf((data_sq.get("after_price",    [None]) or [None])[0])
-                        ovn_price   = _sf((data_sq.get("overnight_price",[None]) or [None])[0])
-                        ask_sq      = _sf((data_sq.get("ask_price",      [None]) or [None])[0])
-                        bid_sq      = _sf((data_sq.get("bid_price",      [None]) or [None])[0])
+                # ── 基本株価（last / ask・bid の補完）─────────────────────────────────
+                ret_sq, data_sq = ctx.get_stock_quote([code])
+                if ret_sq == RET_OK and _df_has_rows(data_sq):
+                    # ★ v2.75: moomoo が 'N/A' 文字列を返すフィールドを安全に変換するヘルパー
+                    # float('N/A') は ValueError を出し、get_quote 全体がクラッシュしていた問題を修正。
+                    def _sf(v, d=0.0):
+                        """'N/A'・None・非数値を安全に float へ変換"""
+                        try:
+                            return float(v) if v is not None and str(v).strip() not in ('N/A','nan','') else d
+                        except (ValueError, TypeError):
+                            return d
 
-                    # セッション別リアルタイム価格を優先する
-                    # pre_price / after_price / overnight_price はそれぞれのセッションの
-                    # リアルタイム価格を返す（moomooはLV2でプリ・アフター・24H取引対応）
-                    _session_now, _ = get_session_info()
-                    if _session_now == SESSION_PREMARKET and pre_price > 0:
-                        last = pre_price
-                        log.debug(f"[get_quote] {symbol}: プリマーケット価格 ${pre_price:.2f}（pre_price）")
-                    elif _session_now == SESSION_AFTERHOURS and after_price > 0:
-                        last = after_price
-                        log.debug(f"[get_quote] {symbol}: アフターアワーズ価格 ${after_price:.2f}（after_price）")
-                    elif _session_now == SESSION_OVERNIGHT and ovn_price > 0:
-                        last = ovn_price
-                        log.debug(f"[get_quote] {symbol}: オーバーナイト価格 ${ovn_price:.2f}（overnight_price）")
-                    elif cur > 0 and cur != last:
-                        last = cur
+                    try:
+                        if hasattr(data_sq, "iloc"):
+                            row          = data_sq.iloc[0]
+                            last         = _sf(row.get("last_price"))
+                            cur          = _sf(row.get("cur_price"))
+                            pre_price    = _sf(row.get("pre_price"))
+                            after_price  = _sf(row.get("after_price"))
+                            ovn_price    = _sf(row.get("overnight_price"))
+                            ask_sq       = _sf(row.get("ask_price"))
+                            bid_sq       = _sf(row.get("bid_price"))
+                        else:
+                            last        = _sf((data_sq.get("last_price",     [None]) or [None])[0])
+                            cur         = _sf((data_sq.get("cur_price",      [None]) or [None])[0])
+                            pre_price   = _sf((data_sq.get("pre_price",      [None]) or [None])[0])
+                            after_price = _sf((data_sq.get("after_price",    [None]) or [None])[0])
+                            ovn_price   = _sf((data_sq.get("overnight_price",[None]) or [None])[0])
+                            ask_sq      = _sf((data_sq.get("ask_price",      [None]) or [None])[0])
+                            bid_sq      = _sf((data_sq.get("bid_price",      [None]) or [None])[0])
 
-                    # ask_price / bid_price が ORDER_BOOK より精度が高い場合は補完
-                    # ★ v3.9.154: get_stock_quote で補完した側は板由来ではない
-                    #   （Codexレビュー指摘）。片側でも補完したらフラグを落とす。
-                    if ask <= 0 and ask_sq > 0:
-                        ask = ask_sq
+                        # セッション別リアルタイム価格を優先する
+                        # pre_price / after_price / overnight_price はそれぞれのセッションの
+                        # リアルタイム価格を返す（moomooはLV2でプリ・アフター・24H取引対応）
+                        _session_now, _ = get_session_info()
+                        if _session_now == SESSION_PREMARKET and pre_price > 0:
+                            last = pre_price
+                            log.debug(f"[get_quote] {symbol}: プリマーケット価格 ${pre_price:.2f}（pre_price）")
+                        elif _session_now == SESSION_AFTERHOURS and after_price > 0:
+                            last = after_price
+                            log.debug(f"[get_quote] {symbol}: アフターアワーズ価格 ${after_price:.2f}（after_price）")
+                        elif _session_now == SESSION_OVERNIGHT and ovn_price > 0:
+                            last = ovn_price
+                            log.debug(f"[get_quote] {symbol}: オーバーナイト価格 ${ovn_price:.2f}（overnight_price）")
+                        elif cur > 0 and cur != last:
+                            last = cur
+
+                        # ask_price / bid_price が ORDER_BOOK より精度が高い場合は補完
+                        # ★ v3.9.154: get_stock_quote で補完した側は板由来ではない
+                        #   （Codexレビュー指摘）。片側でも補完したらフラグを落とす。
+                        if ask <= 0 and ask_sq > 0:
+                            ask = ask_sq
+                            _quote_from_book = False
+                        if bid <= 0 and bid_sq > 0:
+                            bid = bid_sq
+                            _quote_from_book = False
+                    except (KeyError, IndexError, TypeError, AttributeError, ValueError) as ex:
+                        # ValueError も明示的に捕捉（float('N/A') 対策）
+                        log.warning(f"[get_quote] {symbol}: get_stock_quote パース失敗 ({type(ex).__name__}: {ex})")
+                        last = 0.0
+                    # OrderBook が空だった場合は last を ask/bid の代替に使う
+                    # ★ v3.9.154: 代替で埋めたことを記録する（認定サポーターの指摘§5）。
+                    #   従来はここで ask=bid=last になり、返却ログも板由来と同じ文面
+                    #   だったため、ログから板の取得可否を判定できなかった。
+                    if ask <= 0:
+                        ask = last
                         _quote_from_book = False
-                    if bid <= 0 and bid_sq > 0:
-                        bid = bid_sq
+                        _quote_two_sided = False   # ★ v3.9.155: 合成値
+                    if bid <= 0:
+                        bid = last
                         _quote_from_book = False
-                except (KeyError, IndexError, TypeError, AttributeError, ValueError) as ex:
-                    # ValueError も明示的に捕捉（float('N/A') 対策）
-                    log.warning(f"[get_quote] {symbol}: get_stock_quote パース失敗 ({type(ex).__name__}: {ex})")
-                    last = 0.0
-                # OrderBook が空だった場合は last を ask/bid の代替に使う
-                # ★ v3.9.154: 代替で埋めたことを記録する（認定サポーターの指摘§5）。
-                #   従来はここで ask=bid=last になり、返却ログも板由来と同じ文面
-                #   だったため、ログから板の取得可否を判定できなかった。
-                if ask <= 0:
-                    ask = last
-                    _quote_from_book = False
-                    _quote_two_sided = False   # ★ v3.9.155: 合成値
-                if bid <= 0:
-                    bid = last
-                    _quote_from_book = False
-                    _quote_two_sided = False
+                        _quote_two_sided = False
 
+        except OpenDUnavailableError:
+            # ★ v3.9.157b: OpenD 不達でも Alpaca/Finnhub フォールバックへ落とす
+            #   （新規Claudeレビュアーの指摘——従来は末尾の except に直行して全ゼロを
+            #   返し、フォールバックが一度も使われない「盲目監視」になっていた。
+            #   通知は _note_opend_down が120秒間引きで出すため、ここでは静かに続行）。
+            ask, bid, last = 0.0, 0.0, 0.0
+            _quote_from_book = False
+            _quote_two_sided = False
         # ★ v2.90: with ブロックを抜けた時点で ctx.close() 済み
         # 以降の return は ctx を使わないため with の外に配置（フォールバック含む）
 
@@ -13123,6 +13504,26 @@ def place_buy(
 
     if qty is None:
         qty = max(1, math.floor(order_size / limit_price))
+        # ★ v3.9.157 (C-1): 1株への切り上げが残余力を超えないか確認する（認定
+        #   サポーターの指摘——目標額が残余力以下でも、残余力 < 1株の値段のとき
+        #   max(1, ...) がそのまま送られ BUDGET_USD を超過していた。同じ関数の
+        #   qty 明示側には v3.9.108 で入っている判定が、計算側に無かった）。
+        _rb_calc = _BUDGET_USD - portfolio_total
+        # ★ v3.9.157b: 個別株は銘柄上限（STOCK_MAX_USD）の残余も併用する
+        #   （レビュー指摘——予算側だけ塞いでも銘柄上限を1株切り上げで超えられた）。
+        if symbol in STOCK_TICKERS:
+            _rb_calc = min(_rb_calc,
+                           STOCK_MAX_USD - (_tracked_position_cost.get(symbol, 0.0) or 0))
+        if qty * limit_price > _rb_calc:
+            _qty_fit = math.floor(_rb_calc / limit_price)
+            if _qty_fit < 1:
+                log.info(
+                    f"{tag} 残余力 ${_rb_calc:,.0f} が1株の値段 ${limit_price:.2f} に"
+                    f"届きません → 発注スキップ（予算超過の防止）"
+                )
+                return False
+            log.info(f"{tag} 残余力に合わせて数量を調整: {qty} → {_qty_fit}株")
+            qty = _qty_fit
     else:
         # ★ v3.9.108 (レビューH1): qty明示の「新規買い」（モメンタムLONG・動的個別株）にも
         #   残余力（BUDGET_USD − 既存建玉合計）を適用する。従来は無チェックで送信され
@@ -13563,6 +13964,17 @@ def place_short(
                 return False
             order_size = remaining_budget
         qty = max(1, math.floor(order_size / limit_price))
+        # ★ v3.9.157 (C-1): place_buy と同じ切り上げ超過ガード（空売り側）。
+        if qty * limit_price > remaining_budget:
+            _qty_fit_s = math.floor(remaining_budget / limit_price)
+            if _qty_fit_s < 1:
+                log.info(
+                    f"{tag} 残余力 ${remaining_budget:,.0f} が1株の値段 ${limit_price:.2f} に"
+                    f"届きません → 空売りスキップ（予算超過の防止）"
+                )
+                return False
+            log.info(f"{tag} 残余力に合わせて数量を調整: {qty} → {_qty_fit_s}株")
+            qty = _qty_fit_s
     else:
         # ★ v3.9.108 (レビューH1・利用者B報告 7/2 実害確認): qty明示指定（モメンタム実発注等）
         #   でも残余力（BUDGET_USD − 既存建玉合計）を必ず適用する。従来は $ベースの調整
@@ -13996,7 +14408,7 @@ def _backfill_index_price_history() -> None:
                             fail_count += 1
                             continue
 
-                    cnt = 0
+                    _bars = []
                     for _, row in klines.iterrows():
                         try:
                             ts_et = datetime.datetime.strptime(
@@ -14008,14 +14420,30 @@ def _backfill_index_price_history() -> None:
                         except (KeyError, ValueError, TypeError):
                             continue
                         if price > 0:
-                            _INDEX_PRICE_HISTORY[sym].append((ts_local, price))
-                            cnt += 1
-                    # 念のため時刻順にソート
+                            _bars.append((ts_local, price))
+                    _bars.sort(key=lambda x: x[0])
+                    # ★ v3.9.157b (C-4 の裁定変更): 一度「合成時刻で夜間の空白を詰める」
+                    #   案を実装したが、4レーンレビューが一致して反証した——ギャップを
+                    #   1分に圧縮すると、5/15/60分の変化率・モメンタム検知・気配の乖離
+                    #   基準・AIへの市場文脈のすべてが「前日の値動き」を「直近の値動き」
+                    #   と誤認する（この履歴の読者はトレンドガードだけではなかった）。
+                    #   時刻は実時刻のまま保存し、75分より古い分は従来どおり削除する。
+                    #   セッション開始直後に約60分ガードが効かないのは fail-open の
+                    #   設計として明示する（下の INFO ログ）。
+                    cnt = 0
+                    for _ts_real, _bprice in _bars:
+                        _INDEX_PRICE_HISTORY[sym].append((_ts_real, _bprice))
+                        cnt += 1
                     _INDEX_PRICE_HISTORY[sym].sort(key=lambda x: x[0])
-                    # 60 分より古いエントリーは削除 (record_index_price と同じ cutoff)
                     cutoff = now_local - datetime.timedelta(seconds=_INDEX_PRICE_HISTORY_MAX_SEC)
                     while _INDEX_PRICE_HISTORY[sym] and _INDEX_PRICE_HISTORY[sym][0][0] < cutoff:
                         _INDEX_PRICE_HISTORY[sym].pop(0)
+                    if not _INDEX_PRICE_HISTORY[sym]:
+                        log.info(
+                            f"[起動時バックフィル] {sym}: 直近75分内の取引バーなし"
+                            f"（前セッションとの間隔が大きいため採用せず）。"
+                            f"トレンドガード・変化率判定は約60分のデータ蓄積後から有効になります"
+                        )
                     if _INDEX_PRICE_HISTORY[sym]:
                         oldest = _INDEX_PRICE_HISTORY[sym][0][0]
                         latest = _INDEX_PRICE_HISTORY[sym][-1][0]
@@ -15777,6 +16205,16 @@ def place_close_all(
             # SHORT カバー → is_short フラグを下ろす (発注時点で意図的に下ろす)
             ts.is_short = False
 
+    # ★ v3.9.157 (A-1): スイープ文脈なら、出した注文を収集器へ記録する
+    if getattr(_sweep_oid_ctx, "oids", None) is not None:
+        try:   # ★ v3.9.157b: 記録の失敗で決済結果の確定を妨げない
+            for _c_oid, _c_q in placed_orders:
+                _sweep_oid_ctx.oids.append(
+                    {"oid": str(_c_oid), "symbol": symbol,
+                     "qty": int(_c_q), "ts": time.monotonic()})
+        except Exception:
+            pass
+
     # ── 約定確認を非同期で実行 ────────────────────────────────────────────────
     for oid, oq in placed_orders:
         _threadsafe_future(
@@ -16331,7 +16769,9 @@ async def process_headlines(
                 f"(元: {_orig_targets} → {exec_targets})"
             )
 
-    sync_positions(trd_env_real)
+    # ★ v3.9.157: await を伴わない同期呼び出しはイベントループを塞ぐ
+    #   （OpenD 停止時の4時間23分凍結の特定経路・認定サポーターの機序特定）。
+    await asyncio.to_thread(sync_positions, trd_env_real)
 
     # ── score=-1: ショート（空売り or 既存ロング決済）────────────────────────────
     if score == -1:
@@ -17852,6 +18292,7 @@ def _heartbeat_watchdog_thread() -> None:
                     _fmin = int((time.monotonic() - _hb_freeze_start_mono) // 60)
                 _hb_freeze_start_mono = None
                 rmsg = (f"✅ Bot応答が復帰しました（約{_fmin}分の無応答がありました）。"
+                        f"時間切れを超過した建玉があれば直ちに決済されます。"
                         f"ポジション・注文状態を念のためご確認ください。")
                 try:
                     print(f"\033[92m[HEARTBEAT] {rmsg}\033[0m", flush=True)
@@ -18475,6 +18916,11 @@ async def ovn_overnight_loop(trd_env) -> None:
                     pos, ids, pdetail = await asyncio.to_thread(_ovn_position, trd_env)
                 if pos > 0:
                     st.update(phase="HELD", qty=pos, position_ids=ids)
+                    # ★ v3.9.157: 約定確認をログに1行残す（従来は成功時に無言だった）。
+                    log.info(
+                        f"[夜間持ち越し] ✅ [約定確認] QQQ {pos}株 保有を確認しました"
+                        f"（orderId={st.get('buy_oid', '不明')}）"
+                    )
                     # ★ v3.9.140: 実際の取得単価が取れたら建値を上書きする（記録の精度）
                     try:
                         _ts_ovn = state.get(OVN_SYMBOL)
@@ -18624,8 +19070,10 @@ async def ovn_overnight_loop(trd_env) -> None:
                           # ★ v3.9.140: 集計へ記録するための建値と時刻
                           entry_price=round(entry_price, 4),
                           entry_at=datetime.datetime.now().isoformat(timespec="seconds"))
+                # ★ v3.9.157: orderId をログに残す（認定サポーターの指摘——
+                #   受付1行だけでは約定可否をログから追えなかった）。
                 _ovn_say(f"買い注文を受け付けました。QQQ {qty}株（{last:.2f} / 200日線 {sma:.2f} / VIXY {vchg:+.2%}）"
-                         f"\n翌営業日の寄り付きで売ります。")
+                         f"\n翌営業日の寄り付きで売ります。（orderId={oid}）")
                 if not _ovn_save(st):
                     # BUY_INTENT はディスクに残るので再起動時に口座照会から回収可能。
                     _ovn_say("買い受付後の状態保存に失敗しました。再起動時は口座照会から復旧します。", "error")
@@ -21180,12 +21628,9 @@ async def main(live: bool) -> None:
             # ★ v3.9.153: select_v1 有効時は「プロファイル絞り込み後」の実効サイドを
             #   表示する（認定サポーターの指摘）。従来は env の生値を出しており、
             #   すぐ上の「SPY除外」の行と食い違って見えた。
-            _eff_sides = sorted(MOMENTUM_ENABLED_SIDES)
-            _prof_note = ""
-            if MOMENTUM_PROFILE_SELECT:
-                # ★ v3.9.156: シャドーループ側と同じヘルパーから作る（表示の版ずれ防止）。
-                _eff_sides = _select_v1_live_sides_disp()
-                _prof_note = "（select_v1 絞り込み後）"
+            # ★ v3.9.157 (A-2): シャドーループ側と同じヘルパー（口座別ゲート適用後）。
+            _eff_sides = _momentum_effective_live_sides(trd_env)
+            _prof_note = "（select_v1 絞り込み後・口座別ゲート適用後）" if MOMENTUM_PROFILE_SELECT else "（口座別ゲート適用後）"
             _mom_note = f"実発注対象サイド={_eff_sides}{_prof_note} (それ以外はシャドー記録のみ)"
             # ★ v3.9.155/156: select_v1（SHORTのみ）×デモのSHORT無効 では実発注が
             #   発生しない（デモ限定・ヘルパーが環境で分岐する）。
@@ -21314,6 +21759,38 @@ async def main(live: bool) -> None:
         await asyncio.sleep(5)
 
     client = get_anthropic_client()
+
+    # ── ★ v3.9.157b: OpenD より先に Bot が起動した場合は待つ ─────────────────
+    #   旧版は SDK コンストラクタの無限ブロックが「偶然の待機」になっていたが、
+    #   v3.9.157 の期限付き生成で即例外→exit(1) に変わり、Win365 の自動起動
+    #   （OpenD と Bot が同時に立ち上がる）で Bot 側が先に走ると起動できなくなる
+    #   （レビュー指摘——起動順の自己修復という既存の暗黙契約を壊していた）。
+    #   素の TCP で明示的に待つ（既定10分・OPEND_STARTUP_WAIT_MIN で変更可）。
+    try:
+        _opend_wait_min = float(os.environ.get("OPEND_STARTUP_WAIT_MIN", "10") or 10)
+        if not math.isfinite(_opend_wait_min) or _opend_wait_min < 0:
+            _opend_wait_min = 10.0   # ★ v3.9.157c: nan/負値で待機が消えるのを防ぐ
+    except (TypeError, ValueError):
+        _opend_wait_min = 10.0
+    _opend_wait_deadline = time.monotonic() + _opend_wait_min * 60
+    _opend_waited = False
+    while not _opend_tcp_ok() and time.monotonic() < _opend_wait_deadline:
+        if not _opend_waited:
+            _opend_waited = True
+            log.warning(
+                f"[起動] OpenD にまだ接続できません（{MOOMOO_HOST}:{MOOMOO_PORT}）"
+                f" → 起動を待ちます（最大 {_opend_wait_min:.0f}分・15秒間隔で再確認）"
+            )
+        await asyncio.sleep(15)
+    if _opend_waited:
+        if _opend_tcp_ok():
+            log.info("[起動] ✅ OpenD への接続を確認 → 起動を続行します")
+        else:
+            log.error(
+                f"[起動] 🔴 {_opend_wait_min:.0f}分待っても OpenD に接続できません。"
+                f"OpenD を起動してから Bot を再実行してください"
+            )
+            sys.exit(1)
 
     # ── 接続テスト・全銘柄サブスクライブ（株価ストリーミング権限確認）─────────────
     # バッチsubscribeは部分失敗しても RET_OK を返す場合があるため、
@@ -22450,11 +22927,32 @@ def run_daily_data_collect(log_path: str = "moomoo_trade_v1.log",
             ensure_ascii=False
         )
         result = _gas_post(cfg_url, payload, timeout=60)
+        if not isinstance(result, dict):
+            # ★ v3.9.157b: null/配列/文字列の応答は .get で AttributeError になり
+            #   「通信エラー」へ化けていた（レビュー指摘）。詳細を出して未送信扱いに。
+            log.warning(
+                f"[データ収集] 送信エラー: 応答が想定外の型です"
+                f"（type={type(result).__name__} body={str(result)[:200]}）"
+                f"→ この日付は未送信として記録し、次回起動時の追いかけで再送します"
+            )
+            return
         if result.get("ok"):
             _mark_date_sent(date_str)
             log.info(f"[データ収集] ✅ 送信完了  名前:{cfg_name}  日付:{date_str}")
         else:
-            log.warning(f"[データ収集] 送信エラー: {result.get('error')}")
+            # ★ v3.9.157: 「送信エラー: None」だけでは切り分け不能だった（認定
+            #   サポーターの指摘——error キーの欠落・ok=false・空dict が同じ1行に
+            #   潰れていた）。応答の型とキーと短縮表現を残す。
+            try:
+                _resp_disp = (f"type={type(result).__name__}"
+                              f" keys={sorted(result.keys()) if isinstance(result, dict) else '-'}"
+                              f" body={str(result)[:200]}")
+            except Exception:
+                _resp_disp = repr(result)[:200]
+            log.warning(
+                f"[データ収集] 送信エラー: error={result.get('error') if isinstance(result, dict) else None}"
+                f"（{_resp_disp}）→ この日付は未送信として記録し、次回起動時の追いかけで再送します"
+            )
     except Exception as e:
         log.warning(f"[データ収集] 通信エラー: {e}")
 
