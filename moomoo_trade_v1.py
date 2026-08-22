@@ -66,6 +66,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import signal
 import sys
 import json
@@ -170,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.164"
+BOT_VERSION = "v3.9.166"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -4259,13 +4260,32 @@ def _ovn_migrate_legacy_dir() -> None:
                              "bot_position_ledger.json")
                 or _name.startswith("bot_position_ledger.json.initialized")):
             continue
+        # ★ v3.9.165b: 印を付けた元ファイル自体を再び対象にしない（新規Claudeレビュアーの
+        #   指摘——起動のたびに .migrated_away が積み重なる）。
+        if _name.endswith(".migrated_away"):
+            continue
         _src = os.path.join(_OVN_LEGACY_DIR, _name)
         _dst = os.path.join(OVN_STATE_DIR, _name)
         _tmp = None
-        if _name == "bot_position_ledger.json" and os.path.isfile(_src):
-            _mig_saw_ledger = True
+        # ★ v3.9.165: os.path.isfile は「壊れた symlink」「stat できない ACL」でも
+        #   False を返し、引き継ぎ対象が無いものとして飛ばされる（認定サポーターの
+        #   指摘——continue は例外ではないので完了マーカーが立ち、原因を解消しても
+        #   二度と引き継がれない）。stat で「無い」と「読めない」を区別する。
         try:
-            if not os.path.isfile(_src) or os.path.exists(_dst):
+            os.stat(_src)
+            _src_exists, _src_unknown = True, False
+        except FileNotFoundError:
+            _src_exists, _src_unknown = False, False
+        except Exception:
+            _src_exists, _src_unknown = False, True
+        if _name == "bot_position_ledger.json" and (_src_exists or _src_unknown):
+            _mig_saw_ledger = True
+        if _src_unknown:
+            _mig_ok = False   # 完了マーカーを立てない（次回起動で再試行する）
+            log.warning(f"[夜間持ち越し] {_name} の状態を確認できません（次回起動で再試行します）")
+            continue
+        try:
+            if not _src_exists or os.path.exists(_dst):
                 continue
             # ★ v3.9.160b: 直接コピーだと、書いている途中を他プロセスが読んで
             #   壊れたJSONを掴む（＝状態不明＝まさに事故の入口）。一時ファイルへ
@@ -4273,6 +4293,23 @@ def _ovn_migrate_legacy_dir() -> None:
             _tmp = _dst + f".mig.{os.getpid()}"
             shutil.copy2(_src, _tmp)
             os.replace(_tmp, _dst)
+            # ★ v3.9.165: 移行元に印を付ける（認定サポーターの指摘——保存先が
+            #   書けなくなる／BOT_STATE_DIR を変える等で本体フォルダへ戻ったとき、
+            #   移行時点の古いスナップショットが「現在の状態」として復元され、
+            #   口座の建玉数がそのまま売却対象になる）。印のある元ファイルは
+            #   読み込み対象から外す。
+            # ★ v3.9.165b: ただし「台帳を作った目印」は **絶対に動かさない**
+            #   （新規Claudeレビュアーの指摘）。目印まで消すと、保存先が本体フォルダへ
+            #   戻ったとき「台帳も目印も無い＝初回起動」と判定され、口座の全建玉を
+            #   Bot の建玉として取り込む——何度も潰してきた事故そのものになる。
+            #   目印だけ残っていれば「初回ではない」と分かり、取り込みを避けられる。
+            if not _name.startswith("bot_position_ledger.json.initialized"):
+                try:
+                    os.replace(_src, _src + ".migrated_away")
+                except Exception as _e_mk2:
+                    log.warning(
+                        f"[夜間持ち越し] {_name} の移行元に印を付けられません"
+                        f"（保存先が戻ると古い状態を読む恐れ）: {_mask_secrets(_e_mk2)}")
             log.info(f"[夜間持ち越し] 旧フォルダの状態ファイルを引き継ぎました: {_name}")
         except Exception as _e_mig:
             _mig_ok = False   # ★ v3.9.162b: 1件でも失敗したら完了マーカーを立てない
@@ -7620,7 +7657,9 @@ _ext_last_remind: dict = {}
 def _ext_blocked_symbols() -> list:
     """いま管理対象外になっている銘柄の一覧（画面表示・日次サマリ用）。"""
     try:
-        return [s for s in ALL_TICKERS if getattr(state.get(s), "externally_held", False)]
+        # ★ v3.9.165: OVN 銘柄が ALL_TICKERS に入らない構成でも6時間ごとの再送に載せる
+        return [s for s in dict.fromkeys(list(ALL_TICKERS) + [OVN_SYMBOL])
+                if getattr(state.get(s), "externally_held", False)]
     except Exception:
         return []
 
@@ -12657,7 +12696,18 @@ def sync_positions(trd_env: TrdEnv) -> None:
         # ── ★ v3.9.134: ゴースト判定後に台帳と突き合わせる ──────────────────
         # API が1回だけ建玉を返さなくても externally_held を解除せず、既存の
         # _GHOST_MISS_THRESHOLD 回連続不在を満たした場合だけ解除・台帳削除する。
-        for _sym_j in ALL_TICKERS:
+        # ★ v3.9.165: ALL_TICKERS に OVN 銘柄が入らない構成（TRIGGER から外し、
+        #   モメンタムもシャドー専用にした場合）では保護ループを素通りし、
+        #   名指しの保護通知と6時間ごとの再送が出ない（認定サポーターの指摘）。
+        # ★ v3.9.165b: 追加は **OVN を使っている人だけ**（新規Claudeレビュアーの指摘——
+        #   OVN 無効の既定構成では状態ファイルが常に「読めない」ので、QQQ を手で
+        #   持っているだけの利用者に「夜間持ち越しの記録が読めません」という
+        #   事実と違う通知が6時間ごとに届く。Bot が元々触らない銘柄なので保護も不要）。
+        _prot_syms = list(ALL_TICKERS)
+        _ovn_extra = bool(OVN_ENABLED) and OVN_SYMBOL not in _prot_syms
+        if _ovn_extra:
+            _prot_syms.append(OVN_SYMBOL)
+        for _sym_j in list(dict.fromkeys(_prot_syms)):
             _sides_j = _agg.get(_sym_j)
             _held_j = (
                 _sides_j is not None and
@@ -12682,6 +12732,15 @@ def sync_positions(trd_env: TrdEnv) -> None:
                         _sym_j, True,
                         f"口座に {_sd} {int(abs(_q))}株 ありますが、Bot の記録にありません"
                         f"（夜間持ち越しの記録も読めません）。")
+                elif _ledger_first_run and _sym_j == OVN_SYMBOL and _ovn_extra:
+                    # ★ v3.9.165b: 初回起動の取り込みは「Bot が普段から売買する銘柄で
+                    #   通知が二重に出るのを防ぐ」ためのもの（新規Claudeレビュアーの指摘）。
+                    #   売買対象に入っていない OVN 銘柄まで取り込むと、利用者が手で
+                    #   持っている QQQ を Bot の建玉にしてしまう。守る側へ倒す。
+                    _ext_set_held(
+                        _sym_j, True,
+                        f"口座に {_sd} {int(abs(_q))}株 ありますが、Bot の記録にありません"
+                        f"（日中の売買対象に入っていない銘柄です）。")
                 elif _ledger_first_run:
                     # ★ v3.9.134: 台帳を作る最初の起動。旧版は口座の建玉をすべて
                     #   Bot のものとして扱っていたので、ここでも取り込む。
@@ -23202,6 +23261,281 @@ _SINGLE_INSTANCE_EXTRA: list = []   # ★ v3.9.163b: 移行期間の旧位置ロ
 _SINGLE_INSTANCE_ENV_ERROR: bool = False   # ★ v3.9.163d: 二重起動ではなく環境障害だった
 
 
+_BOT_ENTRY_NAME = "moomoo_trade_v1.py"
+# コマンドラインから「先頭の実行ファイル」と「スクリプトのパス」を取り出す。
+# Windows は空白を含むパスが引用符で囲まれるため、単純な split では割れる。
+_RE_ARGV0 = re.compile(r'^\s*(?:"([^"]*)"|(\S+))')
+# ★ v3.9.166b: 語の切れ目まで見る（新規Claudeレビュアーの指摘——
+#   moomoo_trade_v1.py.bak / .pyc も本体として拾っていた）。
+_RE_ENTRY = re.compile(r'"([^"]*' + _BOT_ENTRY_NAME.replace(".", r"\.") + r')"'
+                       r'|(\S*' + _BOT_ENTRY_NAME.replace(".", r"\.") + r')(?=\s|$)',
+                       re.IGNORECASE)
+
+
+def _looks_absolute_path(_p: str) -> bool:
+    """他OSの表記も含めて「絶対パスに見えるか」。os.path.isabs は実行中のOSの
+    規則しか知らないため、Windows のコマンドラインを解釈する場面で使えない。"""
+    _s = (_p or "").strip().strip('"')
+    return bool(_s.startswith("/") or _s.startswith("\\\\")
+                or re.match(r"^[A-Za-z]:[\\/]", _s))
+
+
+def _proc_age_seconds(_text: str) -> float:
+    """ps の etime（[[dd-]hh:]mm:ss）または秒数の文字列を秒に直す。不明なら -1。"""
+    _t = (_text or "").strip()
+    if not _t:
+        return -1.0
+    try:
+        if "-" not in _t and ":" not in _t:
+            return float(_t)
+        _days, _, _rest = _t.partition("-")
+        if not _rest:
+            _days, _rest = "0", _t
+        _parts = [float(_p) for _p in _rest.split(":")]
+        while len(_parts) < 3:
+            _parts.insert(0, 0.0)
+        return (float(_days) * 86400.0
+                + _parts[0] * 3600.0 + _parts[1] * 60.0 + _parts[2])
+    except Exception:
+        return -1.0
+
+
+def _list_process_rows() -> tuple:
+    """OS のプロセス一覧を取る。戻り値: (rows, 走査できたか)
+
+    rows = [(pid, ppid, 起動からの経過秒, コマンドライン), ...]（経過秒が不明なら -1）
+    Bot だけに絞らず **全プロセス** を返す。親子関係をたどるには Bot 以外の
+    プロセスも要るため（中継役の間に別のプロセスが挟まることがある）。
+
+    ★ v3.9.165b: Windows 11 / Windows 365 には **wmic が存在しない**（本番環境で実測）。
+    PowerShell の CIM を主経路にし、wmic は古い Windows 向けの控えとして残す。
+    """
+    _rows = []
+    # ★ v3.9.165b: 「1行も返らない」を "Bot は1つだけ" と読むと、走査が壊れている場合を
+    #   静かに見逃す。PowerShell 経路は必ず目印を出させ、それが返ったときだけ
+    #   「走査できた」と扱う。
+    _MARK = "__PANBOT_SCAN_OK__"
+    if os.name == "nt":
+        _cmds = [
+            # ★ v3.9.166b: 絞り込まずに **全プロセス** を取る（新規Claudeレビュアーの
+            #   指摘——中継役の python.exe が直接の親でない場合、系統をたどれずに
+            #   自分の身内を「別の Bot」と数えて起動を止める）。親子関係は Bot 以外の
+            #   プロセスを挟むことがあるので、系統をたどる材料は全件必要。
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "$r = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue); "
+             "Write-Output '" + _MARK + "'; "
+             "$r | ForEach-Object { $_.ProcessId.ToString() + '|' + "
+             "$_.ParentProcessId.ToString() + '|' + "
+             "[int](((Get-Date) - $_.CreationDate).TotalSeconds) + '|' + $_.CommandLine }"],
+            ["wmic", "process", "get", "ProcessId,ParentProcessId,CommandLine", "/format:csv"],
+        ]
+    else:
+        _cmds = [["ps", "-eo", "pid=,ppid=,etime=,command="]]
+    # ★ v3.9.166: Windows で pythonw から起動している利用者に、走査のたび黒い窓が
+    #   一瞬出るのを防ぐ（起動時の1回だけとはいえ「何か起きた」と見える）。
+    _no_win = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} \
+        if os.name == "nt" else {}
+    for _cmd in _cmds:
+        try:
+            # ★ v3.9.166b: errors="replace" が要る（新規Claudeレビュアーの指摘——
+            #   配布ランチャは PYTHONUTF8=1 を立てるため、日本語のユーザー名を含む
+            #   Windows PowerShell 5.1 の CP932 出力を UTF-8 として読んで
+            #   UnicodeDecodeError になり、走査が丸ごと死んでいた）。
+            _res = subprocess.run(_cmd, capture_output=True, text=True,
+                                  errors="replace", timeout=25, **_no_win)
+        except Exception:
+            continue
+        _stdout = _res.stdout or ""
+        # 一覧そのものが取れたか（Bot が見つかったかとは別）
+        if os.name == "nt" and _cmd[0] == "powershell":
+            # ★ v3.9.166: 目印だけでは足りない。CIM が権限やサービス停止で
+            #   黙って空を返すと「走査できた・プロセスは無い」に見えてしまう。
+            #   CIM が働いていれば全プロセスが返るので、1行も無い＝働いていない。
+            _scanned = (_MARK in _stdout) and any(
+                _l.split("|", 1)[0].strip().isdigit() for _l in _stdout.splitlines())
+        else:
+            _scanned = bool(_res.returncode == 0
+                            and [_l for _l in _stdout.splitlines() if _l.strip()])
+        if not _scanned:
+            continue
+        for _line in _stdout.splitlines():
+            if os.name == "nt" and _cmd[0] == "powershell":
+                _f = _line.split("|", 3)
+                if len(_f) != 4 or not _f[0].strip().isdigit():
+                    continue
+                _rows.append((int(_f[0].strip()),
+                              int(_f[1].strip()) if _f[1].strip().isdigit() else 0,
+                              _proc_age_seconds(_f[2]),
+                              _f[3].strip()))
+            elif os.name == "nt":
+                # wmic csv: Node,CommandLine,ParentProcessId,ProcessId（経過秒は取れない）
+                _f = _line.rsplit(",", 2)
+                if len(_f) != 3 or not _f[2].strip().isdigit():
+                    continue
+                _rows.append((int(_f[2].strip()),
+                              int(_f[1].strip()) if _f[1].strip().isdigit() else 0,
+                              -1.0,
+                              _f[0].split(",", 1)[-1].strip()))
+            else:
+                _f = _line.split(None, 3)
+                if len(_f) != 4 or not _f[0].isdigit():
+                    continue
+                _rows.append((int(_f[0]), int(_f[1]) if _f[1].isdigit() else 0,
+                              _proc_age_seconds(_f[2]), _f[3]))
+        # ★ v3.9.166d: 1行も解釈できなければ「走査できた」と言ってはいけない
+        #   （新規Claudeレビュアーの指摘——復号を寛容にした結果、wmic の UTF-16 出力や
+        #   CommandLine が読めない環境で「行はあるが全部解釈不能」になり、
+        #   警告も出さずに『別の Bot は居ない』として起動していた）。
+        #   プロセスが実際に0件ということはあり得ないので、空＝解釈失敗と断定できる。
+        if _rows:
+            return _rows, True
+    return [], False
+
+
+def _find_other_bot_processes(tag: str) -> list:
+    """★ v3.9.165: 自分以外の Bot プロセスを OS のプロセス一覧から探す。
+
+    ロックはファイル位置で排他するため、**旧版が別フォルダで稼働中**のときは
+    噛み合わない（旧版は自分のフォルダのロックしか見ない・認定サポーターの指摘。
+    実口座で両方が発注しうる）。未改造の旧版に新しいロックを取らせる手段が無いので、
+    「**別の場所にある**同じスクリプトを同じモードで動かしている別プロセス」を探す。
+    ロックの置き換えではなく補助。
+    戻り値: [(pid, コマンドライン), ...]
+    """
+    _me = os.getpid()
+    _out = []
+    try:
+        _rows, _scanned = _list_process_rows()
+        if not _scanned:
+            # ★ v3.9.165b: 走査できないこと自体を黙って通すと「守られているつもり」に
+            #   なる（本番の Windows で wmic 不在により起きていた）。必ず見える形で残す。
+            print("[二重起動防止] ⚠ プロセス一覧を取得できませんでした。"
+                  "別フォルダの旧版が動いていないかは確認できていません。")
+            return []
+
+        def _norm(_p):
+            try:
+                return os.path.normcase(os.path.realpath(_p))
+            except Exception:
+                return os.path.normcase(_p or "")
+
+        _my_entry = _norm(os.path.abspath(__file__))
+
+        # ★ v3.9.165b: Windows の本番では「中継役の python.exe」が同じコマンドラインで
+        #   親として残る（Win365 で実測——親子ペアで見える）。自分の先祖・子孫を
+        #   他人と数えると、正規の起動が毎回止まる。系統を除外する。
+        #   除外するのは **先祖だけ**。子孫まで除外すると、自分から派生したシェル経由で
+        #   起動された別フォルダの Bot を見逃す（テストが検知した）。Bot は自分の複製を
+        #   生成しないので、除外は先祖方向だけで足りる。
+        _pp = {_r[0]: _r[1] for _r in _rows}
+        _kin = {_me}
+        _cur, _hop = _pp.get(_me, 0), 0
+        while _cur and _cur not in _kin and _hop < 30:
+            _kin.add(_cur)
+            _cur, _hop = _pp.get(_cur, 0), _hop + 1
+        _my_age = next((_r[2] for _r in _rows if _r[0] == _me), -1.0)
+
+        for _pid, _ppid, _age, _cmdline in _rows:
+            if _pid in _kin or _BOT_ENTRY_NAME not in _cmdline:
+                continue
+            _m0 = _RE_ARGV0.match(_cmdline)
+            _me_entry = _RE_ENTRY.search(_cmdline)
+            if not _m0 or not _me_entry:
+                continue
+            _argv0 = _m0.group(1) or _m0.group(2) or ""
+            _entry = _me_entry.group(1) or _me_entry.group(2) or ""
+            # 「python が実行している」形だけを拾う（エディタ・grep・シェルを除外）。
+            # ★ v3.9.165b: Windows のランチャ py.exe / pythonw.exe も通す（Codex指摘）。
+            #   区切りは自前で割る（他OSのパス表記を解釈する場面があるため、
+            #   os.path.basename では \ を区切りとみなさない環境がある）。
+            _exe = re.split(r"[\\/]", _argv0)[-1].strip().lower()
+            if not ("python" in _exe or _exe in ("py", "py.exe")):
+                continue
+            # ★ v3.9.165b: 実行ファイルそのものが argv[0] の場合（引数として渡していない）は
+            #   スクリプト実行ではないので対象外。
+            if _norm(_entry) == _norm(_argv0):
+                continue
+            # ★ v3.9.165b: `python -m py_compile moomoo_trade_v1.py` のように
+            #   **本体を実行していない** python を Bot と誤認していた（新規Claude
+            #   レビュアーの指摘——tests/run_all.sh が毎回これを走らせるので、
+            #   検査中にデモを起動すると必ず止まる）。
+            # ★ v3.9.166b: ただし「オプションがあれば除外」は行き過ぎだった
+            #   （Codexレビュー指摘——`python -u 本体.py --live` や -O / -X 付きで
+            #   動かしている旧版を丸ごと見逃す）。実行対象を差し替えるのは -m と -c
+            #   だけなので、それだけを見る。
+            # ★ v3.9.166b: あわせて「本体より前に別のスクリプト名がある」形
+            #   （`python3 なにか.py moomoo_trade_v1.py` ＝本体を引数として渡しただけ）も
+            #   除外する（新規Claudeレビュアーの指摘）。値を取るオプションの値は読み飛ばす。
+            # トークン分割は引用符を尊重する（Windows のコマンドラインは引用符が残る）。
+            # ただし ps は引用符を保持しないので、これだけでは
+            # `-X pycache_prefix=/a/Cache Folder` の "Folder" を救えない。
+            # 実際の歯止めは下の「.py で終わるものだけを実行対象とみなす」判定。
+            _head = _cmdline[_m0.end():_me_entry.start()]
+            _runs_other_target = False
+            _skip_value = False
+            for _a in re.findall(r'"[^"]*"|\S+', _head):
+                _a = _a.strip('"')
+                if _skip_value:                        # 直前のオプションの値
+                    _skip_value = False
+                    continue
+                if _a == "-":
+                    _runs_other_target = True          # 標準入力から実行
+                    break
+                if not _a.startswith("-"):
+                    # ★ v3.9.166c: 「オプションでないトークン＝別のスクリプト」は
+                    #   強すぎた（Codexレビュー指摘・実プロセスで再現）。ps は引用符を
+                    #   保持しないため、`-X pycache_prefix=/a/Cache Folder` の "Folder" が
+                    #   別スクリプト扱いになり、旧版を見逃していた。**.py で終わる
+                    #   ものだけ**を実行対象とみなす。
+                    # ★ v3.9.166d: 拡張子の無いコンソールスクリプト
+                    #   （`python3 /venv/bin/pylint 本体.py`）も実行対象とみなす
+                    #   （新規Claudeレビュアーの指摘——これを Bot と誤認して
+                    #   デモの起動が止まっていた）。区切り文字を含めばパス＝実行対象。
+                    if (_a.lower().endswith((".py", ".pyw", ".pyc"))
+                            or "/" in _a or "\\" in _a):
+                        _runs_other_target = True      # 実行対象は別のスクリプト
+                        break
+                    continue                            # 拾えなかったオプション値
+                if _a in ("-X", "-W", "--check-hash-based-pycs"):
+                    _skip_value = True                 # 次のトークンは値
+                    continue
+                if (not _a.startswith("--")
+                        and not _a.startswith("-X") and not _a.startswith("-W")
+                        and ("m" in _a[1:] or "c" in _a[1:])):
+                    _runs_other_target = True          # -m モジュール / -c コマンド
+                    break
+            if _runs_other_target:
+                continue
+            # ★ v3.9.165b: **同じファイル**を動かしているなら、その相手はロックで
+            #   排他できている（同じ OVN_STATE_DIR・同じ旧位置）。この走査が拾うべきは
+            #   「別の場所にある本体」だけ。中継役の python.exe も監視スクリプトも
+            #   自分と同じパスを持つので、ここで落ちる。
+            # ★ v3.9.166b: 相対パスで起動された相手（`python moomoo_trade_v1.py --live`）は
+            #   **相手の作業フォルダが分からない**ので、同じファイルかどうか判定できない
+            #   （Codexレビュー指摘——realpath は自分の作業フォルダを基準に解決するため、
+            #   別フォルダの旧版を「自分と同じ」と誤認して見逃していた）。
+            #   判定できないときは検知する側（＝二重発注を避ける安全側）に倒す。
+            if _looks_absolute_path(_entry) and _norm(_entry) == _my_entry:
+                continue
+            # 同じモード同士だけを衝突とみなす（実口座とデモの併走は正当）
+            _tail = _cmdline[_me_entry.end():]
+            _targs = [_a.strip('"') for _a in _tail.split()]
+            _is_live_other = ("--live" in _targs) or ("real" in _targs)
+            if (tag == "live") != bool(_is_live_other):
+                continue
+            # ★ v3.9.166b: ここに「後から起動した相手には譲る（先着優先）」を入れていたが、
+            #   **撤回した**（新規Claudeレビュアーの指摘）。走査を持たない旧版が1秒あとに
+            #   立ち上がっただけで、新版が旧版を見逃して両方稼働する——実口座で発注が
+            #   重複する、この機能が防ぐはずだったものそのものになる。
+            #   先着優先が救おうとした「新版どうしが両方中止」は、共有ロックが先に効くので
+            #   ほぼ起きない（起きても損害は「動かない」＝目に見える側）。
+            _out.append((_pid, _cmdline[:200], _age))
+    except Exception as _e_ps:
+        print(f"[二重起動防止] ⚠ プロセス走査に失敗しました（{_e_ps}）。"
+              f"別フォルダの旧版が動いていないかは確認できていません。")
+    return _out
+
+
 def _acquire_single_instance(tag: str = "bot"):
     """同じBotが二重に起動しないようにOSのロックを取る。
 
@@ -23301,6 +23635,34 @@ def _acquire_single_instance(tag: str = "bot"):
     if not _held:
         return True   # どの位置も開けなかった＝ロックが使えないだけなので通す
     fh = _held[0]
+
+    # ★ v3.9.165: ロックは取れたが、別フォルダの旧版が動いていないかを確かめる
+    #   （認定サポーターの指摘——版跨ぎ×フォルダ跨ぎではロックが噛み合わない）。
+    #   誤検知で起動できないほうが困る場面のために BOT_SKIP_PROCESS_SCAN=true で無効化可。
+    # ★ v3.9.165b: PID の書き込みより **前** に走査する（新規Claudeレビュアーの指摘——
+    #   走査で中止すると、ロックファイルに起動しなかったプロセスの PID が残り、
+    #   次に本物の二重起動を弾いたとき存在しない PID を「稼働中」と表示する）。
+    if (os.environ.get("BOT_SKIP_PROCESS_SCAN", "").strip().lower() != "true"):
+        _others = _find_other_bot_processes(tag)
+        if _others:
+            print("=" * 60)
+            print("[二重起動防止] 🔴 別の Bot プロセスが動いています（別フォルダの可能性）。")
+            for _p_id, _p_cmd, _p_age in _others[:3]:
+                _p_since = (f"（{int(_p_age)}秒前から稼働）" if _p_age >= 0 else "")
+                print(f"  PID {_p_id}{_p_since}: {_p_cmd}")
+            print("  同じ口座へ二重に発注しないため、この起動を中止します。")
+            print("  版を入れ替えるときは、先に古い方を完全に停止してください。")
+            print("  （誤検知の場合は BOT_SKIP_PROCESS_SCAN=true で無効化できます）")
+            print("=" * 60)
+            for _h in _held:
+                try:
+                    _h.close()
+                except Exception:
+                    pass
+            globals()["_SINGLE_INSTANCE_EXTRA"] = []
+            globals()["_SINGLE_INSTANCE_ENV_ERROR"] = False
+            return False
+
     _SINGLE_INSTANCE_EXTRA = _held[1:]
     globals()["_SINGLE_INSTANCE_EXTRA"] = _SINGLE_INSTANCE_EXTRA
 
