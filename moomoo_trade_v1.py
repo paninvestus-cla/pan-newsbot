@@ -170,7 +170,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.161"
+BOT_VERSION = "v3.9.164"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -4166,10 +4166,24 @@ def _bot_state_dir() -> str:
         # 書けるかを実地で確かめる（書けなければ従来どおり本体と同じ場所を使う）
         # ★ v3.9.160b: 固定名だと REAL/DEMO 同時起動で互いの残骸を消し合い、
         #   片方が誤って旧保存先へフォールバックする（Codex指摘）。PID固有名にする。
+        # ★ v3.9.163b: 検証すべきは「作れるか」ではなく、本番で使う
+        #   「一時ファイル作成 → os.replace で置換 → 後始末」が通るか
+        #   （Codexレビュー指摘——作成だけ通る保存先を採用すると、状態の保存が
+        #   毎回失敗して「記録が読めない」状態に落ちる）。
         _probe = os.path.join(_d, f".write_test.{os.getpid()}")
-        with open(_probe, "w", encoding="utf-8") as _f:
-            _f.write("ok")
-        os.remove(_probe)
+        _probe2 = _probe + ".tmp"
+        try:
+            with open(_probe2, "w", encoding="utf-8") as _f:
+                _f.write("ok")
+            os.replace(_probe2, _probe)   # 置換できなければ例外→フォールバック
+        finally:
+            # ★ v3.9.163c: 成功・失敗どちらでも両方の候補を掃除する
+            #   （Codexレビュー指摘——残骸が毎起動たまり続ける）
+            for _leftover in (_probe2, _probe):
+                try:
+                    os.remove(_leftover)
+                except Exception:
+                    pass
         return _d
     except Exception as _e_dir:
         # ★ v3.9.160c: 無言でフォールバックすると、古いスナップショットを正として
@@ -4183,6 +4197,11 @@ def _bot_state_dir() -> str:
 
 
 _OVN_LEGACY_DIR: str = os.path.dirname(os.path.abspath(__file__))
+_mig_attempted_this_process: bool = False   # ★ v3.9.162c: 引き継ぎは1プロセス1回
+# ★ v3.9.163: 旧フォルダに台帳が実在したのにコピーできなかった（新規Claudeレビュアーの
+#   指摘——この状態で「台帳が無い＝初回起動」と判定すると、口座の全建玉を Bot の建玉と
+#   して取り込む）。読み手（_ledger_load）が安全側へ倒すための印。
+_mig_ledger_failed: bool = False
 OVN_STATE_DIR: str = _bot_state_dir()
 OVN_STATE_FILE: str = os.path.join(OVN_STATE_DIR, "ovn_state.json")
 
@@ -4199,9 +4218,36 @@ def _ovn_migrate_legacy_dir() -> None:
     """
     if os.path.abspath(OVN_STATE_DIR) == os.path.abspath(_OVN_LEGACY_DIR):
         return
+    # ★ v3.9.162/162b: 二度目以降の走査を省くための完了マーカー。
+    #   ★ 作業「前」に立てると、途中で落ちた場合にフラグだけ残って引き継ぎが
+    #   二度と走らず、新フォルダが空のまま「初回起動」判定になる（＝口座の全建玉を
+    #   取り込む事故の再現・新規Claudeレビュアーの指摘）。**完了後**に立てる。
+    #   並行起動の競合は、下の「移行先に既にあれば触らない」＋原子的置換で受ける。
+    global _mig_attempted_this_process
+    if _mig_attempted_this_process:
+        return   # ★ v3.9.162c: 1プロセス1回（警告と旧フォルダ走査の二重化を防ぐ）
+    _mig_attempted_this_process = True
+    _mig_flag = os.path.join(OVN_STATE_DIR, ".migrated_from_legacy")
+    if os.path.exists(_mig_flag):
+        return
+    _mig_ok = True
+    _mig_saw_ledger = False   # ★ v3.9.163: 旧フォルダに台帳が実在したか
     try:
         _names = sorted(os.listdir(_OVN_LEGACY_DIR))
     except Exception as _e_ls:
+        # ★ v3.9.163b: 列挙できないだけで「引き継ぐものが無い」と判断すると、
+        #   旧フォルダに台帳があっても新側が空のまま「初回起動」＝全建玉取り込みに
+        #   なる（Codexレビュー指摘）。既知のパスを直接確認して安全側へ倒す。
+        # ★ v3.9.163c: os.path.isfile は権限エラーでも False を返すため、
+        #   「本当に無い」と「確認できない」を区別できない（Codexレビュー指摘）。
+        #   os.stat を直接呼び、FileNotFoundError のときだけ「なし」と判断する。
+        try:
+            os.stat(os.path.join(_OVN_LEGACY_DIR, "bot_position_ledger.json"))
+            globals()["_mig_ledger_failed"] = True    # 台帳が実在するのに運べない
+        except FileNotFoundError:
+            pass                                       # 本当に無い＝引き継ぐものが無い
+        except Exception:
+            globals()["_mig_ledger_failed"] = True    # 判定不能＝安全側
         log.warning(f"[夜間持ち越し] 旧フォルダを読めません（続行）: {_mask_secrets(_e_ls)}")
         return
     for _name in _names:
@@ -4215,6 +4261,9 @@ def _ovn_migrate_legacy_dir() -> None:
             continue
         _src = os.path.join(_OVN_LEGACY_DIR, _name)
         _dst = os.path.join(OVN_STATE_DIR, _name)
+        _tmp = None
+        if _name == "bot_position_ledger.json" and os.path.isfile(_src):
+            _mig_saw_ledger = True
         try:
             if not os.path.isfile(_src) or os.path.exists(_dst):
                 continue
@@ -4226,12 +4275,24 @@ def _ovn_migrate_legacy_dir() -> None:
             os.replace(_tmp, _dst)
             log.info(f"[夜間持ち越し] 旧フォルダの状態ファイルを引き継ぎました: {_name}")
         except Exception as _e_mig:
+            _mig_ok = False   # ★ v3.9.162b: 1件でも失敗したら完了マーカーを立てない
             log.warning(f"[夜間持ち越し] {_name} の引き継ぎに失敗（続行）: {_mask_secrets(_e_mig)}")
             try:
-                if os.path.exists(_tmp):
+                if _tmp and os.path.exists(_tmp):   # ★ 未束縛参照の防止
                     os.remove(_tmp)
             except Exception:
                 pass
+    globals()["_mig_ledger_failed"] = (not _mig_ok) and _mig_saw_ledger
+    if _mig_ok:
+        try:
+            with open(_mig_flag, "w", encoding="utf-8") as _f_flag:
+                _f_flag.write(datetime.datetime.now().isoformat(timespec="seconds"))
+        except Exception as _e_flag:
+            # ★ v3.9.162b: 無音だと「毎起動で引き継ぎを試している」ことに気づけない
+            log.warning(
+                f"[夜間持ち越し] 引き継ぎ完了の記録を残せません（毎起動で再確認します）:"
+                f" {_mask_secrets(_e_flag)}"
+            )
 
 
 # ★ 初回抑制バグ回避（:4211 の HEARTBEAT と同じ教訓）: monotonic は環境により
@@ -4345,9 +4406,11 @@ def _ovn_unknown_state_guard(symbol: str) -> bool:
         _ovn_unknown_guard["noted"] = True
         _msg = (
             f"🛡 【{symbol}】 夜間持ち越しの記録が読めないため、この建玉には触りません"
-            f"（日中の損切り・時間切れ・トレールを適用しません）。"
+            f"（日中の損切り・時間切れ・トレールも、夜間持ち越しの自動売却も行いません）。"
             f"記録の置き場所: {OVN_STATE_DIR}。"
-            f"翌朝の寄り付きでも売られない場合は moomoo アプリでご確認ください"
+            f"■ ご確認のお願い: この建玉が夜間持ち越しのものなら moomoo アプリで決済して"
+            f"ください（Bot は勝手に売りません）。手動で保有されているものなら、そのままで"
+            f"問題ありません"
         )
         log.warning(f"[夜間持ち越し] {_msg}")
         try:
@@ -7345,6 +7408,17 @@ def _ledger_load() -> int:
         # v3.9.134開発版で作られた旧・環境共通マーカーも「初回済み」として扱う。
         # 台帳消失時に既存建玉を再取り込みする危険を避けるための互換措置。
         _initialized = os.path.exists(_init_mark) or os.path.exists(_LEDGER_INIT_MARK)
+        if _mig_ledger_failed and not os.path.exists(_LEDGER_PATH):
+            # ★ v3.9.163: 旧フォルダに台帳があったのに運べなかった＝「初回起動」では
+            #   ない。取り込まず、破損として安全側（全建玉を管理対象外＋通知）に倒す。
+            _ledger_broken = True
+            log.error(
+                "[建玉台帳] 🔴 旧フォルダの台帳を引き継げませんでした"
+                " → 既存建玉はすべて管理対象外にします（取り込みは行いません）"
+            )
+            with _LEDGER_LOCK:
+                _position_ledger = {}
+            return 0
         if not os.path.exists(_LEDGER_PATH):
             # 目印も無ければ「この版に上げてからの初回起動」。旧版は口座の建玉を
             # すべて Bot のものとして扱っていたので、初回だけその前提を引き継ぐ
@@ -7359,8 +7433,46 @@ def _ledger_load() -> int:
         with _LEDGER_LOCK:
             with open(_LEDGER_PATH, "r", encoding="utf-8") as f:
                 _position_ledger = json.load(f) or {}
+        # ★ v3.9.162c: 現在環境のセクションが dict でない（null / 配列 / 文字列）ときは
+        #   破損として扱う（Codexレビュー指摘——キー存在だけを見ると、破損した台帳でも
+        #   初回扱いにならず、既存の Bot 建玉が静かに管理対象外へ落ちて損切りが止まる。
+        #   しかも「台帳を読めませんでした」の通知も出ない）。
+        _sec_key_now = _ledger_env_key()
+        if (_sec_key_now in _position_ledger
+                and not isinstance(_position_ledger[_sec_key_now], dict)):
+            _sec_now = _position_ledger[_sec_key_now]
+            _ledger_broken = True
+            log.error(
+                f"[建玉台帳] 🔴 台帳の {_sec_key_now} セクションが壊れています"
+                f"（{type(_sec_now).__name__}）→ 既存建玉はすべて管理対象外にします"
+            )
+            with _LEDGER_LOCK:
+                _position_ledger = {}
+            return 0
         # 台帳ファイルは共有だが、初回移行は環境ごとに一度ずつ必要。
         _ledger_first_run = not _initialized
+        # ★ v3.9.162: 台帳が実在して読めたのに「マーカーが無い」だけで初回扱いに
+        #   すると、口座の建玉をすべて Bot の建玉として取り込む（＝夜間持ち越しの
+        #   建玉が日中ロジックに吸収され早期決済される事故の再発経路・Codexレビュー
+        #   指摘）。マーカーの欠落は移行の部分失敗などで起こり得るため、台帳がある
+        #   ならマーカー側を補完して初回扱いを取り消す。
+        # ★ v3.9.162b: 台帳は REAL/DEMO 共有なので、全体で判定すると
+        #   「DEMO の記録しかない台帳で REAL を初めて起動」したときに正当な初回移行が
+        #   取り消され、REAL の建玉が一斉に管理対象外になる（＝損切り・時間切れが
+        #   全部止まる・新規Claudeレビュアーの指摘）。現在環境のセクションで判定する。
+        # ★ v3.9.162b: 判定は「非空か」ではなく「このキーがあるか」（Codexレビュー指摘——
+        #   建玉ゼロで初回移行を終えた環境は "REAL": {} が正常状態。非空判定だと
+        #   マーカー消失時に初回扱いが続き、既存建玉を取り込む）。
+        if _ledger_first_run and _ledger_env_key() in _position_ledger:
+            log.warning(
+                "[建玉台帳] 台帳はありますが初回移行の目印が見つかりません。"
+                "口座の建玉を取り込まず、目印だけを補完します（安全側）"
+            )
+            _ledger_first_run = False
+            try:
+                _ledger_touch_mark()
+            except Exception as _e_mk:
+                log.warning(f"[建玉台帳] 目印の補完に失敗（続行）: {_mask_secrets(_e_mk)}")
         return sum(len(v or {}) for v in _position_ledger.values())
     except Exception as _e:
         # 読めない＝自分の建玉を判別できない。既存建玉は触らない側に倒す（安全側）。
@@ -7405,6 +7517,47 @@ def _ledger_mark(symbol: str, trd_env=None, entry_time=None, category=None) -> N
             _ledger_touch_mark(trd_env)
     except Exception as _e:
         log.warning(f"[建玉台帳] 記録失敗 {symbol}: {_mask_secrets(_e)}")
+
+
+def _ledger_repair_ovn_absorption() -> bool:
+    """★ v3.9.162: 過去の版で誤って台帳に取り込まれた OVN 建玉を外す。
+
+    Codexレビューの指摘——一度取り込まれると「台帳にある＝Bot の建玉」として
+    日中ロジックの決済対象になり続け、事故条件（夜間持ち越しの建玉が早期決済
+    される）が永続する。所有権の単一の真実は OVN の永続状態なので、OVN が
+    所有を主張しているなら台帳から外すのが正しい。戻り値=外したか。
+    """
+    try:
+        # ★ v3.9.162b: 古い phase=HELD が残っているだけの状態で、日中ロジックが
+        #   建てた QQQ を台帳から外すと、その建玉の損切り・時間切れが効かなくなる
+        #   （新規Claudeレビュアーの指摘）。記録が「直近のもの」のときだけ修復する。
+        _st_rep = _ovn_load()
+        _ed_rep = str(_st_rep.get("entry_date", "") or "")
+        _fresh_rep = False
+        try:
+            if _ed_rep:
+                # ★ v3.9.162b: 上限だけだと未来日（時計ずれ・不正データ）で常に真になり、
+                #   日中ロジックの QQQ 建玉が台帳から消えて損切りが効かなくなる
+                #   （Codexレビュー指摘）。0日以上4日以内に限定する。
+                _age_rep = (datetime.datetime.now(_ET).date()
+                            - datetime.date.fromisoformat(_ed_rep)).days
+                if _age_rep < 0:
+                    log.warning(
+                        f"[建玉台帳] 夜間持ち越しの記録日が未来です（{_ed_rep}）→ 修復は行いません"
+                    )
+                _fresh_rep = (0 <= _age_rep <= 4)
+        except Exception:
+            _fresh_rep = False
+        if _fresh_rep and _ovn_owns_now() and _ledger_has(OVN_SYMBOL):
+            _ledger_unmark(OVN_SYMBOL)
+            log.warning(
+                f"[建玉台帳] 【{OVN_SYMBOL}】 夜間持ち越しの建玉が台帳に取り込まれていたため"
+                f"外しました（日中ロジックの決済対象から戻します）"
+            )
+            return True
+    except Exception as _e_fix:
+        log.warning(f"[建玉台帳] 取り込みの修復に失敗（続行）: {_mask_secrets(_e_fix)}")
+    return False
 
 
 def _ledger_unmark(symbol: str, trd_env=None) -> None:
@@ -12517,10 +12670,18 @@ def sync_positions(trd_env: TrdEnv) -> None:
             elif _held_j and not _ledger_has(_sym_j, trd_env):
                 _q = _sides_j["LONG"]["qty"] or _sides_j["SHORT"]["qty"]
                 _sd = "ロング" if _sides_j["LONG"]["qty"] > 0 else "ショート"
-                # ★ v3.9.160c: 状態が読めない OVN 銘柄は初回移行で取り込まない
-                #   （取り込むと安全網の「台帳に無い」条件が崩れる）
+                # ★ v3.9.160c/163: 状態が読めない OVN 銘柄は初回移行で取り込まない。
+                #   ただし v3.9.160c は _ext_set_held(False) と書いており、これは
+                #   「外部建玉ではない＝Bot が触ってよい」の意味だった（新規Claude
+                #   レビュアーの指摘）。OVN が無効な既定構成では安全網も効かないため、
+                #   利用者が手で持っている QQQ の保護（v3.9.134）が毎周回剥がされ、
+                #   損切り・時間切れで決済され得た（v3.9.133 の事故の再現）。
+                #   取り込まないなら「Bot の記録に無い建玉」として守るのが正しい。
                 if _sym_j == OVN_SYMBOL and not _ovn_state_readable():
-                    _ext_set_held(_sym_j, False)
+                    _ext_set_held(
+                        _sym_j, True,
+                        f"口座に {_sd} {int(abs(_q))}株 ありますが、Bot の記録にありません"
+                        f"（夜間持ち越しの記録も読めません）。")
                 elif _ledger_first_run:
                     # ★ v3.9.134: 台帳を作る最初の起動。旧版は口座の建玉をすべて
                     #   Bot のものとして扱っていたので、ここでも取り込む。
@@ -13171,8 +13332,23 @@ async def _check_order_filled(
                                             _realized_pct_for_disc2 = (realized2 / (prev_avg2 * filled_qty2) * 100
                                                                        if prev_avg2 > 0 else 0.0)
                                             _realized_qty_for_disc2 = int(filled_qty2)
+                                            # ★ v3.9.164: 通常経路と同じ絵文字つきの
+                                            #   決済行も出す（認定サポーターの指摘——
+                                            #   リトライ経路だけ「決済益／決済損」の行が
+                                            #   無く、ログを目で数えると件数が合わなかった。
+                                            #   集計は [確定損益(...)] を拾うので従来から
+                                            #   正しいが、読み手の数え方と食い違っていた）。
+                                            _e2, _l2, _c2 = (
+                                                ("📈", "LONG決済益", "\033[1;32m") if realized2 > 0
+                                                else ("📉", "LONG決済損", "\033[1;31m") if realized2 < 0
+                                                else ("➡️", "LONG決済 同値", ""))
+                                            _r2 = "\033[0m" if _c2 else ""
                                             log.info(
-                                                f"{tag} [確定損益(リトライ)]"
+                                                f"{tag} {_c2}{_e2} {_l2} "
+                                                f"${realized2:+.2f} ({_realized_pct_for_disc2:+.2f}%){_r2}"
+                                                f"  │  {int(filled_qty2)}株"
+                                                f"  │  買 ${prev_avg2:.2f} → 売 ${filled_price2:.2f}"
+                                                f"  │  [確定損益(リトライ)]"
                                                 f"  realized_pnl={realized2:+.2f}"
                                                 f"  sell_avg={filled_price2:.2f}"
                                                 f"  buy_avg={prev_avg2:.2f}"
@@ -13245,8 +13421,19 @@ async def _check_order_filled(
                                             _realized_pct_for_disc2 = (realized_sc2 / (prev_avg_sc2 * filled_qty2) * 100
                                                                        if prev_avg_sc2 > 0 else 0.0)
                                             _realized_qty_for_disc2 = int(filled_qty2)
+                                            # ★ v3.9.164: ショートカバー側のリトライ経路にも
+                                            #   絵文字つきの決済行を出す（認定サポーターの指摘）。
+                                            _e3, _l3, _c3 = (
+                                                ("📈", "SHORT決済益", "\033[1;32m") if realized_sc2 > 0
+                                                else ("📉", "SHORT決済損", "\033[1;31m") if realized_sc2 < 0
+                                                else ("➡️", "SHORT決済 同値", ""))
+                                            _r3 = "\033[0m" if _c3 else ""
                                             log.info(
-                                                f"{tag} [確定損益(SC・リトライ)]"
+                                                f"{tag} {_c3}{_e3} {_l3} "
+                                                f"${realized_sc2:+.2f} ({_realized_pct_for_disc2:+.2f}%){_r3}"
+                                                f"  │  {int(filled_qty2)}株"
+                                                f"  │  売 ${prev_avg_sc2:.2f} → 買 ${filled_price2:.2f}"
+                                                f"  │  [確定損益(SC・リトライ)]"
                                                 f"  realized_pnl={realized_sc2:+.2f}"
                                                 f"  cover_avg={filled_price2:.2f}"
                                                 f"  short_avg={prev_avg_sc2:.2f}"
@@ -19254,48 +19441,20 @@ async def ovn_overnight_loop(trd_env) -> None:
             #   （日中ロジックは触らず、OVN も状態が無いので売らない・週末決済や
             #   パニックセルも対象外——Codex指摘）。ここで口座の建玉を採用して
             #   HELD として引き受け、通常の「翌寄りで売る」流れに戻す。
+            # ★ v3.9.163: 「孤児の引き受け（口座の建玉を OVN として採用して売る）」は
+            #   撤回した（新規Claudeレビュアーの指摘）。記録が読めない状況では
+            #   「OVN が建てた建玉」と「利用者が手で持っている建玉」を区別する手段が
+            #   無く、引き受けは後者を翌寄りで売ってしまう。売る判断は自動で行わず、
+            #   触らずに知らせる側へ倒す（保護は _ovn_unknown_state_guard と
+            #   sync_positions の externally_held が担い、6時間ごとの再通知に載る）。
             if phase == "IDLE" and _ovn_unknown_guard.get("active"):
-                # ★ v3.9.160c: フラグは「候補の合図」に留め、判断は毎回やり直す
-                #   （新規Claudeレビュアーの指摘——粘着フラグだけを根拠に発注すると、
-                #   手動保有の建玉や日中ロジックの建玉を OVN として引き受けてしまう）。
-                #   ・記録が読めるようになった／台帳に載った／Bot以外の建玉と分かった
-                #     場合は引き受けない
-                #   ・記録のみ(shadow)モードでは引き受けない（売る主体がいないため
-                #     引き受けると永久に決済されない建玉になる）
-                if (not _live or _ovn_state_readable() or _ledger_has(OVN_SYMBOL)
-                        or getattr(state.get(OVN_SYMBOL), "externally_held", False)):
-                    _ovn_unknown_guard["active"] = False
-                    _ovn_unknown_guard["noted"] = False
-                    log.info("[夜間持ち越し] 引き受けの条件を満たさなくなったため保護を解除しました")
-                    continue
                 _pos_o, _ids_o, _dt_o = await asyncio.to_thread(_ovn_position, trd_env)
-                if _pos_o > 0:
-                    st.update(phase="HELD", qty=_pos_o, position_ids=_ids_o,
-                              trade_env=_RUN_TRADE_ENV,
-                              entry_date=(st.get("entry_date")
-                                          or (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")))
-                    _ts_o = state.get(OVN_SYMBOL)
-                    if getattr(_ts_o, "avg_cost", 0) > 0:
-                        st.setdefault("entry_price", round(float(_ts_o.avg_cost), 4))
-                    if _ovn_save(st):
-                        state.get(OVN_SYMBOL).ovn_held = True
-                        _ovn_unknown_guard["active"] = False
-                        _ovn_unknown_guard["noted"] = False
-                        _ovn_say(
-                            f"記録が読めない状態で残っていた QQQ {_pos_o}株 を"
-                            f"夜間持ち越しとして引き受けました（翌営業日の寄り付きで売ります）。",
-                            "warning")
-                    else:
-                        # ★ v3.9.160c: phase を IDLE に戻さないと、次の巡回の
-                        #   入口条件（phase=="IDLE"）を自分で塞いでしまう
-                        #   （BUY_INTENT 側と同じロールバック作法に揃える）。
-                        st["phase"] = "IDLE"
-                        log.warning("[夜間持ち越し] 孤児建玉の引き受けを保存できません → 次の巡回で再試行します")
-                    continue
-                elif _dt_o == "OK" and _pos_o == 0:
-                    # 建玉が無くなった＝保護の必要も消えた（手動決済など）
+                if _dt_o == "OK" and _pos_o == 0:
+                    # 建玉が無くなった（手動決済など）＝保護の必要も消えた
                     _ovn_unknown_guard["active"] = False
                     _ovn_unknown_guard["noted"] = False
+                    _ovn_unknown_guard["since"] = None
+                    log.info("[夜間持ち越し] 記録が読めない建玉は無くなりました（保護を解除）")
 
             # 発注直前に BUY_INTENT を永続化しているため、発注応答前に落ちても
             # 同じ環境の実建玉・注文から回収できる。
@@ -21545,6 +21704,16 @@ async def main(live: bool) -> None:
     except Exception as _e_led0:
         log.warning(f"[建玉台帳] 読込で例外: {_mask_secrets(_e_led0)}")
 
+    # ★ v3.9.163: フラグ復元を先に行う（新規Claudeレビュアーの指摘——後にすると
+    #   OVN 保有中の正常な起動でも毎回「所有権フラグが落ちていたため自己修復」の
+    #   warning が出て、本当の異常時の信号として使えなくなる）。
+    try:
+        if _ovn_state_owns_position():
+            state.get(OVN_SYMBOL).ovn_held = True
+    except Exception:
+        pass
+    _ledger_repair_ovn_absorption()   # ★ v3.9.162: 誤って取り込まれた OVN 建玉を外す
+
     # 起動時の最初の sync_positions より前に OVN 所有権を復元する。
     # 後回しにすると台帳に無い QQQ が外部建玉と誤通知される。
     # ★ v3.9.159: 判定結果に関わらず永続状態の中身を必ず1行残す（実機の早期決済
@@ -23029,6 +23198,8 @@ async def catchup_data_send_on_startup(log_path: str = "moomoo_trade_v1.log") ->
 # 二重起動の防止
 # =============================================================================
 _SINGLE_INSTANCE_HANDLE = None   # プロセスが生きている間ロックを保持し続ける
+_SINGLE_INSTANCE_EXTRA: list = []   # ★ v3.9.163b: 移行期間の旧位置ロック（同時に保持）
+_SINGLE_INSTANCE_ENV_ERROR: bool = False   # ★ v3.9.163d: 二重起動ではなく環境障害だった
 
 
 def _acquire_single_instance(tag: str = "bot"):
@@ -23043,37 +23214,95 @@ def _acquire_single_instance(tag: str = "bot"):
     global _SINGLE_INSTANCE_HANDLE
     import os as _o
 
-    lock_path = _o.path.join(_o.path.dirname(_o.path.abspath(__file__)),
-                             f".{tag}_single.lock")
-    try:
-        fh = open(lock_path, "a+")
-    except OSError as e:
-        print(f"[二重起動防止] ロックファイルを開けません（{e}）。起動は継続します。")
-        return True   # ロックが使えないだけで止めるのは過剰なので通す
+    # ★ v3.9.163: 状態（台帳・OVN）を固定フォルダへ集約したのに、二重起動ロックだけ
+    #   本体フォルダのままだった（新規Claudeレビュアーの指摘）。版の更新で本体フォルダを
+    #   差し替える運用では、旧フォルダと新フォルダの2プロセスが別々のロックを取って
+    #   同時に起動でき、同じ台帳・同じ OVN 状態を上書きし合う。排他の範囲を状態の
+    #   共有範囲に合わせる。
+    # ★ v3.9.163b: ロック位置を移すと、旧位置のロックを持ったまま稼働している
+    #   旧版プロセスと**同時に起動できてしまう**（Codexレビュー指摘——実口座で
+    #   発注が重複する）。移行期間は新旧の両方を取る。片方でも取れなければ中止。
+    _lock_paths = [_o.path.join(OVN_STATE_DIR, f".{tag}_single.lock")]
+    _legacy_lock = _o.path.join(_o.path.dirname(_o.path.abspath(__file__)),
+                                f".{tag}_single.lock")
+    if _o.path.abspath(_legacy_lock) != _o.path.abspath(_lock_paths[0]):
+        _lock_paths.append(_legacy_lock)
 
-    try:
-        fh.seek(0)
-        if _o.name == "nt":
-            import msvcrt
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        # 既に別のBotが持っている
+    def _try_lock(_path, _required=False):
+        """1つのロックを非ブロッキングで取る。(handle, 取得できたか, 保持者)
+
+        ★ v3.9.163c: 共有先（OVN_STATE_DIR）のロックは「唯一プロセス間で共通する
+        排他点」なので、開けないときに通すと排他そのものが無効になる
+        （Codexレビュー指摘——別フォルダの新旧Bot が両方起動して実口座で二重発注）。
+        必須のロックが開けない場合は起動を中止する。
+        """
         try:
-            fh.seek(0)
-            other = (fh.read() or "").strip()
-        except Exception:
-            other = ""
-        fh.close()
-        print("=" * 60)
-        print("[二重起動防止] 既にBotが動いているため、この起動を中止します。")
-        if other:
-            print(f"  稼働中のプロセス: PID {other}")
-        print("  同じ口座へ二重に発注しないための安全装置です。")
-        print("=" * 60)
-        return False
+            _fh = open(_path, "a+")
+        except OSError as _e_o:
+            if _required:
+                print(f"[二重起動防止] 共有のロックファイルを開けません（{_e_o}）。"
+                      f"二重起動を防げないため、この起動を中止します: {_path}")
+                return None, False, "__ENV_ERROR__"   # ★ v3.9.163d: 環境障害の印
+            print(f"[二重起動防止] ロックファイルを開けません（{_e_o}）。この位置は無視します。")
+            return None, True, ""   # 旧位置は判定に使わない（従来どおり通す）
+        try:
+            _fh.seek(0)
+            if _o.name == "nt":
+                import msvcrt
+                msvcrt.locking(_fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as _e_lk:
+            try:
+                _fh.seek(0)
+                _who = (_fh.read() or "").strip()
+            except Exception:
+                _who = ""
+            _fh.close()
+            # ★ v3.9.163d: 競合以外のロックエラーを「既にBotが動いている」と説明しない
+            if getattr(_e_lk, "errno", None) not in (
+                    getattr(__import__("errno"), "EACCES", 13),
+                    getattr(__import__("errno"), "EAGAIN", 11),
+                    getattr(__import__("errno"), "EWOULDBLOCK", 11), 33):
+                return None, False, "__ENV_ERROR__"
+            return None, False, _who
+        return _fh, True, ""
+
+    _held = []
+    for _idx_l, _lp in enumerate(_lock_paths):
+        # 先頭は共有先（必須）。2つ目以降は移行期間の旧位置（任意）。
+        _fh_l, _ok_l, _who_l = _try_lock(_lp, _required=(_idx_l == 0))
+        if not _ok_l:
+            for _h in _held:      # 取得済みを解放してから中止する
+                try:
+                    _h.close()
+                except Exception:
+                    pass
+            print("=" * 60)
+            if _who_l == "__ENV_ERROR__":
+                # ★ v3.9.163d: 環境障害を「二重起動」と説明しない（Codexレビュー指摘——
+                #   監視側が正常な抑止と誤認する）。異常として知らせる。
+                print("[二重起動防止] 🔴 排他のためのロックを扱えませんでした。")
+                print(f"  ロック: {_lp}")
+                print("  権限・空き容量・保存先の状態をご確認ください。")
+                print("  二重起動を防げないため、この起動を中止します。")
+                globals()["_SINGLE_INSTANCE_ENV_ERROR"] = True
+            else:
+                print("[二重起動防止] 既にBotが動いているため、この起動を中止します。")
+                if _who_l:
+                    print(f"  稼働中のプロセス: PID {_who_l}")
+                print(f"  ロック: {_lp}")
+                print("  同じ口座へ二重に発注しないための安全装置です。")
+            print("=" * 60)
+            return False
+        if _fh_l is not None:
+            _held.append(_fh_l)
+    if not _held:
+        return True   # どの位置も開けなかった＝ロックが使えないだけなので通す
+    fh = _held[0]
+    _SINGLE_INSTANCE_EXTRA = _held[1:]
+    globals()["_SINGLE_INSTANCE_EXTRA"] = _SINGLE_INSTANCE_EXTRA
 
     # 取得できた。自分のPIDを書いておく（誰が持っているか分かるように）
     try:
@@ -23089,16 +23318,21 @@ def _acquire_single_instance(tag: str = "bot"):
     import atexit
 
     def _release():
-        try:
-            if _o.name == "nt":
-                import msvcrt
-                fh.seek(0)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
+        for _h in [fh] + list(globals().get("_SINGLE_INSTANCE_EXTRA") or []):
+            try:
+                if _o.name == "nt":
+                    import msvcrt
+                    _h.seek(0)
+                    msvcrt.locking(_h.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(_h.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                _h.close()
+            except Exception:
+                pass
         try:
             fh.close()
         except Exception:
@@ -23430,7 +23664,10 @@ if __name__ == "__main__":
     # 同じ口座へ二重に発注しないための安全装置。
     # 実口座かデモかで別のロックにし、それぞれ1つだけ動けるようにする。
     if not _acquire_single_instance("live" if _is_live else "demo"):
-        sys.exit(0)   # 異常ではないので 0 で終わる（監視に失敗と誤解させない）
+        # ★ v3.9.163d: 「既に動いている」（正常な抑止）と「ロックを扱えない」
+        #   （環境障害）を終了コードで区別する（Codexレビュー指摘——同じ 0 だと
+        #   監視側が環境障害を正常な抑止と誤認する）。
+        sys.exit(2 if globals().get("_SINGLE_INSTANCE_ENV_ERROR") else 0)
 
     import platform, subprocess
     _caffeinate_proc = None
