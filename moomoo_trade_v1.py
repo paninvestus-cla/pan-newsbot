@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.166"
+BOT_VERSION = "v3.9.167"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -7904,13 +7904,38 @@ def _format_daily_summary() -> Optional[str]:
             s['w'] += 1
         # 決済理由は短縮ラベルに正規化
         reason = (t.get('exit_reason') or '')
-        if   '時間切れ' in reason:                   r_key = '時間切れ'
-        elif 'トレール' in reason:                   r_key = 'トレール'
-        elif 'パニック' in reason:                   r_key = 'パニックセル'
-        elif '強制損切り' in reason or '損切' in reason: r_key = '強制損切り'
-        elif '週末' in reason or '日次' in reason:   r_key = '日次/週末決済'
-        elif 'シグナル' in reason or '切替' in reason: r_key = 'シグナル切替'
-        else:                                          r_key = 'その他'
+        # ★ v3.9.167: 自前のキーワード連鎖をやめ、正規の分類器に合わせる
+        #   （認定サポーター2名の指摘）。実際に記録される理由は
+        #   「トレイリングストップ（利益確保後の戻り）」で **「トレール」を含まない**ため、
+        #   利益トレールが丸ごと「その他」に落ちていた。同じ型の取りこぼしは
+        #   6/22 にも起きており（「その他」-$3,062 の実体が建玉トレールだった）、
+        #   そのとき作った _exit_code_from_reason() をこちら側でも使う。
+        #   夜間持ち越しは分類器が OTHER を返す（GAS 側の集計と互換を保つため
+        #   分類器そのものには手を入れない）。ここでだけ先に拾う。
+        # ★ v3.9.167b: 分類器が拾えない実在の理由を先に受ける（レビュー指摘——
+        #   正規の分類器に寄せた結果、旧実装が 'シグナル' で拾っていた
+        #   「個別株ネガティブシグナルにより…」「決算ネガティブシグナル: …」と、
+        #   半休日・連休前の「早期クローズ前強制決済」「連休前強制決済」が
+        #   『その他』へ退行していた。分類器は GAS へ送る exit_code も決めるため、
+        #   表示側だけで補う）。夜間持ち越しは構造化された種別で判定する。
+        if (t.get('ai_category') or '') == 'OVN' or '夜間持ち越し' in reason:
+            r_key = '夜間持ち越し'
+        elif '早期クローズ' in reason or '連休前' in reason:
+            r_key = '日次/週末決済'
+        elif 'シグナル' in reason:
+            r_key = 'シグナル切替'
+        else:
+            r_key = {
+                'TIMEOUT':       '時間切れ',
+                'TRAIL':         'トレール（利益確保）',
+                'ENTRY_TRAIL':   '建玉トレール',
+                'FORCED_STOP':   '強制損切り',
+                'PANIC':         'パニックセル',
+                'LS_REVERSE':    'シグナル切替',
+                'SESSION_CLOSE': '日次/週末決済',
+                'DEMO_DAILY':    '日次/週末決済',
+                'TAKE_PROFIT':   '利確',
+            }.get(_exit_code_from_reason(reason), 'その他')
         r = by_reason.setdefault(r_key, {'n': 0, 'pnl': 0.0})
         r['n']  += 1
         r['pnl'] += t['pnl']
@@ -11492,6 +11517,53 @@ def _opend_tcp_ok(timeout_sec: float = 3.0) -> bool:
         return False
 
 
+async def _wait_for_opend() -> bool:
+    """OpenD が起動するまで待つ。戻り値: 最終的に到達できたか。
+
+    ★ v3.9.167: v3.9.157b でこの待機を入れたが、**起動時の到達性チェックが手前で
+    sys.exit(1) するため、OpenD 未起動のままでは一度も実行されなかった**
+    （認定サポーターの指摘）。共通の関数に切り出して到達性チェックから呼ぶ。
+
+    ★ v3.9.167b: レビューで3点直した。
+      - 待たなかったときに **一言も出さずに False を返す**経路があり、呼び出し側の
+        sys.exit(1) が完全な無言終了になっていた → 結果は必ずログに残す
+      - ループ条件で確認した直後にもう一度 TCP を張っており、その一瞬の揺れで
+        「待って到達したのに失敗」になり得た → 確認は1回だけにする
+      - `OPEND_STARTUP_WAIT_MIN=0` は従来「待たずに続行」だったのに「1回の失敗で終了」に
+        変わっていた → 0 は「この関門を使わない」に戻す
+    """
+    try:
+        _min = float(os.environ.get("OPEND_STARTUP_WAIT_MIN", "10") or 10)
+        if not math.isfinite(_min) or _min < 0:
+            _min = 10.0   # ★ v3.9.157c: nan/負値で待機が消えるのを防ぐ
+        _min = min(_min, 120.0)   # ★ v3.9.167b: 桁を打ち間違えても止まり続けない
+    except (TypeError, ValueError):
+        _min = 10.0
+    if _min <= 0:
+        # ★ v3.9.167c: 「待たない」＝現状をそのまま答える（Codexレビュー指摘——
+        #   True 固定にすると、最初の到達性チェックが失敗を握り潰して続行し、
+        #   実口座検証の SDK 接続でハングする。従来の 0 は「後段の待機をスキップ」
+        #   であって「到達性チェックもスキップ」ではない）。
+        return _opend_tcp_ok()
+    if _opend_tcp_ok():
+        return True
+    log.warning(
+        f"[起動] OpenD にまだ接続できません（{MOOMOO_HOST}:{MOOMOO_PORT}）"
+        f" → 起動を待ちます（最大 {_min:.0f}分・15秒間隔で再確認）"
+    )
+    _deadline = time.monotonic() + _min * 60
+    while time.monotonic() < _deadline:
+        await asyncio.sleep(15)
+        if _opend_tcp_ok():
+            log.info("[起動] ✅ OpenD への接続を確認 → 起動を続行します")
+            return True
+    log.error(
+        f"[起動] 🔴 {_min:.0f}分待っても OpenD に接続できません。"
+        f"OpenD を起動してから Bot を再実行してください"
+    )
+    return False
+
+
 def _note_opend_down(what: str, detail: str) -> None:
     """OpenD 不達の明示通知（120秒に1回へ間引き・イベントループ非依存）。
 
@@ -12290,6 +12362,30 @@ def sync_positions(trd_env: TrdEnv) -> None:
             #   場合（戦略が モメンタム⇄ニュース で変わった等）、前の建玉の値が記録に紛れる。
             #   None にしておけば記録側が設計値で補完する。
             ts.enforced_stop_pct = None
+    # ★ v3.9.167c: 取り込みの通知は sync 全体の try より外で管理する
+    #   （新規Claudeレビュアーの指摘——取り込みは1件ごとに台帳へ即永続化されるのに、
+    #   まとめ送信はループの後ろにあるため、途中の例外で通知だけが消える。台帳に
+    #   載った銘柄は次回から取り込み分岐を通らないので、通知は二度と送られない）。
+    #   送ったら空にする＝正常経路と例外経路のどちらか一方からしか送られない。
+    _absorbed_syms: list = []
+
+    def _flush_absorbed_notice() -> None:
+        if not _absorbed_syms:
+            return
+        _threadsafe_discord(
+            "📒 口座にあった建玉を Bot の建玉として引き継ぎました\n"
+            + "\n".join(f"・{_x}" for _x in _absorbed_syms)
+            + "\nこれらは**自動売買の対象**です"
+            "（損切り・時間切れ・トレールの判定に入ります）。\n"
+            "・Bot が建てたものであれば、そのままで問題ありません\n"
+            "・**別の用途で保有されている建玉**が含まれる場合は、まず Bot を停止してください。\n"
+            "  そのうえで、moomoo アプリでその建玉を決済してから Bot を再開するか、"
+            "この銘柄を .env の設定から外してください。監視対象は1か所では決まらないため"
+            "（TRIGGER_TICKERS / STOCK_TICKERS / EARNINGS_PRE / EARNINGS_AFTER"
+            " / MOMENTUM_ENABLED_SIDES）、**該当する設定すべて**から外す必要があります"
+        )
+        _absorbed_syms.clear()
+
     try:
         # ★ v2.86: with _trade_ctx() で例外時の ctx.close() を保証
         with _trade_ctx() as ctx:
@@ -12727,7 +12823,15 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 #   利用者が手で持っている QQQ の保護（v3.9.134）が毎周回剥がされ、
                 #   損切り・時間切れで決済され得た（v3.9.133 の事故の再現）。
                 #   取り込まないなら「Bot の記録に無い建玉」として守るのが正しい。
-                if _sym_j == OVN_SYMBOL and not _ovn_state_readable():
+                # ★ v3.9.167: この枝に OVN_ENABLED が抜けていた（認定サポーターの指摘）。
+                #   既定構成（OVN 無効・QQQ は TRIGGER に入る）では状態ファイルが
+                #   そもそも無いので `_ovn_state_readable()` は常に False。その結果、
+                #   (1) OVN を使っていない利用者に「夜間持ち越しの記録も読めません」と
+                #   事実と違う理由が出る、(2) **台帳を作る最初の起動で QQQ だけが
+                #   取り込まれず**、リスク監視のループから外れて損切り・時間切れ・
+                #   トレール・上限超過のいずれも評価されなくなる。
+                #   OVN が無効なら、そもそも守るべき夜間持ち越しの建玉が存在しない。
+                if OVN_ENABLED and _sym_j == OVN_SYMBOL and not _ovn_state_readable():
                     _ext_set_held(
                         _sym_j, True,
                         f"口座に {_sd} {int(abs(_q))}株 ありますが、Bot の記録にありません"
@@ -12756,6 +12860,13 @@ def sync_positions(trd_env: TrdEnv) -> None:
                         f"[建玉台帳] 【{_sym_j}】 台帳の初回作成: 既存の建玉"
                         f"（{_sd} {int(abs(_q))}株）を Bot の建玉として登録しました"
                     )
+                    # ★ v3.9.167: この取り込みは **無音**だった。初回起動の時点では
+                    #   台帳が無く「Bot が建てた建玉」と「利用者が手で持っている建玉」を
+                    #   区別できないため、後者も自動売買の対象にしてしまう（過去に事故に
+                    #   なった形）。何を引き受けたかを必ず知らせる。
+                    # ★ v3.9.167b: 銘柄ごとに送ると、建玉が多い人ほど Discord の
+                    #   レート制限で落ちる（レビュー指摘）。ループの後で1通にまとめる。
+                    _absorbed_syms.append(f"{_sym_j}（{_sd} {int(abs(_q))}株）")
                 else:
                     _ext_set_held(_sym_j, True,
                                   f"口座に {_sd} {int(abs(_q))}株 ありますが、Bot の記録にありません。")
@@ -12780,6 +12891,10 @@ def sync_positions(trd_env: TrdEnv) -> None:
         #   その注文が後から未約定・取消・拒否になると、建玉が残っているのに
         #   時間切れ監視だけが外れたままになる。戻す経路は起動時復元しか無く、
         #   再起動しない限り復帰しなかった。毎回の同期で見て、必要なら戻す。
+        # ★ v3.9.167b: 初回の取り込みを1通にまとめて知らせる（銘柄ごとに送ると
+        #   建玉が多い人ほど Discord のレート制限で落ち、いちばん要る人に届かない）。
+        _flush_absorbed_notice()
+
         for _sym_h in ALL_TICKERS:
             try:
                 _ts_h = state.get(_sym_h)
@@ -12816,6 +12931,12 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 pass
         _ext_remind_if_due()
     except Exception as e:
+        # ★ v3.9.167c: 途中で失敗しても、既に台帳へ書いた取り込みは知らせる
+        #   （黙って引き受けたままにしない）。
+        try:
+            _flush_absorbed_notice()
+        except Exception:
+            pass
         # ★ v3.9.130: 例外失敗も consecutive_fail に計上する。
         #   従来はここで log.warning のみ＝失敗カウントを進めず、health_warning_loop の
         #   発火条件 (consecutive_fail>=3) を満たせなかった。OpenDプロセス消滅時に
@@ -21868,10 +21989,29 @@ async def main(live: bool) -> None:
     # ─────────────────────────────────────────────────────────────
     if True:   # ★ v3.9.83: 以前は if live: だったがデモにも適用 (大多数の受講生はデモ)
         import socket as _socket
+        _conn_err = None
         try:
             with _socket.create_connection((MOOMOO_HOST, MOOMOO_PORT), timeout=3.0):
                 pass
-        except (OSError, _socket.timeout) as _e:
+        except (OSError, _socket.timeout) as _e_conn:
+            _conn_err = _e_conn
+        # ★ v3.9.167: すぐ諦めず、まず OpenD の起動を待つ（認定サポーターの指摘——
+        #   v3.9.157b で入れた最大10分の待機が、この即時終了に阻まれて
+        #   「OpenD 未起動」という本来の想定場面で一度も走っていなかった）。
+        #   自動起動で Bot が先に立ち上がった回は、ここで自己修復する。
+        if _conn_err is not None:
+            # ★ v3.9.167b: 待つ前に原因を見せる（レビュー指摘——待機を前に置いた結果、
+            #   OpenD を立て忘れただけの人が10分間ほぼ無言で待たされ、原因の枠が
+            #   出るのは10分後になっていた）。表示してから待ち、直れば続行する。
+            log.warning(
+                f"[起動] OpenD に接続できません（{MOOMOO_HOST}:{MOOMOO_PORT}）。"
+                f"OpenD を起動してログインしてください。"
+                f"起動を検知したら自動で続行します（{str(_conn_err)[:50]}）"
+            )
+            if await _wait_for_opend():
+                _conn_err = None
+        if _conn_err is not None:
+            _e = _conn_err
             _login_kind = "実口座" if live else "デモ口座"
             print()
             print("  ╔══════════════════════════════════════════════════════════════╗")
@@ -22443,37 +22583,18 @@ async def main(live: bool) -> None:
 
     client = get_anthropic_client()
 
-    # ── ★ v3.9.157b: OpenD より先に Bot が起動した場合は待つ ─────────────────
-    #   旧版は SDK コンストラクタの無限ブロックが「偶然の待機」になっていたが、
-    #   v3.9.157 の期限付き生成で即例外→exit(1) に変わり、Win365 の自動起動
-    #   （OpenD と Bot が同時に立ち上がる）で Bot 側が先に走ると起動できなくなる
-    #   （レビュー指摘——起動順の自己修復という既存の暗黙契約を壊していた）。
-    #   素の TCP で明示的に待つ（既定10分・OPEND_STARTUP_WAIT_MIN で変更可）。
-    try:
-        _opend_wait_min = float(os.environ.get("OPEND_STARTUP_WAIT_MIN", "10") or 10)
-        if not math.isfinite(_opend_wait_min) or _opend_wait_min < 0:
-            _opend_wait_min = 10.0   # ★ v3.9.157c: nan/負値で待機が消えるのを防ぐ
-    except (TypeError, ValueError):
-        _opend_wait_min = 10.0
-    _opend_wait_deadline = time.monotonic() + _opend_wait_min * 60
-    _opend_waited = False
-    while not _opend_tcp_ok() and time.monotonic() < _opend_wait_deadline:
-        if not _opend_waited:
-            _opend_waited = True
-            log.warning(
-                f"[起動] OpenD にまだ接続できません（{MOOMOO_HOST}:{MOOMOO_PORT}）"
-                f" → 起動を待ちます（最大 {_opend_wait_min:.0f}分・15秒間隔で再確認）"
-            )
-        await asyncio.sleep(15)
-    if _opend_waited:
-        if _opend_tcp_ok():
-            log.info("[起動] ✅ OpenD への接続を確認 → 起動を続行します")
-        else:
-            log.error(
-                f"[起動] 🔴 {_opend_wait_min:.0f}分待っても OpenD に接続できません。"
-                f"OpenD を起動してから Bot を再実行してください"
-            )
-            sys.exit(1)
+    # ── ★ v3.9.157b/167: OpenD より先に Bot が起動した場合は待つ ────────────
+    #   待機の本体は _wait_for_opend()（起動時の到達性チェックからも呼ぶ）。
+    #   そこで既に待って到達済みのはずなので、ここは念のための再確認。
+    # ★ v3.9.167b: ここで再び **待つ** と、設定した上限の2倍まで待ちうる
+    #   （レビュー指摘）。手前の関門で待ち終えているので、ここは素早い再確認だけにする。
+    if not _opend_tcp_ok():
+        log.error(
+            f"[起動] 🔴 OpenD への接続が失われました（{MOOMOO_HOST}:{MOOMOO_PORT}）。"
+            f"OpenD を起動してから Bot を再実行してください"
+        )
+        _play_alert_sound("opend_connection_failed")
+        sys.exit(1)
 
     # ── 接続テスト・全銘柄サブスクライブ（株価ストリーミング権限確認）─────────────
     # バッチsubscribeは部分失敗しても RET_OK を返す場合があるため、
@@ -22783,9 +22904,18 @@ async def main(live: bool) -> None:
             #   （新規Claudeレビュアーの指摘——事故の経路では台帳も同時に消えるため
             #   初回移行が走り、QQQ を Bot 建玉として取り込む。すると安全網の
             #   「台帳に無い」条件が崩れ、v3.9.160 の砦が一度も発動しない）。
+            # ★ v3.9.167b: 同じ判断が sync_positions（:12791）にもあり、そちらだけ
+            #   OVN_ENABLED を足していた（レビュー指摘）。2か所が食い違うと、
+            #   どちらが先に建玉を見たかで「取り込む／凍結する」が変わる。揃える。
+            # ★ v3.9.167c: OVN_ENABLED の掛かる範囲を正した（機械検証で発見——
+            #   `OVN_ENABLED and (owns or not readable)` だと、OVN で建てた建玉を
+            #   持ったまま OVN_ENABLED=false にした人の建玉を取り込んでしまう。
+            #   所有の確認（_ovn_owns_now）は ENABLED に依存させない。
+            #   これで sync_positions 側の実効挙動と全16組み合わせで一致する）。
             if (_ledger_first_run and not _ledger_has(sym, trd_env)
                     and not (sym == OVN_SYMBOL
-                             and (_ovn_owns_now() or not _ovn_state_readable()))):
+                             and (_ovn_owns_now()
+                                  or (OVN_ENABLED and not _ovn_state_readable())))):
                 # 台帳をこの環境で初めて作る起動。旧版は口座の建玉をすべて Bot の
                 # ものとして扱っていたので、初回だけその前提を引き継ぐ。これをしないと
                 # 建玉を持ったまま版を上げた利用者の損切りが一斉に止まる。
@@ -23419,7 +23549,20 @@ def _find_other_bot_processes(tag: str) -> list:
             except Exception:
                 return os.path.normcase(_p or "")
 
-        _my_entry = _norm(os.path.abspath(__file__))
+        def _is_my_file(_p):
+            # ★ v3.9.167c: 同一ファイルかは**実体**で判定する（Codexレビュー指摘）。
+            #   文字列を .lower() で畳むと、大小を区別するボリューム上の
+            #   本当に別のファイル（/Bot/ と /bot/）まで「同じ」と誤認して
+            #   実口座の二重起動を見逃す。逆に畳まないと、大小を区別しない
+            #   ボリュームで大文字パス起動の自分を「別の Bot」と誤検知する
+            #   （v3.9.167b で実測）。os.path.samefile は inode で比べるので
+            #   どちらのボリュームでも正しい。確認できなければ検知側に倒す。
+            try:
+                return os.path.samefile(_p, os.path.abspath(__file__))
+            except OSError:
+                return False
+
+
 
         # ★ v3.9.165b: Windows の本番では「中継役の python.exe」が同じコマンドラインで
         #   親として残る（Win365 で実測——親子ペアで見える）。自分の先祖・子孫を
@@ -23436,7 +23579,11 @@ def _find_other_bot_processes(tag: str) -> list:
         _my_age = next((_r[2] for _r in _rows if _r[0] == _me), -1.0)
 
         for _pid, _ppid, _age, _cmdline in _rows:
-            if _pid in _kin or _BOT_ENTRY_NAME not in _cmdline:
+            # ★ v3.9.167: 大小を区別していたため、_RE_ENTRY の re.IGNORECASE に
+            #   到達していなかった（認定サポーターの指摘・Mac で実測）。Windows も
+            #   macOS も既定でファイル名の大小を区別しないので MOOMOO_TRADE_V1.py でも
+            #   同じ本体が起動する。
+            if _pid in _kin or _BOT_ENTRY_NAME.lower() not in _cmdline.lower():
                 continue
             _m0 = _RE_ARGV0.match(_cmdline)
             _me_entry = _RE_ENTRY.search(_cmdline)
@@ -23515,12 +23662,18 @@ def _find_other_bot_processes(tag: str) -> list:
             #   （Codexレビュー指摘——realpath は自分の作業フォルダを基準に解決するため、
             #   別フォルダの旧版を「自分と同じ」と誤認して見逃していた）。
             #   判定できないときは検知する側（＝二重発注を避ける安全側）に倒す。
-            if _looks_absolute_path(_entry) and _norm(_entry) == _my_entry:
+            if _looks_absolute_path(_entry) and _is_my_file(_entry):
                 continue
             # 同じモード同士だけを衝突とみなす（実口座とデモの併走は正当）
             _tail = _cmdline[_me_entry.end():]
             _targs = [_a.strip('"') for _a in _tail.split()]
-            _is_live_other = ("--live" in _targs) or ("real" in _targs)
+            # ★ v3.9.167: Bot 自身は argparse で受けており、**長いオプションの
+            #   省略形が既定で通る**（--liv / --li / --l はいずれも実口座で起動する）。
+            #   走査側だけ完全一致で見ていたため、その形の実口座の旧版を「デモだから
+            #   別モード」と読み飛ばしていた（認定サポーターの指摘・実測）。
+            _is_live_other = ("real" in _targs) or any(
+                _a.startswith("--") and len(_a) > 2 and "--live".startswith(_a)
+                for _a in _targs)
             if (tag == "live") != bool(_is_live_other):
                 continue
             # ★ v3.9.166b: ここに「後から起動した相手には譲る（先着優先）」を入れていたが、
