@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.168"
+BOT_VERSION = "v3.9.169"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -689,6 +689,10 @@ OBS_VEXIT_SAMPLE_PCT = _parse_pct_env("OBS_VEXIT_SAMPLE_PCT", 30.0)
 _OBS_FULL_STAGES = {
     "momentum_shadow", "trend_filter_ab", "premarket_filter_ab", "forced_stop_ab",
     "shadow_short_entry", "shadow_short_exit",
+    # ★ v3.9.169: ニュース選抜で見送った分は間引かず全件記録する。
+    #   「フィルタが良いニュースを弾いていないか」を後から検証するための母数なので、
+    #   サンプリングすると検証そのものができなくなる。
+    "news_select_v1",
     # peak_retrace_sim / timeout_extension は v3.9.116 で計測終了・撤去
 }
 
@@ -2595,6 +2599,90 @@ LEVERAGED_MAP: Dict[str, Dict[str, str]] = {
     "SEMI":        {"bull": _semi_sym,  "bear": _semi_sym},
 }
 
+# ── ★ v3.9.169: ニュース選抜プロファイル v1（既定オフ・opt-in）────────────────
+# 6週間（7/13〜8/21・設定資金$100k未満）の実データで、ニュースのカテゴリ別成績は
+#   MACRO       平均 -0.015% (t=-5.8・1,633件)  ← 唯一の有意な損失源
+#   TECH        平均 +0.019% (t=+2.5・  740件)
+#   SEMI_STRONG 平均 +0.016% (t=+1.9・  816件)
+# だった。TECH+SEMI_STRONG のみに絞ると平均 +0.018%（t=+3.0）で有意にプラスへ転じる。
+# モメンタムの select_v1 と同じ発想を、ニュース側にも用意する。
+#
+# 設計上の約束（バグの連鎖を避けるための制約。変更時はここも読むこと）:
+#   ・判定そのものには一切触れない。AI 判定・判定後ガードを全部通過した
+#     「発注する直前」でだけ発注を止める（既存の SEMI スキップと同じ形）。
+#   ・既読の印（mark_headline_seen）はキャッシュ確認より前で済んでいるため、
+#     ここで見送っても同じニュースを再判定し続ける穴にはならない。
+#     キャッシュ登録とトピック記録は AI 判定を実行した回にだけ走る（ヒット時は
+#     どちらも走らない）が、いずれもゲートより前なので影響しない。
+#   ・既定 false のときは短絡評価で 1 行も実行されない ＝ 既存の挙動と完全に同一。
+#   ・見送りは観察ログ（block_stage="news_select_v1"）に残す。フィルタが良い
+#     ニュースを弾いていないかを後から数字で検証できる状態を保つため。
+#   ・採用カテゴリを変えるときは v1 のまま中身を差し替えず v2 を新設する
+#     （集計が「同じ v1」で別物を混ぜないようにするため）。
+# ★ 既存のプロファイル版管理の規約（v3.9.116・:3473 付近）に合わせ、bool ではなく
+#   文字列で「どの版か」を持つ。bool だと v2 を出すときに名前か意味を変えるしかなく、
+#   「過去にどのルールで発注したかを名前で一意に追跡する」という規約を満たせない。
+NEWS_STRATEGY_PROFILE: str = (
+    os.environ.get("NEWS_STRATEGY_PROFILE", "standard").strip().lower() or "standard"
+)
+if NEWS_STRATEGY_PROFILE not in ("standard", "select_v1"):
+    NEWS_STRATEGY_PROFILE = "standard"   # 不正値は従来どおり（他configと同じ静かなfallback）
+NEWS_PROFILE_SELECT: bool = (NEWS_STRATEGY_PROFILE == "select_v1")
+# 選抜 v1 が新規エントリーを許すカテゴリ。ここ以外（MACRO 等）は新規建てしない。
+NEWS_SELECT_V1_CATEGORIES: frozenset = frozenset({"TECH", "SEMI_STRONG"})
+
+
+def _news_select_v1_flush_skips(skipped: list, *, category: str, score: int,
+                                confidence: float, texts, beneficiaries,
+                                victims, tag: str, why: str) -> None:
+    """選抜 v1 で新規エントリーを見送った銘柄を、まとめて観察ログへ記録する。
+
+    ★ 呼び出しの決まり（レビューで見つけた3つの穴への対処）:
+      ・銘柄ごとに1行残す。先頭1件だけだと売り側の母数が過小になり、
+        「フィルタが良いニュースを弾いていないか」の検証が方向で歪む。
+      ・**パニックセル（緊急退避）より後**に呼ぶ。_log_observation は
+        price_at_decision 未指定だと同期の get_quote を引くため、先に呼ぶと
+        いちばん急ぐ場面でイベントループを塞ぐ。
+      ・**銘柄ロックの外**で呼ぶ。ロックを握ったまま照会とファイル追記をすると
+        後続の銘柄が直列に待たされる。
+      ・記録するのは「他のガードでも止まっていた分を除いた、本当に発注される
+        はずだった銘柄」だけ。そうしないと機会損失を過大評価する。
+    """
+    # ★ AI が同じ銘柄を重複して返すことがある（resolve_execution_symbols は
+    #   候補をそのまま返す）。従来は2回目の place_buy が「保有中」で自然に
+    #   1回へ収束していたので、ここでも重複を潰さないと機会損失が二重計上される。
+    skipped = list(dict.fromkeys(skipped or []))
+    if not skipped:
+        return
+    log.info(
+        f"[ニュース選抜v1] {tag} {why} → 新規エントリーを見送り: "
+        f"{', '.join(skipped)}"
+        f"（採用: {'/'.join(sorted(NEWS_SELECT_V1_CATEGORIES))} × RTH のみ・"
+        f"決済は従来どおり）"
+    )
+    _side = "BUY" if score == 1 else "SELL_SHORT"
+    for _sym in skipped:
+        # ★ v3.9.169b（レビュー指摘）: price_at_decision を渡さないと
+        #   _log_observation が同期の get_quote を引き、非同期ループを塞ぐ
+        #   （v3.9.157 が根治した凍結経路と同型）。リスク監視が約60秒ごとに
+        #   補充している値動き履歴から渡し、無ければ 0 のまま（記録は残る）。
+        _px = 0.0
+        try:
+            _hist = _INDEX_PRICE_HISTORY.get(_sym) or []
+            if _hist:
+                _px = float(_hist[-1][1]) or 0.0
+        except Exception:
+            _px = 0.0
+        _log_observation(
+            symbol=_sym, side=_side, confidence=confidence, score=score,
+            price_at_decision=_px,
+            category=category, headlines=texts,
+            beneficiaries=beneficiaries, victims=victims,
+            outcome="blocked", block_stage="news_select_v1",
+            block_reason=f"news_select_v1: {why}（新規建てのみ見送り）",
+        )
+
+
 # ── 個別株監視銘柄（任意）────────────────────────────────────────────────
 # STOCK_TICKERS=TSLA,NVDA,AAPL のように.envに設定すると
 # その銘柄固有のニュースをFinnhub company-news APIで取得して直接売買する。
@@ -3452,11 +3540,24 @@ elif not MOMENTUM_TRAIL_FROM_ENTRY:
     _PROFILE_TAG = "+flatstop"     # 標準プロファイル × 建玉トレールOFF（固定損切り）
 else:
     _PROFILE_TAG = ""
-BOT_VERSION_TAGGED: str = BOT_VERSION + _PROFILE_TAG
+# ★ v3.9.169: ニュース選抜も同じ規約でタグ付けする。見送り行は観察ログの
+#   block_stage で分かるが、それだけでは「通った側（TECH/SEMI_STRONG の実発注）」を
+#   標準運転と区別できず、絞り込みの効果を比較できない。
+#   ★ _PROFILE_TAG 自体には足さない。この変数は他所で
+#   `_PROFILE_TAG == "+flatstop"` と**完全一致**で比較されており（:1743 と下の
+#   _PROFILE_DISPLAY）、連結すると「標準＋固定損切り」の表示が消える（Codex指摘）。
+#   版の文字列にだけ足す。
+_NEWS_PROFILE_TAG: str = "+news_v1" if NEWS_PROFILE_SELECT else ""
+BOT_VERSION_TAGGED: str = BOT_VERSION + _PROFILE_TAG + _NEWS_PROFILE_TAG
 _PROFILE_DISPLAY: str = (
     "選抜プロファイル v1（絞り込み運転）" if MOMENTUM_PROFILE_SELECT
     else ("標準＋固定損切り（建玉トレールOFF・検証中）" if _PROFILE_TAG == "+flatstop"
           else "標準（今まで通り）")
+) + (
+    # ★ v3.9.169: 日次サマリ（端末・Discord）はこの文字列だけを見せているため、
+    #   ニュース選抜が効いているのに「標準（今まで通り）」と出ていた。
+    #   MACRO の発注が消えた理由を、毎日見る表示から辿れるようにする。
+    "＋ニュース選抜v1" if NEWS_PROFILE_SELECT else ""
 )
 
 # 状態管理: 最後にシグナルを記録した時刻 (クールダウン判定用)
@@ -6018,6 +6119,10 @@ _ERROR_LOG_EXCLUDE_TAGS = (
     # ── ★ v3.9.132: 今週(8/3-8/7)の実データで漏れが判明した情報バナー ──────────
     #   1,548件のエラーのうち 226件(15%)がこの2種で、本物のエラーが埋もれていた。
     "戦略プロファイル:",     # [モメンタム] 🎛 戦略プロファイル: 選抜プロファイル v1 …（起動バナー・165件）
+    # ★ v3.9.169: ニュース選抜の起動バナーも log.warning なので同様に除外する。
+    #   入れ忘れると毎起動「エラーログ詳細」に偽の1件が積まれ、さらに未知エラー
+    #   扱いで AI に対処法を問い合わせてコンソールに表示する（v3.9.132 の退行）。
+    "ニュース選抜プロファイル",
     "実口座モードが有効",     # 実口座モードが有効です。5秒後に開始します…（起動バナー・61件）
     "3連敗到達",             # [モメンタム] ⚠ 3連敗到達 → サイズ縮小（設計どおりの自動調整）
     "サイズを 50% に縮小",   # 同上（連敗時の自動縮小は正常動作）
@@ -14649,6 +14754,34 @@ def place_short(
                 log.info(f"{tag} 残余力不足 → 空売りスキップ")
                 return False
             order_size = remaining_budget
+        # ── ★ v3.9.169b: 個別株の1銘柄上限を空売り側にも適用する ────────────
+        #   認定サポーターの実測報告（2026-08-24・デモ）: 起動バナーは
+        #   「$1,000/銘柄」なのに SHORT だけ $3,957 で発注されていた。
+        #   place_buy には :14260 に同じチェックがあるのに、place_short には
+        #   ポートフォリオ全体の上限しか無く、銘柄単位の歯止めが効いていなかった
+        #   （v3.9.167 以前も同様＝退行ではなく実装漏れ）。
+        _is_stock_sym_s = (symbol in STOCK_TICKERS
+                           or symbol in EARNINGS_PRE_TICKERS
+                           or symbol in EARNINGS_AFTER_TICKERS)
+        if _is_stock_sym_s and STOCK_MAX_USD > 0:
+            _sym_cost_s = _tracked_position_cost.get(symbol, 0.0) or 0
+            if _sym_cost_s >= STOCK_MAX_USD:
+                log.info(
+                    f"{tag} 個別株上限到達: {symbol}=${_sym_cost_s:,.0f}"
+                    f" ≥ STOCK_MAX=${STOCK_MAX_USD:,.0f} → 空売りスキップ"
+                )
+                return False
+            _stock_remaining_s = STOCK_MAX_USD - _sym_cost_s
+            if order_size > _stock_remaining_s:
+                log.info(
+                    f"{tag} 個別株上限調整: ${order_size:,.0f}"
+                    f" → ${_stock_remaining_s:,.0f}"
+                    f"（残余=${_stock_remaining_s:,.0f} / 上限=${STOCK_MAX_USD:,.0f}）"
+                )
+                order_size = _stock_remaining_s
+                if order_size < limit_price:
+                    log.info(f"{tag} 個別株上限後に残余力不足 → 空売りスキップ")
+                    return False
         qty = max(1, math.floor(order_size / limit_price))
         # ★ v3.9.157 (C-1): place_buy と同じ切り上げ超過ガード（空売り側）。
         if qty * limit_price > remaining_budget:
@@ -17439,6 +17572,34 @@ async def process_headlines(
     trigger_sym = _CATEGORY_TO_TRIGGER.get(category, _macro_sym)
     tag = f"【{trigger_sym}】"
 
+    # ── ★ v3.9.169: ニュース選抜プロファイル v1 の判定（止めるのは新規建てだけ）──
+    # 既定オフ（NEWS_PROFILE_SELECT=false）では短絡評価で何も実行されない。
+    # ★ 重要（Codexレビュー指摘）: ここで return してはいけない。この先には
+    #   「ネガティブニュースで既存ロングを決済する」「ポジティブニュースで既存
+    #   ショートを買い戻す」というリスクを減らす動作が含まれる。カテゴリで
+    #   丸ごと止めると、保有中の建玉がニュースによる退避を失う。
+    #   選抜が止めるのは新規エントリーだけで、決済は従来どおり通す。
+    # ★ v3.9.169b: 選抜 v1 は「検証済みルール一式」として、他の設定より優先する
+    #   （PAN指示・モメンタムの select_v1 と同じ思想）。利用者が時間帯の設定を
+    #   どう書いていても、選抜中の新規建ては RTH のみ。
+    #   根拠（6週・$100k未満）: 採用カテゴリの優位性は RTH に集中している——
+    #     RTH        1,485件 平均 +0.020%（t=+3.3）
+    #     プリマーケット 62件 平均 -0.004%（t=-0.1・優位性なし）
+    #     アフターアワーズ 16件（母数不足・平均 -0.068%）
+    #   決済・パニックセルは時間帯に関わらず従来どおり動く（止めるのは新規建てのみ）。
+    _sess_now = get_session_info()[0]
+    _select_v1_off_category = (
+        NEWS_PROFILE_SELECT and category not in NEWS_SELECT_V1_CATEGORIES
+    )
+    _select_v1_off_session = (
+        NEWS_PROFILE_SELECT and _sess_now != SESSION_RTH
+    )
+    _select_v1_block_entry = _select_v1_off_category or _select_v1_off_session
+    _select_v1_why = (
+        f"category={category} は採用外" if _select_v1_off_category
+        else f"{_sess_now} は対象外（選抜は RTH のみ）"
+    )
+
     if score == 1:
         exec_targets = resolve_execution_symbols(texts, trigger_sym, beneficiaries)
     else:
@@ -17523,6 +17684,7 @@ async def process_headlines(
             _skipped_existing_short: list = []   # 既存 SHORT 保有でスキップ
             _skipped_etf_reentry:    list = []   # ETF 再エントリー禁止でスキップ
             _skipped_with_long:      list = []   # 同銘柄 LONG 保有のためスキップ (まずは LONG 決済が必要)
+            _skipped_select_v1_s:    list = []   # ★ v3.9.169: 選抜で新規建てを見送り
             for sym in short_targets:
                 # ★ v2.99: ETF 再エントリー禁止チェック (決済から N 分以内ならスキップ)
                 if _is_etf_ticker(sym):
@@ -17545,6 +17707,29 @@ async def process_headlines(
                     if _cur_qty > 0:
                         # LONG 保有中 → ショート前に LONG 決済が必要
                         _skipped_with_long.append(sym)
+                        continue
+                    # ★ v3.9.169: ここまで来た銘柄＝選抜が無ければ実際に発注されていた
+                    #   銘柄。既存ショート保有・LONG保有・ETF再エントリー禁止で
+                    #   元々止まる分を数えると、機会損失を過大評価してしまう。
+                    #   記録はロックの外・パニックセルの後でまとめて出す。
+                    if _select_v1_block_entry:
+                        _skipped_select_v1_s.append(sym)
+                        # ★ v3.9.169b（レビュー指摘）: SHORT を止めるときはシャドー記録へ
+                        #   転送する（実口座の買い専用ゲート :14507 と同じ扱い）。
+                        #   これが無いと、デモ口座では place_short が本来やっていた
+                        #   唯一の仕事＝仮想SHORTの記録が消え、MACRO のシャドー成績が
+                        #   丸ごと欠測する。モメンタムの select_v1 も
+                        #   「シャドー観察は全銘柄・全サイド・全時間帯で継続」が原則。
+                        if SHADOW_SHORT_ENABLED:
+                            try:
+                                _shadow_short_open(
+                                    symbol=sym, confidence=confidence,
+                                    category=category, news_source=_news_src,
+                                    headlines=texts[:3],
+                                    beneficiaries=beneficiaries, victims=victims,
+                                )
+                            except Exception as _e_sh:
+                                log.debug(f"[ニュース選抜v1] シャドーSHORT記録の失敗（黙殺）: {_e_sh}")
                         continue
                     # 中立 (qty=0) なら空売り可能
                     ok = place_short(sym, trd_env_real, confidence=confidence,
@@ -17574,13 +17759,24 @@ async def process_headlines(
                     _reasons.append(f"LONG 保有中・SHORT 不可: {','.join(_skipped_with_long)}")
                 if _skipped_etf_reentry:
                     _reasons.append(f"ETF 再エントリー禁止: {','.join(_skipped_etf_reentry)}")
+                if _skipped_select_v1_s:   # ★ v3.9.169: 選抜で見送った分も理由に併記
+                    _reasons.append(f"ニュース選抜v1で見送り: {','.join(_skipped_select_v1_s)}")
                 if not _reasons:
                     # 上記いずれにも該当しない場合 = place_short() 内で却下 (余力不足/急変動/トレンドガード等)
                     _reasons.append("place_short() 内でブロック (詳細は直前ログ参照)")
                 log.info(f"{tag} → 空売り試行: 全銘柄スキップ ({' / '.join(_reasons)})")
 
-            if confidence >= PANIC_CONFIDENCE:
-                await panic_sell_all(trd_env_real, trigger_sym, reason)
+            # ★ v3.9.169: 見送りの記録はパニックセルの後・ロックの外で出す。
+            #   先に出すと同期の照会がイベントループを塞ぎ、いちばん急ぐ緊急退避を遅らせる。
+            #   パニックセルが例外で落ちても記録は残す（finally・Codex指摘）。
+            try:
+                if confidence >= PANIC_CONFIDENCE:
+                    await panic_sell_all(trd_env_real, trigger_sym, reason)
+            finally:
+                _news_select_v1_flush_skips(
+                    _skipped_select_v1_s, category=category, score=score,
+                    confidence=confidence, texts=texts, beneficiaries=beneficiaries,
+                    victims=victims, tag=tag, why=_select_v1_why)
         else:
             # confidence < _thresh → 空売りも既存ロング決済もしない
             # しきい値はすべての発注（新規・決済とも）に適用する
@@ -17640,6 +17836,7 @@ async def process_headlines(
         return
 
     ordered = []
+    _skipped_select_v1: list = []   # ★ v3.9.169: 選抜で新規買いを見送った銘柄
     for sym in exec_targets:
         # ★ v2.99: ETF 再エントリー禁止チェック (決済から N 分以内ならスキップ)
         # v3.9.20: ピラミッド撤去により「既存ポジ無し」のときだけチェック。
@@ -17664,6 +17861,16 @@ async def process_headlines(
                 if _take_close_result(sym) == "full":
                     state.get(sym).entry_time = None
                 await asyncio.sleep(1)
+            # ★ v3.9.169: 既存ショートの買い戻し（上のブロック）は済ませたうえで、
+            #   新規の買いだけ見送る。記録はロックの外でまとめて出す（ロックを
+            #   握ったまま照会とファイル追記をすると後続銘柄が直列に待たされる）。
+            if _select_v1_block_entry:
+                # ★ 見送りに数えるのは建玉ゼロの銘柄だけ。place_buy は保有中(>0)でも
+                #   買い戻し残り(<0)でも発注しないので、それらを数えると機会損失を
+                #   過大評価して絞り込みの検証が歪む（レビューで 2 度指摘）。
+                if state.get(sym).position_qty == 0:
+                    _skipped_select_v1.append(sym)
+                continue
             ok = place_buy(sym, trd_env_real, confidence=confidence,
                            trigger=trigger_sym, reason=reason,
                            category=category, news_source=_news_src,
@@ -17683,8 +17890,23 @@ async def process_headlines(
             f"理由: {reason}\n"
             f"--- ニュース ---\n" + "\n".join(f"・{t}" for t in texts[:3])
         ))
+    elif _skipped_select_v1:
+        # ★ v3.9.169: 選抜で見送った回に「余力不足」と誤記録しない。
+        #   他の理由と混在する回もあるので、全件一致ではなく併記する。
+        _other = [x for x in exec_targets if x not in _skipped_select_v1]
+        log.info(
+            f"{tag} → 新規買いなし（ニュース選抜v1で見送り: "
+            f"{', '.join(_skipped_select_v1)}"
+            + (f" / 他の理由でスキップ: {', '.join(_other)}" if _other else "")
+            + "）"
+        )
     else:
         log.info(f"{tag} → 発注試行したが全銘柄スキップ（余力不足または価格取得失敗）")
+    # ★ v3.9.169: 見送りの記録はロックの外・全銘柄の処理が終わってから出す。
+    _news_select_v1_flush_skips(
+        _skipped_select_v1, category=category, score=score, confidence=confidence,
+        texts=texts, beneficiaries=beneficiaries, victims=victims, tag=tag,
+        why=_select_v1_why)
 
 # ── 外部ニュースAPI（Finnhub） ──────────────────────────────────────
 def _fetch_finnhub() -> list[SimpleNamespace]:
@@ -22501,7 +22723,26 @@ async def main(live: bool) -> None:
         log.info(f"  🔴 実口座: 夜間セッションも取引継続（週末のみ {_FRIDAY_CLOSE_TIME.strftime('%H:%M')} ET に全決済）")
         log.info(f"  　　→ moomoo確認済: オーバーナイトも株価取得・発注・ポジション照会すべて対応")
     log.info(f"  戦略: SPY/QQQ ロング（現物買い）/ ショート（空売り）")
-    # ★ v2.99.4: ETF/個別株でバッファを分離表示
+    # ★ v3.9.169: ニュース選抜プロファイルの適用状態を起動時に明示（既定オフ）
+    if NEWS_PROFILE_SELECT:
+        log.warning(
+            "  🎛 ニュース選抜プロファイル v1 (news_select_v1) が有効です。"
+            f" ニュース連動の新規建てを {'/'.join(sorted(NEWS_SELECT_V1_CATEGORIES))} × RTH に絞ります"
+            "（MACRO 等・時間外は新規建てせず、見送りとして記録）。"
+            " 検証済みルール一式のため、時間帯の個別設定より優先します。"
+            " 決済（既存建玉の退避・パニックセル）は従来どおり実行します。"
+            " 従来どおりに戻すには .env の NEWS_STRATEGY_PROFILE を standard にしてください。"
+        )
+        if not _is_data_collect_enabled():
+            # ★ v3.9.169b（レビュー指摘）: 見送りの記録は DATA_COLLECT=true ＋
+            #   STUDENT_NAME が前提。片方でも欠けると「発注だけ止まって検証データは
+            #   ゼロ」になるので、その状態を黙って進めない。
+            log.warning(
+                "  ⚠️ ただし DATA_COLLECT が無効（または STUDENT_NAME 未設定）のため、"
+                "見送りの記録は残りません。検証に使うなら .env の DATA_COLLECT=true と "
+                "STUDENT_NAME をご設定ください。"
+            )
+
     log.info(
         f"  指値バッファ: ETF={LIMIT_BUFFER_PCT_ETF*100:.2f}% / "
         f"個別株={LIMIT_BUFFER_PCT_STOCK*100:.2f}%（気配値基準）  時間外: outsideRth=True"
