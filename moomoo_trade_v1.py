@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.167"
+BOT_VERSION = "v3.9.168"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -1643,6 +1643,23 @@ def _select_v1_live_sides_disp(trd_env: TrdEnv) -> list:
     return _momentum_effective_live_sides(trd_env)
 
 
+def _momentum_sides_setting_disp(trd_env: TrdEnv) -> str:
+    """起動サマリ [モメンタム個別設定] の「有効サイド」表示文字列。
+
+    ★ 認定サポーターの受入確認（v3.9.167）C: この行だけ生の設定値を出しており、
+    実口座＋買い専用などの構成で、同じ起動出力の「実発注モード有効」行
+    （口座別ゲート適用後）と食い違って見えた（A-2 の集約宣言からの漏れ）。
+    設定値の表示は「設定の確認」という役割があるため残し、実発注でゲートに
+    止められるサイドがある場合だけ、その場で実発注可の一覧を注記する。
+    """
+    _cfg = sorted(MOMENTUM_ENABLED_SIDES)
+    if MOMENTUM_LIVE_TRADING:
+        _eff = _momentum_effective_live_sides(trd_env)
+        if _eff != _cfg:
+            return f"{_cfg}（設定値・うち実発注可 {_eff}）"
+    return f"{_cfg}"
+
+
 def _momentum_demo_short_note(trd_env: TrdEnv) -> str:
     """SHORT の実発注可否についての起動時注記（環境で内容が変わる）。
 
@@ -1783,7 +1800,7 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
     )
     log.info(
         f"[モメンタム個別設定] "
-        f"有効サイド {sorted(MOMENTUM_ENABLED_SIDES)} / "
+        f"有効サイド {_momentum_sides_setting_disp(trd_env)} / "
         f"サイズ係数 {MOMENTUM_SIZE_MULTIPLIER} / "
         f"損切り -{MOMENTUM_STOP_LOSS_PCT:.2f}% / "
         f"強シグナル上限 ±{MOMENTUM_MAX_SIGNAL_PCT:.2f}%"
@@ -2233,16 +2250,32 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
 def _exit_code_from_reason(reason: str) -> str:
     """決済理由(自由文字列) を構造化コードへ正規化する。判定は決定論的・順序依存。"""
     s = str(reason or "")
+    # ★ 受入確認【B】フォロー（Codex所見・中→レビューで兄弟経路にも拡張）:
+    #   シグナル系の決済理由は「決算ネガティブシグナル: …: {AIの自由文}」
+    #   「ショートシグナルのためロング決済: {AIの自由文}」の形で、自由文に
+    #   『利確』『損切り』『時間切れ』等が入ると後段の判定に奪われる。
+    #   固定プレフィックス側が決済の種別なので最優先で判定する。これらの語の
+    #   生成元はシグナル決済の呼び出し箇所のみ（先頭配置で他の割当は変わらない）。
+    if ("ネガティブシグナル" in s
+            or ("シグナルのため" in s and "決済" in s)):       return "LS_REVERSE"
     if "建玉トレール" in s:                                   return "ENTRY_TRAIL"
     if "トレイリングストップ" in s:                           return "TRAIL"
     if "強制損切り" in s or ("損切り" in s and "トレール" not in s): return "FORCED_STOP"
     if "時間切れ" in s or "タイムアウト" in s:                 return "TIMEOUT"
     if ("ロング前ショート" in s or "ショート前ロング" in s
-            or "転換" in s or ("シグナルのため" in s and "決済" in s)): return "LS_REVERSE"
+            or "転換" in s): return "LS_REVERSE"   # シグナルのため+決済 は先頭で判定済み
     if "パニック" in s:                                        return "PANIC"
     if "デモ日次" in s:                                        return "DEMO_DAILY"
     if "移行前全決済" in s or "週末" in s or "金曜" in s or "セッション" in s: return "SESSION_CLOSE"
     if "利確" in s or "利益確定" in s or "リトレース" in s:     return "TAKE_PROFIT"
+    # ★ 認定サポーターの受入確認（v3.9.167）【B】: 表示側の特例だけが救っていた
+    #   5類型を分類器本体でも構造化する（GAS へ送る exit_code も揃える）。
+    #   既存の判定を「すべて通過した」文字列だけが到達する末尾に置くことで、
+    #   既存コードの割り当ては1件も変わらない（B-1 の懸念への設計上の回答）。
+    #   GAS は exit_code を素通しで記録するのみ（値で分岐しない）ため変更不要。
+    #   集計側は未知コードをテキスト判定へ落とす設計なので、OVN 新設でも壊れない。
+    if "夜間持ち越し" in s:                                    return "OVN"
+    if "早期クローズ" in s or "連休前" in s:                   return "SESSION_CLOSE"
     if s.strip() == "":                                        return "UNKNOWN"
     return "OTHER"
 
@@ -2409,7 +2442,7 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
             "ai_category":  ai_category,
             "news_source":  news_source,
             "exit_reason":  exit_reason,
-            "exit_code":    _exit_code_from_reason(exit_reason),  # ★ v3.9.91: 構造化決済コード
+            "exit_code":    _exit_code_val,  # ★ v3.9.91 構造化決済コード（:2366 で算出済みを再利用）
             "trade_env":    _RUN_TRADE_ENV,                       # ★ v3.9.99: REAL / DEMO（実取引/デモ判別）
             # ★ v3.9.140: 戦略の識別。NEWS（日中のニュース売買）/ MOMENTUM / OVN（夜間持ち越し）。
             #   OVN は建て方も決済条件もまったく別なので、勝率・損益を混ぜて集計しない。
@@ -6872,17 +6905,34 @@ _SWEEP_VERIFY_WAIT_SEC: int = 10    # 成行の約定反映を待つ秒数（テ
 #   「建玉ゼロ確認」と確定しないため、注文の側（終端＋約定数）でも裏を取る。
 _sweep_oid_ctx = threading.local()
 _last_sweep_close_orders: list = []
-# ★ v3.9.157b: 記録の鮮度上限。これより古い注文記録は裏取りの照合対象から外す
-#   （4レーンレビューの一致指摘——前日の記録が残ったままだと、フラットな日の
-#   スイープが「照会不能な古い注文」を審査し続け、停止に入れず誤警報を出す。
-#   moomoo の order_list_query(order_id) は当日の注文しか返さない）。
-_SWEEP_ORDER_FRESH_SEC: float = 300.0
 
 
-def _fresh_sweep_orders(entries: list) -> list:
-    _nowm = time.monotonic()
-    return [e for e in (entries or [])
-            if (_nowm - float(e.get("ts", 0) or 0)) <= _SWEEP_ORDER_FRESH_SEC]
+def _sweep_today_et() -> str:
+    """記録の「取引日」スタンプ（ET）。order_list_query が当日の注文しか
+    返さない制約に合わせ、台帳の掃除は秒数ではなく ET 日付で区切る。"""
+    return datetime.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+
+
+def _sweep_session_begin() -> None:
+    """一斉決済シーケンス（初回発注＋再試行＋裏取り）の開始宣言。
+
+    ★ 認定サポーターの受入確認（v3.9.167）: 注文記録の寿命を「経過時間
+    （旧 _SWEEP_ORDER_FRESH_SEC=300秒）」で区切ると、再試行シーケンス自体が
+    最大約490秒あるため、3回目以降の裏取りで照合対象が空になり、約定していない
+    決済注文が残っていても「決済完了」に反転していた（関数まるごとの切り出し
+    実行で証明済み）。寿命は時間ではなく取引日で区切り、以後はセッション内の
+    全記録を経過時間に関係なく照合する。
+    ★ レビュー後の追修正（3レーン一致）: ここで「無条件の全消去」をすると、
+    同日の直前のシーケンス（移行前全決済が15:44に出した注文、クラッシュ再起動で
+    再発火した週末決済の1巡目など）が残した未約定注文の証拠まで消え、建玉照会の
+    空応答と重なると裏取りが素通しになる——旧300秒窓が守っていた防御の退行。
+    捨てるのは「当日以外の記録」だけにする：前日の記録の永久ブロック
+    （v3.9.157b・order_list_query は当日の注文しか返さない）は防ぎつつ、
+    同日の証拠は全シーケンスを通して照合対象に残す。
+    """
+    _today = _sweep_today_et()
+    globals()["_last_sweep_close_orders"] = [
+        e for e in _last_sweep_close_orders if e.get("day") == _today]
 _SWEEP_VERIFY_ATTEMPTS: int = 3     # ★ v3.9.156b: 裏取りの試行回数
 # ★ v3.9.156c: 20秒×2回（初回10秒と合わせ最大50秒）。60秒間隔だと、注文拒否等で
 #   本当に決済できていない場合の再決済が1巡あたり最大130秒遅れ、15:45 ET 起点の
@@ -6937,10 +6987,26 @@ def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> 
             #   新旧の注文が並ぶとき、「どれか1本が全量約定」していればその銘柄は充足。
             #   充足が無く UNKNOWN/生存中が残るなら未解決（再確認）。全て終端かつ
             #   未約定なら不成立（再決済へ）。
+            # ★ 認定サポーターの受入確認（v3.9.167）: 照合対象は経過時間で絞らない。
+            #   台帳はセッション単位（_sweep_session_begin でクリア）なので、
+            #   ここにある記録は全て「今回のシーケンスで出した注文」。時間で絞ると
+            #   再試行の3回目以降（発注から300秒超）で対象が空になり、取消済み注文が
+            #   残っていても下の return True に落ちて判定が反転していた。
+            _audited = list(_last_sweep_close_orders)
             _by_sym: dict = {}
-            for _co in _fresh_sweep_orders(_last_sweep_close_orders):
-                _st_o, _dealt_o, _det_o = _order_status_snapshot(
-                    _co["oid"], _co["symbol"], trd_env)
+            for _co in _audited:
+                # ★ レビュー後の追修正（効率所見）: 終端を一度観測した注文は状態が
+                #   変わらないので再照会しない（記録へメモ化）。台帳が同日全体に
+                #   広がったため、再試行のたびに全件を引き直すと moomoo の照会
+                #   頻度制限に当たり、UNKNOWN 化で裏取り自体が遅く・煩くなる。
+                _fin = _co.get("fin")
+                if _fin is not None:
+                    _st_o, _dealt_o = _fin
+                else:
+                    _st_o, _dealt_o, _det_o = _order_status_snapshot(
+                        _co["oid"], _co["symbol"], trd_env)
+                    if _st_o in _TERMINAL_ORDER_STATUSES:
+                        _co["fin"] = (_st_o, _dealt_o)
                 _by_sym.setdefault(_co["symbol"], []).append((_co, _st_o, _dealt_o))
             _unfilled, _unresolved = [], []
             for _sym_o, _entries in _by_sym.items():
@@ -6977,10 +7043,19 @@ def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> 
                     f" → 確定させず再確認します（{_v_try + 1}/{_SWEEP_VERIFY_ATTEMPTS}回目）"
                 )
                 continue
-            log.info(
-                f"[{log_prefix}] ✅ 決済後の裏取り: Bot 所有の建玉ゼロ＋"
-                f"決済注文の約定（{len(_last_sweep_close_orders)}件）を確認しました"
-            )
+            # ★ 認定サポーターの受入確認（v3.9.167）A-3: 件数は「実際に照合した数」。
+            #   旧実装は絞る前の台帳の長さを出しており、0件しか照合していない回にも
+            #   「（1件）を確認しました」と裏取りが働いたように読めるログを出していた。
+            if _audited:
+                log.info(
+                    f"[{log_prefix}] ✅ 決済後の裏取り: Bot 所有の建玉ゼロ＋"
+                    f"決済注文の約定（{len(_audited)}件を照合）を確認しました"
+                )
+            else:
+                log.info(
+                    f"[{log_prefix}] ✅ 決済後の裏取り: Bot 所有の建玉ゼロを確認しました"
+                    f"（このセッションで出した決済注文はありません）"
+                )
             return True
         log.warning(
             f"[{log_prefix}] 発注後も建玉が見えます（{_v_try + 1}/{_SWEEP_VERIFY_ATTEMPTS}回目・"
@@ -7010,7 +7085,11 @@ def close_all_for_weekend(trd_env: TrdEnv,
                     ★ v3.9.35: 移行前全決済から呼ぶ際に "移行前全決済" を渡す。
     """
     # ログプレフィックスを呼び出し元によって出し分け
-    is_weekly = (reason == "週末前強制決済（金曜15:45 ET）")
+    # ★ レビュー後の追修正（既存バグ）: 完全一致だと再試行（「…（再試行N）」）と
+    #   早期クローズ/連休前の理由が弾かれ、実口座の週末決済が「デモ日次決済」の
+    #   ラベルで走り、🏁 の週末通知も出なかった。種別は先頭一致で判定する。
+    is_weekly = str(reason or "").startswith(
+        ("週末前強制決済", "早期クローズ前強制決済", "連休前強制決済"))
     if log_prefix is None:
         log_prefix = "週末決済" if is_weekly else "デモ日次決済"
     # ★ v3.9.113: スイープ前に実口座と同期し、内部状態のズレ（orphan建玉）を再捕捉する。
@@ -7051,10 +7130,11 @@ def close_all_for_weekend(trd_env: TrdEnv,
         )
 
     if not targets:
-        # ★ v3.9.157b: ここで返る前に、前回スイープの古い注文記録を掃除する
-        #   （4レーンレビューの一致指摘——掃除しないと、フラットな日の裏取りが
-        #   前日の注文を照会し続けて UNKNOWN → 停止に入れず偽の🔴警報になる）。
-        globals()["_last_sweep_close_orders"] = _fresh_sweep_orders(_last_sweep_close_orders)
+        # ★ 認定サポーターの受入確認（v3.9.167）: ここで記録を掃除してはいけない。
+        #   再試行中の「建玉照会の空応答」でこの分岐に入ったとき、直前に出した
+        #   決済注文（取消済みかもしれない）の証拠を捨てると、裏取りが照合対象を
+        #   失って「決済完了」に反転する。前日の記録の掃除（v3.9.157b の目的）は
+        #   _sweep_session_begin（シーケンス開始時のクリア）が担う。
         log.info(f"[{log_prefix}] 決済対象ポジションなし → スキップ")
         # ★ v3.9.141: 決済すべきものが無い＝成功。裸の return（None=偽）のままだと、
         #   建玉ゼロの正常な状態を呼び出し側が「失敗」と誤判定し、毎分再試行し続ける。
@@ -7062,14 +7142,16 @@ def close_all_for_weekend(trd_env: TrdEnv,
 
     targets_str = ", ".join(targets)
     if is_weekly:
-        log.warning(f"[{log_prefix}] 🏁 金曜強制全決済開始  対象: {targets_str}")
-        _threadsafe_discord(
-            f"[Bot] 🏁 週末前強制全決済\n"
-            f"対象: {targets_str}\n"
-            f"理由: 週末金利（土日3日分）・地政学リスク回避\n"
-            f"ニュース取得・発注を停止し、月曜プリマーケットまで待機します\n"
-            f"（プリマーケットを「発注しない」設定にしている場合は月曜 09:30 ET まで）"
-        )
+        log.warning(f"[{log_prefix}] 🏁 強制全決済開始  対象: {targets_str}")
+        # ★ レビュー後の追修正: 通知は初回だけ（再試行のたびに同文を送らない）。
+        if "再試行" not in str(reason or ""):
+            _threadsafe_discord(
+                f"[Bot] 🏁 週末・休場前の強制全決済\n"
+                f"対象: {targets_str}\n"
+                f"理由: 週末金利（土日3日分）・地政学リスク回避\n"
+                f"ニュース取得・発注を停止し、次のプリマーケットまで待機します\n"
+                f"（プリマーケットを「発注しない」設定にしている場合は次の 09:30 ET まで）"
+            )
     else:
         log.warning(f"[{log_prefix}] 🌙 デモ日次全決済開始  対象: {targets_str}")
     # ★ v3.9.141: 各決済の成否を集約して返す（認定サポーターからの指摘）。
@@ -7162,7 +7244,9 @@ def close_all_for_weekend(trd_env: TrdEnv,
         #   旧注文が遅れて約定した二重決済や、取消の失敗証拠を検知できなくなる）。
         #   重複排除は oid 単位のみ。新旧の裁定は裏取り側が銘柄ごとに行う。
         _cur_oids = {e["oid"] for e in _cur}
-        _carry = [e for e in _fresh_sweep_orders(_last_sweep_close_orders)
+        # ★ 認定サポーターの受入確認（v3.9.167）: 持ち越しは経過時間で絞らない。
+        #   台帳はセッション単位で管理する（_sweep_session_begin 参照）。
+        _carry = [e for e in _last_sweep_close_orders
                   if e["oid"] not in _cur_oids]
         globals()["_last_sweep_close_orders"] = _cur + _carry
         _sweep_oid_ctx.oids = None
@@ -7910,20 +7994,12 @@ def _format_daily_summary() -> Optional[str]:
         #   利益トレールが丸ごと「その他」に落ちていた。同じ型の取りこぼしは
         #   6/22 にも起きており（「その他」-$3,062 の実体が建玉トレールだった）、
         #   そのとき作った _exit_code_from_reason() をこちら側でも使う。
-        #   夜間持ち越しは分類器が OTHER を返す（GAS 側の集計と互換を保つため
-        #   分類器そのものには手を入れない）。ここでだけ先に拾う。
-        # ★ v3.9.167b: 分類器が拾えない実在の理由を先に受ける（レビュー指摘——
-        #   正規の分類器に寄せた結果、旧実装が 'シグナル' で拾っていた
-        #   「個別株ネガティブシグナルにより…」「決算ネガティブシグナル: …」と、
-        #   半休日・連休前の「早期クローズ前強制決済」「連休前強制決済」が
-        #   『その他』へ退行していた。分類器は GAS へ送る exit_code も決めるため、
-        #   表示側だけで補う）。夜間持ち越しは構造化された種別で判定する。
-        if (t.get('ai_category') or '') == 'OVN' or '夜間持ち越し' in reason:
+        # ★ 受入確認（v3.9.167）【B】対応後: 5類型（夜間持ち越し・早期クローズ/
+        #   連休前・ネガティブシグナル）は分類器本体が OVN/SESSION_CLOSE/LS_REVERSE
+        #   を返すようになった（GAS へ送る exit_code も同じ）。下の先取りは
+        #   ai_category=='OVN'（理由文字列に依存しない構造化判定）のためだけに残す。
+        if (t.get('ai_category') or '') == 'OVN':
             r_key = '夜間持ち越し'
-        elif '早期クローズ' in reason or '連休前' in reason:
-            r_key = '日次/週末決済'
-        elif 'シグナル' in reason:
-            r_key = 'シグナル切替'
         else:
             r_key = {
                 'TIMEOUT':       '時間切れ',
@@ -7935,6 +8011,7 @@ def _format_daily_summary() -> Optional[str]:
                 'SESSION_CLOSE': '日次/週末決済',
                 'DEMO_DAILY':    '日次/週末決済',
                 'TAKE_PROFIT':   '利確',
+                'OVN':           '夜間持ち越し',   # ★ 受入確認【B】: 分類器が構造化
             }.get(_exit_code_from_reason(reason), 'その他')
         r = by_reason.setdefault(r_key, {'n': 0, 'pnl': 0.0})
         r['n']  += 1
@@ -8181,6 +8258,9 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
             # ★ v3.9.141: 戻り値を見て、失敗時は60秒間隔で最大4回まで再試行する。
             #   従来は戻り値を捨てており、決済に失敗しても監視を止めて
             #   建玉を持ち越していた（認定サポーターからの指摘）。
+            # ★ 受入確認（v3.9.167）: シーケンス開始で前回までの注文記録を捨てる。
+            #   以後（初回＋再試行4回＋各裏取り）の記録は全てこのセッションのもの。
+            _sweep_session_begin()
             _wk_ok = await asyncio.to_thread(close_all_for_weekend, trd_env, close_reason)
             # ★ v3.9.156: 「発注できた」で終わらせず、口座の実態（建玉ゼロ）まで
             #   裏を取ってから停止に入る（5日分レビュー・Codex指摘）。
@@ -8243,6 +8323,8 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 f"→ デモ口座のため全ポジション決済・翌プリマーケットまで停止"
             )
             # ★ v3.9.141: 週末決済と同じく、失敗時は再試行し、駄目なら監視を止めない。
+            # ★ 受入確認（v3.9.167）: 週末決済と同じくセッション開始で記録を捨てる。
+            _sweep_session_begin()
             _dd_ok = await asyncio.to_thread(
                 close_all_for_weekend, trd_env,
                 f"デモ日次決済（{close_trigger_time.strftime('%H:%M')} ET）")
@@ -8302,6 +8384,11 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                     #   完了マークと「全決済しました」の通知を出す（認定サポーターからの指摘）。
                     #   旧実装は例外が出なければ成功扱いで、全決済が失敗していても
                     #   同じ通知を送り、境界までの再試行も止めていた。
+                    # ★ 受入確認（v3.9.167）フォロー（Codex所見・低）: この経路は裏取りを
+                    #   呼ばないが close_all は台帳へ書くため、セッション開始を置かないと
+                    #   週末/デモ日次スイープが走らない運用（長期連続稼働）で記録が
+                    #   際限なく溜まる。「台帳＝現在のシーケンスの記録のみ」を全経路で守る。
+                    _sweep_session_begin()
                     _pc_ok = await asyncio.to_thread(
                         close_all_for_weekend, trd_env,
                         f"移行前全決済（{_pc_reason}）", "移行前全決済",
@@ -16810,7 +16897,8 @@ def place_close_all(
             for _c_oid, _c_q in placed_orders:
                 _sweep_oid_ctx.oids.append(
                     {"oid": str(_c_oid), "symbol": symbol,
-                     "qty": int(_c_q), "ts": time.monotonic()})
+                     "qty": int(_c_q), "ts": time.monotonic(),
+                     "day": _sweep_today_et()})   # ★ 台帳の掃除は取引日単位
         except Exception:
             pass
 
@@ -18606,7 +18694,12 @@ async def process_dynamic_stock(
             ts = state.get(symbol)
             if ts.position_qty > 0:
                 log.info(f"[動的銘柄] 【{symbol}】 ネガティブ → 既存ロング決済")
-                place_close_all(symbol, trd_env, reason)
+                # ★ レビュー後の追修正: AI の自由文を裸の決済理由にしない。
+                #   固定プレフィックスが無いと分類器が自由文中の語（利確・損切り等）で
+                #   誤分類し、日次サマリ・GAS の決済コードが揺れる（:18106 の個別株
+                #   経路と同型の決済なので同じ文言に揃える）。
+                place_close_all(symbol, trd_env,
+                                f"個別株ネガティブシグナルによりロング決済: {reason}")
             else:
                 _dyn_qty_s: Optional[int] = None
                 if _dyn_order_usd is not None:
