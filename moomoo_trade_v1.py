@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.169"
+BOT_VERSION = "v3.9.181"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -368,6 +368,39 @@ def _gas_enqueue(url: str, payload_str: str, kind: str, key: str) -> None:
         log.debug(f"[GAS再送] 退避失敗(黙殺): {_mask_secrets(_e)}")
 
 
+def _gas_queue_purge_key(key: str) -> None:
+    """指定キーの退避レコードをキューから取り除く（best-effort）。
+
+    ★ v3.9.174: 新しい内容の送信が成功した後、古い退避レコードが残っていると、
+      あとから gas_retry_loop がそれを送り、GAS v9.25 の「生徒名＋日付で上書き」が
+      **新しい行を古いスナップショットで上書きしてしまう**（最後に届いた方が勝つ
+      ため）。日次集計は 15:45 ET 時点の断面を退避し、翌朝の追いかけは1日ぶんを
+      再集計するので、両者は同一内容ではない（レビュー4レーンが独立に指摘）。
+      成功した時点で同じ鍵の残骸を消し、古い方が後から届く経路を断つ。"""
+    if not key:
+        return
+    try:
+        with _GAS_QUEUE_LOCK:
+            if not os.path.exists(_GAS_QUEUE_PATH):
+                return
+            with open(_GAS_QUEUE_PATH, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            def _same_key(_ln):
+                try:
+                    return json.loads(_ln).get("key", "") == key
+                except Exception:
+                    return False
+            kept = [ln for ln in lines if not _same_key(ln)]
+            if len(kept) != len(lines):
+                with open(_GAS_QUEUE_PATH, "w", encoding="utf-8") as f:
+                    f.writelines(kept)
+                log.debug(f"[GAS再送] 送信成功につき退避を掃除: key={key} "
+                          f"({len(lines) - len(kept)}件)")
+    except Exception as _e:
+        log.debug(f"[GAS再送] 掃除失敗(黙殺): {_mask_secrets(_e)}")
+
+
 def _gas_send_with_retry(url: str, payload_str: str, kind: str,
                          key: str = "", timeout: int = 15,
                          jitter_max: Optional[float] = None) -> bool:
@@ -437,6 +470,11 @@ def _gas_send_with_retry(url: str, payload_str: str, kind: str,
     return False
 
 
+# ★ v3.9.181: 再送成功時に鍵の末尾から日付を取り出すときの検査。
+#   生徒名に "|" が入っていても、末尾が YYYY-MM-DD でなければ記録しない。
+_re_date_key = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
 def _gas_queue_drain_once() -> None:
     """退避キューを1巡再送（同期・asyncio.to_thread から呼ばれる前提）。
 
@@ -482,13 +520,30 @@ def _gas_queue_drain_once() -> None:
             pass
         ok = False
         try:
-            r = _gas_post(rec.get("url", ""), payload, timeout=20)
+            # ★ v3.9.174: summary は本文が大きく GAS 側の上書き探索も重いため
+            #   短い timeout だと「混雑時ほど直らない」形になる（レビュー指摘）。
+            _to = 30 if rec.get("kind") == "summary" else 20
+            r = _gas_post(rec.get("url", ""), payload, timeout=_to)
             ok = isinstance(r, dict) and r.get("ok")
         except Exception:
             ok = False
         if ok:
             sent += 1
             _gas_mark_success()   # ★ v3.9.82: プローブ成功でクールダウン解除（送信再開）
+            # ★ v3.9.181: 日次集計の再送が通ったら、送信済み日付を記録する
+            #   （認定サポーターの指摘）。従来は直接送信の成功経路でしか記録して
+            #   おらず、「再送で届いているのに履歴上は未送信」となって翌起動で
+            #   無駄な追いかけが走っていた。鍵は "生徒名|YYYY-MM-DD"。
+            #   GAS は生徒名＋日付の上書きなので二重行にはならないが、
+            #   通信と診断の両方で紛らわしい。
+            if rec.get("kind") == "summary":
+                try:
+                    _k = str(rec.get("key", ""))
+                    _d = _k.rsplit("|", 1)[-1] if "|" in _k else ""
+                    if _re_date_key.fullmatch(_d):
+                        _mark_date_sent(_d)
+                except Exception as _e:
+                    log.debug(f"[GAS再送] 送信済み日付の記録に失敗(黙殺): {_mask_secrets(_e)}")
             continue
         rec["attempts"] = int(rec.get("attempts", 0)) + 1
         # ★ v3.9.88: 種別別の上限で破棄（トレードは高上限＝実質破棄しない／observation_pnlは最初に諦める）
@@ -823,6 +878,11 @@ async def observation_batch_flush_loop() -> None:
             log.debug(f"[観察バッチ] ループ例外(黙殺): {_mask_secrets(_e)}")
 
 
+# ★ v3.9.172: 実在しない内部識別子。銘柄列に入ることがあるが、
+#   OpenD へ照会してはいけないもの。
+_PSEUDO_SYMBOLS: frozenset = frozenset({"SHARED", ""})
+
+
 def _log_observation(
     *,
     symbol: str,
@@ -877,7 +937,14 @@ def _log_observation(
 
     try:
         # 価格未指定の場合は get_quote で取得を試みる (失敗時は 0 のまま)
-        if price_at_decision <= 0:
+        # ★ v3.9.172: 疑似銘柄は照会しない。ETF モードの AI 判定は
+        #   analyze_news(..., trigger_symbol="SHARED") で呼ばれ、その値が
+        #   そのまま symbol として観察ログに渡る（引数のコメントは「ログ用」
+        #   だが実際には銘柄列にも入る）。結果 US.SHARED を OpenD に照会し、
+        #   Unknown stock のエラーが出ていた（認定サポーターの報告）。
+        #   売買には影響しないが、OpenD 障害と紛らわしく、観察データにも
+        #   実在しない銘柄が混じる。
+        if price_at_decision <= 0 and symbol not in _PSEUDO_SYMBOLS:
             try:
                 _q = get_quote(symbol)
                 price_at_decision = float(_q.get("last", 0)) or float(_q.get("ask", 0)) or 0.0
@@ -1241,8 +1308,14 @@ def _compute_and_send_observation_pnl(obs_id: str, info: dict) -> None:
             _merged["pnl_60min"] = pnl_results.get("pnl_60min")
             _merged.update(_vexit)   # mfe_trail_*（★ v3.9.116: exit15_* は計測終了）
             _buffer_obs_entry(_merged)   # 統合：エントリ＋PnLを1行追記
+            # ★ v3.9.181: 基準価格も出す（認定サポーターの要望）。
+            #   v3.9.178 ② の受入確認「60分評価が体感と合う向きか」は、
+            #   基準がログに出ないため4晩ぶん確認できないままだった。
+            #   ここが実勢価格（発注指値ではない）であることを、利用者が
+            #   自分のログで確かめられるようにする。
             log.debug(
                 f"[観察統合] {obs_id} バッファ追加(エントリ+PnL) {symbol} "
+                f"判定時価格={_entry.get('price_at_decision')} "
                 f"60m={pnl_results.get('pnl_60min')}"
             )
         else:
@@ -1498,7 +1571,7 @@ def _shadow_short_check_exit(pos: Dict[str, Any]) -> Optional[Tuple[str, float]]
                 log.info(
                     f"[シャドーSHORT-TRAIL] {symbol} トレール作動 "
                     f"peak=${pos['peak_price']:.2f} entry=${entry:.2f} "
-                    f"(-{TRAIL_TRIGGER_PCT*100:.1f}% 到達)"
+                    f"(-{TRAIL_TRIGGER_PCT*100:.2f}% 到達)"
                 )
         # ── ③ トレール決済 (peak から TRAIL_DROP_PCT 戻り) ──
         if pos["trail_triggered"]:
@@ -1593,7 +1666,7 @@ async def shadow_short_exit_loop() -> None:
         return
     log.info(
         f"[シャドーSHORT] 監視ループ開始 "
-        f"(損切り -{MAX_LOSS_PCT*100:.2f}% / トレール -{TRAIL_TRIGGER_PCT*100:.1f}% 作動・戻り +{TRAIL_DROP_PCT*100:.1f}% / "
+        f"(損切り -{MAX_LOSS_PCT*100:.2f}% / トレール -{TRAIL_TRIGGER_PCT*100:.2f}% 作動・戻り +{TRAIL_DROP_PCT*100:.2f}% / "
         f"タイムアウト {TIMEOUT_EXIT_MINUTES}分)"
     )
     while True:
@@ -2276,6 +2349,15 @@ def _exit_code_from_reason(reason: str) -> str:
     #   5類型を分類器本体でも構造化する（GAS へ送る exit_code も揃える）。
     #   既存の判定を「すべて通過した」文字列だけが到達する末尾に置くことで、
     #   既存コードの割り当ては1件も変わらない（B-1 の懸念への設計上の回答）。
+    #   ★ v3.9.179: この「1件も変わらない」は**末尾に足した2規則**
+    #   （夜間持ち越し→OVN / 早期クローズ・連休前→SESSION_CLOSE）に係る。
+    #   **先頭へ移したシグナル判定には当てはまらない。**固定語彙の組み合わせ
+    #   2,625通りで294件の割り当てが変わる（認定サポーターの検証・v3.9.180 で
+    #   291/239 から訂正。取り直すと 294/238 で、291 になるのは語とその上位語が
+    #   同じ組に入る3件を採点から外した場合だけ）。うち238件は
+    #   既存種別→LS_REVERSE で、いずれも「ネガティブシグナル」または
+    #   「シグナルのため＋決済」を含むシグナル決済の生成箇所からしか到達しない
+    #   ため動作上は正しいが、注記だけを読むと【B】の変更全体が無害に読める。
     #   GAS は exit_code を素通しで記録するのみ（値で分岐しない）ため変更不要。
     #   集計側は未知コードをテキスト判定へ落とす設計なので、OVN 新設でも壊れない。
     if "夜間持ち越し" in s:                                    return "OVN"
@@ -2303,7 +2385,11 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
                        #   損切り%」（%単位）。本関数は別スレッドで走るため、ここで受け取らずに
                        #   state から読むと、同一銘柄の次の建玉や sync のクリアで値が
                        #   入れ替わりうる（Codexレビュー指摘）。None のときのみ state を参照する。
-                       enforced_stop_pct: Optional[float] = None) -> None:
+                       enforced_stop_pct: Optional[float] = None,
+                       # ★ v3.9.175: 監視ループが適用した出口条件を1組で受け取る。
+                       #   enforced_stop_pct と同じ理由（別スレッドで走るため、
+                       #   ここで state から読むと次の建玉の値に入れ替わりうる）。
+                       enforced_exit: Optional[dict] = None) -> None:
     """1トレード完結時にGAS Webhookへ即時送信する。 / DATA_COLLECT=true かつ STUDENT_NAME 設定済みの場合のみ動作。 / センシティブ情報（APIキー・口座番号）は一切送信しない。"""
     import json as _json, datetime as _dt
     # ★ v3.8.6: 当日トレード集計バッファに追記 (DATA_COLLECT 設定や送信成否に依存せず、
@@ -2372,6 +2458,26 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
     _exit_code_val   = _exit_code_from_reason(exit_reason)
     _trail_triggered = 1 if _exit_code_val in ("TRAIL", "ENTRY_TRAIL") else 0
     _is_mom = (ai_category == "MOMENTUM")
+    # ★ v3.9.175: 戦略の正準表現は1度だけ作って使い回す（v3.9.173 は settings 側に
+    #   別の語彙で2つ目の strategy を作り、同じ payload 内で NEWS と TECH のように
+    #   食い違っていた）。GAS はこの値を「戦略」列へ書く。
+    _strategy_label = ("OVN" if ai_category == "OVN"
+                       else ("MOMENTUM" if _is_mom else "NEWS"))
+
+    def _eff_exit_get(key: str):
+        """監視ループが適用した出口条件を1項目取り出す。
+
+        ★ v3.9.175: state へのフォールバックは置かない。本関数は別スレッドで
+          走るため、ここで state を読むと、同一銘柄の次の建玉が監視ループに
+          評価された後だった場合に「次の建玉の値」を前の建玉の記録へ載せる。
+          渡されなかった＝監視ループが評価する前に決済された建玉なので、
+          誤った値を書くより空にする（GAS 側は空欄として保存する）。
+          夜間持ち越しの「掛からない」(None) も空欄になるが、両者は
+          exit_basis 列で区別できる（overnight か、空か）。"""
+        if not isinstance(enforced_exit, dict):
+            return ""
+        v = enforced_exit.get(key)
+        return "" if v is None else v
     # ★ v3.9.133: 損切り%は「設定の素の値」と「実際に適用された値」を分けて記録する。
     #   旧実装は常に高ボラ倍率を掛けて出力していたが、モメンタム建玉は監視ループ側で
     #   倍率をスキップする仕様（v3.9.93）のため、記録=1.50% / 実際=0.50%（SMH）のように
@@ -2386,12 +2492,22 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
         _base_stop = 0.0; _base_stop_pct = ""
     _eff_stop = ""
     try:
+        # ★ v3.9.175b: 出口条件を1組で受け取っているなら、そちらを最優先する
+        #   （外部レビュー指摘）。同じ行に並ぶ列54-58 と食い違わせないため。
+        #   とくに夜間持ち越しは損切りが掛からない（stop_pct=None）のに、
+        #   下の③が共通設定 0.30% を推測で埋めるため、この列だけが
+        #   「実効損切り 0.30%」と読めていた。監視ループ由来の値なので、
+        #   通常の建玉では下の①と同じ値になる。
+        _has_exit = isinstance(enforced_exit, dict) and "stop_pct" in enforced_exit
         # ①決済時に渡されたスナップショットを最優先（本関数は別スレッドで走るため、
         #   state から読むと同一銘柄の次の建玉や sync のクリアで値が入れ替わりうる）
-        _ts_stop = enforced_stop_pct
-        if _ts_stop is None:
+        _ts_stop = None if _has_exit else enforced_stop_pct
+        if not _has_exit and _ts_stop is None:
             _ts_stop = getattr(state.get(symbol), "enforced_stop_pct", None)  # ②現在値
-        if _ts_stop is not None:
+        if _has_exit:
+            _v = enforced_exit.get("stop_pct")
+            _eff_stop = "" if _v is None else round(float(_v), 4)
+        elif _ts_stop is not None:
             _eff_stop = round(float(_ts_stop), 4)          # ← 実際に適用された値
         else:
             # ③監視ループが一度も評価していない建玉（即時決済等）。設計上の適用値で補完。
@@ -2450,8 +2566,7 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
             "trade_env":    _RUN_TRADE_ENV,                       # ★ v3.9.99: REAL / DEMO（実取引/デモ判別）
             # ★ v3.9.140: 戦略の識別。NEWS（日中のニュース売買）/ MOMENTUM / OVN（夜間持ち越し）。
             #   OVN は建て方も決済条件もまったく別なので、勝率・損益を混ぜて集計しない。
-            "strategy":     ("OVN" if ai_category == "OVN"
-                             else ("MOMENTUM" if _is_mom else "NEWS")),
+            "strategy":     _strategy_label,
             "momentum_level": MOMENTUM_LEVEL,                     # ★ v3.9.109: L1-5（設定別レポート用）
             # ── ★ v3.9.111: 出口チューニング解析用（利用者B要望B案・決済時計算・GAS負荷増なし）──
             "realized_pnl_pct":        _realized_pct,      # 確定損益%（建玉額比・予算非依存）
@@ -2466,6 +2581,18 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
             # ★ v3.9.133: 上の損切り%がこの決済で実際に発動したか（1=発動 / 0=非発動）。
             #   FORCED_STOP と ENTRY_TRAIL は損切り閾値で決済、TRAIL は利確トレールで決済。
             "stop_pct_applied":        1 if _exit_code_val in ("FORCED_STOP", "ENTRY_TRAIL") else 0,
+            # ★ v3.9.175: 出口条件の実効値を最上位フィールドで送る。
+            #   GAS は settings の JSON を丸ごと保存せず、既知のキーだけを列へ写すため、
+            #   settings に入れただけではシートに載らない（外部レビュー指摘）。
+            #   列22-24（timeout_min / trail_trigger / trail_drop）と列46（トレール幅%）は
+            #   グローバル値・環境変数の直読みで、モメンタム・決算・夜間持ち越しでは
+            #   実挙動とずれる。既存列の意味は変えず、実効値は別列（54-58）に足す。
+            #   監視ループが評価する前に決済された建玉は空（誤った値を書かない）。
+            "timeout_min_effective":       _eff_exit_get("timeout_min"),
+            "trail_trigger_pct_effective": _eff_exit_get("trail_trigger_pct"),
+            "trail_drop_pct_effective":    _eff_exit_get("trail_drop_pct"),
+            "stop_mode_effective":         _eff_exit_get("stop_mode"),
+            "exit_basis":                  _eff_exit_get("basis"),
             "fee_estimate":            _fee_est,           # 往復手数料 概算$
             "momentum_5m_pct":         _e5m,               # エントリー時モメンタム5分%
             "momentum_15m_pct":        _e15m,              # エントリー時モメンタム15分%
@@ -2478,7 +2605,15 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
             # ── ★ v3.1.0: ショート取引識別フィールド ─────────────────
             # "LONG" または "SHORT"。GAS 側はこの値を「取引方向」列に記録する。
             "trade_type":   trade_type,
-            "settings":     _get_settings_snapshot(),
+            # ★ v3.9.175: 監視ループが適用した出口条件をそのまま記録へ。
+            #   state へのフォールバックは置かない。本関数は別スレッドで走るため、
+            #   ここで state を読むと、同一銘柄の次の建玉が監視ループに評価された
+            #   後だった場合に「次の建玉の出口条件」を前の建玉の記録に載せてしまう
+            #   （外部レビュー指摘）。渡されなかった＝監視ループが評価する前に
+            #   決済された建玉なので、誤った値を書くより空にする。
+            "settings":     _get_settings_snapshot(
+                enforced_exit=enforced_exit,
+                strategy=_strategy_label),
         }
     }, ensure_ascii=False)
     # ★ v3.9.75: インライン再送→失敗時はローカルキューへ退避（記録欠落を防止）。
@@ -2500,24 +2635,67 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
     #   → GAS送信 週約840行削減。復活させる場合は CHANGELOG v3.9.16/17 を参照。
 
 
-def _get_settings_snapshot() -> str:
-    """ルール改善分析用に設定値を文字列化（センシティブ情報は含まない）"""
+def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
+                           strategy: str = "") -> str:
+    """ルール改善分析用に設定値を文字列化（センシティブ情報は含まない）
+
+    ★ v3.9.175: 「実際に適用された値」は**受け取るだけ**にした。
+
+    v3.9.173 では戦略と銘柄を受け取って記録側で再計算していたが、配布前レビューで
+    次が判明したため差し戻し、設計を変えた。
+
+      ・分岐の実態は「決算 > モメンタム > 通常」の3段＋高ボラ倍率＋夜間持ち越しで、
+        記録側の2段では決算銘柄の損切りが10倍・トレールが13.6倍ずれた
+      ・夜間持ち越しは損切りも時間切れも無いのに、両方が記録された
+      ・v3.9.133 のコメントが「後からグローバル値で再計算しない」と明記していた
+
+    いまは監視ループが適用した値を `ts.enforced_exit` に1組で置き、
+    決済発注の瞬間に `place_close_all` が切り出して約定確認へ引数で渡す
+    （v3.9.178。銘柄ごとの共有状態に置くと、約定確認までの窓や次の建玉で壊れる）。
+    本関数はその断面を受け取ってそのまま出すだけ。分岐が増えても記録側は変更不要。
+    None（監視ループが一度も評価していない建玉）のときは effective_* を出さない。
+    **推測で埋めるより、無いほうが誤解を生まない。**
+
+    共通設定（default 相当）は従来どおり残すので、既存の集計は壊れない。
+    ただし env の直読みはやめ、起動時に解決済みの定数を使う（既定値の取り残しを
+    防ぐ。例: max_loss_pct の直書き既定 "0.5" は v3.9.46 以前の値だった）。
+    """
     import json as _json
     snap = {
         # ★ v3.9.116: select_v1 有効時は "+select_v1" 付き。GAS はこの値をシートの
         #   「botバージョン」列へ書くため、決済記録からプロファイル選択が判別できる。
         "bot_version":   BOT_VERSION_TAGGED,
         "strategy_profile": MOMENTUM_STRATEGY_PROFILE,   # ★ v3.9.116（将来のGAS列追加用）
+    }
+    # ★ v3.9.175: 監視ループが実際に適用した出口条件（あるときだけ載せる）
+    if isinstance(enforced_exit, dict):
+        snap["effective_stop_loss_pct"]     = enforced_exit.get("stop_pct")
+        snap["effective_timeout_min"]       = enforced_exit.get("timeout_min")
+        snap["effective_trail_trigger_pct"] = enforced_exit.get("trail_trigger_pct")
+        snap["effective_trail_drop_pct"]    = enforced_exit.get("trail_drop_pct")
+        # 同じ「幅」でも意味が違う（entry=建値からの retrace / peak=高値からの下落）
+        snap["effective_stop_mode"]         = enforced_exit.get("stop_mode")
+        # どの分岐で決まったか（earnings / momentum / common）
+        snap["effective_basis"]             = enforced_exit.get("basis")
+    if strategy:
+        snap["strategy"] = strategy
+    snap.update({
+        # 以下は共通設定（default_*）。env の直読みをやめ、起動時に解決済みの
+        # 定数を使う（既定値の取り残しを防ぐ）。キー名は互換のため据え置き。
         "budget_usd":    int(os.environ.get("BUDGET_USD", "50000") or 50000),
-        "max_loss_pct":  os.environ.get("MAX_LOSS_PCT", "0.5"),
-        "trail_trigger": os.environ.get("TRAIL_TRIGGER_PCT", "0.30"),
-        "trail_drop":    os.environ.get("TRAIL_DROP_PCT", "0.15"),
-        "confidence":    os.environ.get("STRONG_BUY_CONFIDENCE", "0.75"),
-        "panic_conf":    os.environ.get("PANIC_CONFIDENCE", ""),
-        "timeout_min":   os.environ.get("TIMEOUT_EXIT_MINUTES", "10"),
+        "max_loss_pct":  round(MAX_LOSS_PCT * 100.0, 4),
+        "trail_trigger": round(TRAIL_TRIGGER_PCT * 100.0, 4),
+        "trail_drop":    round(TRAIL_DROP_PCT * 100.0, 4),
+        "confidence":    STRONG_BUY_CONFIDENCE,
+        "panic_conf":    PANIC_CONFIDENCE,
+        "timeout_min":   TIMEOUT_EXIT_MINUTES,
         "tickers":       os.environ.get("TRIGGER_TICKERS", "SPY,QQQ"),
         # v3.9.20: pyramid_* キーは撤去 (山型サイズ配分に置き換え)
-        "limit_buf":     os.environ.get("LIMIT_BUFFER_PCT", "0.010"),
+        # ★ v3.9.173: 銘柄タイプで使い分ける現行仕様を反映（従来は使われていない
+        #   グローバル値をそのまま記録しており、実際の発注価格と無関係だった）
+        "limit_buf":       round(LIMIT_BUFFER_PCT * 100.0, 4),
+        "limit_buf_etf":   round(LIMIT_BUFFER_PCT_ETF * 100.0, 4),
+        "limit_buf_stock": round(LIMIT_BUFFER_PCT_STOCK * 100.0, 4),
         "stock_tickers": os.environ.get("STOCK_TICKERS", ""),
         "news_sources":  ",".join(
             s for s, k in [
@@ -2526,7 +2704,7 @@ def _get_settings_snapshot() -> str:
                 ("RSS",          "always"),
             ] if k
         ),
-    }
+    })
     return _json.dumps(snap, ensure_ascii=False, separators=(",", ":"))
 
 # ── セットアップウィザード完了チェック ─────────────────────────────────────────
@@ -5885,9 +6063,24 @@ _stream_handler.addFilter(_secret_filter)  # ★ v3.9.44: 機密マスキング
 # ★ v3.8.7: 週次ログアーカイブ (logbackup/ + 8 週保持) に対応した FileHandler。
 # 旧版 (v3.8.6 以前) の logging.FileHandler はローテーションなしでログが
 # 無限肥大化していたため、WeeklyLogbackupHandler に置き換え。
+# ★ v3.9.178: テスト実行時はログの出力先も使い捨てへ（外部レビュー指摘）。
+#   本体ログは run_daily_data_collect が行単位で解析し、当日サマリと
+#   「エラーログ詳細」シートを作る。テストは意図的に異常系を通すので、
+#   本番ログに書くと**実在しない障害が当日のシートに載る**（1回の実行で
+#   30KB・ERROR 26行・WARNING 83行を追記していた）。除外タグにも入っていない。
+#   BOT_STATE_DIR は既にテスト隔離で使い捨てフォルダを指しているので、それに乗る。
+_LOG_DIR = os.environ.get("BOT_STATE_DIR", "").strip()
+# ★ v3.9.181: 書き手と読み手を1つの値から作る（認定サポーターの指摘）。
+#   v3.9.178 で書き手だけを BOT_STATE_DIR 配下へ移し、読み手5箇所を相対パスの
+#   ままにしていた。run_daily_data_collect は約定・確定損益・セッション別成績を
+#   すべてログ行から組み立てるため、この環境では「取引はしているのに日次サマリが
+#   空」「未送信日が検出されない」が**無症状で**起きる。
+#   既定（BOT_STATE_DIR 未設定）では従来と同じ相対パスになる。
+_LOG_PATH        = os.path.join(_LOG_DIR, "moomoo_trade_v1.log") if _LOG_DIR else "moomoo_trade_v1.log"
+_LOG_BACKUP_DIR  = os.path.join(_LOG_DIR, "logbackup") if _LOG_DIR else "logbackup"
 _file_handler = WeeklyLogbackupHandler(
-    "moomoo_trade_v1.log",
-    archive_dir="logbackup",
+    _LOG_PATH,
+    archive_dir=_LOG_BACKUP_DIR,
     retention_weeks=8,
     encoding="utf-8",
 )
@@ -6096,7 +6289,9 @@ _ERROR_LOG_EXCLUDE_TAGS = (
     "[移行前全決済]",       # セッション移行時の定常決済通知
     "[モメンタム監視整合]", # 実発注対象の定常リコンサイル通知
     "実発注モード有効",     # [モメンタム] ⚡ 実発注モード有効: ... の起動バナー
-    "[gas_cooldown]",       # 送信側オートバックオフ(設計どおりの一時休止)
+    # ★ v3.9.174: 実際のログは大文字 [GAS_COOLDOWN]（:388）で、小文字の
+    #   タグは一度も一致していなかった（レビュー指摘・比較は大小文字を区別する）。
+    "[GAS_COOLDOWN]",       # 送信側オートバックオフ(設計どおりの一時休止)
     # ── ★ v3.9.92 (A-2): GAS送信失敗・再送退避（売買影響なし）はエラーではない ──
     "記録送信のみ失敗",     # OBSERVATION_TIMEOUT/ERR/EMPTYRESP・DATA_COLLECT_* 共通の語
     "[データ収集] 通信エラー",  # 送信タイムアウト（再送キューが処理・売買影響なし）
@@ -6301,6 +6496,24 @@ class TickerState:
     #   高ボラ倍率をスキップする＝v3.9.93 の仕様）、監視ループ側で確定した値をここへ保存し、
     #   決済記録はこれをそのまま出す。None = 監視ループが一度も評価していない。
     enforced_stop_pct:  object = field(default=None)
+    # ★ v3.9.175: 出口条件を1組で保存する（認定サポーターの報告 → 設計見直し）。
+    #   v3.9.133 で損切りだけ「監視ループが決めた値を建玉に置き、決済記録はそれを
+    #   そのまま出す」形にしたが、タイムアウトとトレールには同じ器が無く、記録は
+    #   共通設定のままだった（実効60分に対し記録10分など）。
+    #   分岐（決算 > モメンタム > 通常／高ボラ倍率／夜間持ち越し）は「横の軸」、
+    #   項目（損切り・タイムアウト・トレール）は「縦の軸」で、v3.9.173 は横しか
+    #   見ていなかったため決算・夜間持ち越しで record と実挙動が10倍ずれた。
+    #   監視ループは3つを同じ場所で同時に決めているので、決めた時点で1組にする。
+    #   キー: stop_pct / stop_mode / timeout_min / trail_trigger_pct / trail_drop_pct / basis
+    #   None = 監視ループが一度も評価していない（＝記録側は「不明」を出す）。
+    enforced_exit:      object = field(default=None)
+    # ★ v3.9.179: 直近に決済し終えた建玉の entry_time。時間切れ監視が「建玉が無い」と
+    #   気づいたときに、正常に決済できたのか注文が通らなかったのかを区別する。
+    #   **時刻の前後では判定できない**——決済→1秒→反転エントリーの経路では、
+    #   旧決済の約定確認（8〜17秒後）が新しい建玉より必ず後になるため、
+    #   新しい建玉を「決済済み」と誤判定してしまう（外部レビュー指摘）。
+    #   どの建玉を決済したかで照合する。
+    last_closed_entry_time: object = field(default=None)
     # ★ v3.9.134: Bot が建てた建玉ではない（＝台帳にこの銘柄が無い）ことを示すフラグ。
     #   True の間はこの銘柄を「見るだけ・触らない」に切り替える:
     #     ・自動決済を一切しない（時間切れ/損切り/トレール/パニック等すべて）
@@ -8113,8 +8326,12 @@ def _format_daily_summary() -> Optional[str]:
                 'FORCED_STOP':   '強制損切り',
                 'PANIC':         'パニックセル',
                 'LS_REVERSE':    'シグナル切替',
-                'SESSION_CLOSE': '日次/週末決済',
-                'DEMO_DAILY':    '日次/週末決済',
+                # ★ v3.9.179: SESSION_CLOSE と DEMO_DAILY を別の行に分ける
+                #   （認定サポーターの受入確認）。分類器は v3.9.168 から
+                #   両者を区別していたが、この表が同じ文言に写していたため
+                #   早期クローズ・連休前・週末が「日次/週末決済」に丸まっていた。
+                'SESSION_CLOSE': 'セッション終了決済',
+                'DEMO_DAILY':    'デモ日次決済',
                 'TAKE_PROFIT':   '利確',
                 'OVN':           '夜間持ち越し',   # ★ 受入確認【B】: 分類器が構造化
             }.get(_exit_code_from_reason(reason), 'その他')
@@ -8964,7 +9181,7 @@ def _extract_request_id(exc: Exception) -> Optional[str]:
     return None
 
 
-def _check_recent_credit_exhaustion(log_path: str = "moomoo_trade_v1.log",
+def _check_recent_credit_exhaustion(log_path: str = _LOG_PATH,
                                      hours: int = 24) -> tuple[int, Optional["datetime.datetime"]]:
     """★ v3.9.18: 過去 N 時間以内のクレジット切れエラー件数と最終発生時刻を返す。
 
@@ -12454,6 +12671,85 @@ def get_quote(symbol: str) -> dict:
                 "from_book": False, "two_sided": False}
 
 
+
+# ★ v3.9.171: async から get_quote を呼ぶための入口。get_quote は OpenD への
+#   同期RPC（接続生成＋subscribe＋板＋気配）で、await せずに呼ぶとイベントループ
+#   ごと止まる。各所で to_thread を手書きすると必ず書き漏れる（初版が実際に
+#   3箇所中1箇所しか直せなかった）ので、経路を1本にする。
+#
+#   ★ 期限と警報をセットで持つ理由（配布前レビューの指摘）
+#   イベントループから逃がすと、**故障が静かになる**。従来は同期呼び出しが
+#   ループごと止めるので心拍が途絶え、10分で赤い警告が出た。逃がした後は
+#   心拍が別ループで鳴り続けるため、リスク監視だけが黙って死ぬ。
+#   そこで、期限切れを「価格が取れない」経路に合流させるだけでなく、
+#   連続したら _note_opend_down で名指しの通知を出す（既存の警報路・
+#   120秒に1回へ間引き・使い捨てスレッドなのでループの状態に依存しない）。
+#
+#   ★ 同時実行数を絞る理由
+#   to_thread は取り消せないので、期限切れ後もスレッドは走り続ける。
+#   _CTX_BUILD_MAX_INFLIGHT は「接続生成」の在庫しか数えておらず（生成が
+#   終わった時点で減る）、生成後のRPCで固まったスレッドは1件も数えない。
+#   放置すると既定のスレッドプール（コア数+4・最小構成では6本程度）を
+#   食い潰し、他の to_thread（建玉同期・決済・通知）まで巻き添えで止まる。
+#   セマフォで同時実行を絞り、滞留の上限を実際に作る。
+#
+#   期限の根拠: 接続生成の上限（既定15秒）＋生成後のRPC（既定20秒）＋
+#   Alpaca/Finnhub のフォールバック（5秒＋8秒）が入る幅を取る。短すぎると
+#   OpenD 不調時にフォールバックが完走できず、v3.9.157b が潰した「盲目監視」を
+#   外側から作り直してしまう。
+_QUOTE_FETCH_TIMEOUT_SEC: float = (
+    MOOMOO_CTX_BUILD_TIMEOUT_SEC + MOOMOO_CONNECT_TIMEOUT_SEC + 20.0
+)
+_QUOTE_FETCH_MAX_INFLIGHT: int = 4
+_quote_fetch_sema: "asyncio.Semaphore | None" = None
+_quote_timeout_streak: int = 0
+_QUOTE_TIMEOUT_ALERT_AT: int = 3
+
+
+def quote_price(q: dict) -> float:
+    """気配値から「いまの値段」を1つ選ぶ。last → bid → ask の順。
+
+    ★ v3.9.171: 同じ選び方が risk_monitor_loop の中だけで3通りに分かれており、
+      板が片側しか無いとき（薄いプレ・一時中断明け）に、ある枝は価格を出せて
+      別の枝は「価格取得失敗」になっていた。とくに損切り・トレールを動かす枝が
+      ask を見ておらず、Ask 側だけの板では監視が丸ごと飛んでいた
+      （表示だけの枝は価格を出しているので、利用者には正常に見える）。
+      板のどちら側が残るかで監視が生き死にするのはおかしいので、1本に揃える。
+    """
+    return q.get("last", 0) or q.get("bid", 0) or q.get("ask", 0) or 0.0
+
+
+async def get_quote_async(symbol: str) -> dict:
+    """get_quote をイベントループの外で実行する（期限つき・同時実行を制限）。"""
+    global _quote_fetch_sema, _quote_timeout_streak
+    if _quote_fetch_sema is None:
+        _quote_fetch_sema = asyncio.Semaphore(_QUOTE_FETCH_MAX_INFLIGHT)
+    try:
+        async with _quote_fetch_sema:
+            _q = await asyncio.wait_for(
+                asyncio.to_thread(get_quote, symbol),
+                timeout=_QUOTE_FETCH_TIMEOUT_SEC,
+            )
+        _quote_timeout_streak = 0
+        return _q
+    except asyncio.TimeoutError:
+        _quote_timeout_streak += 1
+        log.warning(
+            f"[価格取得] {symbol}: {_QUOTE_FETCH_TIMEOUT_SEC:.0f}秒以内に応答なし"
+            f"（{_quote_timeout_streak}回連続）。このティックは価格取得失敗として扱います"
+        )
+        if _quote_timeout_streak >= _QUOTE_TIMEOUT_ALERT_AT:
+            # ループは動いているので心拍では検知できない。名指しで知らせる。
+            _note_opend_down(
+                "気配値の取得",
+                f"{_QUOTE_FETCH_TIMEOUT_SEC:.0f}秒以内に応答が無い状態が"
+                f"{_quote_timeout_streak}回続いています。"
+                f"損切り・トレールの判定が止まっている可能性があります",
+            )
+        return {"ask": 0.0, "bid": 0.0, "last": 0.0,
+                "from_book": False, "two_sided": False}
+
+
 def unlock_trade_if_needed(trd_env: TrdEnv) -> bool:
     """moomoo GUI版ではAPIからの取引ロック解除が無効化されました。 / 取引ロックが発生した場合は moomoo アプリで手動アンロックしてください。 / （OpenD → 設定 → トレードロック解除）"""
     log.info("[ロック解除] moomoo GUI版のためAPIロック解除はスキップ（手動でアンロックしてください）")
@@ -12554,6 +12850,13 @@ def sync_positions(trd_env: TrdEnv) -> None:
             #   場合（戦略が モメンタム⇄ニュース で変わった等）、前の建玉の値が記録に紛れる。
             #   None にしておけば記録側が設計値で補完する。
             ts.enforced_stop_pct = None
+            # ★ v3.9.175: 出口条件一式も同じ理由でクリアする
+            #   （損切りだけ消えて時間切れ・トレールが前の建玉のまま残るのを防ぐ）。
+            ts.enforced_exit = None
+            # ★ v3.9.178: 出口条件の断面は TickerState に置かない。決済ごとに
+            #   _check_order_filled へ引数で渡すので、ここで消すものは無い
+            #   （共有状態に置いていた頃は、決済発注→約定確認の8〜17秒の窓で
+            #   消える／次の建玉の値が紛れる、を何度も踏んだ）。
     # ★ v3.9.167c: 取り込みの通知は sync 全体の try より外で管理する
     #   （新規Claudeレビュアーの指摘——取り込みは1件ごとに台帳へ即永続化されるのに、
     #   まとめ送信はループの後ろにあるため、途中の例外で通知だけが消える。台帳に
@@ -13172,6 +13475,38 @@ def calc_order_size(confidence: float) -> float:
     return max(ORDER_SIZE_MIN_USD, min(ORDER_SIZE_MAX_USD, size))
 
 
+def limit_price_base(quote: dict, action: str) -> float:
+    """指値の基準にする気配値。BUY は ask、SELL は bid（無ければ last）。
+
+    ★ v3.9.176b: 観察ログの「判定時価格」もこれを使う（外部レビュー指摘）。
+
+      指値の基準と同じものを使うことで、
+        ・発注の根拠になった値を必ず拾う（指値だけがバッファ分ずれる状態を解消）
+        ・limit_price > 0 のガードと基準が一致する（発注できたのに
+          判定時価格だけ欠測、が起きない）
+        ・仲値基準にすると乗る半スプレッド分の楽観が入らない
+          （両側板のとき get_quote は last を (ask+bid)/2 に上書きする）
+      が同時に満たされる。
+
+      ★ 残る限界（外部レビュー指摘・誇張しないこと）:
+        板が片側しか無いとき、get_quote は欠けた側を last で埋める。そのとき
+        last は上書きされないため、プレマーケットでまだ約定が無い銘柄では
+        last = 前日終値のままになる。約定する側がその合成値だった場合、
+        ここも前日終値を返す。**これは発注価格 calc_limit_price も同じ基準**
+        なので本関数に固有の欠陥ではなく、この版で新しく作った経路でもない。
+        両側板が取れているかは quote["two_sided"] で判別できる。
+
+    quote_price() は監視ループ用のヘルパーで、そちらは現状のままでよい
+    （どちら側の板が残っても価格を出せることが目的のため）。
+    """
+    ask  = quote.get("ask",  0.0) or 0.0
+    bid  = quote.get("bid",  0.0) or 0.0
+    last = quote.get("last", 0.0) or 0.0
+    if action == "BUY":
+        return ask if ask > 0 else (last if last > 0 else 0.0)
+    return bid if bid > 0 else (last if last > 0 else 0.0)
+
+
 def calc_limit_price(quote: dict, action: str, symbol: Optional[str] = None) -> float:
     """
     LV1 板情報（ask/bid）を基準に指値を算出する。
@@ -13186,19 +13521,12 @@ def calc_limit_price(quote: dict, action: str, symbol: Optional[str] = None) -> 
     ★ v2.99.4: symbol を受け取り、ETF/個別株でバッファを自動切替。
        symbol が None の場合は後方互換で LIMIT_BUFFER_PCT (旧値) を使用。
     """
-    ask  = quote.get("ask",  0.0) or 0.0
-    bid  = quote.get("bid",  0.0) or 0.0
-    last = quote.get("last", 0.0) or 0.0
-
+    base = limit_price_base(quote, action)
+    if base <= 0:
+        return 0.0
     # ★ v2.99.4: シンボル種別に応じたバッファ選択
     buf = get_limit_buffer_pct(symbol) if symbol else LIMIT_BUFFER_PCT
-
-    if action == "BUY":
-        base = ask if ask > 0 else (last if last > 0 else 0.0)
-        return round(base * (1 + buf), 2) if base > 0 else 0.0
-    else:
-        base = bid if bid > 0 else (last if last > 0 else 0.0)
-        return round(base * (1 - buf), 2) if base > 0 else 0.0
+    return round(base * ((1 + buf) if action == "BUY" else (1 - buf)), 2)
 
 # ── 注文ヘルパー ──────────────────────────────────────────────────────────────────
 async def _check_order_filled(
@@ -13209,8 +13537,25 @@ async def _check_order_filled(
     trd_env: TrdEnv,
     mode: str,
     wait_sec: int = 5,
+    exit_snapshot: Optional[dict] = None,
+    stop_snapshot: Optional[float] = None,
 ) -> None:
-    """発注後 wait_sec 秒待ってから order_list_query で約定状態を確認し 結果を Discord に通知する。 デモ口座（SIMULATE）でも呼び出し可能。"""
+    """発注後 wait_sec 秒待ってから order_list_query で約定状態を確認し 結果を Discord に通知する。 デモ口座（SIMULATE）でも呼び出し可能。
+
+    ★ v3.9.178: exit_snapshot は「この決済に適用されていた出口条件」。
+      place_close_all が発注の瞬間に切り出して渡す。銘柄ごとの共有状態
+      （TickerState）に置くと、約定確認までの8〜17秒のあいだに
+      同じ銘柄の次の建玉が入って上書き・消去されうる。実際、決済→1秒→
+      エントリーの反転経路が4本あり、退避を state に置いた実装は
+      そこで断面を失っていた（外部レビュー指摘）。
+      引数で持てば、寿命は決済1件ぶんに閉じてクリアも順序も要らない。
+
+      **None は「監視ループが評価する前に決済された」ことを意味する確定値**であって
+      「未指定」ではない。したがって現在値へフォールバックしてはいけない。
+      一度 `exit_snapshot or ts.enforced_exit` と書いたが、断面が正当に None の
+      決済で、約定確認までの間に入った次の建玉の値を拾ってしまう（外部レビュー指摘）。
+      記録の分岐に入るのは place_close_all 経由だけなので、この引数は必ず明示される
+      （エントリーの約定確認は mode に決済語が無く、記録の分岐に入らない）。"""
     tag = f"【{symbol}】"
     await asyncio.sleep(wait_sec)
     try:
@@ -13318,6 +13663,12 @@ async def _check_order_filled(
                             if prev_avg <= 0 and ts_upd.pending_avg_cost > 0:
                                 prev_avg = ts_upd.pending_avg_cost
                                 log.debug(f"{tag} [確定損益] avg_cost=0のためpending_avg_cost={prev_avg:.2f}を使用")
+                            # ★ v3.9.179b: 決済し終えた建玉の entry_time を、**ガードの外で無条件に**控える。
+                            #   下の `if prev_avg > 0 and filled_price > 0:` の中で控えると、
+                            #   その条件が偽のとき未定義になり、決済確定の処理が途中で例外に落ちる
+                            #   （建玉ゼロなのに発注額が残る＝この版が消そうとしている表示そのものを作る）。
+                            #   pending_entry_time はこの後クリアされるので、使う場所での再評価もできない。
+                            _closed_et = ts_upd.pending_entry_time or ts_upd.entry_time
                             if prev_avg > 0 and filled_price > 0:
                                 realized = (filled_price - prev_avg) * filled_qty
                                 # ★ v2.90: Discord PnL表示用に退避（pending_avg_cost クリア前に取得）
@@ -13372,7 +13723,7 @@ async def _check_order_filled(
                                     f"  ai_category={ts_upd.entry_ai_category}"
                                     f"  news_source={ts_upd.entry_news_source}"
                                     f"  exit_reason={ts_upd.pending_close_reason}"
-                                    f"  settings={_get_settings_snapshot()}"
+                                    f"  settings={_get_settings_snapshot(enforced_exit=exit_snapshot, strategy=('OVN' if ts_upd.entry_ai_category == 'OVN' else ('MOMENTUM' if ts_upd.entry_ai_category == 'MOMENTUM' else 'NEWS')))}"
                                 )
                                 # リアルタイムWebhook送信（DATA_COLLECT=trueの場合）
                                 threading.Thread(
@@ -13397,7 +13748,10 @@ async def _check_order_filled(
                                         "trade_type":    "LONG",
                                         # ★ v3.9.133: 決済時点の「実際に適用された損切り%」をスナップショットして渡す
                                         #   （別スレッドで state を読むと次の建玉の値に入れ替わりうるため）
-                                        "enforced_stop_pct": getattr(ts_upd, "enforced_stop_pct", None),
+                                        "enforced_stop_pct": stop_snapshot,
+                                        # ★ v3.9.175: 損切りだけでなく、タイムアウトと
+                                        #   トレールも同じスナップショットで渡す。
+                                        "enforced_exit": exit_snapshot,
                                     },
                                     daemon=True,
                                 ).start()
@@ -13423,6 +13777,11 @@ async def _check_order_filled(
                             else:
                                 ts_upd.position_qty = 0
                                 ts_upd.avg_cost     = 0.0
+                                # ★ v3.9.179: 「どの建玉を決済し終えたか」を残す。
+                                #   entry_time 自体はここで消さない——複数建玉の1本だけが
+                                #   約定した場合や、決済→1秒→反転エントリーの経路で、
+                                #   残玉や次の建玉の時間切れ時計を止めてしまうため。
+                                ts_upd.last_closed_entry_time = _closed_et
                                 ts_upd.is_short     = False  # ショートカバー完了
                                 ts_upd.entry_pending_fill = False  # v3.9.17: クローズ完了 → フラグリセット
                                 _tracked_position_cost[symbol] = 0.0
@@ -13436,6 +13795,12 @@ async def _check_order_filled(
                             if prev_avg_sc <= 0 and ts_upd.pending_avg_cost > 0:
                                 prev_avg_sc = ts_upd.pending_avg_cost
                                 log.debug(f"{tag} [確定損益(SC)] avg_cost=0のためpending_avg_cost={prev_avg_sc:.2f}を使用")
+                            # ★ v3.9.179b: 決済し終えた建玉の entry_time を、**ガードの外で無条件に**控える。
+                            #   下の `if prev_avg_sc > 0 and filled_price > 0:` の中で控えると、
+                            #   その条件が偽のとき未定義になり、決済確定の処理が途中で例外に落ちる
+                            #   （建玉ゼロなのに発注額が残る＝この版が消そうとしている表示そのものを作る）。
+                            #   pending_entry_time はこの後クリアされるので、使う場所での再評価もできない。
+                            _closed_et_sc = ts_upd.pending_entry_time or ts_upd.entry_time
                             if prev_avg_sc > 0 and filled_price > 0:
                                 realized_sc = (prev_avg_sc - filled_price) * filled_qty
                                 # Discord PnL表示用に退避
@@ -13489,7 +13854,7 @@ async def _check_order_filled(
                                     f"  news_source={ts_upd.entry_news_source}"
                                     f"  exit_reason={ts_upd.pending_close_reason}"
                                     f"  trade_type=SHORT"
-                                    f"  settings={_get_settings_snapshot()}"
+                                    f"  settings={_get_settings_snapshot(enforced_exit=exit_snapshot, strategy=('OVN' if ts_upd.entry_ai_category == 'OVN' else ('MOMENTUM' if ts_upd.entry_ai_category == 'MOMENTUM' else 'NEWS')))}"
                                 )
                                 # リアルタイムWebhook送信（DATA_COLLECT=trueの場合）
                                 threading.Thread(
@@ -13514,7 +13879,10 @@ async def _check_order_filled(
                                         "trade_type":    "SHORT",
                                         # ★ v3.9.133: 決済時点の「実際に適用された損切り%」をスナップショットして渡す
                                         #   （別スレッドで state を読むと次の建玉の値に入れ替わりうるため）
-                                        "enforced_stop_pct": getattr(ts_upd, "enforced_stop_pct", None),
+                                        "enforced_stop_pct": stop_snapshot,
+                                        # ★ v3.9.175: 損切りだけでなく、タイムアウトと
+                                        #   トレールも同じスナップショットで渡す。
+                                        "enforced_exit": exit_snapshot,
                                     },
                                     daemon=True,
                                 ).start()
@@ -13541,6 +13909,11 @@ async def _check_order_filled(
                                 # ショートカバー完了 → ポジション状態を 0 にクリーン化
                                 ts_upd.position_qty = 0
                                 ts_upd.avg_cost     = 0.0
+                                # ★ v3.9.179: 「どの建玉を決済し終えたか」を残す。
+                                #   entry_time 自体はここで消さない——複数建玉の1本だけが
+                                #   約定した場合や、決済→1秒→反転エントリーの経路で、
+                                #   残玉や次の建玉の時間切れ時計を止めてしまうため。
+                                ts_upd.last_closed_entry_time = _closed_et_sc
                                 ts_upd.is_short     = False
                                 ts_upd.entry_pending_fill = False  # v3.9.17: クローズ完了 → フラグリセット
                                 _tracked_position_cost[symbol] = 0.0
@@ -13697,6 +14070,12 @@ async def _check_order_filled(
                                         prev_avg2 = ts_upd2.avg_cost
                                         if prev_avg2 <= 0 and ts_upd2.pending_avg_cost > 0:
                                             prev_avg2 = ts_upd2.pending_avg_cost
+                                        # ★ v3.9.179b: 決済し終えた建玉の entry_time を、**ガードの外で無条件に**控える。
+                                        #   下の `if prev_avg2 > 0 and filled_price2 > 0:` の中で控えると、
+                                        #   その条件が偽のとき未定義になり、決済確定の処理が途中で例外に落ちる
+                                        #   （建玉ゼロなのに発注額が残る＝この版が消そうとしている表示そのものを作る）。
+                                        #   pending_entry_time はこの後クリアされるので、使う場所での再評価もできない。
+                                        _closed_et2 = ts_upd2.pending_entry_time or ts_upd2.entry_time
                                         if prev_avg2 > 0 and filled_price2 > 0:
                                             realized2 = (filled_price2 - prev_avg2) * filled_qty2
                                             # ★ v2.90: Discord PnL表示用に退避
@@ -13746,7 +14125,7 @@ async def _check_order_filled(
                                                 f"  ai_category={ts_upd2.entry_ai_category}"
                                                 f"  news_source={ts_upd2.entry_news_source}"
                                                 f"  exit_reason={ts_upd2.pending_close_reason}"
-                                                f"  settings={_get_settings_snapshot()}"
+                                                f"  settings={_get_settings_snapshot(enforced_exit=exit_snapshot, strategy=('OVN' if ts_upd2.entry_ai_category == 'OVN' else ('MOMENTUM' if ts_upd2.entry_ai_category == 'MOMENTUM' else 'NEWS')))}"
                                             )
                                             threading.Thread(
                                                 target=_send_trade_result,
@@ -13770,7 +14149,9 @@ async def _check_order_filled(
                                                     "trade_type":    "LONG",
                                                     # ★ v3.9.133: 決済時点の「実際に適用された損切り%」をスナップショットして渡す
                                                     #   （別スレッドで state を読むと次の建玉の値に入れ替わりうるため）
-                                                    "enforced_stop_pct": getattr(ts_upd2, "enforced_stop_pct", None),
+                                                    "enforced_stop_pct": stop_snapshot,
+                                                    # ★ v3.9.175: 出口条件を1組で渡す
+                                                    "enforced_exit": exit_snapshot,
                                                 },
                                                 daemon=True,
                                             ).start()
@@ -13778,6 +14159,8 @@ async def _check_order_filled(
                                             ts_upd2.pending_avg_cost   = 0.0
                                         ts_upd2.position_qty = 0
                                         ts_upd2.avg_cost     = 0.0
+                                        # ★ v3.9.179: 決済し終えた建玉の entry_time（上の注記を参照）
+                                        ts_upd2.last_closed_entry_time = _closed_et2
                                         ts_upd2.is_short     = False
                                         _tracked_position_cost[symbol] = 0.0
                                         _tracked_qty[symbol]           = 0
@@ -13787,6 +14170,12 @@ async def _check_order_filled(
                                         prev_avg_sc2 = ts_upd2.avg_cost
                                         if prev_avg_sc2 <= 0 and ts_upd2.pending_avg_cost > 0:
                                             prev_avg_sc2 = ts_upd2.pending_avg_cost
+                                        # ★ v3.9.179b: 決済し終えた建玉の entry_time を、**ガードの外で無条件に**控える。
+                                        #   下の `if prev_avg_sc2 > 0 and filled_price2 > 0:` の中で控えると、
+                                        #   その条件が偽のとき未定義になり、決済確定の処理が途中で例外に落ちる
+                                        #   （建玉ゼロなのに発注額が残る＝この版が消そうとしている表示そのものを作る）。
+                                        #   pending_entry_time はこの後クリアされるので、使う場所での再評価もできない。
+                                        _closed_et_sc2 = ts_upd2.pending_entry_time or ts_upd2.entry_time
                                         if prev_avg_sc2 > 0 and filled_price2 > 0:
                                             realized_sc2 = (prev_avg_sc2 - filled_price2) * filled_qty2
                                             _realized_for_disc2 = realized_sc2
@@ -13832,7 +14221,7 @@ async def _check_order_filled(
                                                 f"  news_source={ts_upd2.entry_news_source}"
                                                 f"  exit_reason={ts_upd2.pending_close_reason}"
                                                 f"  trade_type=SHORT"
-                                                f"  settings={_get_settings_snapshot()}"
+                                                f"  settings={_get_settings_snapshot(enforced_exit=exit_snapshot, strategy=('OVN' if ts_upd2.entry_ai_category == 'OVN' else ('MOMENTUM' if ts_upd2.entry_ai_category == 'MOMENTUM' else 'NEWS')))}"
                                             )
                                             threading.Thread(
                                                 target=_send_trade_result,
@@ -13856,7 +14245,9 @@ async def _check_order_filled(
                                                     "trade_type":    "SHORT",
                                                     # ★ v3.9.133: 決済時点の「実際に適用された損切り%」をスナップショットして渡す
                                                     #   （別スレッドで state を読むと次の建玉の値に入れ替わりうるため）
-                                                    "enforced_stop_pct": getattr(ts_upd2, "enforced_stop_pct", None),
+                                                    "enforced_stop_pct": stop_snapshot,
+                                                    # ★ v3.9.175: 出口条件を1組で渡す
+                                                    "enforced_exit": exit_snapshot,
                                                 },
                                                 daemon=True,
                                             ).start()
@@ -13864,6 +14255,8 @@ async def _check_order_filled(
                                             ts_upd2.pending_avg_cost   = 0.0
                                         ts_upd2.position_qty = 0
                                         ts_upd2.avg_cost     = 0.0
+                                        # ★ v3.9.179: 決済し終えた建玉の entry_time（上の注記を参照）
+                                        ts_upd2.last_closed_entry_time = _closed_et_sc2
                                         ts_upd2.is_short     = False
                                         _tracked_position_cost[symbol] = 0.0
                                         _tracked_qty[symbol]           = 0
@@ -14103,9 +14496,13 @@ def place_buy(
         # SMH のみハードコードで confidence ≥ 0.80 を要求 (他銘柄は既存設定維持)
         # 730 件分析で SMH 0.75 帯の損失が -$212 と最大だったことへの対策。
         if confidence < SMH_CONFIDENCE_THRESHOLD:
+            # ★ v3.9.170: 「同じ conf なのに片方だけ弾かれる」と読めるため、
+            #   このしきい値が買い（LONG）専用であることをログに出す
+            #   （認定サポーターのログ解析で指摘。空売り側に同じ関門は無い）。
             log.info(
                 f"{tag} 🚫 [SMH 専用厳格化] confidence={confidence:.2f} "
-                f"< {SMH_CONFIDENCE_THRESHOLD} → SMH 発注をスキップ"
+                f"< {SMH_CONFIDENCE_THRESHOLD} → SMH の新規買いをスキップ"
+                f"（この関門は買いのみ・空売りには適用されません）"
             )
             _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
                              category=category, headlines=headlines,
@@ -14424,6 +14821,12 @@ def place_buy(
     ts_state.entry_price_trend   = get_index_pct_change(symbol, 5) or 0.0
     ts_state.entry_peak_pnl      = 0.0           # エントリー時は 0.0 で初期化
     ts_state.entry_count         = 1             # v3.9.20: 常に 1 (ピラミッド撤去)
+    # ★ v3.9.178: 新しい建玉なので、前の建玉の出口条件を捨てる（外部レビュー指摘）。
+    #   これらは記録専用で売買判定には使われないため、消しても挙動は変わらない。
+    #   消さないと、新建玉が監視ループに評価される前に決済されたとき（一斉決済・
+    #   パニック等）、前の建玉の値が「正しい値の顔で」記録に載る。
+    ts_state.enforced_exit     = None
+    ts_state.enforced_stop_pct = None
     ts_state.entry_time   = datetime.datetime.now()   # 時間切れ決済の起点
     # v3.9.17: 約定確認待ち中はリスク判定スキップ (avg_cost が指値価格仮設定の間の誤発動防止)
     ts_state.entry_pending_fill = True
@@ -14463,11 +14866,25 @@ def place_buy(
         f"{_headlines_str}"
     ))
     # ★ v3.9.7: 観察ログ — 発注成功パス
+    # ★ v3.9.176b: 2桁に丸めるのは、シートに載る値（GAS ペイロードで round(_,2)）と
+    #   PnL の基準を一致させるため。ただし丸めで 0.00 に潰れると観察ログ側が
+    #   同期 get_quote を引き直してしまうので、その場合だけ生の基準値を使う
+    #   （外部レビュー指摘。指値は buffer を掛けてから丸めるため 0 にならず、
+    #   ここだけ 0 になる価格帯が理論上ある）。
+    _px_basis = limit_price_base(quote, "BUY")
+    _px_basis = round(_px_basis, 2) or _px_basis
+    # ★ v3.9.176: 判定時価格には「実勢価格」を渡す（認定サポーターの報告）。
+    #   従来は発注指値 limit_price を渡していたが、指値は約定しやすさのために
+    #   実勢から意図的にずらしてある（calc_limit_price）。これを理論上の建値に
+    #   使うと、そのズレがまるごと成績の歪みとして観察ログに乗る。
+    #   観察ログ 11,833件を実約定価格と突き合わせた実測では、60分評価が
+    #   LONG で +0.14%・SHORT で +0.06% 不利側に歪んでいた（合計 約 +61,101$）。
+    #   実際の売買・確定損益には影響しない。狂っていたのは判断を測る物差しのほう。
     _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
                      category=category, headlines=headlines,
                      beneficiaries=beneficiaries, victims=victims,
                      outcome="ordered", block_stage="",
-                     block_reason="", price_at_decision=limit_price)
+                     block_reason="", price_at_decision=_px_basis)
     return True
 
 
@@ -14953,6 +15370,9 @@ def place_short(
     # 誤発動 → 即 BUY_BACK で自己決済の race condition への根本対策。
     ts_state.entry_pending_fill = True
     ts_state.avg_cost_confirmed = False  # v3.9.101: 実約定単価が入るまで未確定（指値仮設定）
+    # ★ v3.9.178: 新しい建玉なので前の建玉の出口条件を捨てる（LONG 側と同じ理由）。
+    ts_state.enforced_exit     = None
+    ts_state.enforced_stop_pct = None
     ts_state.is_short          = True  # 意図的なショート中フラグ（リスク監視の誤検知防止）
     ts_state.entry_ai_score    = -1  # SHORTはベア
     ts_state.entry_ai_conf     = confidence
@@ -14985,11 +15405,17 @@ def place_short(
         f"{_headlines_str}"
     ))
     # ★ v3.9.7: 観察ログ — 発注成功パス (SHORT)
+    # ★ v3.9.176b: 丸めの扱いは BUY 側と同じ（上の注記を参照）。
+    _px_basis = limit_price_base(quote, "SELL")
+    _px_basis = round(_px_basis, 2) or _px_basis
+    # ★ v3.9.176: 判定時価格には「実勢価格」を渡す（BUY 側と同じ理由・上の注記を参照）。
+    #   報告はショートの事例だったが、実測では LONG のほうが 2.5 倍歪んでいた。
+    #   買いのほうが指値を実勢から離す幅が大きいため。両方向とも直す。
     _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
                      category=category, headlines=headlines,
                      beneficiaries=beneficiaries, victims=victims,
                      outcome="ordered", block_stage="",
-                     block_reason="", price_at_decision=limit_price)
+                     block_reason="", price_at_decision=_px_basis)
     return True
 
 # 起動時ポジション不明フラグ
@@ -16702,6 +17128,21 @@ def place_close_all(
 
     ts  = state.get(symbol)
 
+    # ★ v3.9.178: この決済に適用されていた出口条件を、**ここで**切り出す
+    #   （外部レビュー指摘）。以前は発注直前に置いていたが、この関数は途中で
+    #   sync_positions() を呼ぶことがあり（取消してからの再決済など）、その
+    #   冒頭ガードが「_tracked_position_cost <= 0」で ts.enforced_exit を消す。
+    #   決済発注→track_position_clear で必ずその条件が立つので、再決済では
+    #   断面が常に None になっていた（記録の列54-58 が必ず空欄）。
+    #   ts を取った直後なら、まだ誰も消していない。
+    #   実体コピーにするのは、切り出した後に書き換えられても断面を保つため。
+    _exit_snap = (dict(ts.enforced_exit)
+                  if isinstance(ts.enforced_exit, dict) else None)
+    # ★ v3.9.178: 損切り%も同じ理由で同時に切り出す（外部レビュー指摘）。
+    #   従来は約定確認の8〜17秒後に共有状態から読んでおり、出口条件で塞いだ穴と
+    #   同型のまま残っていた。
+    _stop_snap = ts.enforced_stop_pct
+
     # ── ★ v2.99: ETF 再エントリー禁止タイマー開始 ─────────────────────────────
     # 決済発注時点でタイマーを開始する (約定確認まで待たない)。
     # 同じニュースが繰り返し流れた際の即時再エントリーを防ぐのが主目的のため、
@@ -16918,6 +17359,12 @@ def place_close_all(
         ts.pending_entry_time = ts.entry_time
     if ts.avg_cost > 0:
         ts.pending_avg_cost = ts.avg_cost
+    # ★ v3.9.175b: 出口条件も同じ理由で退避する（外部レビュー指摘）。
+    #   この直後の track_position_clear() で _tracked_position_cost が 0 になり、
+    #   約定確認（8秒後・リトライなら最大17秒後）までの間に sync_positions が
+    #   走ると enforced_exit が None にされる。退避しないと列54-58 が
+    #   高確率で空欄になる（enforced_stop_pct は設計値で推測するため表面化
+    #   していなかった）。
 
     # ── 各 position_id に対して個別 place_order ──────────────────────────────
     placed_orders: list[tuple[str, int]] = []   # (order_id, qty)
@@ -17039,7 +17486,9 @@ def place_close_all(
     for oid, oq in placed_orders:
         _threadsafe_future(
             _check_order_filled(oid, symbol, oq, limit_price, trd_env,
-                                f"{mode}[{side_label}]", wait_sec=8)
+                                f"{mode}[{side_label}]", wait_sec=8,
+                                exit_snapshot=_exit_snap,
+                                stop_snapshot=_stop_snap)
         )
 
     # ── Discord 通知 ─────────────────────────────────────────────────────────
@@ -19428,7 +19877,20 @@ def _ovn_report_trade(st: dict, exit_price: float, exit_reason: str) -> None:
             target=_send_trade_result,
             args=(OVN_SYMBOL, entry, exit_price, qty, realized, hold_min,
                   "ovn", 0, 0.0, "OVN", "", exit_reason),
-            kwargs={"trade_type": "LONG"},
+            kwargs={
+                "trade_type": "LONG",
+                # ★ v3.9.175: 夜間持ち越しは損切りも時間切れもトレールも掛けない。
+                #   リスク監視は所有権を OVN に渡した時点で打ち切るため、
+                #   ここで明示しないと記録が「無し」ではなく「不明」になる。
+                "enforced_exit": {
+                    "stop_pct":          None,
+                    "timeout_min":       None,
+                    "trail_trigger_pct": None,
+                    "trail_drop_pct":    None,
+                    "stop_mode":         None,
+                    "basis":             "overnight",
+                },
+            },
             daemon=True,
         ).start()
         log.info(
@@ -19761,6 +20223,149 @@ def _ovn_order_status(trd_env, order_id: str) -> tuple[str, int, str]:
         return "UNKNOWN", 0, str(df)
     except Exception as e:
         return "UNKNOWN", 0, f"{type(e).__name__}: {_mask_secrets(e)}"
+
+
+# ★ v3.9.181: 新しいサイクルを始めるときに捨てる鍵。
+#   st は _ovn_load で1度読んだきりプロセス寿命ずっと使い回され、
+#   これらを消す場所がどこにも無かった（外部レビュー指摘）。
+#   前サイクルの値が残ると、次の建玉の記録がその値で作られる。
+_OVN_POSITION_SCOPED_KEYS = (
+    "sell_oids",           # 決済単価が「数日前の約定単価」に化ける
+    "sell_oid",            # 同上（旧形式）
+    "sell_oids_cycle",
+    "entry_price",         # 建値が前サイクルのまま → 確定損益が丸ごとずれる
+    "entry_at",            # 保有時間が日単位でずれる
+    "buy_oid",
+    "position_ids",
+    "sell_fail_count",     # 前の失敗が残り、新しい建玉の1回目で手動決済を促す
+    "zero_unfilled_count",
+)
+
+
+def _ovn_new_cycle(st: dict) -> None:
+    """新しいサイクルに入る前に、前の建玉に属する値を捨てる。
+
+    ★ v3.9.181: 鍵ごとに場当たりで pop していたのをやめ、境界を1箇所にした。
+      残しておくのは phase / trade_env / entry_date / ref_price / shadow_* など、
+      サイクルをまたいで意味を持つものだけ。
+    """
+    for _k in _OVN_POSITION_SCOPED_KEYS:
+        st.pop(_k, None)
+
+
+def _ovn_sell_fill_avg(trd_env, st: dict) -> float:
+    """OVN の売り注文の、実約定単価（株数で加重した平均）を返す。取れなければ 0.0。
+
+    ★ v3.9.181: 確定損益の決済側が「その時点の気配」だった（認定サポーターの指摘）。
+      建値側は _check_order_filled が実約定単価へ上書きするのに、OVN の決済側には
+      同じ補正が無く、`get_quote` の値をそのまま exit_price にしていた。
+      確定処理が走るのは寄り（OVN_EXIT_ET=9:31）の数分後なので、
+      **いちばん動く時間帯の数分ぶんが、そのまま成績の誤差になる。**
+
+      _ovn_order_status は3要素タプルを6箇所が受けているので契約は変えず、
+      単価だけを取る関数を分ける（契約を変える前に読み手を数える方針）。
+
+    **返すのは「全株ぶんを説明できたときだけ」。** ここで返した値は
+    _ovn_report_trade が `st["qty"]`（全株数）に掛けて確定損益にするので、
+    一部しか見えていない平均を返すと、**気配より確からしい顔をした誤った数字**が
+    記録に載る。分からないなら 0.0 を返して気配へ落とす（呼び出し側が WARNING を残す）。
+    """
+    # ★ v3.9.181: その晩の注文だけを見る（外部レビュー指摘）。
+    #   st はプロセス寿命ずっと使い回され、sell_oids は BUY_INTENT でしか消えない。
+    #   HELD_NO_RESERVE へ落ちる経路や、旧版から持ち越した状態ファイルでは
+    #   **前サイクルの注文IDが残る**。それを読むと決済単価が「数日前の約定単価」に
+    #   化け、値が正なので気配へ落ちる警告も出ない。サイクル印で照合する。
+    _cycle = str(st.get("entry_date", "") or "")
+    if not _re_date_key.fullmatch(_cycle):
+        log.debug("[夜間持ち越し] 建玉の日が分からないため、実約定単価は使いません")
+        return 0.0
+    if str(st.get("sell_oids_cycle", "") or "") != _cycle:
+        log.debug(f"[夜間持ち越し] 売り注文が今回のサイクル({_cycle})のものではありません"
+                  f" → 実約定単価は使いません")
+        return 0.0
+    _ids = [str(x) for x in st.get("sell_oids", [st.get("sell_oid")]) if x]
+    if not _ids:
+        return 0.0
+    # ★ v3.9.181: 期間は「建玉の日 00:00:00 〜 今日の 23:59:59」。
+    #   **日付だけを渡してはいけない**——SDK の normalize_date_format は
+    #   時刻の無い日付を 00:00:00 に正規化するため、`end` が当日の始まりになり
+    #   **その日に出した注文がまるごと範囲外**になる（実測で確認）。
+    #   両端とも ET。entry_date が ET なので、片方だけローカル時刻にすると
+    #   ホストのタイムゾーン次第で範囲が壊れる。
+    _now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
+    _kw = {"start": f"{_cycle} 00:00:00",
+           "end":   _now_et.strftime("%Y-%m-%d 23:59:59")}
+    _amt, _qty = 0.0, 0
+    try:
+        with _trade_ctx() as ctx:
+            for _oid in _ids:
+                # ★ 1本でも読めなければ、その場でやめる。見えた分だけの平均を
+                #   全株に掛けるのが危険なので、続けても結果は捨てる（外部レビュー指摘）。
+                try:
+                    ret, df = ctx.order_list_query(
+                        trd_env=trd_env, order_id=_oid,
+                        acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0),
+                        **_kw)
+                    if ret != RET_OK or df is None or not _df_has_rows(df):
+                        log.debug(f"[夜間持ち越し] 注文 {_oid} が照会で返りません"
+                                  f"（ret={ret}）→ 実約定単価は使いません")
+                        return 0.0
+                    # ★ 期間を渡すと応答が複数行になりうる。行を取り違えると
+                    #   買い注文の単価を決済単価として記録してしまうので、
+                    #   注文IDが一致する行だけを見る。
+                    _row = None
+                    for _k in range(len(df)):
+                        _r = df.iloc[_k]
+                        if str(_r.get("order_id", "")) == _oid:
+                            _row = _r
+                            break
+                    if _row is None:
+                        log.debug(f"[夜間持ち越し] 注文 {_oid} の行が応答にありません"
+                                  f" → 実約定単価は使いません")
+                        return 0.0
+                    _d = int(float(_row.get("dealt_qty", 0) or 0))
+                    _p = float(_row.get("dealt_avg_price", 0) or 0)
+                except Exception as _e1:
+                    log.debug(f"[夜間持ち越し] 注文 {_oid} の照会に失敗(黙殺): "
+                              f"{_mask_secrets(_e1)} → 実約定単価は使いません")
+                    return 0.0
+                if _d > 0 and _p > 0:
+                    _amt += _p * _d
+                    _qty += _d
+    except Exception as e:
+        log.debug(f"[夜間持ち越し] 売りの実約定単価を取得できません(黙殺): {_mask_secrets(e)}")
+        return 0.0
+    if _qty <= 0:
+        return 0.0
+    # ★ v3.9.181: 見えた株数が記録する株数に足りないなら使わない（外部レビュー指摘）。
+    #   _ovn_report_trade は st["qty"] に掛けるので、40株ぶんの単価を60株に
+    #   掛けるような記録になる。照会は全部通っていても起こるので、
+    #   「照会できたか」とは別に確かめる。
+    _want = int(st.get("qty", 0) or 0)
+    if _want > 0 and _qty != _want:
+        log.debug(f"[夜間持ち越し] 約定が確認できたのは {_qty}/{_want}株"
+                  f" → 実約定単価は使いません")
+        return 0.0
+    return _amt / _qty
+
+
+async def _ovn_exit_price(trd_env, st: dict) -> float:
+    """OVN の決済単価。実約定単価を優先し、取れなければ気配へ落とす。
+
+    ★ v3.9.181: 従来はここが常に「その時点の気配」だった。確定処理が走るのは
+      寄り（9:31）の数分後なので、いちばん動く時間帯の数分ぶんが成績の誤差になる。
+      落ちた場合はログに残す——気配ベースの行が混ざったことが後から分かるように。
+    """
+    _px = await asyncio.to_thread(_ovn_sell_fill_avg, trd_env, st)
+    if _px > 0:
+        return _px
+    _q = await asyncio.to_thread(get_quote, OVN_SYMBOL)
+    _px = float(_q.get("last", 0) or _q.get("bid", 0) or 0)
+    log.warning(
+        f"[夜間持ち越し] 売りの実約定単価を取得できませんでした → "
+        f"その時点の気配 ${_px:.2f} で損益を記録します（数分ぶんの誤差が乗ります）"
+    )
+    return _px
 
 
 # ★ v3.9.144: SDK 定義の DISABLED（已失効）を追加（認定サポーターの指摘）。
@@ -20121,6 +20726,15 @@ async def ovn_overnight_loop(trd_env) -> None:
                     _ovn_save(st); continue
 
                 # 注文応答前クラッシュでも口座から回収できるよう、意図を先に永続化する。
+                # ★ v3.9.181: 前サイクルの売り注文IDをここで捨てる（外部レビュー指摘）。
+                #   sell_oids を消す箇所がどこにも無く、st はプロセス寿命ずっと
+                #   使い回される。v3.9.179 まで読み手は全て phase=RESERVED（＝その晩の
+                #   注文）だったので露見しなかったが、v3.9.180 で HELD / HELD_NO_RESERVE
+                #   の枝に読み手を足した。その枝は「その晩まだ売り注文を出していない」
+                #   ことを確かめて入るので、残っているIDは**必ず前サイクルのもの**になる。
+                #   放置すると決済単価が「数日前の約定単価」に化け、値が正なので
+                #   気配へ落ちる警告も出ない——直した欠陥より悪い形になる。
+                _ovn_new_cycle(st)
                 st.update(phase="BUY_INTENT", qty=qty, trade_env=_RUN_TRADE_ENV,
                           ref_price=round(last, 2))
                 if not _ovn_save(st):
@@ -20305,10 +20919,8 @@ async def ovn_overnight_loop(trd_env) -> None:
                         _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
                         state.get(OVN_SYMBOL).ovn_held = False
                         _ovn_say("建玉が無いことを確認しました。")
-                        _q_ovn2 = await asyncio.to_thread(get_quote, OVN_SYMBOL)
-                        _ovn_report_trade(
-                            st, float(_q_ovn2.get("last", 0) or _q_ovn2.get("bid", 0) or 0),
-                            "夜間持ち越し: 翌朝の売却")
+                        _exit_px = await _ovn_exit_price(trd_env, st)
+                        _ovn_report_trade(st, _exit_px, "夜間持ち越し: 翌朝の売却")
                         _ovn_save(st)
                         continue
                 if pos < 0:
@@ -20450,14 +21062,14 @@ async def ovn_overnight_loop(trd_env) -> None:
                         _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順
                         state.get(OVN_SYMBOL).ovn_held = False
                         if _dealt_total > 0:
-                            _q_ovn_p = await asyncio.to_thread(get_quote, OVN_SYMBOL)
+                            _exit_px = await _ovn_exit_price(trd_env, st)
                             _ovn_say(
                                 f"予約注文は一部のみ約定（{_dealt_total}/{_target_qty}株）で終端となり、"
                                 "残りの建玉も確認できません。moomoo アプリの履歴をご確認ください。",
                                 "warning")
                             st["qty"] = _dealt_total  # 損益記録は実約定数で送る
                             _ovn_report_trade(
-                                st, float(_q_ovn_p.get("last", 0) or _q_ovn_p.get("bid", 0) or 0),
+                                st, _exit_px,
                                 f"夜間持ち越し: 一部約定 {_dealt_total}/{_target_qty}株（残りは手動決済の可能性）")
                         else:
                             _ovn_say(
@@ -20476,10 +21088,8 @@ async def ovn_overnight_loop(trd_env) -> None:
                     _ovn_save(st)
                     state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say("予約していた注文が寄り付きで約定しました。")
-                    _q_ovn = await asyncio.to_thread(get_quote, OVN_SYMBOL)
-                    _ovn_report_trade(
-                        st, float(_q_ovn.get("last", 0) or _q_ovn.get("bid", 0) or 0),
-                        "夜間持ち越し: 予約が寄り付きで約定")
+                    _exit_px = await _ovn_exit_price(trd_env, st)
+                    _ovn_report_trade(st, _exit_px, "夜間持ち越し: 予約が寄り付きで約定")
                     _ovn_save(st)
                 elif pos > 0:
                     statuses = []
@@ -21139,14 +21749,19 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
         log.info(f"  (モメンタム実発注銘柄 {sorted(_mom_live_syms)} を監視対象に含めています)")
     log.info(
         f"  強制損切り: -{MAX_LOSS_PCT*100:.2f}%（ポジション評価額基準） / "
-        f"トレール発動: +{TRAIL_TRIGGER_PCT*100:.1f}%（投下額基準） / "
-        f"トレール幅: {TRAIL_DROP_PCT*100:.1f}%"
+        # ★ v3.9.170: .1f だと 0.22%→"0.2%"・0.15%→"0.1%" と丸まり、実設定と
+        #   食い違って見えた（認定サポーターのログ解析で指摘）。設定確認の
+        #   主要な手段なので桁を増やす。
+        #   注: .2f も万能ではなく、0.225% のような3桁の設定は表示だけ丸まる
+        #   （判定には元の値が使われる）。標準値 0.22 / 0.15 では問題にならない。
+        f"トレール発動: +{TRAIL_TRIGGER_PCT*100:.2f}%（投下額基準） / "
+        f"トレール幅: {TRAIL_DROP_PCT*100:.2f}%"
         + (f" / 時間切れ決済: {TIMEOUT_EXIT_MINUTES}分" if TIMEOUT_EXIT_MINUTES > 0 else "")
     )
     if _all_earnings_set:
         log.info(
-            f"  　決算銘柄専用: トレール発動 +{EARNINGS_TRAIL_TRIGGER_PCT*100:.1f}% / "
-            f"トレール幅 {EARNINGS_TRAIL_DROP_PCT*100:.1f}% / "
+            f"  　決算銘柄専用: トレール発動 +{EARNINGS_TRAIL_TRIGGER_PCT*100:.2f}% / "
+            f"トレール幅 {EARNINGS_TRAIL_DROP_PCT*100:.2f}% / "
             f"時間切れ {'無効' if EARNINGS_TIMEOUT_EXIT_MINUTES == 0 else f'{EARNINGS_TIMEOUT_EXIT_MINUTES}分'} / "
             f"損切り {'MAX_LOSS_PCT流用(' + f'{MAX_LOSS_PCT*100:.2f}' + '%)' if EARNINGS_MAX_LOSS_PCT == 0 else f'{EARNINGS_MAX_LOSS_PCT*100:.2f}%[決算専用]'}"
         )
@@ -21226,6 +21841,10 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         _clear_trade_lock("解除を確認")
                     elif _unlocked is False:
                         log.debug("[取引ロック] まだ解除されていません")
+            # ★ v3.9.179b: この判定は await より前に行う。以降の枝で
+            #   get_quote_async を待つあいだに決済が確定すると実態とずれるが、
+            #   ずれるのは1回ぶんの表示だけで、次の巡回（約60秒後）で揃う。
+            #   建玉ごとの行は await の後に読み直しているので、金額の食い違いは出ない。
             _has_any_pos = any(
                 state.get(s).position_qty != 0 or _tracked_position_cost.get(s, 0) > 0
                 for s in exec_syms
@@ -21235,14 +21854,21 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 session_now, _ = get_session_info()
                 _prices = []
                 for s in exec_syms:
-                    q = get_quote(s)
-                    if q.get("last", 0) > 0:
-                        _prices.append(f"{s}:${q['last']:.2f}")
+                    # ★ v3.9.179: 表示ティックだけ同期のまま残っていた（認定サポーターの
+                    #   受入確認）。約60秒に1度必ず通る枝で、建玉の数だけ直列に呼ぶため、
+                    #   OpenD が重いと監視が止まる時間がここだけ伸びる。
+                    #   価格の取り出しも quote_price() に統一する。統一されていないと、
+                    #   板が bid 側だけのとき「監視は価格を出せるのに表示だけ取得失敗」になる。
+                    q = await get_quote_async(s)
+                    _px = quote_price(q)          # 表示用（板が片側でも出せる）
+                    _px_rec = q.get("last", 0)    # 記録用（従来どおり・売買の入力になる）
+                    if _px > 0:
+                        _prices.append(f"{s}:${_px:.2f}")
                         # ★ v2.92/v2.94: QQQ/SPY/SMH の価格スナップショットを記録
                         # （AI 判定時のマクロ文脈に使う、追加 API コールなし）
                         # v2.94: SMH を追加 (SMH 固有の下落トレンド検知に使用)
-                        if s in _INDEX_PRICE_HISTORY:  # ★ v2.99.4: STOCK_TICKERS も自動対象
-                            record_index_price(s, q["last"])
+                        if s in _INDEX_PRICE_HISTORY and _px_rec > 0:  # ★ v2.99.4
+                            record_index_price(s, _px_rec)
                 price_str = "  ".join(_prices) if _prices else "価格取得失敗"
                 log.info(
                     f"[状況] ポジションなし  セッション:{session_now.upper()}"
@@ -21253,12 +21879,19 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 session_now, _ = get_session_info()
                 _prices = []
                 for s in exec_syms:
-                    q = get_quote(s)
-                    if q.get("last", 0) > 0:
-                        _prices.append(f"{s}:${q['last']:.2f}")
+                    # ★ v3.9.179: 表示ティックだけ同期のまま残っていた（認定サポーターの
+                    #   受入確認）。約60秒に1度必ず通る枝で、建玉の数だけ直列に呼ぶため、
+                    #   OpenD が重いと監視が止まる時間がここだけ伸びる。
+                    #   価格の取り出しも quote_price() に統一する。統一されていないと、
+                    #   板が bid 側だけのとき「監視は価格を出せるのに表示だけ取得失敗」になる。
+                    q = await get_quote_async(s)
+                    _px = quote_price(q)          # 表示用（板が片側でも出せる）
+                    _px_rec = q.get("last", 0)    # 記録用（従来どおり・売買の入力になる）
+                    if _px > 0:
+                        _prices.append(f"{s}:${_px:.2f}")
                         # ★ v2.92/v2.94: QQQ/SPY/SMH の価格スナップショットを記録
-                        if s in _INDEX_PRICE_HISTORY:  # ★ v2.99.4: STOCK_TICKERS も自動対象
-                            record_index_price(s, q["last"])
+                        if s in _INDEX_PRICE_HISTORY and _px_rec > 0:  # ★ v2.99.4
+                            record_index_price(s, _px_rec)
                 price_str = "  ".join(_prices) if _prices else "価格取得失敗"
                 # ★ v3.9.143: 発注が止まるのは実口座だけ。デモに「発注ブロック中」と
                 #   表示すると事実と異なる（Codexレビュー指摘）。
@@ -21276,11 +21909,23 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     tracked = _tracked_position_cost.get(s, 0)
                     if ts_s.position_qty == 0 and tracked <= 0:
                         continue
-                    q = get_quote(s)
-                    price_now = q.get("last", 0) or q.get("ask", 0) or 0
+                    # ★ v3.9.179: 同上（表示ティック内・建玉の数だけ直列に呼ぶ箇所）
+                    q = await get_quote_async(s)
+                    price_now = quote_price(q)
+                    # ★ v3.9.179b: await の間に別タスク（約定確認）が走り、決済が確定すると
+                    #   position_qty も _tracked_position_cost も 0 になる。await より前に
+                    #   読んだ tracked を使うと「注文中（約定待ち・未ポジション） 発注額$…」
+                    #   という行が、正常に決済できた直後に出る。まさにこの版が消そうと
+                    #   している誤読なので、await の後に読み直す（外部レビュー指摘）。
+                    tracked = _tracked_position_cost.get(s, 0)
                     # ★ v2.92/v2.94: QQQ/SPY/SMH の価格スナップショットを記録（追加 API コールなし）
-                    if s in _INDEX_PRICE_HISTORY and price_now > 0:  # ★ v2.99.4
-                        record_index_price(s, price_now)
+                    # ★ v3.9.179b: 記録は従来の取り出し（last→ask）のまま。ここは表示専用では
+                    #   なく _quote_sanity_ok（乖離15%で発注を止める）・_momentum_high_chase_block・
+                    #   トレンドフィルタの入力になるため、取り出し方を変えると売買が変わる
+                    #   （外部レビュー指摘）。表示だけ quote_price に揃える。
+                    _px_rec = q.get("last", 0) or q.get("ask", 0) or 0
+                    if s in _INDEX_PRICE_HISTORY and _px_rec > 0:  # ★ v2.99.4
+                        record_index_price(s, _px_rec)
                     qty   = ts_s.position_qty
                     cost  = ts_s.avg_cost
                     if qty > 0 and cost > 0 and price_now > 0:
@@ -21373,8 +22018,14 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         _own_note = ("  ⚠️ Bot 以外の建玉のため自動売買は停止中"
                                      "（決済しません。この建玉を決済すると再開します）")
                         _own_log = log.warning
-                    _ext_q = get_quote(symbol)
-                    _ext_price = _ext_q.get("last", 0) or _ext_q.get("bid", 0) or _ext_q.get("ask", 0) or 0
+                    # ★ v3.9.171: 夜間持ち越し（OVN）の建玉を抱えている間、この分岐が
+                    #   毎ティック走り、continue するので下の③には到達しない。
+                    #   走る時間帯はプレ（04:00 ET）〜寄りでの OVN 売却まで。
+                    #   夜間セッション中はループ自体が market_open_event で停まっている。
+                    #   ちょうど ovn_overnight_loop が30秒ごとに気配を見に行く時間帯で、
+                    #   同期のままだとそこと競合したまま塞ぐ。
+                    _ext_q = await get_quote_async(symbol)
+                    _ext_price = quote_price(_ext_q)
                     if _ext_price > 0 and ts.avg_cost > 0 and ts.position_qty != 0:
                         _ext_pnl = ((_ext_price - ts.avg_cost) * ts.position_qty
                                     if ts.position_qty > 0
@@ -21395,8 +22046,13 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 # v2.99 hotfix: SHORT の PnL 符号反転を修正、avg_cost>0 で旧entry_timeなら
                 # タイムアウト判定も実施。
                 if ts.position_qty == 0 and _tracked_cost > 0:
-                    _fp  = get_quote(symbol)
-                    _cur = _fp.get("last", 0) or _fp.get("ask", 0) or 0
+                    # ★ v3.9.171: 発注直後〜建玉反映までの窓。リスクが最も高い
+                    #   時間帯なので、ここも塞がないようにする。
+                    _fp  = await get_quote_async(symbol)
+                    # ★ v3.9.171: bid を見ていなかった。板が片側しか無いとき
+                    #   （薄いプレ・一時中断明けなど）、上の外部保有側は価格を
+                    #   出せるのにここだけ「価格取得失敗」になっていた。
+                    _cur = quote_price(_fp)
                     if _cur > 0:
                         # avg_cost(約定反映済み)があれば正確なP&L、なければ推定
                         if ts.avg_cost > 0:
@@ -21578,23 +22234,57 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                             else:
                                 # ★ v3.9.148: 建玉が無い理由は「注文が通らなかった」
                                 #   だけでなく「損切り・トレールで既に決済済み」でも
-                                #   起きる（損切り経路は entry_time を消さないため、
+                                #   起きる（決済経路は entry_time を消さないため、
                                 #   決済後もここへ来る）。旧文言の「未約定とみなし
                                 #   リセット」は後者のとき誤解を招くので、断定しない。
-                                log.warning(
-                                    f"{tag} ⏰ 時間切れ（再同期後もポジションなし）: エントリから {elapsed:.1f}分経過"
-                                    f" → entry_timeをリセット"
-                                )
+                                # ★ v3.9.179: どちらだったかは記録から分かる（認定サポーターの報告）。
+                                #   この建玉より後に決済の確定があれば、正常に決済できた側。
+                                #   その場合は通知を出さない——パニックセル等で正常に決済した
+                                #   数分後に「建玉が無い」と届き、利用者には「決済に失敗したのか」
+                                #   と読めていた。
+                                #   entry_time はここで消す（従来どおり）。決済の確定を
+                                #   待たずに消すと、複数建玉の残玉や、決済→1秒→反転エントリー
+                                #   の次の建玉の時間切れ時計まで止めてしまう。
+                                #   照合は「決済し終えた建玉が、いま時計を持っている建玉と
+                                #   同じか」で行う。**時刻の前後では判定できない**——
+                                #   決済→1秒→反転エントリーでは、旧決済の約定確認（8〜17秒後）が
+                                #   新しい建玉より必ず後になり、新しい建玉を「決済済み」と
+                                #   誤判定して、出すべき警告のほうを消してしまう（外部レビュー指摘）。
+                                _closed_et = getattr(ts, "last_closed_entry_time", None)
+                                _was_closed = (_closed_et is not None
+                                               and ts.entry_time is not None
+                                               and _closed_et == ts.entry_time)
+                                if _was_closed:
+                                    log.info(
+                                        f"{tag} ⏰ 時間切れの確認: 既に決済済みでした"
+                                        f"（{_closed_et:%H:%M:%S} 建て分）→ 内部の時刻管理をリセット"
+                                    )
+                                else:
+                                    log.warning(
+                                        f"{tag} ⏰ 時間切れ（再同期後もポジションなし）: エントリから {elapsed:.1f}分経過"
+                                        f" → entry_timeをリセット"
+                                    )
                                 ts.entry_count = 0
                                 ts.entry_time  = None
-                                _threadsafe_future(asyncio.to_thread(
-                                    send_discord_message,
-                                    f"[Bot] {tag} ⏰ 時間切れの確認（建玉なし）\n"
-                                    f"エントリから {elapsed:.1f}分経過  上限: {_t_timeout}分\n"
-                                    f"口座に建玉が無いため、内部の時刻管理をリセットしました。\n"
-                                    f"（既に決済済み、または注文が成立しなかったケースです。"
-                                    f"新たな決済は行っていません）"
-                                ))
+                                # ★ v3.9.179b: 使い終わった控えは捨てる（外部レビュー提案）。
+                                #   いまは entry_time が毎回マイクロ秒つきで振られるので
+                                #   古い控えと偶然一致する経路は無いが、起点の作り方が
+                                #   変わったときに誤って通知を止めないための余裕。
+                                ts.last_closed_entry_time = None
+                                if not _was_closed:
+                                    _threadsafe_future(asyncio.to_thread(
+                                        send_discord_message,
+                                        f"[Bot] {tag} ⏰ 時間切れの確認（建玉なし）\n"
+                                        f"エントリから {elapsed:.1f}分経過  上限: {_t_timeout}分\n"
+                                        f"口座に建玉が無いため、内部の時刻管理をリセットしました。\n"
+                                        # ★ v3.9.181: 断定を戻した（認定サポーターの指摘）。
+                                        #   抑止が効くのは last_closed_entry_time が書かれた回だけで、
+                                        #   sync_positions は一度も書かない。手動決済・外部決済で
+                                        #   建玉が消えた回はここへ落ちるので、「注文が成立しなかった」
+                                        #   と断定すると事実と食い違う。
+                                        f"（既に決済済み、または注文が成立しなかったケースです。"
+                                        f"新たな決済は行っていません）"
+                                    ))
                     continue
 
                 # ── ① ポジション上限超過チェック ────────────────────────────
@@ -21784,8 +22474,21 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         continue
 
                 # ── ③ リアルタイム株価の取得 ─────────────────────────────────
-                quote = get_quote(symbol)
-                price = quote["last"] or quote["bid"] or 0.0
+                # ★ v3.9.171: await せずに呼ぶとイベントループを塞ぐ。get_quote は
+                #   OpenD への同期RPC（subscribe＋板＋気配）で、生成は
+                #   _make_ctx_bounded で最大 MOOMOO_CTX_BUILD_TIMEOUT_SEC（既定15秒）
+                #   まで待つ。建玉ごとに毎ティック呼ぶこの箇所は、建玉数ぶん直列に
+                #   積み上がり、その間は損切り・トレール・時間切れ・ニュース取得・
+                #   心拍が同時に止まる。v3.9.129 が sync_positions を to_thread に
+                #   逃がしたのと同じ理由・同じ形。
+                #   ★ この per-symbol ループには同種の同期呼び出しが3箇所あり
+                #     （外部保有・約定直後の未反映窓・ここ）、前2つは continue で
+                #     抜けるためここには到達しない。1つだけ直すと夜間持ち越し中や
+                #     エントリー直後は塞がったままなので、3箇所すべてを揃える。
+                #     残る同期は同関数の約60秒ゲート（_status_interval）内の
+                #     状況表示のみ。行番号は書かない（挿入のたびに腐るため）。
+                quote = await get_quote_async(symbol)
+                price = quote_price(quote)
                 if price <= 0:
                     _price_fail_count[symbol] += 1
                     cnt = _price_fail_count[symbol]
@@ -21860,9 +22563,9 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     ts.trail_active = True
                     _trail_label = f"{'決算専用' if _is_earn_sym else ''}トレール発動"
                     if qty > 0:
-                        log.info(f"{tag} [{_trail_label}] 利益 {pnl_colored(pnl)}  peak=${ts.peak_price:.2f}  発動条件: +{_t_trigger*100:.1f}%")
+                        log.info(f"{tag} [{_trail_label}] 利益 {pnl_colored(pnl)}  peak=${ts.peak_price:.2f}  発動条件: +{_t_trigger*100:.2f}%")
                     else:
-                        log.info(f"{tag} [{_trail_label}] ショート利益 {pnl_colored(pnl)}  trough=${ts.peak_price:.2f}  発動条件: +{_t_trigger*100:.1f}%")
+                        log.info(f"{tag} [{_trail_label}] ショート利益 {pnl_colored(pnl)}  trough=${ts.peak_price:.2f}  発動条件: +{_t_trigger*100:.2f}%")
 
                 trail_str = ""
                 if ts.trail_active and ts.peak_price > 0:
@@ -21877,11 +22580,31 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 #   建玉があるとき＝まさに知らせたい場面で画面に出ていなかった
                 #   （デモ実機テストで判明）。
                 if _is_other_owner(symbol):
-                    log.warning(
-                        f"{tag} [ポジション] ${price:.2f}  PnL={pnl_colored(pnl)}({pct_colored(unr_pct)})"
-                        f"  ⚠️ Bot 以外の建玉のため自動売買は停止中"
-                        f"（決済しません。この建玉を決済すると再開します）"
+                    # ★ v3.9.171: OVN と外部建玉を出し分ける。v3.9.140 で1つ目の
+                    #   チェックは直したが、この2つ目には入っていなかった。
+                    #   ここへ来る主因は「待機中に OVN が所有権を取った」場合なので、
+                    #   出し分けないと、OVN が正常に建てた瞬間に「Bot 以外の建玉＝
+                    #   手動介入が必要かも」と出る（v3.9.140 が消した誤解の再現）。
+                    if bool(getattr(ts, "ovn_held", False)):
+                        _late_note = ("  🌙 夜間持ち越しが管理中です"
+                                      "（日中の自動売買は触りません）")
+                        _late_log = log.info
+                    else:
+                        _late_note = ("  ⚠️ Bot 以外の建玉のため自動売買は停止中"
+                                      "（決済しません。この建玉を決済すると再開します）")
+                        _late_log = log.warning
+                    _late_log(
+                        f"{tag} [ポジション] ${price:.2f}  "
+                        f"PnL={pnl_colored(pnl)}({pct_colored(unr_pct)}){_late_note}"
                     )
+                    # ★ v3.9.171: ここで打ち切る。株価取得の await 中に OVN が所有権を
+                    #   取る（ovn_held=True）ことがあり、従来はログだけ出して④⑤へ
+                    #   落ちていた。実際の売却は place_close_all の低レベルガードが
+                    #   止めるので誤発注にはならないが、その手前で「強制損切り発動」の
+                    #   通知を送り、決済試行の時刻を刻んで60秒のクールダウンを自分に
+                    #   掛けてしまう（所有権が戻った直後の本物の損切りが遅れる）。
+                    #   ログの文言どおり「決済しません」で揃える。
+                    continue
                 else:
                     log.info(
                         f"{tag} [ポジション] ${price:.2f}  PnL={pnl_colored(pnl)}({pct_colored(unr_pct)})"
@@ -21896,12 +22619,20 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 #   で被弾が頻発し 60分タイムアウト前に刈られていた (寄り高値掴みの早期損切り
                 #   連発)。MOMENTUM_STOP_LOSS_PCT は % 単位 (例 0.50) のため /100 で小数化。
                 #   優先順位: 決算 > モメンタム > 通常。0 以下のときは通常値にフォールバック。
+                # ★ v3.9.176c: どの枝が値を決めたかをここで確定させる（外部レビュー指摘）。
+                #   従来は記録側で `_is_earn_sym` だけを見て "earnings" と書いていたが、
+                #   EARNINGS_MAX_LOSS_PCT が 0（既定値・「通常値を流用」の意味）のときは
+                #   この枝を通らないので、決算銘柄なのに通常の値が入る。それを
+                #   「決算の設定でこうなった」と記録すると読み手を誤らせる。
                 if _is_earn_sym and EARNINGS_MAX_LOSS_PCT > 0:
                     _eff_max_loss = EARNINGS_MAX_LOSS_PCT
+                    _stop_basis = "earnings"
                 elif _is_momentum and MOMENTUM_STOP_LOSS_PCT > 0:
                     _eff_max_loss = MOMENTUM_STOP_LOSS_PCT / 100.0
+                    _stop_basis = "momentum"
                 else:
                     _eff_max_loss = MAX_LOSS_PCT
+                    _stop_basis = "common"
                 # ★ v3.9.32: 高ボラ銘柄 (NVDA/SMH/TSLA 等) は損切り幅を拡大
                 # (発注時にサイズを縮小済みなのでドル損失額は ETF と同水準に保たれる)
                 # モメンタム専用値を使う場合は二重拡大を避けるため倍率は適用しない。
@@ -21914,8 +22645,12 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 #   記録=1.50% / 実際=0.50% のように乖離する。今週の分析で判明）。
                 try:
                     ts.enforced_stop_pct = round(_eff_max_loss * 100.0, 4)
-                except Exception:
-                    pass
+                except Exception as _es_exc:
+                    # ★ v3.9.178: 隣の enforced_exit と同じ扱い（外部レビュー指摘）。
+                    #   握り潰すと前回の巡回の値が残り、決済記録に古い損切り%が載る。
+                    ts.enforced_stop_pct = None
+                    log.warning(f"{tag} 損切り%の保存に失敗（記録は設計値で補完されます）: "
+                                f"{type(_es_exc).__name__}: {_es_exc}")
                 max_loss_dollar = position_cost * _eff_max_loss
                 # ★ v3.9.66 (施策B'): 個別株は 1 トレード絶対損失上限 (USD) も併用。
                 # % 損切りが間に合わない急変動でも -STOCK_MAX_LOSS_USD で必ず切る。
@@ -21955,6 +22690,40 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     _stop_hit = (_drop_from_peak >= _eff_max_loss)
                 else:
                     _stop_hit = (pnl <= -max_loss_dollar)
+                # ★ v3.9.175: 損切りと同じ考えで、タイムアウトとトレールも
+                #   「いま適用した値」をここで1組にして残す。この時点で
+                #   _t_timeout / _t_trigger / _t_drop は決算・モメンタム・通常の
+                #   分岐を通過済みなので、記録側で再計算する必要がなくなる。
+                #   ★ v3.9.175b: 保存を _pan_trail_mode の確定後に移した（外部レビュー
+                #     指摘）。損切りの方式は「設定 × モメンタム」だけでは決まらず、
+                #     利益トレールが発動済み（trail_active）なら固定幅に戻る。
+                #     _pan_trail_mode をそのまま使えば、条件がコード内に2つできない。
+                try:
+                    ts.enforced_exit = {
+                        "stop_pct":          round(_eff_max_loss * 100.0, 4),
+                        "timeout_min":       _t_timeout,
+                        "trail_trigger_pct": round(_t_trigger * 100.0, 4),
+                        "trail_drop_pct":    round(_t_drop * 100.0, 4),
+                        # 損切り(④)の方式。MOMENTUM_TRAIL_FROM_ENTRY が効くのは
+                        # ここであって、利益トレール(⑤)ではない。
+                        #   entry_trail … 建値を下限/上限にしたトレールで損失保護
+                        #                 （幅は上の stop_pct）
+                        #   fixed       … 建値からの固定幅で損切り
+                        # ⑤の利益トレール（trail_trigger_pct / trail_drop_pct）は
+                        # 設定に関わらず常に高値・安値基準なので、方式の区別は無い。
+                        "stop_mode":         ("entry_trail" if _pan_trail_mode else "fixed"),
+                        # 実際に値を決めた枝（銘柄の分類ではなく）。
+                        "basis":             _stop_basis,
+                    }
+                except Exception as _ee_exc:
+                    # ★ v3.9.178: ログを出すだけでは足りない（外部レビュー指摘）。
+                    #   ここで例外が出たまま放置すると ts.enforced_exit は**前回の巡回の
+                    #   断面のまま**残り、決済記録に古い値が「正しい値の顔で」載る。
+                    #   None に落として記録側を空欄にする（推測より空欄、が本版の方針）。
+                    #   log.debug はコンソールにもエラー収集にも乗らないので warning。
+                    ts.enforced_exit = None
+                    log.warning(f"{tag} 出口条件の保存に失敗（記録は空欄になります）: "
+                                f"{type(_ee_exc).__name__}: {_ee_exc}")
                 # ★ v3.9.101: 約定直後の猶予中は損失保護（建玉トレール/強制損切り）を抑止。
                 #   指値の仮設定→実約定単価の反映までの過渡期に誤発火しない保険。
                 #   利益確定のトレール(⑤)は対象外（損失保護のみ抑止）。
@@ -22152,6 +22921,20 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 log.error(f"[{symbol}] リスク監視エラー: {e}", exc_info=True)
 
 # ── エントリポイント ────────────────────────────────────────────────────────────────
+def _startup_block_note(trd_env) -> str:
+    """起動時復元で建玉が確認できないときの、末尾の一文。
+
+    ★ v3.9.181: デモ口座にも「実口座の新規発注を止めます」と出ていた
+      （外部レビュー指摘）。実際に止まるのは REAL 限定（:14384 / :14962 の
+      `trd_env == TrdEnv.REAL`）なのに、デモの利用者が「発注が止まっている」と
+      読み、**別の理由で発注に至らなかった件までこれのせいだと判断していた**。
+      認定サポーターの報告に、その誤った因果が実際に載っている。
+    """
+    return ("（実口座の新規発注を止めます。明細が取得でき次第、自動で再開します）"
+            if trd_env == TrdEnv.REAL else
+            "（デモ口座のため発注は止めていません）")
+
+
 async def main(live: bool) -> None:
     global market_open_event, _main_loop, _anthropic_api_lock
     market_open_event = asyncio.Event()
@@ -22725,12 +23508,20 @@ async def main(live: bool) -> None:
     log.info(f"  戦略: SPY/QQQ ロング（現物買い）/ ショート（空売り）")
     # ★ v3.9.169: ニュース選抜プロファイルの適用状態を起動時に明示（既定オフ）
     if NEWS_PROFILE_SELECT:
+        # ★ v3.9.173: 適用範囲を明記（認定サポーターの報告）。従来の文言は
+        #   「時間外は新規建てしない」と読めたが、絞るのは ETF ニュース連動
+        #   （process_headlines）だけで、個別株ルート（process_stock_news /
+        #   process_dynamic_stock）は対象外。個別株の採用カテゴリ STOCK は
+        #   選抜対象に含まれないため、同じゲートを掛けると個別株が全停止する
+        #   （＝意図した除外）。実際にプレマーケットで個別株 SHORT が建ち、
+        #   バナーとの食い違いとして報告された。
         log.warning(
             "  🎛 ニュース選抜プロファイル v1 (news_select_v1) が有効です。"
-            f" ニュース連動の新規建てを {'/'.join(sorted(NEWS_SELECT_V1_CATEGORIES))} × RTH に絞ります"
+            f" ETFニュース連動の新規建てを {'/'.join(sorted(NEWS_SELECT_V1_CATEGORIES))} × RTH に絞ります"
             "（MACRO 等・時間外は新規建てせず、見送りとして記録）。"
+            " ★個別株ルート（STOCK_TICKERS のニュース）は対象外で、従来どおり時間外も建てます。"
             " 検証済みルール一式のため、時間帯の個別設定より優先します。"
-            " 決済（既存建玉の退避・パニックセル）は従来どおり実行します。"
+            " 決済（既存建玉の退避・パニックセル）は全ルートで従来どおり実行します。"
             " 従来どおりに戻すには .env の NEWS_STRATEGY_PROFILE を standard にしてください。"
         )
         if not _is_data_collect_enabled():
@@ -22753,7 +23544,7 @@ async def main(live: bool) -> None:
              f"  範囲: ${ORDER_SIZE_MIN_USD:,.0f}〜${ORDER_SIZE_MAX_USD:,.0f}")
     log.info(f"  損切り: -{MAX_LOSS_PCT*100:.2f}%（ポジション評価額基準）")
     timeout_str = f"{TIMEOUT_EXIT_MINUTES}分" if TIMEOUT_EXIT_MINUTES > 0 else "無効"
-    log.info(f"  時間切れ決済: {timeout_str}  トレール発動: +{TRAIL_TRIGGER_PCT*100:.1f}%  トレール幅: {TRAIL_DROP_PCT*100:.1f}%")
+    log.info(f"  時間切れ決済: {timeout_str}  トレール発動: +{TRAIL_TRIGGER_PCT*100:.2f}%  トレール幅: {TRAIL_DROP_PCT*100:.2f}%")
     log.info(f"  AIしきい値: confidence>{STRONG_BUY_CONFIDENCE}（ベース）  パニックしきい値: confidence>{PANIC_CONFIDENCE}")
     if any([_CONF_RTH, _CONF_PREMARKET, _CONF_AFTERHOURS, _CONF_OVERNIGHT]):
         # ★ v3.9.159: 旧表示「OVN=」は夜間持ち越し機能（OVN_ENABLED）と紛らわしい
@@ -23102,14 +23893,14 @@ async def main(live: bool) -> None:
                 _startup_position_unknown = True
                 log.error(
                     f"[起動時復元] 🔴 accinfo_query(最終確認) ret={_ret_acc} エラー: {_data_acc}"
-                    f" → 建玉不明として実口座の新規発注を止めます"
+                    f" → 建玉不明 {_startup_block_note(trd_env)}"
                 )
             elif not _df_has_rows(_data_acc):
                 # 空応答も「建玉ゼロ」ではなく「確認できなかった」
                 _startup_position_unknown = True
                 log.error(
                     "[起動時復元] 🔴 accinfo の応答が空でした"
-                    " → 建玉不明として実口座の新規発注を止めます"
+                    f" → 建玉不明 {_startup_block_note(trd_env)}"
                 )
             elif _df_has_rows(_data_acc):
                 _mktval     = 0.0
@@ -23149,8 +23940,7 @@ async def main(live: bool) -> None:
                     _startup_position_unknown = True
                     log.error(
                         f"[起動時復元] 🔴 建玉明細は空だが {_field_used}=${_mktval:,.0f}。"
-                        f"何を保有しているか確認できないため、実口座の新規発注を止めます"
-                        f"（明細が取得でき次第、自動で再開します）"
+                        f"何を保有しているか確認できません{_startup_block_note(trd_env)}"
                     )
                     # Discord 通知はここでは送らない（Codexレビュー指摘）。
                     #   ①発注が止まるのは実口座だけなのに、デモにも「止めています」が届く
@@ -23170,7 +23960,7 @@ async def main(live: bool) -> None:
                     _startup_position_unknown = True
                     log.error(
                         f"[起動時復元] 🔴 accinfo の3列のうち {_read_n} 列しか読めませんでした。"
-                        f"建玉の有無を確認できないため、実口座の新規発注を止めます"
+                        f"建玉の有無を確認できません{_startup_block_note(trd_env)}"
                         f"（既存建玉の損切り・時間切れ決済は通常どおり動きます）"
                     )
                     if trd_env == TrdEnv.REAL:
@@ -23184,7 +23974,11 @@ async def main(live: bool) -> None:
         except Exception as _e:
             # ★ v3.9.141: 照会そのものが失敗＝建玉の有無は不明。ゼロ扱いにしない。
             _startup_position_unknown = True
-            log.error(f"[起動時復元] 🔴 accinfo確認エラー → 建玉不明として新規発注を止めます: {_e}")
+            # ★ v3.9.181: ここが5番目の site だった（外部レビュー指摘・5レーンが独立に指摘）。
+            #   しかも一番広い経路（accinfo の全例外を受ける）なので、
+            #   デモの利用者がいちばん見やすい。
+            log.error(f"[起動時復元] 🔴 accinfo確認エラー → 建玉不明 "
+                      f"{_startup_block_note(trd_env)}: {_e}")
 
     # ★ v3.9.149: 復元対象を risk_monitor_loop（:18452 付近）と同じ式で作る。
     #   従来は EXECUTION_MAP（= TRIGGER_TICKERS）だけを回していたため、
@@ -23551,28 +24345,61 @@ _DATA_SENT_HISTORY_FILE = ".data_sent_history.json"
 
 def _load_sent_dates() -> set:
     """送信済み日付（YYYY-MM-DD文字列）のセットを返す。存在しなければ空集合。"""
-    try:
-        with open(_DATA_SENT_HISTORY_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return set(data.get("sent_dates", []))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return set()
+    # ★ v3.9.181: 書き換えと同じ錠を取る（外部レビュー指摘）。
+    #   Windows では読み手がファイルを開いている間の os.replace が失敗する。
+    with _SENT_HISTORY_LOCK:
+        try:
+            with open(_DATA_SENT_HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return set(data.get("sent_dates", []))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return set()
+
+# ★ v3.9.181: 送信履歴の書き手が2つになった（外部レビュー指摘）。
+#   v3.9.179 までは run_daily_data_collect の1箇所だけだったが、v3.9.180 で
+#   再送キューの排出（gas_retry_loop の別スレッド）からも呼ぶようにした。
+#   読み出し → 加工 → 書き戻しをロック無しでやると、起動時の追いかけ
+#   （7日ぶんを5秒間隔）と再送ループ（120秒周期）が重なったとき、
+#   **open("w") の途中で読んだ側が JSONDecodeError → 空集合**になり、
+#   履歴が丸ごと消えて最大7日ぶんの再送バーストになる。
+#   ロックと、tmp → os.replace（同ファイル内の _ovn_save と同じ作り）で塞ぐ。
+#   ★ v3.9.181: RLock にして、読み手（_load_sent_dates）も同じ錠で守る。
+#     Windows は「読み手がファイルを開いている間の os.replace」が
+#     PermissionError になる（CPython の open は FILE_SHARE_DELETE を立てない）。
+#     Win365 が対象環境なので、そこで日付が記録されず再送バーストになる。
+#     _mark_date_sent が内部で _load_sent_dates を呼ぶため、再入可能である必要がある。
+_SENT_HISTORY_LOCK = threading.RLock()
+
 
 def _mark_date_sent(date_str: str) -> None:
     """指定日付を送信済みとして記録。90日以上古いエントリは自動削除。"""
+    # ★ try の外で束縛する。中で作ると、それより前で例外が出たとき
+    #   except 側が未定義を参照する（同じ型の欠陥を3回作っている）。
+    # ★ v3.9.181: プロセスIDだけだと**同一プロセスの全スレッドで同じ名前**になり、
+    #   片方の後始末がもう片方の書きかけを消す（外部レビュー指摘）。スレッドIDも足す。
+    _tmp = f"{_DATA_SENT_HISTORY_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
-        sent = _load_sent_dates()
-        sent.add(date_str)
-        # 90日以上古い履歴は削除（ファイル肥大化防止）
-        # ★ v2.86: 固定オフセット(-4h)を ZoneInfo に変更（DST 自動対応）。
-        from datetime import timedelta as _td
-        cutoff = (datetime.datetime.now(ZoneInfo("America/New_York")).date()
-                  - _td(days=90)).strftime("%Y-%m-%d")
-        sent = {d for d in sent if d >= cutoff}
-        with open(_DATA_SENT_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump({"sent_dates": sorted(sent)}, f, ensure_ascii=False)
+        with _SENT_HISTORY_LOCK:
+            sent = _load_sent_dates()
+            sent.add(date_str)
+            # 90日以上古い履歴は削除（ファイル肥大化防止）
+            # ★ v2.86: 固定オフセット(-4h)を ZoneInfo に変更（DST 自動対応）。
+            from datetime import timedelta as _td
+            cutoff = (datetime.datetime.now(ZoneInfo("America/New_York")).date()
+                      - _td(days=90)).strftime("%Y-%m-%d")
+            sent = {d for d in sent if d >= cutoff}
+            with open(_tmp, "w", encoding="utf-8") as f:
+                json.dump({"sent_dates": sorted(sent)}, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(_tmp, _DATA_SENT_HISTORY_FILE)
     except Exception as e:
         log.warning(f"[データ収集] 送信履歴保存エラー: {e}")
+    finally:
+        # ★ v3.9.181: 後始末は必ず通す（成功時は os.replace が名前を消費済みで無害）。
+        #   例外の枝だけに置くと、強制終了で書きかけが残り続ける。
+        with _contextlib.suppress(OSError):
+            os.remove(_tmp)
 
 # ── ★ v3.9.48: ログ + logbackup/ アーカイブ統合スキャン ──────────────────────
 # 旧版 (v3.9.47 以前) の find_unsent_trading_dates / run_daily_data_collect は
@@ -23599,7 +24426,7 @@ def _iter_log_lines(log_path: str, cutoff_date):
             log.warning(f"[データ収集] 現在ログ読込エラー ({log_path}): {e}")
 
     # 2) logbackup/ 内のアーカイブ
-    backup_dir = "logbackup"
+    backup_dir = _LOG_BACKUP_DIR   # ★ v3.9.181: 書き手と同じ場所を見る
     if not os.path.isdir(backup_dir):
         return
 
@@ -23649,7 +24476,7 @@ def _iter_log_lines(log_path: str, cutoff_date):
             continue
 
 
-def find_unsent_trading_dates(log_path: str = "moomoo_trade_v1.log",
+def find_unsent_trading_dates(log_path: str = _LOG_PATH,
                                lookback_days: int = 7) -> list:
     """ログをスキャンして、過去lookback_days日以内でログ記録があり、かつ / まだ送信していないET日付のリストを返す（古い順）。 / 当日は含めない（定時送信で処理）。DATA_COLLECT=false の場合は空を返す。
     ★ v3.9.48: logbackup/ 内のアーカイブ (.log/.zip) もスキャンするように改修。
@@ -23696,7 +24523,7 @@ def find_unsent_trading_dates(log_path: str = "moomoo_trade_v1.log",
     return sorted(d for d in found if d.strftime("%Y-%m-%d") not in sent)
 
 
-async def catchup_data_send_on_startup(log_path: str = "moomoo_trade_v1.log") -> None:
+async def catchup_data_send_on_startup(log_path: str = _LOG_PATH) -> None:
     """Bot起動時：過去7日以内の未送信日を順次送信する。 取引ループをブロックしないよう to_thread 経由で実行。 各日の送信間に5秒のインターバルを入れ、GAS側の負荷を避ける。"""
     try:
         unsent = await asyncio.to_thread(find_unsent_trading_dates, log_path, 7)
@@ -24191,7 +25018,7 @@ def _acquire_single_instance(tag: str = "bot"):
     return True
 
 
-def run_daily_data_collect(log_path: str = "moomoo_trade_v1.log",
+def run_daily_data_collect(log_path: str = _LOG_PATH,
                            target_date=None) -> None:
     """
     .env の DATA_COLLECT=true の場合のみ集計してGASに送信する。
@@ -24464,40 +25291,50 @@ def run_daily_data_collect(log_path: str = "moomoo_trade_v1.log",
     log.info(f"[データ収集] 集計完了  名前:{cfg_name}  損益:{pnl_disp}  決済:{trade_count}回")
 
     try:
-        import requests as _requests
         payload = _json.dumps(
             {"token": "algo2026secret", "student_name": cfg_name, "data": summary},
             ensure_ascii=False
         )
-        result = _gas_post(cfg_url, payload, timeout=60)
-        if not isinstance(result, dict):
-            # ★ v3.9.157b: null/配列/文字列の応答は .get で AttributeError になり
-            #   「通信エラー」へ化けていた（レビュー指摘）。詳細を出して未送信扱いに。
-            log.warning(
-                f"[データ収集] 送信エラー: 応答が想定外の型です"
-                f"（type={type(result).__name__} body={str(result)[:200]}）"
-                f"→ この日付は未送信として記録し、次回起動時の追いかけで再送します"
-            )
-            return
-        if result.get("ok"):
+        # ★ v3.9.174: 再送＋キュー退避つきの共通経路で送る（従来ここだけ
+        #   _gas_post 直呼びで、LOCK_BUSY 等の失敗がその場で終わっていた）。
+        #   kind="summary" は再送上限・破棄優先度・クールダウン免除が定義済み。
+        #   ジッターは 0（この関数自身が送信前に 0〜180秒 の分散を済ませている）。
+        # timeout は 30秒: 分散遅延の上限180秒 ＋ 再送3回×30秒 ＋ 待機20秒 ＝ 290秒
+        #   で、asyncio が executor スレッドの終了を待つ 300秒の予算内に収まる
+        #   （60秒だと 385秒になり予算超過＝Ctrl+C 時に退避前へ打ち切られうる）。
+        _sent_ok = _gas_send_with_retry(cfg_url, payload, kind="summary",
+                                        key=f"{cfg_name}|{date_str}", timeout=30,
+                                        jitter_max=0)
+        if _sent_ok:
             _mark_date_sent(date_str)
+            # 同じ鍵の古い退避が残っていれば掃除（後から届いて新しい行を
+            #   上書きするのを防ぐ。詳細は _gas_queue_purge_key の docstring）。
+            _gas_queue_purge_key(f"{cfg_name}|{date_str}")
             log.info(f"[データ収集] ✅ 送信完了  名前:{cfg_name}  日付:{date_str}")
         else:
-            # ★ v3.9.157: 「送信エラー: None」だけでは切り分け不能だった（認定
-            #   サポーターの指摘——error キーの欠落・ok=false・空dict が同じ1行に
-            #   潰れていた）。応答の型とキーと短縮表現を残す。
-            try:
-                _resp_disp = (f"type={type(result).__name__}"
-                              f" keys={sorted(result.keys()) if isinstance(result, dict) else '-'}"
-                              f" body={str(result)[:200]}")
-            except Exception:
-                _resp_disp = repr(result)[:200]
-            log.warning(
-                f"[データ収集] 送信エラー: error={result.get('error') if isinstance(result, dict) else None}"
-                f"（{_resp_disp}）→ この日付は未送信として記録し、次回起動時の追いかけで再送します"
+            # 失敗の原因と WARNING は _gas_send_with_retry 側が出している
+            #   （ここでも WARNING を出すと1回の失敗が翌日の error_count に
+            #     二重計上される）。ここは文脈（誰の・どの日付か）だけ残す。
+            # 安全網は2段: キュー退避（gas_retry_loop が再送・ただしディスク障害
+            #   では書けず黙る）と、成功時にしか _mark_date_sent しないことに
+            #   よる次回起動時の追いかけ（何も書き込まないので障害に強い）。
+            #   GAS v9.25 の生徒名＋日付上書きにより、両方が走っても二重にならない。
+            # 送信先の由来も残す（v3.9.171 の診断。通信エラーが except に
+            #   届かなくなったため、文脈行のこちらへ移した）。
+            _src = "env" if os.environ.get("WEBHOOK_URL", "").strip() else "既定値"
+            _tail = cfg_url.rstrip("/").split("/")[-2][-8:] if "/" in cfg_url else "?"
+            log.info(
+                f"[データ収集] 送信できず  名前:{cfg_name}  日付:{date_str}  "
+                f"（送信先={_src}・デプロイ末尾…{_tail}）"
+                f"→ 再送キューと次回起動時の追いかけで再試行します"
             )
+        return
     except Exception as e:
-        log.warning(f"[データ収集] 通信エラー: {e}")
+        # ★ v3.9.174: 通信エラーはここへ届かなくなった（共通経路が内部で握り、
+        #   分類・マスクつきの WARNING を自前で出す）。ここに来るのは payload の
+        #   組み立て失敗くらいなので、ラベルを実態に合わせる。日付は未送信の
+        #   ままなので、次回起動時の追いかけが再試行する。
+        log.warning(f"[データ収集] 送信準備エラー: {_mask_secrets(e)} → 次回起動時に再送")
 
 
 if __name__ == "__main__":

@@ -618,7 +618,7 @@ TOTAL = 14   # ★ v1.21: 11→14（データ収集12・モメンタム13・ア�
 
 # 既知ETFリスト（STOCK_TICKERS入力時のバリデーション用）
 # ★ v1.38: 版数は必ずここを更新する（起動バナー・ヘッダ表示で共用。取り残し防止）
-WIZARD_VERSION = "v1.43"
+WIZARD_VERSION = "v1.44"
 
 _KNOWN_ETFS = {
     "SPY", "QQQ", "SMH", "SPXL", "SPXS", "TQQQ", "SQQQ", "SOXL", "SOXS",
@@ -2744,8 +2744,11 @@ def step_confirm(config):
         ("BUDGET_USD",            f"${float(config.get('BUDGET_USD','0')):,.0f}",     "予算"),
         ("MAX_LOSS_PCT",          f"{config.get('MAX_LOSS_PCT','')} %",               "損切りライン"),
         ("TIMEOUT_EXIT_MINUTES",  timeout_label,                                          "時間切れ決済"),
-        ("TRAIL_TRIGGER_PCT",     f"+{trig_pct:.1f}% でトレール開始",                    "トレール発動"),
-        ("TRAIL_DROP_PCT",        f"最高値から {drop_pct:.1f}% 下落で決済",              "トレール幅"),
+        # ★ v1.44: .1f だと 0.22%→"0.2%"・0.15%→"0.1%" と丸まり、設定した値と
+        #   食い違って見える（本体のバナーと同じ不具合。STEP3 の入力画面は
+        #   もともと .2f なので、同じ実行の中で表示が矛盾していた）。
+        ("TRAIL_TRIGGER_PCT",     f"+{trig_pct:.2f}% でトレール開始",                    "トレール発動"),
+        ("TRAIL_DROP_PCT",        f"最高値から {drop_pct:.2f}% 下落で決済",              "トレール幅"),
         ("── AIしきい値 ──────────────────────────────", None, None),
         ("STRONG_BUY_CONFIDENCE", config.get("STRONG_BUY_CONFIDENCE",""),                "ベース（RTH）"),
         ("PANIC_CONFIDENCE",      config.get("PANIC_CONFIDENCE",""),                     "パニック売り"),
