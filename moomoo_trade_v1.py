@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.183"
+BOT_VERSION = "v3.9.184"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -2121,8 +2121,16 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
         + f" / L/S転換 "
         + ("ON(従来=反対シグナルで強制転換)" if MOMENTUM_REVERSE_EXIT
            else "OFF(転換抑制=反対シグナルは見送り・既定 v3.9.89)")  # ★ v3.9.89
-        + (f" / LONG下限 5m≥{MOMENTUM_LONG_MIN_SIGNAL_PCT:.2f}%(弱LONG実発注抑制・v3.9.94)"  # ★ v3.9.94
-           if MOMENTUM_LONG_MIN_SIGNAL_PCT > 0 else " / LONG下限 無効")
+        # ★ v3.9.184: 上限も出す（配布前調査で発覚）。下限しか印字しておらず、
+        #   実発注を左右する MOMENTUM_LONG_MAX_SIGNAL_PCT が**どのログにも残らない**
+        #   ため、報告を読んでも設定を確かめられなかった（.env を直接見るしかない）。
+        + f" / LONG発注レンジ 5m "
+        + ("下限なし" if MOMENTUM_LONG_MIN_SIGNAL_PCT <= 0
+           else f"{MOMENTUM_LONG_MIN_SIGNAL_PCT:.2f}%")
+        + "〜"
+        + ("上限なし" if MOMENTUM_LONG_MAX_SIGNAL_PCT <= 0
+           else f"{MOMENTUM_LONG_MAX_SIGNAL_PCT:.2f}%")
+        + ("（select_v1 のため LONG は実発注しません）" if MOMENTUM_PROFILE_SELECT else "")
     )
 
     while True:
@@ -2222,6 +2230,30 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                 strength_multiplier, strength_label = _momentum_strength_multiplier(pct_15, symbol)
                 # ★ v3.9.66 (施策C): サイド別係数で勝ち筋(SHORT)に資金を寄せる。
                 _side_multiplier = MOMENTUM_SHORT_SIZE_MULT if side == "SELL_SHORT" else MOMENTUM_BUY_SIZE_MULT
+
+                # ★ v3.9.94/114: LONG は 5分モメンタムが選択レンジ [下限, 上限) の内側のみ実発注。
+                #   弱LONG(下限未満)は損失の主因、強すぎるLONG(上限以上)は反転しやすく低調のため除外。
+                #   SHORTは対象外＝従来どおり。シャドー観察は下で全件記録（見送り分もデータに残る）。
+                # ★ v3.9.184: **係数の確定を、そこから導く値より前に済ませる**（配布前調査で発覚）。
+                #   v3.9.114 はレンジ判定と強帯の解除を、発注額を算出した**後**に置いていた。
+                #   解除で effective_size_pct だけを直し、hypothetical_order_usd（＝実発注の
+                #   株数の元）を直し忘れていたため、「強帯も許可」の LONG は
+                #   `max(1, int(0 / price))` で **必ず1株**しか発注していなかった
+                #   （ログにも `想定発注=$0` と出たまま実発注が通る）。
+                #   順番を入れ替え、係数 → 発注額 → ログ文言を1回だけ通す形にする。
+                _long_range_ok = (
+                    side != "BUY"
+                    or (
+                        (MOMENTUM_LONG_MIN_SIGNAL_PCT <= 0 or pct_5 >= MOMENTUM_LONG_MIN_SIGNAL_PCT)
+                        and (MOMENTUM_LONG_MAX_SIGNAL_PCT <= 0 or pct_5 < MOMENTUM_LONG_MAX_SIGNAL_PCT)
+                    )
+                )
+                # ★ v3.9.114: LONGが選択レンジ内なら、山型(15分基準)の「強(発注なし)=0」を解除して
+                #   強帯も実発注する（Wizardの上限緩和選択の意図を反映）。弱/中の縮小配分は維持。
+                #   ショート・レンジ外は従来の山型のまま。
+                if side == "BUY" and _long_range_ok and strength_multiplier <= 0:
+                    strength_multiplier, strength_label = 1.00, "強(LONG許可)"
+
                 effective_size_pct = (
                     MOMENTUM_ORDER_SIZE_PCT * size_multiplier
                     * consec_multiplier * strength_multiplier * _side_multiplier
@@ -2247,31 +2279,15 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     f"強度={strength_label}  "
                     f"[{_elig_tag}]  "
                     f"budget_pct={effective_size_pct:.1f}%  "
+                    # ★ v3.9.184: side= が抜けており、掛け合わせても budget_pct に
+                    #   ならなかった（既定は SHORT=1.00 / LONG=0.60 なので、LONG は
+                    #   必ず食い違う）。読み手が仕組みを誤読する原因になっていた。
                     f"(base={MOMENTUM_ORDER_SIZE_PCT}% × sym={size_multiplier:.2f} "
-                    f"× consec={consec_multiplier:.2f} × 強度={strength_multiplier:.2f})  "
+                    f"× consec={consec_multiplier:.2f} × 強度={strength_multiplier:.2f} "
+                    f"× side={_side_multiplier:.2f})  "
                     f"想定発注=${hypothetical_order_usd:.0f}  "
                     f"想定株数={hypothetical_qty}株"
                 )
-
-                # ★ v3.9.94/114: LONG は 5分モメンタムが選択レンジ [下限, 上限) の内側のみ実発注。
-                #   弱LONG(下限未満)は損失の主因、強すぎるLONG(上限以上)は反転しやすく低調のため除外。
-                #   SHORTは対象外＝従来どおり。シャドー観察は下で全件記録（見送り分もデータに残る）。
-                _long_range_ok = (
-                    side != "BUY"
-                    or (
-                        (MOMENTUM_LONG_MIN_SIGNAL_PCT <= 0 or pct_5 >= MOMENTUM_LONG_MIN_SIGNAL_PCT)
-                        and (MOMENTUM_LONG_MAX_SIGNAL_PCT <= 0 or pct_5 < MOMENTUM_LONG_MAX_SIGNAL_PCT)
-                    )
-                )
-                # ★ v3.9.114: LONGが選択レンジ内なら、山型(15分基準)の「強(発注なし)=0」を解除して
-                #   強帯も実発注する（Wizardの上限緩和選択の意図を反映）。弱/中の縮小配分は維持。
-                #   ショート・レンジ外は従来の山型のまま。
-                if side == "BUY" and _long_range_ok and strength_multiplier <= 0:
-                    strength_multiplier, strength_label = 1.00, "強(LONG許可)"
-                    effective_size_pct = (
-                        MOMENTUM_ORDER_SIZE_PCT * size_multiplier
-                        * consec_multiplier * strength_multiplier * _side_multiplier
-                    )
 
                 # ★ v3.9.35: Phase 1 実発注を行うかの判定
                 _will_live_order = (
@@ -5399,6 +5415,15 @@ _alpaca_news_health: Dict[str, Any] = {
     "last_error":      "",     # 直近エラーの概要
     # ★ v3.9.51: 警告の最終発火時刻 (非 RTH の 60 分間隔抑制用)
     "last_warning_at": None,
+    # ★ v3.9.184: 接続が生きているか（認定サポーター2名の指摘）。
+    #   受信間隔だけで「接続不全」と断じていたため、**ニュースが静かなだけの
+    #   時間帯**を障害と誤判定していた（同じ夜に2環境で発生し、52秒/8秒で復帰。
+    #   3人目の環境では受信が続いており ERROR は出ていない＝受信状況の差）。
+    #   購読完了で立て、接続が切れたら倒す。切断・認証失敗が無いのに受信だけが
+    #   途切れている状態を、本物の障害と区別するために使う。
+    "connected_at": None,
+    # ★ v3.9.184: 「受信なし・要確認」の間引き用（30分に1回）
+    "last_quiet_warn_at": None,
 }
 _FINNHUB_URL         = "https://finnhub.io/api/v1/news"
 _FINNHUB_QUOTE_URL   = "https://finnhub.io/api/v1/quote"
@@ -7684,6 +7709,21 @@ def close_all_for_weekend(trd_env: TrdEnv,
         #   失って「決済完了」に反転する。前日の記録の掃除（v3.9.157b の目的）は
         #   _sweep_session_begin（シーケンス開始時のクリア）が担う。
         log.info(f"[{log_prefix}] 決済対象ポジションなし → スキップ")
+        # ★ v3.9.184: 週末はここでも 🏁 を出す（認定サポーターの指摘）。
+        #   従来はこの分岐が 🏁 の出力より手前で return しており、
+        #   **金曜 15:45 ET に建玉が無い回は週末通知が一切出なかった**。
+        #   受講生は「週末モードに入ったか」を通知で確認しているので、
+        #   決済対象の有無にかかわらず区切りは知らせる。
+        #   再試行の回は送らない（同文が何度も飛ぶのを防ぐ・下の分岐と同じ扱い）。
+        if is_weekly:
+            log.warning(f"[{log_prefix}] 🏁 週末・休場前の停止（決済対象なし）")
+            if "再試行" not in str(reason or ""):
+                _threadsafe_discord(
+                    "[Bot] 🏁 週末・休場前の停止\n"
+                    "決済対象の建玉はありませんでした（すでに建玉ゼロ）\n"
+                    "ニュース取得・発注を停止し、次のプリマーケットまで待機します\n"
+                    "（プリマーケットを「発注しない」設定にしている場合は次の 09:30 ET まで）"
+                )
         # ★ v3.9.141: 決済すべきものが無い＝成功。裸の return（None=偽）のままだと、
         #   建玉ゼロの正常な状態を呼び出し側が「失敗」と誤判定し、毎分再試行し続ける。
         return True
@@ -19649,6 +19689,9 @@ async def alpaca_news_loop(
     while True:
         # market_open_event が clear されている間は待機
         await market_open_event.wait()
+        # ★ v3.9.184: 各周回は「未接続」から始める。前の周回の値が残ると、
+        #   本物の切断を「接続は生きていて静かなだけ」と誤って軽く扱う。
+        _alpaca_news_health["connected_at"] = None
 
         try:
             import websockets
@@ -19784,6 +19827,9 @@ async def alpaca_news_loop(
                     log.info(f"[Alpaca News] 購読開始: {_sub_resp}")
 
                 log.info("[Alpaca News] ✅ WebSocket接続・認証・購読完了（Benzingaリアルタイム受信中）")
+                # ★ v3.9.184: ここから先は接続が生きている。受信が途切れても
+                #   「切断」ではないことを health_warning_loop へ伝える。
+                _alpaca_news_health["connected_at"] = datetime.datetime.now()
 
                 # メッセージ受信ループ
                 async for raw_msg in ws:
@@ -19896,6 +19942,10 @@ async def alpaca_news_loop(
                     )
                     await process_headlines(None, client, new_items, trd_env)
 
+                # ★ v3.9.184: 受信ループを抜けた＝この接続は終わっている。
+                #   例外を伴わない正常クローズもここを通る。
+                _alpaca_news_health["connected_at"] = None
+
         except ImportError:
             # ★ v3.9.29: 5/20 集計で 利用者J / 利用者I で 4 件発生。
             # 旧版は return で永久スキップ → 受講生が気づかず Alpaca News が来ない状態継続。
@@ -19927,6 +19977,7 @@ async def alpaca_news_loop(
             log.warning(f"[Alpaca News] 接続エラー・再接続待機 ({_RECONNECT_WAIT}秒): {_mask_secrets(e)}")
             # ★ v3.9.31: 接続エラーも健全性状態に記録 (health_warning_loop が参照)
             _alpaca_news_health["last_error"] = f"接続エラー {_mask_secrets(e)}"[:120]
+            _alpaca_news_health["connected_at"] = None   # ★ v3.9.184: 切れた
             await asyncio.sleep(_RECONNECT_WAIT)
 
 
@@ -21488,8 +21539,29 @@ async def health_warning_loop() -> None:
                 _stale_min  = None
                 if _last_ok is not None:
                     _stale_min = (datetime.datetime.now() - _last_ok).total_seconds() / 60
-                # 警告条件: 認証 3 回以上連続失敗 / または 20 分以上正常受信なし
-                _alpaca_bad = (_auth_fails >= 3) or (_stale_min is not None and _stale_min >= 20)
+                _stale = (_stale_min is not None and _stale_min >= 20)
+                # ★ v3.9.184: 「受信が20分無い」だけで接続不全と断じない
+                #   （認定サポーター2名の指摘・同じ夜に別環境で発生し、52秒/8秒で復帰。
+                #   3人目の環境では同時刻に受信が続いており警告も出ていない）。
+                #   切断も認証失敗も無いのに受信だけが途切れている状態は、
+                #   ニュースが静かなだけのことがある。**接続が生きているか**で分ける:
+                #     ・認証が3回以上失敗、または接続が切れている → 本物の障害（ERROR）
+                #     ・接続は生きていて受信だけが無い → 要確認（WARNING）
+                _connected = _h.get("connected_at") is not None
+                _alpaca_bad = (_auth_fails >= 3) or (_stale and not _connected)
+                _alpaca_quiet = _stale and _connected and not _alpaca_bad
+                if _alpaca_quiet:
+                    # 受信が無いだけ。売買・集計に実害は無いので、事実だけを残す。
+                    _now_q = datetime.datetime.now()
+                    _last_q = _h.get("last_quiet_warn_at")
+                    if _last_q is None or (_now_q - _last_q).total_seconds() >= 1800:
+                        _alpaca_news_health["last_quiet_warn_at"] = _now_q
+                        log.warning(
+                            f"[Alpaca News] {_stale_min:.0f}分 受信なし・要確認"
+                            f"（接続は継続中・切断/認証失敗は検知していません）。"
+                            f"ニュースの少ない時間帯であれば正常です"
+                            f"（この警告は30分ごと）"
+                        )
                 if _alpaca_bad:
                     # ★ v3.9.77 (B-1): 端末は赤字で 5 分おき / Discord は 30 分おき。
                     _now = datetime.datetime.now()
@@ -21501,7 +21573,8 @@ async def health_warning_loop() -> None:
                     # 端末: 赤字 (5分ごと=本ループ毎)
                     log.error(
                         f"{_RED}{_BOLD}[Alpaca News] 🚨 接続不全: "
-                        f"最終受信 {_stale_disp} / 認証失敗 {_auth_fails}回 / 直近: {_err}\n"
+                        f"最終受信 {_stale_disp} / 認証失敗 {_auth_fails}回 / "
+                        f"接続 {'継続中' if _connected else '切断'} / 直近: {_err}\n"
                         f"  → Alpaca の APIキー/購読を確認してください "
                         f"(未設定でも RSS/Finnhub で稼働継続・本警告は5分ごと){_RESET}"
                     )
