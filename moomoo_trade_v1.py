@@ -20251,6 +20251,13 @@ def _ovn_new_cycle(st: dict) -> None:
     """
     for _k in _OVN_POSITION_SCOPED_KEYS:
         st.pop(_k, None)
+    # ★ v3.9.181: 曖昧マーカーも建玉スコープ（外部レビュー指摘）。
+    #   _ovn_clear_ambiguous を呼ばずに DONE / IDLE へ抜ける経路が2つあり、
+    #   前サイクルの ambiguous_since が残ると、新しいサイクルの
+    #   **最初の一過性の曖昧でいきなり ERROR 通知**が飛ぶ
+    #   （「口座の状態を確認できない時間が続いています」という強い文面）。
+    #   新サイクルに入るのは口座照会が成功したときなので、ここで消すのが安全側。
+    _ovn_clear_ambiguous(st)
 
 
 def _ovn_sell_fill_avg(trd_env, st: dict) -> float:
@@ -20276,6 +20283,18 @@ def _ovn_sell_fill_avg(trd_env, st: dict) -> float:
     #   **前サイクルの注文IDが残る**。それを読むと決済単価が「数日前の約定単価」に
     #   化け、値が正なので気配へ落ちる警告も出ない。サイクル印で照合する。
     _cycle = str(st.get("entry_date", "") or "")
+    # ★ v3.9.181: 版上げをまたいだ建玉だけ、印を1度だけ補う（外部レビュー指摘）。
+    #   phase=RESERVED は「その晩の売り注文を出し終えた」状態なので、
+    #   そこに載っている sell_oids は定義上その晩のもの。この条件でだけ補うなら、
+    #   「数日前の注文IDを読む」欠陥は復活しない。
+    #   補わないと、RESERVED（15:50 ET〜翌 9:35 ET の約18時間）で版を上げた環境の
+    #   **最初の1決済だけ**が気配ベースになる。理由は log.debug にしか出ない。
+    if (not st.get("sell_oids_cycle")
+            and st.get("phase") == "RESERVED"
+            and st.get("sell_oids")
+            and _re_date_key.fullmatch(_cycle)):
+        st["sell_oids_cycle"] = _cycle
+        log.info("[夜間持ち越し] 版上げ前から続く売り注文に、サイクル印を補いました")
     if not _re_date_key.fullmatch(_cycle):
         log.debug("[夜間持ち越し] 建玉の日が分からないため、実約定単価は使いません")
         return 0.0
@@ -20302,10 +20321,23 @@ def _ovn_sell_fill_avg(trd_env, st: dict) -> float:
                 # ★ 1本でも読めなければ、その場でやめる。見えた分だけの平均を
                 #   全株に掛けるのが危険なので、続けても結果は捨てる（外部レビュー指摘）。
                 try:
+                    _acc = (REAL_ACC_ID if trd_env == TrdEnv.REAL else 0)
                     ret, df = ctx.order_list_query(
-                        trd_env=trd_env, order_id=_oid,
-                        acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0),
-                        **_kw)
+                        trd_env=trd_env, order_id=_oid, acc_id=_acc, **_kw)
+                    # ★ v3.9.181: 範囲つきで空なら、範囲なしでもう一度引く。
+                    #   このファイルは2箇所（:7229 / :7247）で
+                    #   「order_list_query は当日の注文しか返さない」と書いており、
+                    #   OVN の主経路は「前日 16:05 ET に予約 → 翌朝の寄りで約定」。
+                    #   証券会社側が期間指定を受け付けない／効かない場合、
+                    #   **本命の経路で毎回空になり、常に気配へ落ちる**（配布前レビューで
+                    #   3系統が指摘。実機でしか確かめられないため、どちらに転んでも
+                    #   動く形にする）。
+                    #   余分な1往復は「範囲つきで取れなかったとき」だけ。
+                    if ret != RET_OK or df is None or not _df_has_rows(df):
+                        log.debug(f"[夜間持ち越し] 注文 {_oid} が期間つきの照会で"
+                                  f"返りません（ret={ret}）→ 期間なしで再照会します")
+                        ret, df = ctx.order_list_query(
+                            trd_env=trd_env, order_id=_oid, acc_id=_acc)
                     if ret != RET_OK or df is None or not _df_has_rows(df):
                         log.debug(f"[夜間持ち越し] 注文 {_oid} が照会で返りません"
                                   f"（ret={ret}）→ 実約定単価は使いません")
@@ -20796,6 +20828,7 @@ async def ovn_overnight_loop(trd_env) -> None:
                     continue
                 if sell_orders:
                     st.update(phase="RESERVED", sell_oids=[o["order_id"] for o in sell_orders],
+                              sell_oids_cycle=st.get("entry_date", ""),
                               qty=pos, position_ids=ids)
                     _ovn_say("証券会社側に既存の売り注文を確認したため、その注文を監視します。", "warning")
                     _ovn_save(st)
@@ -20803,7 +20836,9 @@ async def ovn_overnight_loop(trd_env) -> None:
                 oids, msg = await asyncio.to_thread(
                     _ovn_sell_position, trd_env, pos, ids, reserve=True)
                 if oids:
-                    st.update(phase="RESERVED", sell_oids=oids, qty=pos, position_ids=ids)
+                    st.update(phase="RESERVED", sell_oids=oids,
+                              sell_oids_cycle=st.get("entry_date", ""),
+                              qty=pos, position_ids=ids)
                     _ovn_say("翌営業日の寄り付きで売る注文を出しました（このあとBotを止めても売れます）。"
                              + ("" if msg == "OK" else f" 一部発注のみ: {msg[:120]}"),
                              "info" if msg == "OK" else "error")
@@ -20933,6 +20968,7 @@ async def ovn_overnight_loop(trd_env) -> None:
                         continue
                     if sell_orders:
                         st.update(phase="RESERVED", sell_oids=[o["order_id"] for o in sell_orders],
+                                  sell_oids_cycle=st.get("entry_date", ""),
                                   qty=pos, position_ids=ids)
                         _ovn_say("証券会社側に既存の売り注文を確認したため、その注文を監視します。", "warning")
                         _ovn_save(st)
@@ -20940,8 +20976,9 @@ async def ovn_overnight_loop(trd_env) -> None:
                     oids, msg = await asyncio.to_thread(
                         _ovn_sell_position, trd_env, pos, ids, reserve=False)
                     if oids:
-                        st.update(phase="RESERVED", sell_oids=oids, qty=pos,
-                                  position_ids=ids, sell_fail_count=0)
+                        st.update(phase="RESERVED", sell_oids=oids,
+                                  sell_oids_cycle=st.get("entry_date", ""),
+                                  qty=pos, position_ids=ids, sell_fail_count=0)
                         _ovn_say("寄り付きの売り注文を出しました。約定確認まで保護を継続します。"
                                  + ("" if msg == "OK" else f" 一部発注のみ: {msg[:120]}"),
                                  "info" if msg == "OK" else "error")
@@ -21062,12 +21099,17 @@ async def ovn_overnight_loop(trd_env) -> None:
                         _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順
                         state.get(OVN_SYMBOL).ovn_held = False
                         if _dealt_total > 0:
+                            # ★ v3.9.181: 株数を先に直す（外部レビュー指摘）。
+                            #   _ovn_sell_fill_avg は「見えた株数 == st["qty"]」を必須に
+                            #   しているので、_target_qty のまま単価を取ると
+                            #   **この枝は構造的に必ず不一致**になり 100% 気配へ落ちる。
+                            #   単価だけ気配・株数だけ実数という混ざった記録になっていた。
+                            st["qty"] = _dealt_total  # 損益記録は実約定数で送る
                             _exit_px = await _ovn_exit_price(trd_env, st)
                             _ovn_say(
                                 f"予約注文は一部のみ約定（{_dealt_total}/{_target_qty}株）で終端となり、"
                                 "残りの建玉も確認できません。moomoo アプリの履歴をご確認ください。",
                                 "warning")
-                            st["qty"] = _dealt_total  # 損益記録は実約定数で送る
                             _ovn_report_trade(
                                 st, _exit_px,
                                 f"夜間持ち越し: 一部約定 {_dealt_total}/{_target_qty}株（残りは手動決済の可能性）")
@@ -24341,15 +24383,117 @@ async def main(live: bool) -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 
 # 送信履歴ファイル（重複送信防止・起動時キャッチアップで参照）
-_DATA_SENT_HISTORY_FILE = ".data_sent_history.json"
+# ★ v3.9.181: 素の相対パスだった（外部レビュー指摘・(1) とまったく同じ型）。
+#   cwd は launchd 起動と手動起動で変わるため、履歴が空に見えると
+#   起動のたびに最大7日ぶんの再送バーストになる。
+#
+#   保存先は **OVN_STATE_DIR**（＝`_bot_state_dir()`）。台帳・夜間持ち越しの状態と
+#   同じ、v3.9.160 が定めた唯一の置き場所。
+#   ★ 当初は「ログと同じ場所（BOT_STATE_DIR、未設定なら本体スクリプトの隣）」に
+#     していたが、配布前レビューで6系統が独立に指摘した:
+#       ・本体スクリプトの隣は、**v3.9.160 が状態の置き場所として不適と判断した場所**。
+#         版の更新でフォルダごと差し替える運用で履歴が消える
+#       ・_LOG_PATH は BOT_STATE_DIR 未設定なら **cwd 相対**なので、
+#         「ログと同じ場所」は既定構成で成立していなかった
+#       ・_LOG_DIR は環境変数の素の値で、`_bot_state_dir()` が持つ
+#         「書けるか（tmp→os.replace）」の実地確認を通っていない
+#   ★ v3.9.181: REAL と DEMO でファイルを分ける（外部レビュー Codex の指摘）。
+#     OVN の状態は v3.9.145 で分けたのに、送信履歴は1本のままだった。
+#     同じフォルダで併走すると、**DEMO が送った日付を REAL が「送信済み」と
+#     誤判定し、REAL の集計が送られないまま追いかけにも乗らない**。
+#     _RUN_TRADE_ENV は実行時に決まるので、_ovn_state_path と同じく関数にする。
+_DATA_SENT_HISTORY_FILE = os.path.join(OVN_STATE_DIR, ".data_sent_history.json")
+
+
+def _sent_history_path() -> str:
+    """送信履歴の保存先（REAL/DEMO で分ける）。"""
+    _root, _ext = os.path.splitext(_DATA_SENT_HISTORY_FILE)
+    return f"{_root}.{'REAL' if _RUN_TRADE_ENV == 'REAL' else 'DEMO'}{_ext}"
+
+# 旧い置き場所に履歴があれば、1度だけ引き継ぐ（引き継がないと7日ぶん送り直す）。
+#   ★ import 時に実行しない（外部レビュー指摘）。モジュールを読み込むだけで
+#     ファイルコピーが走り、検査のたびに実機の履歴が使い捨てフォルダへ入っていた。
+#     必要になったとき（＝履歴を読むとき）に1度だけ行う。
+_HIST_MIGRATED = False
+
+# ★ v3.9.181: 旧い置き場所の候補。**検査から差し替えられるようにモジュール変数にする**
+#   （外部レビュー指摘）。検査は _OVN_LEGACY_DIR を使い捨てへ向けて実状態を
+#   守っているが、この関数だけその防御を通っておらず、**検査が実機の履歴を
+#   使い捨てフォルダへ持ち去り、元に「済み」の印を付けていた**（実害を確認）。
+_HIST_LEGACY_PATHS: list = [
+    os.path.abspath(".data_sent_history.json"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".data_sent_history.json"),
+]
+
+
+def _migrate_sent_history_once() -> None:
+    """旧パスの送信履歴を、現在の保存先へ1度だけ引き継ぐ。
+
+    ★ 探すのは cwd と本体スクリプトの隣の両方。cwd だけを見ると、
+      launchd 起動（cwd が変わる）でいちばん引き継ぎが要る環境を取り逃す。
+    ★ 書き込みは tmp → os.replace。直接コピーだと、書いている途中を
+      他プロセスが読んで壊れた JSON を掴む（_ovn_migrate_legacy_dir と同じ理由）。
+    ★ 引き継いだ元には印を付ける。付けないと、保存先を変えて戻したときに
+      古いスナップショットが「現在の状態」として復活する。
+    """
+    global _HIST_MIGRATED
+    if _HIST_MIGRATED:
+        return
+    _dst = _sent_history_path()
+    _tmp = ""
+    try:
+        if os.path.exists(_dst):
+            _HIST_MIGRATED = True      # 引き継ぎ済み。以後は見に行かない
+            return
+        _dst_abs = os.path.abspath(_dst)
+        _env = "REAL" if _RUN_TRADE_ENV == "REAL" else "DEMO"
+        for _cand in [_DATA_SENT_HISTORY_FILE] + list(_HIST_LEGACY_PATHS):
+            if os.path.abspath(_cand) == _dst_abs or not os.path.exists(_cand):
+                continue
+            # ★ 印は口座区分ごとに持つ（外部レビュー指摘）。1つにすると、
+            #   先に起動した側だけが旧履歴を引き継ぎ、**あとから上げた側は
+            #   空のまま**になって7日ぶんを送り直す。
+            if os.path.exists(f"{_cand}.migrated_away.{_env}"):
+                continue
+            _tmp = f"{_dst}.tmp.{os.getpid()}.{threading.get_ident()}"
+            with open(_cand, "r", encoding="utf-8") as _fr, \
+                 open(_tmp, "w", encoding="utf-8") as _fw:
+                _fw.write(_fr.read())
+                _fw.flush()
+                os.fsync(_fw.fileno())
+            os.replace(_tmp, _dst)
+            _tmp = ""
+            # ★ 印は「引き継ぎに成功した後」だけ付ける。先に付けると、
+            #   途中で失敗したときに元が二度と読まれなくなる。
+            try:
+                with open(f"{_cand}.migrated_away.{_env}", "w", encoding="utf-8") as _fm:
+                    _fm.write(_dst_abs)
+            except Exception:
+                pass
+            log.info(f"[データ収集] 送信履歴を引き継ぎました: {_cand} → {_dst_abs}")
+            _HIST_MIGRATED = True
+            return
+        # 引き継ぐものが無かった。次回もう一度探す必要はない。
+        _HIST_MIGRATED = True
+    except Exception as _e_hist:
+        # ★ v3.9.181: ここで _HIST_MIGRATED を立てない（外部レビュー Codex の指摘）。
+        #   一時的な入出力の失敗で二度と再試行しなくなり、その後1回でも送信が
+        #   成功すると**空集合＋当日だけ**を書き込んで旧履歴を失う。
+        #   失敗した回は次の呼び出しでもう一度試す。
+        log.warning(f"[データ収集] 送信履歴の引き継ぎに失敗（次回もう一度試します）: {_e_hist}")
+    finally:
+        if _tmp:
+            with _contextlib.suppress(OSError):
+                os.remove(_tmp)
 
 def _load_sent_dates() -> set:
     """送信済み日付（YYYY-MM-DD文字列）のセットを返す。存在しなければ空集合。"""
     # ★ v3.9.181: 書き換えと同じ錠を取る（外部レビュー指摘）。
     #   Windows では読み手がファイルを開いている間の os.replace が失敗する。
     with _SENT_HISTORY_LOCK:
+        _migrate_sent_history_once()
         try:
-            with open(_DATA_SENT_HISTORY_FILE, "r", encoding="utf-8") as f:
+            with open(_sent_history_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
                 return set(data.get("sent_dates", []))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -24377,7 +24521,8 @@ def _mark_date_sent(date_str: str) -> None:
     #   except 側が未定義を参照する（同じ型の欠陥を3回作っている）。
     # ★ v3.9.181: プロセスIDだけだと**同一プロセスの全スレッドで同じ名前**になり、
     #   片方の後始末がもう片方の書きかけを消す（外部レビュー指摘）。スレッドIDも足す。
-    _tmp = f"{_DATA_SENT_HISTORY_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
+    _dst = _sent_history_path()
+    _tmp = f"{_dst}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
         with _SENT_HISTORY_LOCK:
             sent = _load_sent_dates()
@@ -24392,7 +24537,7 @@ def _mark_date_sent(date_str: str) -> None:
                 json.dump({"sent_dates": sorted(sent)}, f, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(_tmp, _DATA_SENT_HISTORY_FILE)
+            os.replace(_tmp, _dst)
     except Exception as e:
         log.warning(f"[データ収集] 送信履歴保存エラー: {e}")
     finally:
