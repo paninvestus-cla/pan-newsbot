@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.186"
+BOT_VERSION = "v3.9.187"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -5428,6 +5428,13 @@ _alpaca_news_health: Dict[str, Any] = {
     #   繰り返す本物のフラッピングでも、5分おきの見回りでは**たいてい接続済みに
     #   見える**ため、「接続は継続中」と事実と違う文面が出続けていた。
     "reconnects": 0,
+    # ★ v3.9.186b: この接続の試行を始めた時刻（配布前レビュー指摘）。
+    #   接続そのものに失敗し続ける環境（ファイアウォール・DNS・TLS）は
+    #   認証にも到達しないので auth_fail_count が increment されず、
+    #   last_success_at も None のままになる。時刻の基準が無いと
+    #   「まだ1件も受信していない」と「1件も受信できない」を区別できず、
+    #   **配信が一度も来ない環境で 🚨 が永久に出なかった**。
+    "started_at": None,
 }
 # ★ v3.9.185: 接続が生きていても、この分数を越えて1件も来なければ障害として扱う
 #   （配布前レビュー指摘）。購読権限が切れて配信が止まった場合、ソケットは開いた
@@ -5466,7 +5473,10 @@ def _alpaca_health_verdict(health: dict, now=None) -> tuple:
         復帰は8〜52秒。3人目の環境では同時刻に受信が続いていた）
     """
     _now = now or datetime.datetime.now()
-    _last_ok = health.get("last_success_at")
+    # ★ v3.9.186b: 一度も受信していないときは「この接続を試み始めてから」を
+    #   基準にする（配布前レビュー指摘）。基準が無いと、接続に失敗し続ける
+    #   環境が永久に「正常」と判定される。
+    _last_ok = health.get("last_success_at") or health.get("started_at")
     _stale_min = None
     if _last_ok is not None:
         _stale_min = (_now - _last_ok).total_seconds() / 60
@@ -19763,6 +19773,9 @@ async def alpaca_news_loop(
         # ★ v3.9.184: 各周回は「未接続」から始める。前の周回の値が残ると、
         #   本物の切断を「接続は生きていて静かなだけ」と誤って軽く扱う。
         _alpaca_news_health["connected_at"] = None
+        # ★ v3.9.186b: 試行の開始時刻を更新する。市場が閉じている間の滞留を
+        #   持ち越すと、再開の1回目でいきなり 🚨 が出る。
+        _alpaca_news_health["started_at"] = datetime.datetime.now()
 
         try:
             import websockets
