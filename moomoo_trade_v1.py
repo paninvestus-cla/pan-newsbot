@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.181"
+BOT_VERSION = "v3.9.182"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -20242,6 +20242,34 @@ _OVN_POSITION_SCOPED_KEYS = (
 )
 
 
+def _ovn_backfill_cycle_stamp(st: dict) -> None:
+    """版上げをまたいだ売り注文に、サイクル印を1度だけ補う。
+
+    ★ v3.9.182: v3.9.181 はこれを _ovn_sell_fill_avg の中に置いていたが、
+      **実運用のどの経路からも到達しなかった**（配布前レビュー10レーンが一致して
+      指摘・再現も取れた）。_ovn_exit_price を呼ぶ3箇所はすべて直前で
+      phase="DONE" にしてから呼ぶため、`phase == "RESERVED"` が真になることは無い。
+      検査が緑だったのは st を手で組んでいたからで、v3.9.180 で
+      sell_oids_cycle の書き手がゼロだったのと同じ型。
+      状態ファイルを読んだ直後——phase がまだ RESERVED のうち——に補う。
+
+    phase=RESERVED は「その晩の売り注文を出し終えた」状態なので、そこに載っている
+    注文IDは定義上その晩のもの。この条件でだけ補うなら、「数日前の注文IDを読んで
+    決済単価が化ける」欠陥は復活しない。
+    """
+    if st.get("sell_oids_cycle") or st.get("phase") != "RESERVED":
+        return
+    # 旧形式（単数 sell_oid）も対象。読み手が両方を受けるので、片方だけ補うと
+    # 旧形式の状態は永久に印が付かない。
+    if not (st.get("sell_oids") or st.get("sell_oid")):
+        return
+    _cycle = str(st.get("entry_date", "") or "")
+    if not _re_date_key.fullmatch(_cycle):
+        return
+    st["sell_oids_cycle"] = _cycle
+    log.info("[夜間持ち越し] 版上げ前から続く売り注文に、サイクル印を補いました")
+
+
 def _ovn_new_cycle(st: dict) -> None:
     """新しいサイクルに入る前に、前の建玉に属する値を捨てる。
 
@@ -20283,18 +20311,6 @@ def _ovn_sell_fill_avg(trd_env, st: dict) -> float:
     #   **前サイクルの注文IDが残る**。それを読むと決済単価が「数日前の約定単価」に
     #   化け、値が正なので気配へ落ちる警告も出ない。サイクル印で照合する。
     _cycle = str(st.get("entry_date", "") or "")
-    # ★ v3.9.181: 版上げをまたいだ建玉だけ、印を1度だけ補う（外部レビュー指摘）。
-    #   phase=RESERVED は「その晩の売り注文を出し終えた」状態なので、
-    #   そこに載っている sell_oids は定義上その晩のもの。この条件でだけ補うなら、
-    #   「数日前の注文IDを読む」欠陥は復活しない。
-    #   補わないと、RESERVED（15:50 ET〜翌 9:35 ET の約18時間）で版を上げた環境の
-    #   **最初の1決済だけ**が気配ベースになる。理由は log.debug にしか出ない。
-    if (not st.get("sell_oids_cycle")
-            and st.get("phase") == "RESERVED"
-            and st.get("sell_oids")
-            and _re_date_key.fullmatch(_cycle)):
-        st["sell_oids_cycle"] = _cycle
-        log.info("[夜間持ち越し] 版上げ前から続く売り注文に、サイクル印を補いました")
     if not _re_date_key.fullmatch(_cycle):
         log.debug("[夜間持ち越し] 建玉の日が分からないため、実約定単価は使いません")
         return 0.0
@@ -20525,6 +20541,7 @@ async def ovn_overnight_loop(trd_env) -> None:
     条件: 前日終値 > 200日移動平均 かつ VIXY の前日比が閾値以下。
     """
     st = _ovn_load()
+    _ovn_backfill_cycle_stamp(st)   # ★ v3.9.182: phase が DONE に変わる前に補う
     owns_persisted = (
         st.get("phase") in ("BUY_INTENT", "BUY_PENDING", "HELD", "RESERVED", "HELD_NO_RESERVE")
         and st.get("trade_env") == _RUN_TRADE_ENV
@@ -24415,6 +24432,17 @@ def _sent_history_path() -> str:
 #     ファイルコピーが走り、検査のたびに実機の履歴が使い捨てフォルダへ入っていた。
 #     必要になったとき（＝履歴を読むとき）に1度だけ行う。
 _HIST_MIGRATED = False
+# ★ v3.9.182: 引き継ぎに失敗した回は「履歴を書かない」（配布前レビュー10レーンが
+#   一致して指摘・再現も取れた）。v3.9.181 は失敗しても _mark_date_sent がそのまま
+#   **空集合＋当日だけ**を保存先へ書いてしまい、以後は「保存先が在る」で
+#   短絡するため、旧履歴が永久に孤立していた（再試行の窓が同じ呼び出しで閉じる）。
+#   重複送信は GAS 側が生徒名＋日付で上書きするので無害、
+#   「送信済みの誤判定」は取り返しがつかない。安全側は前者。
+_HIST_MIGRATE_FAILED = False
+# 恒久的に失敗する原因（権限・非UTF-8の旧ファイル等）で無限に再試行しないための上限。
+#   ここに達したら引き継ぎを諦め、通常の記録を再開する（一度だけ最大7日を送り直す）。
+_HIST_MIGRATE_MAX_TRIES = 3
+_HIST_MIGRATE_TRIES = 0
 
 # ★ v3.9.181: 旧い置き場所の候補。**検査から差し替えられるようにモジュール変数にする**
 #   （外部レビュー指摘）。検査は _OVN_LEGACY_DIR を使い捨てへ向けて実状態を
@@ -24435,30 +24463,50 @@ def _migrate_sent_history_once() -> None:
       他プロセスが読んで壊れた JSON を掴む（_ovn_migrate_legacy_dir と同じ理由）。
     ★ 引き継いだ元には印を付ける。付けないと、保存先を変えて戻したときに
       古いスナップショットが「現在の状態」として復活する。
+    ★ v3.9.182: 印は**口座区分を付けない**（配布前レビュー10レーンが一致して指摘）。
+      旧ファイルは分割前のもので REAL/DEMO が混ざっている。区分ごとの印にすると
+      両方が同じファイルを相続し、**DEMO が送った日を REAL が「送信済み」と誤判定
+      する**——この分割で消したはずの欠陥が、版上げ直後の追いかけ窓にそのまま
+      残っていた。1つの印で1回だけ引き継ぎ、もう一方は空から始めて送り直す。
+      既に付いている区分つきの印も「引き継ぎ済み」として尊重する。
     """
-    global _HIST_MIGRATED
+    global _HIST_MIGRATED, _HIST_MIGRATE_FAILED, _HIST_MIGRATE_TRIES
     if _HIST_MIGRATED:
+        return
+    if os.environ.get("BOT_SKIP_HISTORY_MIGRATION") == "1":
+        # ★ v3.9.182: 引き継ぎの停止スイッチ（配布前レビュー指摘）。
+        #   v3.9.181 の防御はモジュール変数（_HIST_LEGACY_PATHS）だけで、
+        #   **プロセス境界を越えない**。検査が起動する子プロセスは cwd が
+        #   リポジトリなので、実機の履歴を使い捨てフォルダへ持ち去り、元に
+        #   「済み」の印を付けていた（run_all.sh を回すたびに起きる）。
+        #   環境変数なら子プロセスまで届く。
         return
     _dst = _sent_history_path()
     _tmp = ""
     try:
         if os.path.exists(_dst):
             _HIST_MIGRATED = True      # 引き継ぎ済み。以後は見に行かない
+            _HIST_MIGRATE_FAILED = False
             return
         _dst_abs = os.path.abspath(_dst)
-        _env = "REAL" if _RUN_TRADE_ENV == "REAL" else "DEMO"
+        _HIST_MIGRATE_TRIES += 1
         for _cand in [_DATA_SENT_HISTORY_FILE] + list(_HIST_LEGACY_PATHS):
             if os.path.abspath(_cand) == _dst_abs or not os.path.exists(_cand):
                 continue
-            # ★ 印は口座区分ごとに持つ（外部レビュー指摘）。1つにすると、
-            #   先に起動した側だけが旧履歴を引き継ぎ、**あとから上げた側は
-            #   空のまま**になって7日ぶんを送り直す。
-            if os.path.exists(f"{_cand}.migrated_away.{_env}"):
+            if any(os.path.exists(f"{_cand}.migrated_away{_sfx}")
+                   for _sfx in ("", ".REAL", ".DEMO")):
                 continue
+            # ★ v3.9.182: 中身を検証してから差し替える（配布前レビュー指摘）。
+            #   壊れた JSON をそのまま写すと、「引き継ぎました」と記録した上で
+            #   履歴が空になり、次の記録が当日だけで上書きしてしまう。
+            with open(_cand, "r", encoding="utf-8") as _fr:
+                _raw = _fr.read()
+            _parsed = json.loads(_raw)
+            if not isinstance(_parsed, dict) or "sent_dates" not in _parsed:
+                raise ValueError("送信履歴の形式が違います（sent_dates が無い）")
             _tmp = f"{_dst}.tmp.{os.getpid()}.{threading.get_ident()}"
-            with open(_cand, "r", encoding="utf-8") as _fr, \
-                 open(_tmp, "w", encoding="utf-8") as _fw:
-                _fw.write(_fr.read())
+            with open(_tmp, "w", encoding="utf-8") as _fw:
+                _fw.write(_raw)
                 _fw.flush()
                 os.fsync(_fw.fileno())
             os.replace(_tmp, _dst)
@@ -24466,21 +24514,36 @@ def _migrate_sent_history_once() -> None:
             # ★ 印は「引き継ぎに成功した後」だけ付ける。先に付けると、
             #   途中で失敗したときに元が二度と読まれなくなる。
             try:
-                with open(f"{_cand}.migrated_away.{_env}", "w", encoding="utf-8") as _fm:
+                with open(f"{_cand}.migrated_away", "w", encoding="utf-8") as _fm:
                     _fm.write(_dst_abs)
-            except Exception:
-                pass
+            except Exception as _e_mark:
+                # ★ v3.9.182: 黙って捨てない（配布前レビュー指摘）。印を置けないと
+                #   「保存先を戻したときに古い履歴が蘇る」防御が消える。
+                log.warning(f"[データ収集] 送信履歴の引き継ぎ印を置けません: {_e_mark}")
             log.info(f"[データ収集] 送信履歴を引き継ぎました: {_cand} → {_dst_abs}")
             _HIST_MIGRATED = True
+            _HIST_MIGRATE_FAILED = False
             return
         # 引き継ぐものが無かった。次回もう一度探す必要はない。
         _HIST_MIGRATED = True
+        _HIST_MIGRATE_FAILED = False
     except Exception as _e_hist:
         # ★ v3.9.181: ここで _HIST_MIGRATED を立てない（外部レビュー Codex の指摘）。
         #   一時的な入出力の失敗で二度と再試行しなくなり、その後1回でも送信が
         #   成功すると**空集合＋当日だけ**を書き込んで旧履歴を失う。
         #   失敗した回は次の呼び出しでもう一度試す。
-        log.warning(f"[データ収集] 送信履歴の引き継ぎに失敗（次回もう一度試します）: {_e_hist}")
+        if _HIST_MIGRATE_TRIES >= _HIST_MIGRATE_MAX_TRIES:
+            # ★ v3.9.182: 恒久的な失敗で永久に再試行しない（配布前レビュー指摘）。
+            #   起動時の追いかけ（7日）と再送ループ（120秒周期）から呼ばれるので、
+            #   上限が無いと警告とファイル入出力を延々と繰り返す。
+            _HIST_MIGRATED = True
+            _HIST_MIGRATE_FAILED = False
+            log.warning(
+                f"[データ収集] 送信履歴の引き継ぎを {_HIST_MIGRATE_TRIES} 回失敗したので"
+                f"諦めます（一度だけ最大7日ぶんを送り直します）: {_e_hist}")
+        else:
+            _HIST_MIGRATE_FAILED = True
+            log.warning(f"[データ収集] 送信履歴の引き継ぎに失敗（次回もう一度試します）: {_e_hist}")
     finally:
         if _tmp:
             with _contextlib.suppress(OSError):
@@ -24496,7 +24559,10 @@ def _load_sent_dates() -> set:
             with open(_sent_history_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
                 return set(data.get("sent_dates", []))
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except (OSError, ValueError):
+            # ★ v3.9.182: UnicodeDecodeError を取りこぼしていた（配布前レビュー指摘）。
+            #   ValueError の一種だが json.JSONDecodeError でも OSError でもないので
+            #   呼び手まで抜け、その日の集計が送られないまま終わっていた。
             return set()
 
 # ★ v3.9.181: 送信履歴の書き手が2つになった（外部レビュー指摘）。
@@ -24526,6 +24592,15 @@ def _mark_date_sent(date_str: str) -> None:
     try:
         with _SENT_HISTORY_LOCK:
             sent = _load_sent_dates()
+            if _HIST_MIGRATE_FAILED:
+                # ★ v3.9.182: 引き継ぎに失敗している間は保存先を作らない。
+                #   作ると次回の引き継ぎが「保存先が在る」で短絡し、旧履歴が
+                #   永久に孤立する（配布前レビュー10レーンが一致して指摘）。
+                #   記録しそこねた日は、次の起動の追いかけで送り直される。
+                log.warning(
+                    f"[データ収集] 送信履歴を引き継げていないため {date_str} の記録は"
+                    f"見送ります（旧い履歴を失わないため・次回もう一度引き継ぎます）")
+                return
             sent.add(date_str)
             # 90日以上古い履歴は削除（ファイル肥大化防止）
             # ★ v2.86: 固定オフセット(-4h)を ZoneInfo に変更（DST 自動対応）。
