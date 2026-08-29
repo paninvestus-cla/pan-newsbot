@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.182"
+BOT_VERSION = "v3.9.183"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -242,9 +242,217 @@ def _gas_post(url: str, payload: str, timeout: int = 60) -> dict:
 #   ・インライン 0/5/15 秒の3回再送 → 全失敗ならローカル JSONL キューへ退避。
 #   ・gas_retry_loop が定期再送。再送時は retry フラグを立て、GAS 側が
 #     trade_id / observation_id で重複排除（read timeout の二重登録を防ぐ）。
-_GAS_QUEUE_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "gas_retry_queue.jsonl"
-)
+# ══════════════════════════════════════════════════════════════════════════
+# ★ v3.9.183: 実行時の状態ファイルの「置き場所・口座区分・書き方・引き継ぎ」を
+#   1箇所に集約する。
+#
+#   これまでは状態ファイルを足すたびに同じ轍を踏んでいた——本体スクリプトの隣に
+#   置く（配布フォルダを差し替える運用で消える・git の作業ツリーを汚して
+#   `git pull --ff-only` を止める）→ 事故が出てから専用の引き継ぎ関数を書く。
+#   v3.9.160 の OVN 状態、v3.9.181 の送信履歴、台帳で3回繰り返し、その3つが
+#   **印の付け方も原子性の担保もばらばら**になっていた（配布前レビュー5巡目の
+#   一致指摘）。ここを通せば次の1つは最初から正しい場所に置かれる。
+# ══════════════════════════════════════════════════════════════════════════
+
+def _env_tag(trd_env=None) -> str:
+    """口座区分（REAL / DEMO）。この判定の唯一の実装。
+
+    ★ 同じ式が6箇所に写経されていた（配布前レビュー指摘）。区分の表し方を
+      変えるときに1箇所でも取り残すと、その部分系だけ**別の口座のファイルを
+      読む**——送信履歴なら「DEMO が送った日を REAL が送信済みと誤判定」に直結する。
+    """
+    try:
+        if trd_env is None:
+            return "REAL" if _RUN_TRADE_ENV == "REAL" else "DEMO"
+        if isinstance(trd_env, str):
+            return "REAL" if trd_env.strip().upper() == "REAL" else "DEMO"
+        return "REAL" if trd_env == TrdEnv.REAL else "DEMO"
+    except Exception:
+        return "REAL" if _RUN_TRADE_ENV == "REAL" else "DEMO"
+
+
+def _env_suffixed_path(base: str, trd_env=None) -> str:
+    """`.../name.json` → `.../name.REAL.json`（拡張子の手前に区分を入れる）。
+
+    先頭のドット（`.data_sent_history.json`）は拡張子ではなく名前の一部として
+    扱われる（os.path.splitext の仕様）ので、隠しファイルでも正しく割れる。
+    """
+    _root, _ext = os.path.splitext(base)
+    return f"{_root}.{_env_tag(trd_env)}{_ext}"
+
+
+def _state_path(name: str, per_env: bool = True, trd_env=None) -> str:
+    """実行時の状態ファイルのパス。**状態は必ずここを通す**。
+
+    置き場所は `OVN_STATE_DIR`（＝`_bot_state_dir()`：BOT_STATE_DIR →
+    ~/.moomoo_bot → 本体の隣、の順に「実際に書けるか」を確かめて決めた場所）。
+    口座区分は既定で分ける——REAL と DEMO が同じフォルダで併走できるため、
+    分けないと片方の記録をもう片方が自分のものとして読む。
+    """
+    _base = os.path.join(OVN_STATE_DIR, name)
+    return _env_suffixed_path(_base, trd_env) if per_env else _base
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    """一時ファイル → fsync → os.replace で書き換える。**状態の書き込みはこれを通す**。
+
+    ★ 同じ手順が7箇所に写経され、3通りの耐久性に分かれていた（配布前レビュー指摘）。
+      当日サマリは flush も fsync もせずに置換していて、電源断で空になりうる。
+      一時ファイル名にプロセスIDとスレッドIDを入れるのは v3.9.181 の教訓
+      （プロセスIDだけだと同一プロセスの別スレッドが互いの書きかけを消す）。
+    """
+    _tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            _f.write(text)
+            _f.flush()
+            os.fsync(_f.fileno())
+        os.replace(_tmp, path)
+        _tmp = ""
+        # 置換したディレクトリエントリも、可能な環境では永続化する
+        # （_ovn_save が v3.9.141 から持っていた手当てを全員に広げる）。
+        try:
+            _dir_fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+            try:
+                os.fsync(_dir_fd)
+            finally:
+                os.close(_dir_fd)
+        except (AttributeError, OSError):
+            pass
+    finally:
+        if _tmp:
+            try:
+                os.remove(_tmp)
+            except OSError:
+                pass
+
+
+# 引き継ぎの進み具合（保存先ごと）。恒久的に失敗する原因で無限に再試行しない。
+_STATE_MIGRATIONS: Dict[str, Dict[str, Any]] = {}
+_STATE_MIGRATE_MAX_TRIES = 3
+_STATE_MIGRATE_LOCK = threading.RLock()
+
+
+def _state_migration_skipped() -> bool:
+    """引き継ぎの停止スイッチ（検査用）。
+
+    ★ v3.9.182 の教訓: モジュール変数だけの防御は**プロセス境界を越えない**。
+      検査が起動する子プロセスは cwd がリポジトリなので、実機の状態を
+      使い捨てフォルダへ持ち去り、元に「済み」の印を付けていた。
+      環境変数なら子まで届く。`BOT_SKIP_HISTORY_MIGRATION` は v3.9.182 で
+      配った名前なので、そのまま受け続ける。
+    """
+    return (os.environ.get("BOT_SKIP_STATE_MIGRATION") == "1"
+            or os.environ.get("BOT_SKIP_HISTORY_MIGRATION") == "1")
+
+
+def _migrate_state_file_once(dst: str, candidates, label: str, validate=None) -> bool:
+    """旧い置き場所の状態ファイルを、現在の保存先へ1度だけ引き継ぐ。
+
+    戻り値は「保存先へ書いてよいか」。**False の間は書いてはいけない**——
+    書くと保存先ができてしまい、次回の引き継ぎが「保存先が在る」で短絡して
+    旧い内容が永久に孤立する（v3.9.181 で実際に起きた・再現済み）。
+
+    ★ 印は口座区分を付けない。旧ファイルは分割前のもので REAL/DEMO が
+      混ざっているため、区分ごとの印にすると両方が同じ内容を相続し、
+      「相手が送った分を自分も送信済みとみなす」誤判定が復活する
+      （v3.9.182 の (3)）。先に上げた側だけが引き継ぎ、もう一方は空から始める。
+      v3.9.181/182 が付けた区分つきの印も「引き継ぎ済み」として尊重する。
+    """
+    with _STATE_MIGRATE_LOCK:
+        _m = _STATE_MIGRATIONS.setdefault(
+            dst, {"done": False, "failed": False, "tries": 0})
+        if _m["done"] or _state_migration_skipped():
+            return True
+        try:
+            if os.path.exists(dst):
+                _m.update(done=True, failed=False)
+                return True
+            _dst_abs = os.path.abspath(dst)
+            _m["tries"] += 1
+            for _cand in candidates:
+                if not _cand or os.path.abspath(_cand) == _dst_abs:
+                    continue
+                if not os.path.exists(_cand):
+                    continue
+                if os.path.getsize(_cand) == 0:
+                    # 空ファイルは引き継ぐ中身が無い。写すと保存先ができて
+                    # しまい、あとから中身のある候補があっても見に行かない。
+                    continue
+                if any(os.path.exists(f"{_cand}.migrated_away{_sfx}")
+                       for _sfx in ("", ".REAL", ".DEMO")):
+                    continue
+                with open(_cand, "rb") as _fr:
+                    _raw = _fr.read()
+                if validate is not None:
+                    # ★ 中身を確かめてから差し替える。壊れたファイルをそのまま
+                    #   写すと「引き継ぎました」と記録した上で内容が失われる。
+                    validate(_raw.decode("utf-8"))
+                _atomic_write_text(dst, _raw.decode("utf-8"))
+                try:
+                    _atomic_write_text(f"{_cand}.migrated_away", _dst_abs)
+                except Exception as _e_mark:
+                    log.warning(f"[{label}] 引き継ぎ印を置けません: {_e_mark}")
+                log.info(f"[{label}] 引き継ぎました: {_cand} → {_dst_abs}")
+                _m.update(done=True, failed=False)
+                return True
+            _m.update(done=True, failed=False)   # 引き継ぐものが無かった
+            return True
+        except Exception as _e_mig:
+            if _m["tries"] >= _STATE_MIGRATE_MAX_TRIES:
+                # 直らない原因（権限・非UTF-8）で警告とファイル入出力を
+                # 延々と繰り返さない。諦めて通常の記録を再開する。
+                _m.update(done=True, failed=False)
+                log.warning(
+                    f"[{label}] 引き継ぎを {_m['tries']} 回失敗したので諦めます"
+                    f"（内容は引き継げません）: {_e_mig}")
+                return True
+            _m["failed"] = True
+            log.warning(f"[{label}] 引き継ぎに失敗（次回もう一度試します）: {_e_mig}")
+            return False
+
+
+def _legacy_state_candidates(name: str) -> list:
+    """旧い置き場所の候補（cwd と本体スクリプトの隣）。
+
+    ★ cwd だけを見ると、launchd 起動（cwd が変わる）でいちばん引き継ぎが
+      要る環境を取り逃す。**検査から差し替えられるようにモジュール変数**
+      （_STATE_LEGACY_DIRS）から組む。
+    """
+    return [os.path.join(_d, name) for _d in _STATE_LEGACY_DIRS]
+
+
+_STATE_LEGACY_DIRS: list = [
+    os.path.abspath("."),
+    os.path.dirname(os.path.abspath(__file__)),
+]
+
+
+def _gas_queue_path() -> str:
+    """GAS 再送キューの保存先（口座区分ごと）。
+
+    ★ v3.9.183: 本体スクリプトの隣に置いていた（配布前レビューの一致指摘）。
+      (a) 版の更新でフォルダごと差し替える運用で、`trade` の未送信分
+      （実質破棄しない設計・上限480回）が消える。
+      (b) git の追跡下にあり、Bot 機の `git pull --ff-only` を止める。
+      (c) REAL と DEMO が1本を共有し、片方の排出がもう片方の記録を消す
+      （読んで空にしてから追記で戻す作りなので、併走すると取りこぼす）。
+    """
+    return _state_path("gas_retry_queue.jsonl")
+
+
+def _gas_queue_migrate() -> None:
+    """旧い置き場所の再送キューを1度だけ引き継ぐ（best-effort）。
+
+    ★ 引き継ぎに失敗しても**退避そのものは止めない**。ここで止めると
+      進行中の `trade` を取りこぼす方が損失が大きい（送信履歴は逆——
+      「送信済み」の誤判定は取り返しがつかないので、引き継げるまで書かない）。
+    """
+    _migrate_state_file_once(
+        _gas_queue_path(), _legacy_state_candidates("gas_retry_queue.jsonl"),
+        "GAS再送")
+
+
 _GAS_QUEUE_LOCK = threading.Lock()
 _GAS_QUEUE_MAX = 3000             # 退避上限（超過は重要度の低い順に破棄）
 _GAS_RETRY_MAX_ATTEMPTS = 48      # ★ v3.9.82: 24→48（過負荷日でも翌セッションまで粘る）
@@ -329,6 +537,7 @@ def _classify_gas_error(exc, kind: str) -> str:
 def _gas_enqueue(url: str, payload_str: str, kind: str, key: str) -> None:
     """送信失敗ペイロードをローカル JSONL に退避（gas_retry_loop が後で再送）。"""
     import time as _t
+    _gas_queue_migrate()
     try:
         rec = {
             "url": url, "payload": payload_str, "kind": kind, "key": key or "",
@@ -336,8 +545,8 @@ def _gas_enqueue(url: str, payload_str: str, kind: str, key: str) -> None:
         }
         with _GAS_QUEUE_LOCK:
             lines = []
-            if os.path.exists(_GAS_QUEUE_PATH):
-                with open(_GAS_QUEUE_PATH, "r", encoding="utf-8") as f:
+            if os.path.exists(_gas_queue_path()):
+                with open(_gas_queue_path(), "r", encoding="utf-8") as f:
                     lines = f.readlines()
             # 同一 key の既存退避は置き換え（重複退避を防ぐ）
             # ★ v3.9.120: 生テキストの部分一致 → JSON パース比較へ（エスケープを含む
@@ -362,7 +571,7 @@ def _gas_enqueue(url: str, payload_str: str, kind: str, key: str) -> None:
                 _order = sorted(range(len(lines)), key=lambda i: (_drop_prio(lines[i]), -i))
                 _keep = set(_order[:_GAS_QUEUE_MAX])
                 lines = [lines[i] for i in range(len(lines)) if i in _keep]
-            with open(_GAS_QUEUE_PATH, "w", encoding="utf-8") as f:
+            with open(_gas_queue_path(), "w", encoding="utf-8") as f:
                 f.writelines(lines)
     except Exception as _e:
         log.debug(f"[GAS再送] 退避失敗(黙殺): {_mask_secrets(_e)}")
@@ -379,11 +588,12 @@ def _gas_queue_purge_key(key: str) -> None:
       成功した時点で同じ鍵の残骸を消し、古い方が後から届く経路を断つ。"""
     if not key:
         return
+    _gas_queue_migrate()
     try:
         with _GAS_QUEUE_LOCK:
-            if not os.path.exists(_GAS_QUEUE_PATH):
+            if not os.path.exists(_gas_queue_path()):
                 return
-            with open(_GAS_QUEUE_PATH, "r", encoding="utf-8") as f:
+            with open(_gas_queue_path(), "r", encoding="utf-8") as f:
                 lines = f.readlines()
 
             def _same_key(_ln):
@@ -393,7 +603,7 @@ def _gas_queue_purge_key(key: str) -> None:
                     return False
             kept = [ln for ln in lines if not _same_key(ln)]
             if len(kept) != len(lines):
-                with open(_GAS_QUEUE_PATH, "w", encoding="utf-8") as f:
+                with open(_gas_queue_path(), "w", encoding="utf-8") as f:
                     f.writelines(kept)
                 log.debug(f"[GAS再送] 送信成功につき退避を掃除: key={key} "
                           f"({len(lines) - len(kept)}件)")
@@ -485,14 +695,15 @@ def _gas_queue_drain_once() -> None:
     空ファイルへ安全に追記される）、送信後は「追記」で残件を戻す方式に変更。
     途中で予期しない例外が出ても finally で未処理分ごと必ず書き戻す。"""
     import time as _t
-    if not os.path.exists(_GAS_QUEUE_PATH):
+    _gas_queue_migrate()
+    if not os.path.exists(_gas_queue_path()):
         return
     with _GAS_QUEUE_LOCK:
         try:
-            with open(_GAS_QUEUE_PATH, "r", encoding="utf-8") as f:
+            with open(_gas_queue_path(), "r", encoding="utf-8") as f:
                 lines = [ln for ln in f.readlines() if ln.strip()]
             # 読んだ分をファイルから除去（以後の enqueue と衝突しない）
-            with open(_GAS_QUEUE_PATH, "w", encoding="utf-8") as f:
+            with open(_gas_queue_path(), "w", encoding="utf-8") as f:
                 pass
         except Exception:
             return
@@ -561,7 +772,7 @@ def _gas_queue_drain_once() -> None:
             # ★ v3.9.120: 全上書き("w")ではなく追記("a")。読み取り時にファイルは空化済みで、
             #   送信中に enqueue された新規レコードはその空ファイルに追記されているため、
             #   ここで上書きすると消えてしまう。残件（kept）は後ろに足す。
-            with open(_GAS_QUEUE_PATH, "a", encoding="utf-8") as f:
+            with open(_gas_queue_path(), "a", encoding="utf-8") as f:
                 f.writelines(kept)
         except Exception as _e:
             log.debug(f"[GAS再送] キュー書き戻し失敗(黙殺): {_mask_secrets(_e)}")
@@ -610,14 +821,30 @@ _OBSERVATION_PNL_DELAY_SEC: int = 3600  # +60min 後に PnL を取得
 # _PENDING_OBSERVATIONS はメモリのみで、ボット停止/再起動で消えていた (+60分PnL・
 # Step0仮想exit が朝レポートに欠落)。ファイルにも保存し、起動時に読み戻して
 # 「+60分経過済み」分を履歴K線から算出→送信することで、停止/翌朝再起動でも回収する。
-_PENDING_OBS_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "pending_observations.jsonl"
-)
 _PENDING_OBS_LOCK = threading.Lock()
+
+
+def _pending_obs_path() -> str:
+    """pending観察の保存先（口座区分ごと）。
+
+    ★ v3.9.183: 本体スクリプトの隣に置いていた（配布前レビューの一致指摘）。
+      版の更新でフォルダごと差し替える運用で消え、git の追跡下にあるため
+      Bot 機の `git pull --ff-only` も止めていた。REAL/DEMO で1本を共有すると、
+      片方の除去処理がもう片方の観察を消す。
+    """
+    return _state_path("pending_observations.jsonl")
+
+
+def _pending_obs_migrate() -> None:
+    """旧い置き場所の pending観察を1度だけ引き継ぐ（best-effort）。"""
+    _migrate_state_file_once(
+        _pending_obs_path(),
+        _legacy_state_candidates("pending_observations.jsonl"), "観察永続化")
 
 
 def _persist_pending_obs(obs_id: str, info: dict) -> None:
     """pending観察を1行追記（再起動後の +60分PnL/Step0 回収用）。"""
+    _pending_obs_migrate()
     try:
         rec = {
             "obs_id":            obs_id,
@@ -630,7 +857,7 @@ def _persist_pending_obs(obs_id: str, info: dict) -> None:
             "entry":             info.get("entry"),   # ★ v3.9.98: 統合送信用の観察エントリ
         }
         with _PENDING_OBS_LOCK:
-            with open(_PENDING_OBS_PATH, "a", encoding="utf-8") as f:
+            with open(_pending_obs_path(), "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as _e:
         log.debug(f"[観察永続化] 追記失敗(黙殺): {_mask_secrets(_e)}")
@@ -638,28 +865,31 @@ def _persist_pending_obs(obs_id: str, info: dict) -> None:
 
 def _unpersist_pending_obs(obs_id: str) -> None:
     """処理済み（PnL送信に回した）pending観察をファイルから除去。"""
+    _pending_obs_migrate()
     try:
         with _PENDING_OBS_LOCK:
-            if not os.path.exists(_PENDING_OBS_PATH):
+            if not os.path.exists(_pending_obs_path()):
                 return
-            with open(_PENDING_OBS_PATH, "r", encoding="utf-8") as f:
+            with open(_pending_obs_path(), "r", encoding="utf-8") as f:
                 lines = f.readlines()
             _needle = f'"obs_id": "{obs_id}"'
             kept = [ln for ln in lines if _needle not in ln]
             if len(kept) != len(lines):
-                with open(_PENDING_OBS_PATH, "w", encoding="utf-8") as f:
-                    f.writelines(kept)
+                # ★ v3.9.183: 全上書きだと、書いている途中で落ちた回に
+                #   pending観察が丸ごと消える。一時ファイル→置換にする。
+                _atomic_write_text(_pending_obs_path(), "".join(kept))
     except Exception as _e:
         log.debug(f"[観察永続化] 除去失敗(黙殺): {_mask_secrets(_e)}")
 
 
 def _load_pending_observations() -> int:
     """起動時にファイルから pending観察を読み戻す。戻り値=読み込み件数。"""
+    _pending_obs_migrate()
     try:
-        if not os.path.exists(_PENDING_OBS_PATH):
+        if not os.path.exists(_pending_obs_path()):
             return 0
         with _PENDING_OBS_LOCK:
-            with open(_PENDING_OBS_PATH, "r", encoding="utf-8") as f:
+            with open(_pending_obs_path(), "r", encoding="utf-8") as f:
                 lines = [ln for ln in f.readlines() if ln.strip()]
         n = 0
         for ln in lines[-_PENDING_OBSERVATIONS_MAX:]:
@@ -7607,9 +7837,6 @@ _today_shadow_ovn: list[dict] = []        # ★ v3.9.137: 夜間持ち越し「�
 # なっていた (全件は Google シートに記録済みで、あくまで表示側の欠落)。当日分を
 # ファイルに保存し、起動時に同一 ET 日付なら読み戻してマージする。GAS 非依存・
 # 送信負荷ゼロ。ファイルは ET 日付が変われば自動で当日分に置き換わる。
-_TODAY_STATE_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "today_summary_state.json"
-)
 _TODAY_STATE_LOCK = threading.Lock()
 
 
@@ -7620,9 +7847,13 @@ def _today_state_path() -> str:
     復元で合算され、Discord の日次集計に両口座の損益が混ざっていた。
     OVN 状態ファイル（v3.9.145）と同じ REAL/DEMO 分割方式。旧単一ファイルは
     読み戻さない（表示専用のため、更新初日の同日復元だけが対象外になる）。
+
+    ★ v3.9.183: 置き場所を本体スクリプトの隣から `OVN_STATE_DIR` へ移した
+      （配布前レビューの一致指摘・状態の置き場所を1本化）。表示専用なので
+      旧い場所からの引き継ぎはしない——当日ぶんだけの短命なファイルで、
+      引き継がなくても失うのは更新当日の再起動時の復元だけ。
     """
-    _root, _ext = os.path.splitext(_TODAY_STATE_PATH)
-    return f"{_root}.{'REAL' if _RUN_TRADE_ENV == 'REAL' else 'DEMO'}{_ext}"
+    return _state_path("today_summary_state.json")
 
 
 def _save_today_state() -> None:
@@ -7635,11 +7866,10 @@ def _save_today_state() -> None:
             "shadow_momentum": _today_shadow_momentum,
         }
         with _TODAY_STATE_LOCK:
-            _path_ts = _today_state_path()
-            tmp = _path_ts + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False)
-            os.replace(tmp, _path_ts)
+            # ★ v3.9.183: flush も fsync もせずに置換していた（配布前レビュー指摘）。
+            #   電源断で当日サマリが空か途中で切れた状態になる。共通の書き手へ。
+            _atomic_write_text(_today_state_path(),
+                               json.dumps(state, ensure_ascii=False))
     except Exception as _e:
         log.debug(f"[当日サマリ永続化] 保存失敗(黙殺): {_mask_secrets(_e)}")
 
@@ -7699,15 +7929,11 @@ _ledger_broken: bool = False       # 台帳が読めなかった（＝建玉を�
 
 
 def _ledger_env_key(trd_env=None) -> str:
-    """台帳のキー（REAL / DEMO）。実口座とデモで分けて持つ。"""
-    try:
-        if trd_env is None:
-            return "REAL" if _RUN_TRADE_ENV == "REAL" else "DEMO"
-        if isinstance(trd_env, str):
-            return "REAL" if trd_env.strip().upper() == "REAL" else "DEMO"
-        return "REAL" if trd_env == TrdEnv.REAL else "DEMO"
-    except Exception:
-        return "REAL" if _RUN_TRADE_ENV == "REAL" else "DEMO"
+    """台帳のキー（REAL / DEMO）。実口座とデモで分けて持つ。
+
+    ★ v3.9.183: 判定そのものは _env_tag に1本化した（同じ式が6箇所にあった）。
+    """
+    return _env_tag(trd_env)
 
 
 def _ledger_init_mark_path(trd_env=None) -> str:
@@ -7788,12 +8014,9 @@ def _ledger_save() -> bool:
                     )
                     return False
                 _merged[_mine] = _position_ledger.get(_mine, {})
-                tmp = _LEDGER_PATH + f".tmp.{os.getpid()}"   # プロセスごとに分ける
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(_merged, f, ensure_ascii=False)
-                    f.flush()
-                    os.fsync(f.fileno())   # ★ v3.9.141: 停電・強制終了での消失を防ぐ
-                os.replace(tmp, _LEDGER_PATH)
+                # ★ v3.9.183: 共通の書き手へ（v3.9.141 の fsync はそちらが持つ）。
+                _atomic_write_text(_LEDGER_PATH,
+                                   json.dumps(_merged, ensure_ascii=False))
                 # 次回の読み込みと食い違わないよう、メモリ側も揃えておく
                 _position_ledger.update({k: v for k, v in _merged.items() if k != _mine})
             finally:
@@ -19800,9 +20023,11 @@ def _ovn_state_path() -> str:
     旧実装は単一パスで、REAL と DEMO のプロセスが同じ配置先を使うと、後から
     保存した側がもう一方の状態を丸ごと上書きした。読み直して書き戻す方式では
     競合の窓が残るため、ファイル自体を分けて競合の余地を消す。
+
+    ★ v3.9.183: 共通の `_state_path` へ（値は従来と同じ）。口座区分の判定を
+      写経していた6箇所のうちの1つだった。
     """
-    _root, _ext = os.path.splitext(OVN_STATE_FILE)
-    return f"{_root}.{'REAL' if _RUN_TRADE_ENV == 'REAL' else 'DEMO'}{_ext}"
+    return _state_path("ovn_state.json")
 
 
 def _ovn_load() -> dict:
@@ -19929,22 +20154,11 @@ def _ovn_save(st: dict) -> bool:
             st["acc_id"] = int(REAL_ACC_ID) if (_RUN_TRADE_ENV == "REAL" and REAL_ACC_ID) else 0
         except (TypeError, ValueError):
             pass
-        _path = _ovn_state_path()
-        tmp = _path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, _path)
-        # replace のディレクトリエントリも可能な環境では永続化する。
-        try:
-            dir_fd = os.open(os.path.dirname(_path), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except (AttributeError, OSError):
-            pass
+        # ★ v3.9.183: 共通の書き手へ（一時ファイル名にスレッドIDが入る・
+        #   ディレクトリの fsync もそちらが持つ）。ここは `.tmp` 固定名だったため、
+        #   同一プロセスの2つの書き手が互いの書きかけを消しうる状態だった。
+        _atomic_write_text(_ovn_state_path(),
+                           json.dumps(st, ensure_ascii=False, indent=2))
         _ovn_invalidate_owns_cache()   # ★ v3.9.159b: phase遷移を即キャッシュへ反映
         return True
     except Exception as e:
@@ -23051,6 +23265,23 @@ async def main(live: bool) -> None:
         pass
     _ledger_repair_ovn_absorption()   # ★ v3.9.162: 誤って取り込まれた OVN 建玉を外す
 
+    # ★ v3.9.183: 実行時の状態がどこに置かれたかを必ず1行残す（v3.9.160c の教訓——
+    #   `_bot_state_dir()` は書けない場所を黙って避けてフォールバックするので、
+    #   ログに証拠が無いと「配布フォルダの差し替えで消えた」に気づけない）。
+    try:
+        log.info(
+            f"[状態ファイル] 置き場所={OVN_STATE_DIR}"
+            f"  口座={_env_tag()}"
+            f"  台帳={os.path.basename(_LEDGER_PATH)}"
+            f"  夜間持ち越し={os.path.basename(_ovn_state_path())}"
+            f"  送信履歴={os.path.basename(_sent_history_path())}"
+            f"  再送キュー={os.path.basename(_gas_queue_path())}"
+            f"  観察={os.path.basename(_pending_obs_path())}"
+            f"  当日サマリ={os.path.basename(_today_state_path())}"
+        )
+    except Exception as _e_sp:
+        log.warning(f"[状態ファイル] 置き場所を記録できません: {_mask_secrets(_e_sp)}")
+
     # 起動時の最初の sync_positions より前に OVN 所有権を復元する。
     # 後回しにすると台帳に無い QQQ が外部建玉と誤通知される。
     # ★ v3.9.159: 判定結果に関わらず永続状態の中身を必ず1行残す（実機の早期決済
@@ -24419,142 +24650,43 @@ async def main(live: bool) -> None:
 #     同じフォルダで併走すると、**DEMO が送った日付を REAL が「送信済み」と
 #     誤判定し、REAL の集計が送られないまま追いかけにも乗らない**。
 #     _RUN_TRADE_ENV は実行時に決まるので、_ovn_state_path と同じく関数にする。
-_DATA_SENT_HISTORY_FILE = os.path.join(OVN_STATE_DIR, ".data_sent_history.json")
+_DATA_SENT_HISTORY_NAME = ".data_sent_history.json"
 
 
 def _sent_history_path() -> str:
     """送信履歴の保存先（REAL/DEMO で分ける）。"""
-    _root, _ext = os.path.splitext(_DATA_SENT_HISTORY_FILE)
-    return f"{_root}.{'REAL' if _RUN_TRADE_ENV == 'REAL' else 'DEMO'}{_ext}"
-
-# 旧い置き場所に履歴があれば、1度だけ引き継ぐ（引き継がないと7日ぶん送り直す）。
-#   ★ import 時に実行しない（外部レビュー指摘）。モジュールを読み込むだけで
-#     ファイルコピーが走り、検査のたびに実機の履歴が使い捨てフォルダへ入っていた。
-#     必要になったとき（＝履歴を読むとき）に1度だけ行う。
-_HIST_MIGRATED = False
-# ★ v3.9.182: 引き継ぎに失敗した回は「履歴を書かない」（配布前レビュー10レーンが
-#   一致して指摘・再現も取れた）。v3.9.181 は失敗しても _mark_date_sent がそのまま
-#   **空集合＋当日だけ**を保存先へ書いてしまい、以後は「保存先が在る」で
-#   短絡するため、旧履歴が永久に孤立していた（再試行の窓が同じ呼び出しで閉じる）。
-#   重複送信は GAS 側が生徒名＋日付で上書きするので無害、
-#   「送信済みの誤判定」は取り返しがつかない。安全側は前者。
-_HIST_MIGRATE_FAILED = False
-# 恒久的に失敗する原因（権限・非UTF-8の旧ファイル等）で無限に再試行しないための上限。
-#   ここに達したら引き継ぎを諦め、通常の記録を再開する（一度だけ最大7日を送り直す）。
-_HIST_MIGRATE_MAX_TRIES = 3
-_HIST_MIGRATE_TRIES = 0
-
-# ★ v3.9.181: 旧い置き場所の候補。**検査から差し替えられるようにモジュール変数にする**
-#   （外部レビュー指摘）。検査は _OVN_LEGACY_DIR を使い捨てへ向けて実状態を
-#   守っているが、この関数だけその防御を通っておらず、**検査が実機の履歴を
-#   使い捨てフォルダへ持ち去り、元に「済み」の印を付けていた**（実害を確認）。
-_HIST_LEGACY_PATHS: list = [
-    os.path.abspath(".data_sent_history.json"),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".data_sent_history.json"),
-]
+    return _state_path(_DATA_SENT_HISTORY_NAME)
 
 
-def _migrate_sent_history_once() -> None:
-    """旧パスの送信履歴を、現在の保存先へ1度だけ引き継ぐ。
+def _validate_sent_history(_text: str) -> None:
+    """引き継ぐ前に中身を確かめる。壊れていれば例外。"""
+    _parsed = json.loads(_text)
+    if not isinstance(_parsed, dict) or "sent_dates" not in _parsed:
+        raise ValueError("送信履歴の形式が違います（sent_dates が無い）")
 
-    ★ 探すのは cwd と本体スクリプトの隣の両方。cwd だけを見ると、
-      launchd 起動（cwd が変わる）でいちばん引き継ぎが要る環境を取り逃す。
-    ★ 書き込みは tmp → os.replace。直接コピーだと、書いている途中を
-      他プロセスが読んで壊れた JSON を掴む（_ovn_migrate_legacy_dir と同じ理由）。
-    ★ 引き継いだ元には印を付ける。付けないと、保存先を変えて戻したときに
-      古いスナップショットが「現在の状態」として復活する。
-    ★ v3.9.182: 印は**口座区分を付けない**（配布前レビュー10レーンが一致して指摘）。
-      旧ファイルは分割前のもので REAL/DEMO が混ざっている。区分ごとの印にすると
-      両方が同じファイルを相続し、**DEMO が送った日を REAL が「送信済み」と誤判定
-      する**——この分割で消したはずの欠陥が、版上げ直後の追いかけ窓にそのまま
-      残っていた。1つの印で1回だけ引き継ぎ、もう一方は空から始めて送り直す。
-      既に付いている区分つきの印も「引き継ぎ済み」として尊重する。
+
+def _sent_history_ready() -> bool:
+    """旧い置き場所の送信履歴を1度だけ引き継ぐ。戻り値は「書いてよいか」。
+
+    ★ 送信履歴だけは **False の間ぜったいに書かない**。書くと保存先ができて
+      しまい、次回の引き継ぎが「保存先が在る」で短絡して旧い履歴が永久に
+      孤立する（v3.9.181 で実際に起きた）。取り返しがつくのは重複送信の方
+      （GAS は生徒名＋日付で上書きする）で、「送信済みの誤判定」は戻せない。
     """
-    global _HIST_MIGRATED, _HIST_MIGRATE_FAILED, _HIST_MIGRATE_TRIES
-    if _HIST_MIGRATED:
-        return
-    if os.environ.get("BOT_SKIP_HISTORY_MIGRATION") == "1":
-        # ★ v3.9.182: 引き継ぎの停止スイッチ（配布前レビュー指摘）。
-        #   v3.9.181 の防御はモジュール変数（_HIST_LEGACY_PATHS）だけで、
-        #   **プロセス境界を越えない**。検査が起動する子プロセスは cwd が
-        #   リポジトリなので、実機の履歴を使い捨てフォルダへ持ち去り、元に
-        #   「済み」の印を付けていた（run_all.sh を回すたびに起きる）。
-        #   環境変数なら子プロセスまで届く。
-        return
-    _dst = _sent_history_path()
-    _tmp = ""
-    try:
-        if os.path.exists(_dst):
-            _HIST_MIGRATED = True      # 引き継ぎ済み。以後は見に行かない
-            _HIST_MIGRATE_FAILED = False
-            return
-        _dst_abs = os.path.abspath(_dst)
-        _HIST_MIGRATE_TRIES += 1
-        for _cand in [_DATA_SENT_HISTORY_FILE] + list(_HIST_LEGACY_PATHS):
-            if os.path.abspath(_cand) == _dst_abs or not os.path.exists(_cand):
-                continue
-            if any(os.path.exists(f"{_cand}.migrated_away{_sfx}")
-                   for _sfx in ("", ".REAL", ".DEMO")):
-                continue
-            # ★ v3.9.182: 中身を検証してから差し替える（配布前レビュー指摘）。
-            #   壊れた JSON をそのまま写すと、「引き継ぎました」と記録した上で
-            #   履歴が空になり、次の記録が当日だけで上書きしてしまう。
-            with open(_cand, "r", encoding="utf-8") as _fr:
-                _raw = _fr.read()
-            _parsed = json.loads(_raw)
-            if not isinstance(_parsed, dict) or "sent_dates" not in _parsed:
-                raise ValueError("送信履歴の形式が違います（sent_dates が無い）")
-            _tmp = f"{_dst}.tmp.{os.getpid()}.{threading.get_ident()}"
-            with open(_tmp, "w", encoding="utf-8") as _fw:
-                _fw.write(_raw)
-                _fw.flush()
-                os.fsync(_fw.fileno())
-            os.replace(_tmp, _dst)
-            _tmp = ""
-            # ★ 印は「引き継ぎに成功した後」だけ付ける。先に付けると、
-            #   途中で失敗したときに元が二度と読まれなくなる。
-            try:
-                with open(f"{_cand}.migrated_away", "w", encoding="utf-8") as _fm:
-                    _fm.write(_dst_abs)
-            except Exception as _e_mark:
-                # ★ v3.9.182: 黙って捨てない（配布前レビュー指摘）。印を置けないと
-                #   「保存先を戻したときに古い履歴が蘇る」防御が消える。
-                log.warning(f"[データ収集] 送信履歴の引き継ぎ印を置けません: {_e_mark}")
-            log.info(f"[データ収集] 送信履歴を引き継ぎました: {_cand} → {_dst_abs}")
-            _HIST_MIGRATED = True
-            _HIST_MIGRATE_FAILED = False
-            return
-        # 引き継ぐものが無かった。次回もう一度探す必要はない。
-        _HIST_MIGRATED = True
-        _HIST_MIGRATE_FAILED = False
-    except Exception as _e_hist:
-        # ★ v3.9.181: ここで _HIST_MIGRATED を立てない（外部レビュー Codex の指摘）。
-        #   一時的な入出力の失敗で二度と再試行しなくなり、その後1回でも送信が
-        #   成功すると**空集合＋当日だけ**を書き込んで旧履歴を失う。
-        #   失敗した回は次の呼び出しでもう一度試す。
-        if _HIST_MIGRATE_TRIES >= _HIST_MIGRATE_MAX_TRIES:
-            # ★ v3.9.182: 恒久的な失敗で永久に再試行しない（配布前レビュー指摘）。
-            #   起動時の追いかけ（7日）と再送ループ（120秒周期）から呼ばれるので、
-            #   上限が無いと警告とファイル入出力を延々と繰り返す。
-            _HIST_MIGRATED = True
-            _HIST_MIGRATE_FAILED = False
-            log.warning(
-                f"[データ収集] 送信履歴の引き継ぎを {_HIST_MIGRATE_TRIES} 回失敗したので"
-                f"諦めます（一度だけ最大7日ぶんを送り直します）: {_e_hist}")
-        else:
-            _HIST_MIGRATE_FAILED = True
-            log.warning(f"[データ収集] 送信履歴の引き継ぎに失敗（次回もう一度試します）: {_e_hist}")
-    finally:
-        if _tmp:
-            with _contextlib.suppress(OSError):
-                os.remove(_tmp)
+    return _migrate_state_file_once(
+        _sent_history_path(),
+        # 分割前（v3.9.181 の中間版）の同フォルダ 1本 → cwd → 本体の隣
+        [_state_path(_DATA_SENT_HISTORY_NAME, per_env=False)]
+        + _legacy_state_candidates(_DATA_SENT_HISTORY_NAME),
+        "データ収集", validate=_validate_sent_history)
+
 
 def _load_sent_dates() -> set:
     """送信済み日付（YYYY-MM-DD文字列）のセットを返す。存在しなければ空集合。"""
     # ★ v3.9.181: 書き換えと同じ錠を取る（外部レビュー指摘）。
     #   Windows では読み手がファイルを開いている間の os.replace が失敗する。
     with _SENT_HISTORY_LOCK:
-        _migrate_sent_history_once()
+        _sent_history_ready()
         try:
             with open(_sent_history_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -24583,20 +24715,23 @@ _SENT_HISTORY_LOCK = threading.RLock()
 
 def _mark_date_sent(date_str: str) -> None:
     """指定日付を送信済みとして記録。90日以上古いエントリは自動削除。"""
-    # ★ try の外で束縛する。中で作ると、それより前で例外が出たとき
-    #   except 側が未定義を参照する（同じ型の欠陥を3回作っている）。
-    # ★ v3.9.181: プロセスIDだけだと**同一プロセスの全スレッドで同じ名前**になり、
-    #   片方の後始末がもう片方の書きかけを消す（外部レビュー指摘）。スレッドIDも足す。
+    # ★ v3.9.183: 一時ファイルの作成・fsync・置換・後始末は _atomic_write_text に
+    #   集約した（同じ手順が7箇所に写経され、耐久性が3通りに割れていた）。
+    #   一時ファイル名にスレッドIDを入れる v3.9.181 の教訓もそちらが持つ。
     _dst = _sent_history_path()
-    _tmp = f"{_dst}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
         with _SENT_HISTORY_LOCK:
+            # ★ v3.9.183: 引き継ぎの判定を**読み出しより先**に行う。順番を逆に
+            #   すると、読み出しのあとで引き継ぎが成功した回に、引き継いだ内容を
+            #   直後の書き込みが上書きして消す（検査で検出）。
+            _ok = _sent_history_ready()
             sent = _load_sent_dates()
-            if _HIST_MIGRATE_FAILED:
+            if not _ok:
                 # ★ v3.9.182: 引き継ぎに失敗している間は保存先を作らない。
                 #   作ると次回の引き継ぎが「保存先が在る」で短絡し、旧履歴が
                 #   永久に孤立する（配布前レビュー10レーンが一致して指摘）。
                 #   記録しそこねた日は、次の起動の追いかけで送り直される。
+                #   ★ v3.9.183: 判定は共通の引き継ぎ機構へ移した。
                 log.warning(
                     f"[データ収集] 送信履歴を引き継げていないため {date_str} の記録は"
                     f"見送ります（旧い履歴を失わないため・次回もう一度引き継ぎます）")
@@ -24608,18 +24743,10 @@ def _mark_date_sent(date_str: str) -> None:
             cutoff = (datetime.datetime.now(ZoneInfo("America/New_York")).date()
                       - _td(days=90)).strftime("%Y-%m-%d")
             sent = {d for d in sent if d >= cutoff}
-            with open(_tmp, "w", encoding="utf-8") as f:
-                json.dump({"sent_dates": sorted(sent)}, f, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(_tmp, _dst)
+            _atomic_write_text(
+                _dst, json.dumps({"sent_dates": sorted(sent)}, ensure_ascii=False))
     except Exception as e:
         log.warning(f"[データ収集] 送信履歴保存エラー: {e}")
-    finally:
-        # ★ v3.9.181: 後始末は必ず通す（成功時は os.replace が名前を消費済みで無害）。
-        #   例外の枝だけに置くと、強制終了で書きかけが残り続ける。
-        with _contextlib.suppress(OSError):
-            os.remove(_tmp)
 
 # ── ★ v3.9.48: ログ + logbackup/ アーカイブ統合スキャン ──────────────────────
 # 旧版 (v3.9.47 以前) の find_unsent_trading_dates / run_daily_data_collect は
