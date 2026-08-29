@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.184"
+BOT_VERSION = "v3.9.185"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -5424,7 +5424,19 @@ _alpaca_news_health: Dict[str, Any] = {
     "connected_at": None,
     # ★ v3.9.184: 「受信なし・要確認」の間引き用（30分に1回）
     "last_quiet_warn_at": None,
+    # ★ v3.9.185: 再接続の回数（配布前レビュー指摘）。10秒周期で切断・再接続を
+    #   繰り返す本物のフラッピングでも、5分おきの見回りでは**たいてい接続済みに
+    #   見える**ため、「接続は継続中」と事実と違う文面が出続けていた。
+    "reconnects": 0,
 }
+# ★ v3.9.185: 接続が生きていても、この分数を越えて1件も来なければ障害として扱う
+#   （配布前レビュー指摘）。購読権限が切れて配信が止まった場合、ソケットは開いた
+#   ままなので「接続は生きている」だけを根拠にすると 🚨 が二度と出ない。
+#   認定サポーター2名が誤検知を踏んだのは 20〜21分・復帰は8〜52秒だったので、
+#   60分なら誤検知を戻さずに番兵を復活できる。
+_ALPACA_STALE_ERROR_MIN = 60
+# 直近1時間にこの回数を越えて再接続していたらフラッピングとみなす
+_ALPACA_FLAP_RECONNECTS = 3
 _FINNHUB_URL         = "https://finnhub.io/api/v1/news"
 _FINNHUB_QUOTE_URL   = "https://finnhub.io/api/v1/quote"
 
@@ -7716,12 +7728,23 @@ def close_all_for_weekend(trd_env: TrdEnv,
         #   決済対象の有無にかかわらず区切りは知らせる。
         #   再試行の回は送らない（同文が何度も飛ぶのを防ぐ・下の分岐と同じ扱い）。
         if is_weekly:
-            log.warning(f"[{log_prefix}] 🏁 週末・休場前の停止（決済対象なし）")
+            # ★ v3.9.185: 「建玉ゼロ」と断定しない（配布前レビュー指摘）。
+            #   この分岐は「夜間持ち越し・Bot 以外の建玉を除いた結果 targets が空」
+            #   でも通る。金曜 15:45 ET に OVN が QQQ を持ち越していれば口座には
+            #   建玉が残っており、断定すると v3.9.145 が移行前全決済の経路で
+            #   解消した矛盾（口座に株があるのに「全決済」）がここで再発する。
+            _kept = ("、".join(_skipped_owned) if _skipped_owned else "")
+            log.warning(
+                f"[{log_prefix}] 🏁 週末・休場前の停止（決済対象なし"
+                + (f"／対象外: {_kept}" if _kept else "") + "）")
             if "再試行" not in str(reason or ""):
                 _threadsafe_discord(
                     "[Bot] 🏁 週末・休場前の停止\n"
-                    "決済対象の建玉はありませんでした（すでに建玉ゼロ）\n"
-                    "ニュース取得・発注を停止し、次のプリマーケットまで待機します\n"
+                    + ("決済の対象になる建玉はありませんでした\n"
+                       f"（夜間持ち越し・Bot 以外の建玉 {_kept} はそのまま保有します）\n"
+                       if _kept else
+                       "決済対象の建玉はありませんでした（すでに建玉ゼロ）\n")
+                    + "ニュース取得・発注を停止し、次のプリマーケットまで待機します\n"
                     "（プリマーケットを「発注しない」設定にしている場合は次の 09:30 ET まで）"
                 )
         # ★ v3.9.141: 決済すべきものが無い＝成功。裸の return（None=偽）のままだと、
@@ -19842,6 +19865,10 @@ async def alpaca_news_loop(
                     #   22:24:05 に誤警告)。
                     _alpaca_news_health["last_success_at"] = datetime.datetime.now()
                     _alpaca_news_health["last_error"] = ""
+                    # ★ v3.9.185: 受信できた＝この接続は生きている。フラッピングの
+                    #   カウンタを戻す（戻さないと、一度荒れた環境が復旧しても
+                    #   静かな時間帯のたびに 🚨 が出続ける）。
+                    _alpaca_news_health["reconnects"] = 0
                     # market_open_event がクリアされたら受信は続けるが AI判定はスキップ
                     articles = json.loads(raw_msg)
                     if not isinstance(articles, list):
@@ -19977,6 +20004,11 @@ async def alpaca_news_loop(
             log.warning(f"[Alpaca News] 接続エラー・再接続待機 ({_RECONNECT_WAIT}秒): {_mask_secrets(e)}")
             # ★ v3.9.31: 接続エラーも健全性状態に記録 (health_warning_loop が参照)
             _alpaca_news_health["last_error"] = f"接続エラー {_mask_secrets(e)}"[:120]
+            if _alpaca_news_health.get("connected_at") is not None:
+                # ★ v3.9.185: 「つながっていたのに切れた」回だけ数える
+                #   （接続前の失敗を数えるとフラッピングと区別できない）。
+                _alpaca_news_health["reconnects"] = int(
+                    _alpaca_news_health.get("reconnects", 0)) + 1
             _alpaca_news_health["connected_at"] = None   # ★ v3.9.184: 切れた
             await asyncio.sleep(_RECONNECT_WAIT)
 
@@ -21548,7 +21580,19 @@ async def health_warning_loop() -> None:
                 #     ・認証が3回以上失敗、または接続が切れている → 本物の障害（ERROR）
                 #     ・接続は生きていて受信だけが無い → 要確認（WARNING）
                 _connected = _h.get("connected_at") is not None
-                _alpaca_bad = (_auth_fails >= 3) or (_stale and not _connected)
+                # ★ v3.9.185: 接続が生きていることを免罪符にしない（配布前レビュー指摘）。
+                #   (a) 購読権限が切れて配信が止まると、ソケットは開いたままなので
+                #       「接続は生きている」だけを根拠にすると 🚨 が二度と出ない
+                #   (b) 10秒周期のフラッピングは、5分おきの見回りではたいてい
+                #       接続済みに見える
+                #   時間で必ずエスカレートさせ、再接続の連発も拾う。
+                _long_stale = (_stale_min is not None
+                               and _stale_min >= _ALPACA_STALE_ERROR_MIN)
+                _flapping = int(_h.get("reconnects", 0)) >= _ALPACA_FLAP_RECONNECTS
+                _alpaca_bad = ((_auth_fails >= 3)
+                               or (_stale and not _connected)
+                               or _long_stale
+                               or (_stale and _flapping))
                 _alpaca_quiet = _stale and _connected and not _alpaca_bad
                 if _alpaca_quiet:
                     # 受信が無いだけ。売買・集計に実害は無いので、事実だけを残す。
@@ -21558,8 +21602,10 @@ async def health_warning_loop() -> None:
                         _alpaca_news_health["last_quiet_warn_at"] = _now_q
                         log.warning(
                             f"[Alpaca News] {_stale_min:.0f}分 受信なし・要確認"
-                            f"（接続は継続中・切断/認証失敗は検知していません）。"
-                            f"ニュースの少ない時間帯であれば正常です"
+                            f"（接続は継続中・切断/認証失敗は検知していません／"
+                            f"再接続 {int(_h.get('reconnects', 0))}回）。"
+                            f"ニュースの少ない時間帯であれば正常です。"
+                            f"{_ALPACA_STALE_ERROR_MIN}分を越えたら障害として扱います"
                             f"（この警告は30分ごと）"
                         )
                 if _alpaca_bad:
@@ -21574,7 +21620,8 @@ async def health_warning_loop() -> None:
                     log.error(
                         f"{_RED}{_BOLD}[Alpaca News] 🚨 接続不全: "
                         f"最終受信 {_stale_disp} / 認証失敗 {_auth_fails}回 / "
-                        f"接続 {'継続中' if _connected else '切断'} / 直近: {_err}\n"
+                        f"接続 {'継続中' if _connected else '切断'} / "
+                        f"再接続 {int(_h.get('reconnects', 0))}回 / 直近: {_err}\n"
                         f"  → Alpaca の APIキー/購読を確認してください "
                         f"(未設定でも RSS/Finnhub で稼働継続・本警告は5分ごと){_RESET}"
                     )
