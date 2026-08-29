@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.185"
+BOT_VERSION = "v3.9.186"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -5437,6 +5437,54 @@ _alpaca_news_health: Dict[str, Any] = {
 _ALPACA_STALE_ERROR_MIN = 60
 # 直近1時間にこの回数を越えて再接続していたらフラッピングとみなす
 _ALPACA_FLAP_RECONNECTS = 3
+# 受信が途切れたと見なす分数（ここを越えると「静かなだけ」の扱いに入る）
+_ALPACA_STALE_MIN = 20
+
+
+def _alpaca_health_verdict(health: dict, now=None) -> tuple:
+    """Alpaca News の健全性を判定する。戻り値は (判定, 無受信の分数, 接続の有無)。
+
+    判定は "bad"（🚨 接続不全）/ "quiet"（受信なし・要確認）/ ""（正常）。
+
+    ★ v3.9.186: **見回りループの中に埋め込んでいた条件を、そのまま外に出した**
+      （動きは変えていない）。埋め込んだままだと時間の経過を作れないので、
+      検査がソースの文字列を見るだけになり、**判定そのものを一度も動かせて
+      いなかった**。v3.9.184 で番兵を弱めすぎた欠陥は、その形の検査を
+      すり抜けている（配布前レビューが指摘）。
+
+    判定の考え方:
+      ・認証が3回以上連続で失敗 → 本物の障害
+      ・受信が途切れていて、接続も切れている → 本物の障害
+      ・受信が途切れていて、切断・再接続を繰り返している → 本物の障害
+        （10秒周期のフラッピングは、5分おきの見回りではたいてい接続済みに
+        見えるため、接続の有無だけでは拾えない）
+      ・接続の有無にかかわらず、無受信が _ALPACA_STALE_ERROR_MIN を越えた → 本物の障害
+        （購読権限が切れて配信が止まってもソケットは開いたままなので、
+        接続が生きていることを免罪符にすると 🚨 が二度と出ない）
+      ・接続は生きていて受信だけが無い → 要確認にとどめる
+        （認定サポーター2名が踏んだ誤検知はこれ。同じ夜に別環境で発生し、
+        復帰は8〜52秒。3人目の環境では同時刻に受信が続いていた）
+    """
+    _now = now or datetime.datetime.now()
+    _last_ok = health.get("last_success_at")
+    _stale_min = None
+    if _last_ok is not None:
+        _stale_min = (_now - _last_ok).total_seconds() / 60
+    _connected = health.get("connected_at") is not None
+    _auth_fails = int(health.get("auth_fail_count", 0) or 0)
+    _stale = (_stale_min is not None and _stale_min >= _ALPACA_STALE_MIN)
+    _long_stale = (_stale_min is not None
+                   and _stale_min >= _ALPACA_STALE_ERROR_MIN)
+    _flapping = int(health.get("reconnects", 0) or 0) >= _ALPACA_FLAP_RECONNECTS
+    _bad = ((_auth_fails >= 3)
+            or (_stale and not _connected)
+            or _long_stale
+            or (_stale and _flapping))
+    if _bad:
+        return "bad", _stale_min, _connected
+    if _stale and _connected:
+        return "quiet", _stale_min, _connected
+    return "", _stale_min, _connected
 _FINNHUB_URL         = "https://finnhub.io/api/v1/news"
 _FINNHUB_QUOTE_URL   = "https://finnhub.io/api/v1/quote"
 
@@ -21567,33 +21615,9 @@ async def health_warning_loop() -> None:
             ):
                 _h = _alpaca_news_health
                 _auth_fails = _h.get("auth_fail_count", 0)
-                _last_ok    = _h.get("last_success_at")
-                _stale_min  = None
-                if _last_ok is not None:
-                    _stale_min = (datetime.datetime.now() - _last_ok).total_seconds() / 60
-                _stale = (_stale_min is not None and _stale_min >= 20)
-                # ★ v3.9.184: 「受信が20分無い」だけで接続不全と断じない
-                #   （認定サポーター2名の指摘・同じ夜に別環境で発生し、52秒/8秒で復帰。
-                #   3人目の環境では同時刻に受信が続いており警告も出ていない）。
-                #   切断も認証失敗も無いのに受信だけが途切れている状態は、
-                #   ニュースが静かなだけのことがある。**接続が生きているか**で分ける:
-                #     ・認証が3回以上失敗、または接続が切れている → 本物の障害（ERROR）
-                #     ・接続は生きていて受信だけが無い → 要確認（WARNING）
-                _connected = _h.get("connected_at") is not None
-                # ★ v3.9.185: 接続が生きていることを免罪符にしない（配布前レビュー指摘）。
-                #   (a) 購読権限が切れて配信が止まると、ソケットは開いたままなので
-                #       「接続は生きている」だけを根拠にすると 🚨 が二度と出ない
-                #   (b) 10秒周期のフラッピングは、5分おきの見回りではたいてい
-                #       接続済みに見える
-                #   時間で必ずエスカレートさせ、再接続の連発も拾う。
-                _long_stale = (_stale_min is not None
-                               and _stale_min >= _ALPACA_STALE_ERROR_MIN)
-                _flapping = int(_h.get("reconnects", 0)) >= _ALPACA_FLAP_RECONNECTS
-                _alpaca_bad = ((_auth_fails >= 3)
-                               or (_stale and not _connected)
-                               or _long_stale
-                               or (_stale and _flapping))
-                _alpaca_quiet = _stale and _connected and not _alpaca_bad
+                _verdict, _stale_min, _connected = _alpaca_health_verdict(_h)
+                _alpaca_bad   = (_verdict == "bad")
+                _alpaca_quiet = (_verdict == "quiet")
                 if _alpaca_quiet:
                     # 受信が無いだけ。売買・集計に実害は無いので、事実だけを残す。
                     _now_q = datetime.datetime.now()
