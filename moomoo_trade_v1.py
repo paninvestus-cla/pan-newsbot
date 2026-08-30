@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.187"
+BOT_VERSION = "v3.9.188"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -20646,6 +20646,76 @@ def _ovn_new_cycle(st: dict) -> None:
     _ovn_clear_ambiguous(st)
 
 
+def _ovn_buy_fill_avg(trd_env, oid: str, want_qty: int) -> float:
+    """OVN の買い注文の実約定単価。取れなければ 0.0。
+
+    ★ v3.9.188: 建値が発注直前の気配のまま残っていた（認定サポーター3環境の実測・
+      2026-08-30。ovn_state と証券会社アプリの取得単価が 0.022〜0.05 ずれ、
+      いずれも「気配のほうが安い」同じ向き）。v3.9.140 の上書きは日中ロジックの
+      avg_cost に頼っていたが、OVN 建玉は日中ロジックから切り離されており
+      （ovn_held）、そこが更新される経路が実質無い。
+      売り側 v3.9.181（_ovn_sell_fill_avg）と同じく、注文照会の dealt_avg_price
+      を直接取る。買いの約定確認は発注と同日なので期間つき照会で足りるが、
+      売り側と同様に空なら期間なしでもう一度だけ引く。
+    """
+    if not oid:
+        return 0.0
+    _now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
+    _kw = {"start": _now_et.strftime("%Y-%m-%d 00:00:00"),
+           "end":   _now_et.strftime("%Y-%m-%d 23:59:59")}
+    try:
+        with _trade_ctx() as ctx:
+            _acc = (REAL_ACC_ID if trd_env == TrdEnv.REAL else 0)
+            ret, df = ctx.order_list_query(
+                trd_env=trd_env, order_id=str(oid), acc_id=_acc, **_kw)
+            if ret != RET_OK or df is None or not _df_has_rows(df):
+                ret, df = ctx.order_list_query(
+                    trd_env=trd_env, order_id=str(oid), acc_id=_acc)
+            if ret != RET_OK or df is None or not _df_has_rows(df):
+                return 0.0
+            for _k in range(len(df)):
+                _r = df.iloc[_k]
+                if str(_r.get("order_id", "")) != str(oid):
+                    continue
+                _d = int(float(_r.get("dealt_qty", 0) or 0))
+                _p = float(_r.get("dealt_avg_price", 0) or 0)
+                # 見えた株数が保有株数と食い違うなら使わない（部分約定の平均を
+                # 全株の建値にしない・売り側 v3.9.181 と同じ守り）
+                if _d > 0 and _p > 0 and (want_qty <= 0 or _d == want_qty):
+                    return _p
+                return 0.0
+    except Exception as e:
+        log.debug(f"[夜間持ち越し] 買いの実約定単価を取得できません(黙殺): {_mask_secrets(e)}")
+    return 0.0
+
+
+def _ovn_fix_entry_price(trd_env, st: dict, pos: int) -> None:
+    """建値（entry_price）を実約定単価に補正する。約定確認で HELD にした直後に呼ぶ。
+
+    第一候補: 注文照会の dealt_avg_price（_ovn_buy_fill_avg）
+    第二候補: 日中ロジックの avg_cost（従来 v3.9.140 の経路・残してある）
+    どちらも取れなければ気配のまま——**取れなかったことをログに1行残す**
+    （従来は except pass で無言だった・認定サポーターの指摘 2026-08-30）。
+    """
+    _fill = _ovn_buy_fill_avg(trd_env, str(st.get("buy_oid", "") or ""), pos)
+    if _fill <= 0:
+        try:
+            _ts_ovn = state.get(OVN_SYMBOL)
+            if getattr(_ts_ovn, "avg_cost", 0) > 0:
+                _fill = float(_ts_ovn.avg_cost)
+        except Exception:
+            pass
+    if _fill > 0:
+        _old = st.get("entry_price")
+        st["entry_price"] = round(float(_fill), 4)
+        if _old != st["entry_price"]:
+            log.info(f"[夜間持ち越し] 建値を実約定単価に補正しました: "
+                     f"{_old} → {st['entry_price']}")
+    else:
+        log.info("[夜間持ち越し] 実際の取得単価を取得できませんでした。"
+                 f"建値は発注直前の気配のままです（entry_price={st.get('entry_price')}）")
+
+
 def _ovn_sell_fill_avg(trd_env, st: dict) -> float:
     """OVN の売り注文の、実約定単価（株数で加重した平均）を返す。取れなければ 0.0。
 
@@ -21005,13 +21075,9 @@ async def ovn_overnight_loop(trd_env) -> None:
                         f"[夜間持ち越し] ✅ [約定確認] QQQ {pos}株 保有を確認しました"
                         f"（orderId={st.get('buy_oid', '不明')}）"
                     )
-                    # ★ v3.9.140: 実際の取得単価が取れたら建値を上書きする（記録の精度）
-                    try:
-                        _ts_ovn = state.get(OVN_SYMBOL)
-                        if getattr(_ts_ovn, "avg_cost", 0) > 0:
-                            st["entry_price"] = round(float(_ts_ovn.avg_cost), 4)
-                    except Exception:
-                        pass
+                    # ★ v3.9.188: 建値を実約定単価に補正（従来 v3.9.140 は日中ロジックの
+                    #   avg_cost 頼みで実質効かず、気配が最終記録になっていた）
+                    await asyncio.to_thread(_ovn_fix_entry_price, trd_env, st, pos)
                     _ovn_save(st)
                 elif pos == 0:
                     # ★ v3.9.148 (A-3): 建玉照会は「本当にゼロ」と「空応答」を同じ 0 で
@@ -21023,6 +21089,8 @@ async def ovn_overnight_loop(trd_env) -> None:
                         pos2, ids2, pdetail2 = await asyncio.to_thread(_ovn_position, trd_env)
                         if pos2 > 0:
                             st.update(phase="HELD", qty=pos2, position_ids=ids2)
+                            # ★ v3.9.188: この経路でも建値を実約定単価に補正する
+                            await asyncio.to_thread(_ovn_fix_entry_price, trd_env, st, pos2)
                             log.info(
                                 f"[夜間持ち越し] 建玉ゼロは一時的な応答でした"
                                 f"（再照会 {pos2}株・約定 {dealt}株）→ 保有として続行"
