@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.188"
+BOT_VERSION = "v3.9.189"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -5413,8 +5413,14 @@ _alpaca_news_health: Dict[str, Any] = {
     "last_success_at": None,   # 最後に正常認証/受信した時刻 (datetime)
     "auth_fail_count": 0,      # 連続認証失敗回数
     "last_error":      "",     # 直近エラーの概要
-    # ★ v3.9.51: 警告の最終発火時刻 (非 RTH の 60 分間隔抑制用)
-    "last_warning_at": None,
+    # ★ v3.9.189: 「非 RTH は 60 分間隔へ間引く」ための last_warning_at を外した。
+    #   書き込むだけで**どこからも読んでいなかった**（認定サポーターの指摘）。
+    #   v3.9.51 当時は 20 分の無受信でも 🚨 が出ていたので間引く意味があったが、
+    #   v3.9.184〜186 で誤検知の側（接続の生死・60分のしきい値）を塞いだため、
+    #   いま 🚨 が出るのは本物の障害だけになった。本物を 5 分ごとに出し続けるのは
+    #   sync_positions・クレジット切れと同じ意図した動作なので、間引きは入れない。
+    #   認定サポーターの実測（プレ帯の最大空白 13〜22分・5日間で60分超ゼロ・
+    #   受信 300〜390件/日）が、間引きの実害が無いことの裏づけ。
     # ★ v3.9.184: 接続が生きているか（認定サポーター2名の指摘）。
     #   受信間隔だけで「接続不全」と断じていたため、**ニュースが静かなだけの
     #   時間帯**を障害と誤判定していた（同じ夜に2環境で発生し、52秒/8秒で復帰。
@@ -7970,11 +7976,28 @@ def _today_state_path() -> str:
     読み戻さない（表示専用のため、更新初日の同日復元だけが対象外になる）。
 
     ★ v3.9.183: 置き場所を本体スクリプトの隣から `OVN_STATE_DIR` へ移した
-      （配布前レビューの一致指摘・状態の置き場所を1本化）。表示専用なので
-      旧い場所からの引き継ぎはしない——当日ぶんだけの短命なファイルで、
-      引き継がなくても失うのは更新当日の再起動時の復元だけ。
+      （配布前レビューの一致指摘・状態の置き場所を1本化）。
+    ★ v3.9.189: 旧い場所から引き継ぐようにした（認定サポーターの指摘）。
+      v3.9.183 では「表示専用の短命なファイルなので引き継がない」としたが、
+      その根拠は「版の差し替えはセッション外に行う」という前提だった。
+      **取引セッションの最中に差し替えた日は、差し替え前に約定していた分が
+      その日の Discord 日次集計から丸ごと落ちる。** 手順で守る設計は手順を
+      守らない場合に破れるので、仕組みの側で引き継ぐ。
+      シートの数字には影響しない（GAS へ送る集計はログ行から組み立てるため）。
     """
     return _state_path("today_summary_state.json")
+
+
+def _today_state_ready() -> bool:
+    """当日サマリを旧い置き場所から1度だけ引き継ぐ（best-effort）。
+
+    引き継ぎに失敗しても書き込みは止めない。表示専用で、失うのは
+    その日の復元だけ（送信履歴と違い「送信済みの誤判定」は起きない）。
+    """
+    return _migrate_state_file_once(
+        _today_state_path(),
+        _legacy_state_candidates(_env_suffixed_path("today_summary_state.json")),
+        "当日サマリ")
 
 
 def _save_today_state() -> None:
@@ -7986,6 +8009,7 @@ def _save_today_state() -> None:
             "shadow_short":    _today_shadow_short,
             "shadow_momentum": _today_shadow_momentum,
         }
+        _today_state_ready()   # ★ v3.9.189: 旧い置き場所から1度だけ引き継ぐ
         with _TODAY_STATE_LOCK:
             # ★ v3.9.183: flush も fsync もせずに置換していた（配布前レビュー指摘）。
             #   電源断で当日サマリが空か途中で切れた状態になる。共通の書き手へ。
@@ -8000,6 +8024,7 @@ def _load_today_state() -> int:
     global _today_trades, _today_trades_date
     global _today_shadow_short, _today_shadow_momentum
     try:
+        _today_state_ready()   # ★ v3.9.189: 読む前に引き継ぐ（差し替え当日の復元）
         _path_ts = _today_state_path()
         if not os.path.exists(_path_ts):
             return 0
@@ -21686,10 +21711,10 @@ async def health_warning_loop() -> None:
             #   が market_open_event.wait() で意図的に WebSocket を停止している。
             #   この間は「正常受信なし」が当然の状態なので、誤警告を出さない
             #   よう market_open_event.is_set() を必須条件に追加した。
-            # ★ v3.9.51: 警告頻度をセッション別に分岐 + 表示を 1 行のコンパクト形式に変更。
-            #   RTH 中はニュース流量が多い → 5 分間隔の警告を維持 (本物の異常を素早く検知)
-            #   RTH 外 (プリ/アフター) はニュース流量が少なく沈黙は正常範囲 → 60 分間隔に間引き
-            #   表示も大きな ASCII アート枠から WARNING 1 行に変更し、ログを汚さないように。
+            # ★ v3.9.51: 表示を大きな ASCII アート枠から WARNING 1 行に変更し、ログを汚さない。
+            #   ★ v3.9.189: 同じ注記にあった「RTH 外は 60 分間隔へ間引く」は外した。
+            #     実装されていないうえ、いまは 🚨 が本物の障害でしか出ないので不要
+            #     （経緯は _alpaca_news_health の定義側に書いた）。
             if (
                 ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY
                 and market_open_event.is_set()
@@ -21743,7 +21768,6 @@ async def health_warning_loop() -> None:
                             )
                         except Exception as _e_disc:
                             log.debug(f"[Alpaca News] 30分Discord通知失敗: {_e_disc}")
-                    _alpaca_news_health["last_warning_at"] = _now
 
             # ── ③ sync_positions 連続失敗 (OpenD/ネットワーク不安定) ★v3.9.77 B-4 ──
             #   端末は赤字で 5 分おき / Discord は 30 分おき。成功で自動解除。
