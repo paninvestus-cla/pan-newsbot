@@ -5413,7 +5413,7 @@ _alpaca_news_health: Dict[str, Any] = {
     "last_success_at": None,   # 最後に正常認証/受信した時刻 (datetime)
     "auth_fail_count": 0,      # 連続認証失敗回数
     "last_error":      "",     # 直近エラーの概要
-    # ★ v3.9.189: 「非 RTH は 60 分間隔へ間引く」ための last_warning_at を外した。
+    # ★ v3.9.189: セッション別に警告を間引くための last_warning_at を外した。
     #   書き込むだけで**どこからも読んでいなかった**（認定サポーターの指摘）。
     #   v3.9.51 当時は 20 分の無受信でも 🚨 が出ていたので間引く意味があったが、
     #   v3.9.184〜186 で誤検知の側（接続の生死・60分のしきい値）を塞いだため、
@@ -7988,6 +7988,28 @@ def _today_state_path() -> str:
     return _state_path("today_summary_state.json")
 
 
+def _today_state_handover_pending() -> bool:
+    """当日サマリの引き継ぎがまだ済んでいないか。**引き継ぎ自体は走らせない。**
+
+    ★ v3.9.189c: 保存の側はこれを見て、済んでいない間は書かない
+      （配布前レビュー Codex の指摘）。書くと保存先ができてしまい、次回の
+      引き継ぎが `os.path.exists(_dst)` で「済み」と短絡するため、旧ファイルが
+      **永久に孤立**する。一時的な入出力の失敗で起動時の引き継ぎが落ちた回に、
+      その後の決済で保存が走るだけで起きる。
+
+      保存の側で引き継ぎを**走らせて**はいけない（同レビューの別指摘）。
+      成功した直後にその場の書き込みが上書きして消すため。
+      「走らせない・済むまで書かない」の両方が要る。
+
+    引き継ぎの記録が無い（＝一度も試していない）ときは False を返す。
+    起動時に main が必ず _load_today_state を呼ぶので、保存が走る時点では
+    必ず記録がある。
+    """
+    with _STATE_MIGRATE_LOCK:
+        _m = _STATE_MIGRATIONS.get(_today_state_path())
+        return bool(_m) and not _m.get("done")
+
+
 def _today_state_ready() -> bool:
     """当日サマリを旧い置き場所から1度だけ引き継ぐ（best-effort）。
 
@@ -8009,6 +8031,13 @@ def _save_today_state() -> None:
             "shadow_short":    _today_shadow_short,
             "shadow_momentum": _today_shadow_momentum,
         }
+        # ★ v3.9.189c: 引き継ぎが済んでいない間は書かない（配布前レビュー Codex の指摘）。
+        #   書くと保存先ができてしまい、次回の引き継ぎが「保存先が在る」で短絡して
+        #   旧ファイルが永久に孤立する。表示専用なので、書かずに見送るほうが軽い。
+        if _today_state_handover_pending():
+            log.debug("[当日サマリ] 引き継ぎが済んでいないため保存を見送ります"
+                      "（旧い記録を失わないため・次の起動でもう一度引き継ぎます）")
+            return
         # ★ v3.9.189b: **保存の側では引き継がない**（配布前レビュー指摘）。
         #   引き継ぎは「読み戻して復元する」ために行うもので、保存の直前に走らせると
         #   引き継いだ内容をその場の書き込みが上書きして消す。
@@ -21719,7 +21748,7 @@ async def health_warning_loop() -> None:
             #   この間は「正常受信なし」が当然の状態なので、誤警告を出さない
             #   よう market_open_event.is_set() を必須条件に追加した。
             # ★ v3.9.51: 表示を大きな ASCII アート枠から WARNING 1 行に変更し、ログを汚さない。
-            #   ★ v3.9.189: 同じ注記にあった「RTH 外は 60 分間隔へ間引く」は外した。
+            #   ★ v3.9.189: 同じ注記にあったセッション別の間引きの記述は外した。
             #     実装されていないうえ、いまは 🚨 が本物の障害でしか出ないので不要
             #     （経緯は _alpaca_news_health の定義側に書いた）。
             if (
