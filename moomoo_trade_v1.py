@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.189"
+BOT_VERSION = "v3.9.189d"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -7988,33 +7988,26 @@ def _today_state_path() -> str:
     return _state_path("today_summary_state.json")
 
 
-def _today_state_handover_pending() -> bool:
-    """当日サマリの引き継ぎがまだ済んでいないか。**引き継ぎ自体は走らせない。**
-
-    ★ v3.9.189c: 保存の側はこれを見て、済んでいない間は書かない
-      （配布前レビュー Codex の指摘）。書くと保存先ができてしまい、次回の
-      引き継ぎが `os.path.exists(_dst)` で「済み」と短絡するため、旧ファイルが
-      **永久に孤立**する。一時的な入出力の失敗で起動時の引き継ぎが落ちた回に、
-      その後の決済で保存が走るだけで起きる。
-
-      保存の側で引き継ぎを**走らせて**はいけない（同レビューの別指摘）。
-      成功した直後にその場の書き込みが上書きして消すため。
-      「走らせない・済むまで書かない」の両方が要る。
-
-    引き継ぎの記録が無い（＝一度も試していない）ときは False を返す。
-    起動時に main が必ず _load_today_state を呼ぶので、保存が走る時点では
-    必ず記録がある。
-    """
-    with _STATE_MIGRATE_LOCK:
-        _m = _STATE_MIGRATIONS.get(_today_state_path())
-        return bool(_m) and not _m.get("done")
-
-
 def _today_state_ready() -> bool:
     """当日サマリを旧い置き場所から1度だけ引き継ぐ（best-effort）。
 
-    引き継ぎに失敗しても書き込みは止めない。表示専用で、失うのは
-    その日の復元だけ（送信履歴と違い「送信済みの誤判定」は起きない）。
+    ★ v3.9.189d: **引き継ぎに失敗しても保存は止めない**（配布前レビュー10レーンの
+      一致指摘を受けた再設計）。GAS 再送キュー（_gas_queue_migrate）と同じ選択で、
+      理由も同じ形です。
+
+      止めた場合に失うもの: そのプロセスの間、当日サマリを一切保存しない。
+      途中で再起動すると、その日の約定が Discord 日次集計から**丸ごと**落ちる
+      （v3.9.115 が塞いだ事故そのもの）。しかも _today_state_ready の呼び手は
+      起動時の _load_today_state 1箇所だけなので、失敗は**その回ずっと**続き、
+      3回で諦める安全弁にも届かない。
+      止めなかった場合に失うもの: 保存先ができるため次回の引き継ぎが
+      「保存先が在る」で短絡し、**旧ファイル1日ぶんの復元**を失う。表示専用。
+
+      後者のほうが軽いので、書く側を止めません。v3.9.189b/c では逆に倒して
+      いましたが、停止スイッチ（BOT_SKIP_STATE_MIGRATION）を立てた環境で
+      **保存が恒久的に無効になる**ことが分かりました——_migrate_state_file_once は
+      スイッチ時に done を立てないまま True を返すため、内部フラグを見る作りだと
+      「未了」と誤判定し続けます。内部フラグではなく戻り値が契約です。
     """
     return _migrate_state_file_once(
         _today_state_path(),
@@ -8031,13 +8024,6 @@ def _save_today_state() -> None:
             "shadow_short":    _today_shadow_short,
             "shadow_momentum": _today_shadow_momentum,
         }
-        # ★ v3.9.189c: 引き継ぎが済んでいない間は書かない（配布前レビュー Codex の指摘）。
-        #   書くと保存先ができてしまい、次回の引き継ぎが「保存先が在る」で短絡して
-        #   旧ファイルが永久に孤立する。表示専用なので、書かずに見送るほうが軽い。
-        if _today_state_handover_pending():
-            log.debug("[当日サマリ] 引き継ぎが済んでいないため保存を見送ります"
-                      "（旧い記録を失わないため・次の起動でもう一度引き継ぎます）")
-            return
         # ★ v3.9.189b: **保存の側では引き継がない**（配布前レビュー指摘）。
         #   引き継ぎは「読み戻して復元する」ために行うもので、保存の直前に走らせると
         #   引き継いだ内容をその場の書き込みが上書きして消す。
@@ -19932,8 +19918,11 @@ async def alpaca_news_loop(
                             f"このセッションの Alpaca News 受信を停止します（RSS/Finnhub でニュースは継続）。"
                             f"APIキー/購読/キー併用(406)を確認のうえ、再開は Bot 再起動。"
                         )
+                        # ★ v3.9.189d: 以前はここで health["stopped"]=True も立てていたが、
+                        #   読み手がどこにも無かったので消した（last_warning_at と同じ）。
+                        #   停止したことは last_error と、上限に達したまま残る
+                        #   auth_fail_count（判定が「本物の障害」を出し続ける根拠）で伝わる。
                         _alpaca_news_health["last_error"] = f"認証失敗{_auth_fail_count}回で停止"
-                        _alpaca_news_health["stopped"] = True
                         return
                     await asyncio.sleep(_backoff_sec)
                     continue
