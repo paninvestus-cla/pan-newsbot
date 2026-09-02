@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.190c"
+BOT_VERSION = "v3.9.190d"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -8455,7 +8455,12 @@ _ext_last_remind: dict = {}
 #   起動時の整合性警告と、発注ブロック解除の回の2箇所でしか名前が出ず、以後は
 #   どの定期通知にも現れなかった。損切りも時間切れも週末決済も効かない建玉が、
 #   危険が続いているあいだ黙っているのは表示の欠落として重い。
-#   sync_positions が毎回の照会で入れ替える。
+#   sync_positions が毎回の照会で**丸ごと差し替える**（部分更新はしない。
+#   途中の状態を読み手に見せないため）。
+#
+#   ★ 照会が失敗した回は更新しない＝古い一覧が残る。これは意図した選択で、
+#     「分からない」ときに警告を消すより、直近に分かっていたことを言い続ける
+#     ほうが安全側だから（決済済みの銘柄を挙げ続ける期間は、照会が復旧するまで）。
 _unmonitored_holdings: set = set()
 
 
@@ -8495,23 +8500,29 @@ def _ext_remind_if_due() -> None:
         return
     # ★ v3.9.190c: 監視対象外の建玉も同じ間隔で再通知する（配布前レビューの指摘）。
     #   文面は分けて出す（止まっている理由が違う）。
-    _b = _ext_blocked_symbols() + [s for s in _unmonitored_holding_symbols()
-                                   if s not in _ext_blocked_symbols()]
+    # ★ v3.9.190d: 理由ごとに分けて数える（配布前レビュー2者の指摘）。
+    #   ・キーを (銘柄, 理由) にする。銘柄名だけだと、同じ銘柄が「Bot以外の建玉で
+    #     停止」から「監視対象外」へ変わったとき、**理由の違う初回の警告が最大6時間
+    #     出ない**。
+    #   ・両方に該当する銘柄は「停止中」側に入れる。そちらには「決済すれば再開する」
+    #     という行動が書いてあり、落とすと何をすればよいか分からなくなる。
+    _blocked = _ext_blocked_symbols()
+    _unmon = [s for s in _unmonitored_holding_symbols() if s not in _blocked]
+    _b = [(s, "blocked") for s in _blocked] + [(s, "unmonitored") for s in _unmon]
     if not _b:
         return
     _now = datetime.datetime.now()
     _due = [
-        s for s in _b
-        if (_now - _ext_last_remind.get(s, datetime.datetime.min)).total_seconds()
+        _k for _k in _b
+        if (_now - _ext_last_remind.get(_k, datetime.datetime.min)).total_seconds()
         >= _EXT_REMIND_HOURS * 3600
     ]
     if not _due:
         return
-    for s in _due:
-        _ext_last_remind[s] = _now
-    _unmon = set(_unmonitored_holding_symbols())
-    _stopped = [s for s in _due if s not in _unmon]
-    _outside = [s for s in _due if s in _unmon]
+    for _k in _due:
+        _ext_last_remind[_k] = _now
+    _stopped = [s for s, why in _due if why == "blocked"]
+    _outside = [s for s, why in _due if why == "unmonitored"]
     if _stopped:
         _threadsafe_future(asyncio.to_thread(
             send_discord_message,
@@ -13495,10 +13506,18 @@ def sync_positions(trd_env: TrdEnv) -> None:
             #   （v3.9.156 で塞いだ誤警報と同じ理由）。
             try:
                 _mon_now = set(ALL_TICKERS) | _momentum_live_symbols()
-                if _ovn_owns_now():
+                # ★ v3.9.190d: OVN の所有権は、その銘柄が実際に口座にあるときだけ
+                #   見る（配布前レビュー2者の指摘）。_ovn_owns_now は状態ファイルを
+                #   読み、所有権フラグの自己修復まで行う関数で、無関係な口座で
+                #   毎回の照会ごとに走らせてよいものではない。数行下の照合が
+                #   「名簿に居るときだけ呼ぶ」としているのとも揃える。
+                if OVN_SYMBOL in _seen_this_sync and _ovn_owns_now():
                     _mon_now.add(OVN_SYMBOL)
-                _unmonitored_holdings.clear()
-                _unmonitored_holdings.update(_seen_this_sync - _mon_now)
+                # ★ v3.9.190d: clear() → update() の2段だと、その隙間に読み手が
+                #   走って**空集合を見る**（配布前レビュー2者の指摘）。監視対象外の
+                #   建玉が「無い」と表示され、6時間ごとの再送からも落ちる。
+                #   作ってから一撃で差し替える。
+                globals()["_unmonitored_holdings"] = _seen_this_sync - _mon_now
             except Exception as _e_unmon:
                 log.debug(f"[sync_positions] 監視対象外の一覧を作れませんでした: {_e_unmon}")
             globals()["_account_scan_valid"] = True
@@ -13769,6 +13788,10 @@ def sync_positions(trd_env: TrdEnv) -> None:
         # ★ v2.98: SHORT 含む実在判定 (qty!=0 のいずれか方向)。
         global _ghost_miss_count
         _absence_confirmed = set()
+        # ★ v3.9.190d: スナップショットはループの手前で1回だけ取る
+        #   （配布前レビュー2者の指摘）。銘柄ごとにコピーを作ると、銘柄数ぶんの
+        #   無駄なコピーが出るうえ、**銘柄ごとに違う時点の値**を見ることになる。
+        _pending_snapshot = list(_pending_orders.values())
         for _sym_chk in ALL_TICKERS:
             _sides_chk = _agg.get(_sym_chk)
             _has_any = (
@@ -13789,7 +13812,7 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     #   すべて list(...) で囲っている）。
                 _has_pending_order = any(
                     info.get("symbol") == _sym_chk
-                    for info in list(_pending_orders.values())
+                    for info in _pending_snapshot
                 )
                 # 新規発注～約定反映、決済発注～約定反映の間は API に建玉が
                 # 見えなくても不在回数に数えない。pending が無い状態でのみ、
@@ -13922,6 +13945,8 @@ def sync_positions(trd_env: TrdEnv) -> None:
         #   建玉が多い人ほど Discord のレート制限で落ち、いちばん要る人に届かない）。
         _flush_absorbed_notice()
 
+        # ★ v3.9.190d: 同上。ループの手前で1回だけ。
+        _pending_snapshot_h = list(_pending_orders.values())
         for _sym_h in ALL_TICKERS:
             try:
                 _ts_h = state.get(_sym_h)
@@ -13932,7 +13957,7 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 # ★ v3.9.190c: 同上。スナップショットを取ってから回す。
                 _pending_close_h = any(
                     _i.get("is_close") and _i.get("symbol") == _sym_h
-                    for _i in list(_pending_orders.values())
+                    for _i in _pending_snapshot_h
                 )
                 if (_ts_h.position_qty != 0 and _ts_h.entry_time is None
                         and not _pending_close_h
