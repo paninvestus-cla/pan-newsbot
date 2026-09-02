@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.190b"
+BOT_VERSION = "v3.9.190c"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -8451,6 +8451,22 @@ _EXT_REMIND_HOURS: float = float(os.environ.get("EXT_HOLD_REMIND_HOURS", "6") or
 _ext_last_remind: dict = {}
 
 
+# ★ v3.9.190c: いま口座にあって、監視対象に入っていない建玉（配布前レビューの指摘）。
+#   起動時の整合性警告と、発注ブロック解除の回の2箇所でしか名前が出ず、以後は
+#   どの定期通知にも現れなかった。損切りも時間切れも週末決済も効かない建玉が、
+#   危険が続いているあいだ黙っているのは表示の欠落として重い。
+#   sync_positions が毎回の照会で入れ替える。
+_unmonitored_holdings: set = set()
+
+
+def _unmonitored_holding_symbols() -> list:
+    """いま口座にあって監視対象外の建玉（画面表示・再通知用）。"""
+    try:
+        return sorted(_unmonitored_holdings)
+    except Exception:
+        return []
+
+
 def _ext_blocked_symbols() -> list:
     """いま管理対象外になっている銘柄の一覧（画面表示・日次サマリ用）。"""
     try:
@@ -8464,14 +8480,23 @@ def _ext_blocked_symbols() -> list:
 def _ext_status_suffix() -> str:
     """[状況] 行に足す注意書き。管理対象外が無ければ空文字。"""
     _b = _ext_blocked_symbols()
-    return f"  ⚠️ 自動売買停止中: {'/'.join(_b)}（Bot以外の建玉あり）" if _b else ""
+    _s = f"  ⚠️ 自動売買停止中: {'/'.join(_b)}（Bot以外の建玉あり）" if _b else ""
+    # ★ v3.9.190c: 監視対象外の建玉も毎回ここに出す（配布前レビューの指摘）。
+    _u = _unmonitored_holding_symbols()
+    if _u:
+        _s += (f"  ⚠️ 監視対象外の建玉: {'/'.join(_u)}"
+               f"（損切り・時間切れ・週末決済は効きません）")
+    return _s
 
 
 def _ext_remind_if_due() -> None:
     """管理対象外が続いている銘柄を、一定時間ごとに Discord で再通知する。"""
     if _EXT_REMIND_HOURS <= 0:
         return
-    _b = _ext_blocked_symbols()
+    # ★ v3.9.190c: 監視対象外の建玉も同じ間隔で再通知する（配布前レビューの指摘）。
+    #   文面は分けて出す（止まっている理由が違う）。
+    _b = _ext_blocked_symbols() + [s for s in _unmonitored_holding_symbols()
+                                   if s not in _ext_blocked_symbols()]
     if not _b:
         return
     _now = datetime.datetime.now()
@@ -8484,13 +8509,27 @@ def _ext_remind_if_due() -> None:
         return
     for s in _due:
         _ext_last_remind[s] = _now
-    _threadsafe_future(asyncio.to_thread(
-        send_discord_message,
-        f"⏸️ 【{'/'.join(_due)}】 の自動売買は停止したままです\n"
-        f"Bot が建てていない建玉が口座に残っているためです。\n"
-        f"この建玉を moomoo アプリで決済すると、自動売買はすぐに再開します。\n"
-        f"（そのまま保有される場合は、この銘柄だけ Bot が動きません）"
-    ))
+    _unmon = set(_unmonitored_holding_symbols())
+    _stopped = [s for s in _due if s not in _unmon]
+    _outside = [s for s in _due if s in _unmon]
+    if _stopped:
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"⏸️ 【{'/'.join(_stopped)}】 の自動売買は停止したままです\n"
+            f"Bot が建てていない建玉が口座に残っているためです。\n"
+            f"この建玉を moomoo アプリで決済すると、自動売買はすぐに再開します。\n"
+            f"（そのまま保有される場合は、この銘柄だけ Bot が動きません）"
+        ))
+    if _outside:
+        # ★ v3.9.190c: 監視対象外は「止まっている」のではなく「見ていない」。
+        #   損切りも時間切れも週末決済も効かないので、危険が続くあいだ言い続ける。
+        _threadsafe_future(asyncio.to_thread(
+            send_discord_message,
+            f"⚠️ 【{'/'.join(_outside)}】 は監視対象外のまま口座に残っています\n"
+            f"損切り・時間切れ・週末決済のいずれも効きません。\n"
+            f"設定（TRIGGER_TICKERS / MOMENTUM_ENABLED_SIDES）を変えたあとも\n"
+            f"建玉が残っている場合に起きます。moomoo アプリでご確認ください。"
+        ))
 
 
 def _ext_set_held(symbol: str, held: bool, reason: str = "",
@@ -13451,6 +13490,17 @@ def sync_positions(trd_env: TrdEnv) -> None:
         #   であって「建玉ゼロの確認」ではない（Codexレビュー指摘）。有効にしない。
         if data is not None and hasattr(data, "empty"):
             globals()["_account_symbols_seen"] = _seen_this_sync
+            # ★ v3.9.190c: 監視対象外の建玉を毎回ここで入れ替える。
+            #   OVN が所有している銘柄は OVN 巡回が決済するので外す
+            #   （v3.9.156 で塞いだ誤警報と同じ理由）。
+            try:
+                _mon_now = set(ALL_TICKERS) | _momentum_live_symbols()
+                if _ovn_owns_now():
+                    _mon_now.add(OVN_SYMBOL)
+                _unmonitored_holdings.clear()
+                _unmonitored_holdings.update(_seen_this_sync - _mon_now)
+            except Exception as _e_unmon:
+                log.debug(f"[sync_positions] 監視対象外の一覧を作れませんでした: {_e_unmon}")
             globals()["_account_scan_valid"] = True
             globals()["_account_scan_seq"] = _account_scan_seq + 1   # ★ v3.9.156b: 完走の世代を進める
 
@@ -13573,9 +13623,12 @@ def sync_positions(trd_env: TrdEnv) -> None:
             # 「<=0 → position_qty=0」リセットを誘発する問題への対策で仮設定。
             # ★ v2.70: 決済注文 pending 中は仮設定スキップ (約定直後の API 遅延対応)
             # ★ v2.98: SHORT も abs(total_qty) で評価。
+            # ★ v3.9.190c: スナップショットを取ってから回す（配布前レビューの指摘）。
+            #   _pending_orders への挿入・削除はイベントループ側と別スレッドで起きる。
+            #   走査中に大きさが変わると RuntimeError で**同期がまるごと中断**する。
             _has_pending_close = any(
                 info.get("is_close") and info.get("symbol") == sym
-                for info in _pending_orders.values()
+                for info in list(_pending_orders.values())
             )
             if total_qty != 0 and _tracked_position_cost.get(sym, 0.0) <= 0:
                 if sym == OVN_SYMBOL and _ovn_owns_now():   # ★ v3.9.159b: 二重ソース判定
@@ -13612,13 +13665,25 @@ def sync_positions(trd_env: TrdEnv) -> None:
         _has_any_position = any(
             (s["LONG"]["qty"] > 0 or s["SHORT"]["qty"] > 0) for s in _agg.values()
         )
+        # ★ v3.9.190c: 監視対象**外**の建玉しか持たない口座でも解除する
+        #   （配布前レビューの指摘）。_agg は ALL_TICKERS を通った銘柄しか持たない
+        #   ため、たとえば設定から外した NVDA だけを保有していると
+        #   _has_any_position は永久に偽。建玉ゼロ側の経路（下の elif）も
+        #   accinfo が $0 でないので通らず、**実口座の新規発注が再起動しても
+        #   止まったまま**になっていた。今回の機能が動くべき場面そのもの。
+        #
+        #   このフラグの意味は「何を持っているか分からない」。明細が完走して
+        #   建玉が見えたなら、監視対象かどうかに関わらず**分かった**ので解除する。
+        #   監視対象外であることは、下の照合が名指しで警告する。
+        _listing_shows_positions = bool(_seen_this_sync) and _account_scan_seq > _seq_at_entry
+        _can_unblock = _has_any_position or _listing_shows_positions
         # ★ v3.9.190b: フラグの「見て・倒す」を排他する（配布前レビューの指摘）。
         #   ロックを名簿にだけ掛けていたので、2スレッドが同時にこの枝へ入り、
         #   別々の口座スナップショットから解除の行を2本出す競合が残っていた。
         #   sync_positions を直列化するものはどこにも無い（place_buy /
         #   place_short / place_close_all / 週末決済がすべて to_thread で走る）。
         _unlock_now = False
-        if _startup_position_unknown and _has_any_position:
+        if _startup_position_unknown and _can_unblock:
             with _STARTUP_UNKNOWN_LOCK:
                 if _startup_position_unknown:
                     _startup_position_unknown = False
@@ -13681,7 +13746,7 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 # 表示に失敗しても解除は済んでいる。1行だけは必ず出す。
                 log.warning(f"[起動時復元] 解除時の照合に失敗しました: {_e_unk}")
                 log.info("[起動時復元] ✅ ポジション取得成功 → 発注ブロックを解除しました")
-        elif (_startup_position_unknown and not _has_any_position
+        elif (_startup_position_unknown and not _can_unblock
                 and _account_scan_seq > _seq_at_entry):
             # ★ v3.9.156: 建玉ゼロの口座では従来「建玉が見つかる」ことでしか解除されず、
             #   起動時の一時的な照会失敗が再起動まで発注を止め続けた（5日分レビュー）。
@@ -13716,9 +13781,15 @@ def sync_positions(trd_env: TrdEnv) -> None:
                   or _ledger_has(_sym_chk, trd_env)
                   or getattr(state.get(_sym_chk), "externally_held", False)):
                 _ts_chk = state.get(_sym_chk)
+                    # ★ v3.9.190c: スナップショットを取ってから回す（配布前レビューの指摘）。
+                    #   _pending_orders への挿入・削除はイベントループ側（約定見張り・
+                    #   決済追いかけ）と別スレッドの発注登録で起きる。sync_positions は
+                    #   to_thread で走る唯一の読み手なので、走査中に大きさが変わると
+                    #   RuntimeError で**同期がまるごと中断**する（この file の他6箇所は
+                    #   すべて list(...) で囲っている）。
                 _has_pending_order = any(
                     info.get("symbol") == _sym_chk
-                    for info in _pending_orders.values()
+                    for info in list(_pending_orders.values())
                 )
                 # 新規発注～約定反映、決済発注～約定反映の間は API に建玉が
                 # 見えなくても不在回数に数えない。pending が無い状態でのみ、
@@ -13858,9 +13929,10 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 #   受付済みの指値が約定する前に時計を戻すと、次のリスク監視で
                 #   時間切れが再発火し、生きている決済注文を自分で取り消して
                 #   出し直す循環に入る（時間外の指値ほど当たりやすい）。
+                # ★ v3.9.190c: 同上。スナップショットを取ってから回す。
                 _pending_close_h = any(
                     _i.get("is_close") and _i.get("symbol") == _sym_h
-                    for _i in _pending_orders.values()
+                    for _i in list(_pending_orders.values())
                 )
                 if (_ts_h.position_qty != 0 and _ts_h.entry_time is None
                         and not _pending_close_h
