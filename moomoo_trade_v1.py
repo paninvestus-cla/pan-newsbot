@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.190"
+BOT_VERSION = "v3.9.190b"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -1244,7 +1244,9 @@ def _log_observation(
             "side":              side,
             "session":           session,
             "ai_score":          score,
-            "ai_confidence":     round(confidence, 2),
+            # ★ v3.9.190b: 第2位に丸めると、しきい値ぎわの実値（0.779 としきい値 0.78）を
+            #   観察シートから復元できない。判定は実値で行うので記録も実値に寄せる。
+            "ai_confidence":     round(confidence, 4),
             "ai_category":       category,
             "beneficiaries":     beneficiaries or [],
             "victims":           victims or [],
@@ -1737,7 +1739,9 @@ def _shadow_short_open(
                 "side":              "SELL_SHORT",
                 "session":           session,
                 "ai_score":          -1,
-                "ai_confidence":     round(confidence, 2),
+                # ★ v3.9.190b: 第2位に丸めると、しきい値ぎわの実値（0.779 と 0.78）を
+                #   観察シートから復元できない。判定は実値で行うので記録も実値に寄せる。
+                "ai_confidence":     round(confidence, 4),
                 "ai_category":       category,
                 "news_source":       news_source,
                 "beneficiaries":     beneficiaries or [],
@@ -13608,48 +13612,74 @@ def sync_positions(trd_env: TrdEnv) -> None:
         _has_any_position = any(
             (s["LONG"]["qty"] > 0 or s["SHORT"]["qty"] > 0) for s in _agg.values()
         )
+        # ★ v3.9.190b: フラグの「見て・倒す」を排他する（配布前レビューの指摘）。
+        #   ロックを名簿にだけ掛けていたので、2スレッドが同時にこの枝へ入り、
+        #   別々の口座スナップショットから解除の行を2本出す競合が残っていた。
+        #   sync_positions を直列化するものはどこにも無い（place_buy /
+        #   place_short / place_close_all / 週末決済がすべて to_thread で走る）。
+        _unlock_now = False
         if _startup_position_unknown and _has_any_position:
-            _startup_position_unknown = False
+            with _STARTUP_UNKNOWN_LOCK:
+                if _startup_position_unknown:
+                    _startup_position_unknown = False
+                    _unlock_now = True
+        if _unlock_now:
             # ★ v3.9.190: 「建玉が1つ見えた」は照会が回復した証拠であって、
             #   起動時に見えていなかった建玉が見えるようになった証拠ではない。
             #   解除そのものは続ける（止めると照会が一時的に失敗した口座で
             #   発注が再起動まで止まる・v3.9.156 で塞いだ side）。ただし
-            #   起動時に名指しした監視対象外の建玉が今回も明細に無いなら、
+            #   起動時に名指しした監視対象外の建玉が**今も口座にある**なら、
             #   解除の行でそのまま言う。無言で「取得成功」と出すと、
             #   未監視の建玉まで解決したと読めてしまう（認定サポーターの指摘）。
             #
             #   ★ 診断のための表示なので、ここで何が起きても同期は止めない
-            #     （配布前レビュー Codex の指摘——例外が出ると sync_positions が
-            #     中断し、以降の建玉同期がまるごと飛ぶ。表示のために売買の土台を
-            #     落とすのは本末転倒）。
+            #     （配布前レビューの指摘——例外が出ると sync_positions が中断し、
+            #     以降の建玉同期がまるごと飛ぶ。表示のために売買の土台を落とす
+            #     のは本末転倒）。
             try:
-                _seen_now = {sym for sym, st_ in _agg.items()
-                             if st_["LONG"]["qty"] > 0 or st_["SHORT"]["qty"] > 0}
-                # 起動時の名簿は1度きり。読んだら消す（配布前レビュー Codex の指摘）。
-                #   並行するスレッドが同じ名簿でもう一度警告するのを防ぎ、
-                #   古い名簿が後から使われる経路も残さない。
+                # ★ v3.9.190b: 突き合わせる相手は _seen_this_sync（この回の照会で
+                #   口座に実在した銘柄・ALL_TICKERS のふるいより前で作る）。
+                #   v3.9.190 は _agg から作った集合と引き算していたが、_agg は
+                #   `if sym not in ALL_TICKERS: continue` を通った銘柄しか持たない。
+                #   一方 orphan は `_account_symbols_seen - set(ALL_TICKERS)` なので、
+                #   **2つは定義上まったく重ならない**。引き算は何も解決せず、警告が
+                #   無条件に出ていた（配布前レビューの指摘・実際に成立を確認）。
+                #
+                #   向きも逆だった。危ないのは「今も持っていて監視されていない」建玉で、
+                #   明細から消えた銘柄は決済済み＝警告する理由がない。積集合で取る。
+                _seen_now = sorted(_seen_this_sync)
                 with _STARTUP_UNKNOWN_LOCK:
                     _orphans_at_start = set(_startup_unmonitored_symbols)
-                    _startup_unmonitored_symbols.clear()
-                # OVN が所有権を取った銘柄は OVN 巡回が決済する。起動時は
-                # 監視対象外でも、いま所有していれば「効きません」は誤り
-                # （v3.9.156 で同じ誤警報を塞いだのと同じ理由）。
-                if _ovn_owns_now():
-                    _orphans_at_start.discard(OVN_SYMBOL)
-                _still_missing = sorted(_orphans_at_start - _seen_now)
-                log.info(
-                    f"[起動時復元] ✅ ポジション取得成功 → 発注ブロックを解除しました"
-                    f"（今回見えた建玉: {', '.join(sorted(_seen_now)) or 'なし'}）"
-                )
-                if _still_missing:
-                    log.warning(
-                        f"  ⚠️ [整合性警告] 起動時に警告した建玉 {_still_missing} は"
-                        f" 今回の明細にも現れていません。監視対象外のままで、"
-                        f" 損切り・時間切れ・週末決済のいずれも効きません。"
-                        f" moomoo アプリで建玉をご確認ください"
+                    # OVN が所有権を取った銘柄は OVN 巡回が決済する。起動時は
+                    # 監視対象外でも、いま所有していれば「効きません」は誤り
+                    # （v3.9.156 で同じ誤警報を塞いだのと同じ理由）。
+                    # ★ v3.9.190b: 名簿に居るときだけ呼ぶ。_ovn_owns_now は
+                    #   状態ファイルを読み、所有権フラグの自己修復まで行うので、
+                    #   関係のない口座で毎回走らせてよいものではない。
+                    if OVN_SYMBOL in _orphans_at_start and _ovn_owns_now():
+                        _orphans_at_start.discard(OVN_SYMBOL)
+                    _still_unmonitored = sorted(_orphans_at_start & _seen_this_sync)
+                    log.info(
+                        f"[起動時復元] ✅ ポジション取得成功 → 発注ブロックを解除しました"
+                        f"（今回見えた建玉: {', '.join(_seen_now) or 'なし'}）"
                     )
+                    if _still_unmonitored:
+                        # ★ v3.9.190b: リストの repr をそのまま出さない。
+                        #   ['DRAM', 'NVDA'] だと、moomoo の検索窓へ貼るときに
+                        #   括弧と引用符まで写る（4行上の成功行は join 済み）。
+                        log.warning(
+                            f"  ⚠️ [整合性警告] 起動時に警告した建玉"
+                            f" {', '.join(_still_unmonitored)} は、今も口座にあり"
+                            f" 監視対象外のままです。損切り・時間切れ・週末決済の"
+                            f" いずれも効きません。moomoo アプリでご確認ください"
+                        )
+                    # ★ v3.9.190b: 名簿を消すのは報告できた回だけ（配布前レビューの
+                    #   指摘）。先に消すと、途中で例外が出た回に唯一の控えが永久に
+                    #   失われる。ロックの中なので、並行スレッドの二重報告は起きない。
+                    _startup_unmonitored_symbols.clear()
             except Exception as _e_unk:
-                log.debug(f"[起動時復元] 解除時の照合に失敗（黙殺）: {_e_unk}")
+                # 表示に失敗しても解除は済んでいる。1行だけは必ず出す。
+                log.warning(f"[起動時復元] 解除時の照合に失敗しました: {_e_unk}")
                 log.info("[起動時復元] ✅ ポジション取得成功 → 発注ブロックを解除しました")
         elif (_startup_position_unknown and not _has_any_position
                 and _account_scan_seq > _seq_at_entry):
@@ -14944,7 +14974,7 @@ def place_buy(
                              category=category, headlines=headlines,
                              beneficiaries=beneficiaries, victims=victims,
                              outcome="blocked", block_stage="smh_strict",
-                             block_reason=f"SMH conf={confidence:.2f} < {SMH_CONFIDENCE_THRESHOLD}")
+                             block_reason=f"SMH conf={confidence:.3f} < {SMH_CONFIDENCE_THRESHOLD}")
             return False
         # 修正項目 4: SMH 下落トレンド検知ブロック
         # SMH 自体の直近騰落率で下落トレンドを判定（QQQ ベースの構成 B とは独立）。
@@ -18691,7 +18721,7 @@ async def process_headlines(
                 _has_long = any(state.get(sym).position_qty > 0 for sym in short_targets)
                 if _has_long:
                     log.info(
-                        f"{tag} → ショートシグナルだが confidence={confidence:.2f} < {_thresh:.2f}"
+                        f"{tag} → ショートシグナルだが confidence={confidence:.3f} < {_thresh:.3f}"
                         f"（{get_session_info()[0].upper()} しきい値）→ 決済・空売りともスキップ"
                     )
                 else:
@@ -18702,7 +18732,7 @@ async def process_headlines(
                                      category=category, headlines=texts,
                                      beneficiaries=beneficiaries, victims=victims,
                                      outcome="blocked", block_stage="conf_threshold",
-                                     block_reason=f"conf={confidence:.2f} < {_thresh:.2f}")
+                                     block_reason=f"conf={confidence:.3f} < {_thresh:.3f}")
         return
 
     # ── score=1: ロング (現物買い or 既存ショート決済) ────────────────────────
@@ -18727,14 +18757,14 @@ async def process_headlines(
         return
     _thresh = get_confidence_threshold()
     if confidence < _thresh:
-        log.info(f"{tag} → confidence={confidence:.2f} < {_thresh:.2f} 発注見送り（セッション別しきい値）")
+        log.info(f"{tag} → confidence={confidence:.3f} < {_thresh:.3f} 発注見送り（セッション別しきい値）")
         # ★ v3.9.7: 観察ログ — confidence 閾値ブロック (BUY)
         for _sym in exec_targets:
             _log_observation(symbol=_sym, side="BUY", confidence=confidence, score=1,
                              category=category, headlines=texts,
                              beneficiaries=beneficiaries, victims=victims,
                              outcome="blocked", block_stage="conf_threshold",
-                             block_reason=f"conf={confidence:.2f} < {_thresh:.2f}")
+                             block_reason=f"conf={confidence:.3f} < {_thresh:.3f}")
         return
     if not exec_targets:
         log.info(f"{tag} → 連動対象銘柄なし")
@@ -19205,14 +19235,14 @@ async def process_stock_news(
     else:
         _thresh = get_confidence_threshold()
     if confidence < _thresh:
-        log.info(f"{tag} [個別株] confidence={confidence:.2f} < {_thresh:.2f} → 発注見送り")
+        log.info(f"{tag} [個別株] confidence={confidence:.3f} < {_thresh:.3f} → 発注見送り")
         # ★ v3.9.7: 個別株 confidence 閾値ブロックを観察ログ記録
         _side = "BUY" if score == 1 else "SELL_SHORT"
         _log_observation(
             symbol=symbol, side=_side, confidence=confidence, score=score,
             category="STOCK", headlines=texts,
             outcome="blocked", block_stage="conf_threshold",
-            block_reason=f"個別株 conf={confidence:.2f} < {_thresh:.2f}",
+            block_reason=f"個別株 conf={confidence:.3f} < {_thresh:.3f}",
         )
         return
 
