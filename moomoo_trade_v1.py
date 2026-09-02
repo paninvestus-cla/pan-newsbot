@@ -13617,20 +13617,40 @@ def sync_positions(trd_env: TrdEnv) -> None:
             #   起動時に名指しした監視対象外の建玉が今回も明細に無いなら、
             #   解除の行でそのまま言う。無言で「取得成功」と出すと、
             #   未監視の建玉まで解決したと読めてしまう（認定サポーターの指摘）。
-            _seen_now = {sym for sym, st_ in _agg.items()
-                         if st_["LONG"]["qty"] > 0 or st_["SHORT"]["qty"] > 0}
-            _still_missing = sorted(_startup_unmonitored_symbols - _seen_now)
-            log.info(
-                f"[起動時復元] ✅ ポジション取得成功 → 発注ブロックを解除しました"
-                f"（今回見えた建玉: {', '.join(sorted(_seen_now)) or 'なし'}）"
-            )
-            if _still_missing:
-                log.warning(
-                    f"  ⚠️ [整合性警告] 起動時に警告した建玉 {_still_missing} は"
-                    f" 今回の明細にも現れていません。監視対象外のままで、"
-                    f" 損切り・時間切れ・週末決済のいずれも効きません。"
-                    f" moomoo アプリで建玉をご確認ください"
+            #
+            #   ★ 診断のための表示なので、ここで何が起きても同期は止めない
+            #     （配布前レビュー Codex の指摘——例外が出ると sync_positions が
+            #     中断し、以降の建玉同期がまるごと飛ぶ。表示のために売買の土台を
+            #     落とすのは本末転倒）。
+            try:
+                _seen_now = {sym for sym, st_ in _agg.items()
+                             if st_["LONG"]["qty"] > 0 or st_["SHORT"]["qty"] > 0}
+                # 起動時の名簿は1度きり。読んだら消す（配布前レビュー Codex の指摘）。
+                #   並行するスレッドが同じ名簿でもう一度警告するのを防ぎ、
+                #   古い名簿が後から使われる経路も残さない。
+                with _STARTUP_UNKNOWN_LOCK:
+                    _orphans_at_start = set(_startup_unmonitored_symbols)
+                    _startup_unmonitored_symbols.clear()
+                # OVN が所有権を取った銘柄は OVN 巡回が決済する。起動時は
+                # 監視対象外でも、いま所有していれば「効きません」は誤り
+                # （v3.9.156 で同じ誤警報を塞いだのと同じ理由）。
+                if _ovn_owns_now():
+                    _orphans_at_start.discard(OVN_SYMBOL)
+                _still_missing = sorted(_orphans_at_start - _seen_now)
+                log.info(
+                    f"[起動時復元] ✅ ポジション取得成功 → 発注ブロックを解除しました"
+                    f"（今回見えた建玉: {', '.join(sorted(_seen_now)) or 'なし'}）"
                 )
+                if _still_missing:
+                    log.warning(
+                        f"  ⚠️ [整合性警告] 起動時に警告した建玉 {_still_missing} は"
+                        f" 今回の明細にも現れていません。監視対象外のままで、"
+                        f" 損切り・時間切れ・週末決済のいずれも効きません。"
+                        f" moomoo アプリで建玉をご確認ください"
+                    )
+            except Exception as _e_unk:
+                log.debug(f"[起動時復元] 解除時の照合に失敗（黙殺）: {_e_unk}")
+                log.info("[起動時復元] ✅ ポジション取得成功 → 発注ブロックを解除しました")
         elif (_startup_position_unknown and not _has_any_position
                 and _account_scan_seq > _seq_at_entry):
             # ★ v3.9.156: 建玉ゼロの口座では従来「建玉が見つかる」ことでしか解除されず、
@@ -14913,7 +14933,7 @@ def place_buy(
             #   このしきい値が買い（LONG）専用であることをログに出す
             #   （認定サポーターのログ解析で指摘。空売り側に同じ関門は無い）。
             # ★ v3.9.190: 小数第3位まで出す（認定サポーターの指摘）。
-            #   実値 0.779 としきい値 0.78 が :.2f では両方 0.78 に見え、
+            #   実値 0.779 と定数の側が :.2f では両方 0.78 に見え、
             #   「0.78 < 0.78」という成立しない不等式がログに残っていた。
             log.info(
                 f"{tag} 🚫 [SMH 専用厳格化] confidence={confidence:.3f} "
@@ -15842,7 +15862,15 @@ _startup_position_unknown: bool = False
 #   見えるようになった証拠ではない。解除の行で照合するために残す
 #   （認定サポーターの指摘——新規 SMH が見えただけで「取得成功」と出たが、
 #   同じ回の起動時に警告した DRAM / NVDA の可否は何も分かっていなかった）。
+#   ★ 再代入せず中身を入れ替える。globals() 越しの代入も global 宣言も要らず、
+#     名前の追跡が静的解析で切れない（配布前レビュー Gemini の指摘）。
 _startup_unmonitored_symbols: set = set()
+# ★ v3.9.190: 建玉不明フラグの「読んで消す」を1スレッドに限る
+#   （配布前レビュー Codex の指摘）。sync_positions は place_buy / place_short /
+#   place_close_all / 週末決済から呼ばれ、それらは asyncio.to_thread で走るため
+#   実スレッドで並行しうる。守らないと2スレッドが別々の口座スナップショットで
+#   同時に解除に入り、「今回見えた建玉」と「まだ見えない建玉」が食い違う2行が出る。
+_STARTUP_UNKNOWN_LOCK = threading.Lock()
 
 # 起動時ニュース無視期間（秒）
 STARTUP_NEWS_IGNORE_SEC: int = int(os.environ.get("STARTUP_NEWS_IGNORE_SEC", "60"))
@@ -24751,8 +24779,11 @@ async def main(live: bool) -> None:
                 _mon_syms.add(OVN_SYMBOL)
             _orphan_real = sorted(_account_symbols_seen - _mon_syms)
             if _orphan_real:
-                # ★ v3.9.190: 建玉不明フラグを解除するときに照合する（下記参照）
-                globals()["_startup_unmonitored_symbols"] = set(_orphan_real)
+                # ★ v3.9.190: 建玉不明フラグを解除するときに照合する（下記参照）。
+                #   中身の入れ替えで済ませる（再代入しないので global 宣言が要らない）。
+                with _STARTUP_UNKNOWN_LOCK:
+                    _startup_unmonitored_symbols.clear()
+                    _startup_unmonitored_symbols.update(_orphan_real)
                 log.warning(
                     f"  ⚠️ [整合性警告] 口座の建玉 {_orphan_real} が監視対象に含まれていません。"
                     f" 損切り・時間切れ・週末決済のいずれも効きません。"
