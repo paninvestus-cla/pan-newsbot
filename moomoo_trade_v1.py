@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.189d"
+BOT_VERSION = "v3.9.190"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -13610,7 +13610,27 @@ def sync_positions(trd_env: TrdEnv) -> None:
         )
         if _startup_position_unknown and _has_any_position:
             _startup_position_unknown = False
-            log.info("[起動時復元] ✅ ポジション取得成功 → 発注ブロックを解除しました")
+            # ★ v3.9.190: 「建玉が1つ見えた」は照会が回復した証拠であって、
+            #   起動時に見えていなかった建玉が見えるようになった証拠ではない。
+            #   解除そのものは続ける（止めると照会が一時的に失敗した口座で
+            #   発注が再起動まで止まる・v3.9.156 で塞いだ side）。ただし
+            #   起動時に名指しした監視対象外の建玉が今回も明細に無いなら、
+            #   解除の行でそのまま言う。無言で「取得成功」と出すと、
+            #   未監視の建玉まで解決したと読めてしまう（認定サポーターの指摘）。
+            _seen_now = {sym for sym, st_ in _agg.items()
+                         if st_["LONG"]["qty"] > 0 or st_["SHORT"]["qty"] > 0}
+            _still_missing = sorted(_startup_unmonitored_symbols - _seen_now)
+            log.info(
+                f"[起動時復元] ✅ ポジション取得成功 → 発注ブロックを解除しました"
+                f"（今回見えた建玉: {', '.join(sorted(_seen_now)) or 'なし'}）"
+            )
+            if _still_missing:
+                log.warning(
+                    f"  ⚠️ [整合性警告] 起動時に警告した建玉 {_still_missing} は"
+                    f" 今回の明細にも現れていません。監視対象外のままで、"
+                    f" 損切り・時間切れ・週末決済のいずれも効きません。"
+                    f" moomoo アプリで建玉をご確認ください"
+                )
         elif (_startup_position_unknown and not _has_any_position
                 and _account_scan_seq > _seq_at_entry):
             # ★ v3.9.156: 建玉ゼロの口座では従来「建玉が見つかる」ことでしか解除されず、
@@ -14883,15 +14903,20 @@ def place_buy(
     # 5/5 SMH 終日下落事案で、QQQ は横ばい (構成 B が発火しない) でも SMH だけが
     # 下落するケースがあった。SMH 固有のセクター下落を別途検知する。
     if symbol == "SMH":
-        # 修正項目 2: SMH 専用 Confidence しきい値 (0.80)
-        # SMH のみハードコードで confidence ≥ 0.80 を要求 (他銘柄は既存設定維持)
+        # 修正項目 2: SMH 専用 Confidence しきい値
+        # SMH のみ SMH_CONFIDENCE_THRESHOLD を要求 (他銘柄は既存設定維持)。
         # 730 件分析で SMH 0.75 帯の損失が -$212 と最大だったことへの対策。
+        # ★ v3.9.190: ここには v3.9.10 で下げる前の古い数値が直書きされていた。
+        #   数値を2箇所に持つと必ずずれるので、定数だけを見る形にした。
         if confidence < SMH_CONFIDENCE_THRESHOLD:
             # ★ v3.9.170: 「同じ conf なのに片方だけ弾かれる」と読めるため、
             #   このしきい値が買い（LONG）専用であることをログに出す
             #   （認定サポーターのログ解析で指摘。空売り側に同じ関門は無い）。
+            # ★ v3.9.190: 小数第3位まで出す（認定サポーターの指摘）。
+            #   実値 0.779 としきい値 0.78 が :.2f では両方 0.78 に見え、
+            #   「0.78 < 0.78」という成立しない不等式がログに残っていた。
             log.info(
-                f"{tag} 🚫 [SMH 専用厳格化] confidence={confidence:.2f} "
+                f"{tag} 🚫 [SMH 専用厳格化] confidence={confidence:.3f} "
                 f"< {SMH_CONFIDENCE_THRESHOLD} → SMH の新規買いをスキップ"
                 f"（この関門は買いのみ・空売りには適用されません）"
             )
@@ -15811,6 +15836,13 @@ def place_short(
 
 # 起動時ポジション不明フラグ
 _startup_position_unknown: bool = False
+# ★ v3.9.190: 起動時の整合性警告で名指しした「監視対象外の建玉」。
+#   建玉不明フラグの解除は「明細に建玉が1つでも見えたら」で行うが、それは
+#   照会が動くようになった証拠にすぎず、起動時に見えていなかった建玉が
+#   見えるようになった証拠ではない。解除の行で照合するために残す
+#   （認定サポーターの指摘——新規 SMH が見えただけで「取得成功」と出たが、
+#   同じ回の起動時に警告した DRAM / NVDA の可否は何も分かっていなかった）。
+_startup_unmonitored_symbols: set = set()
 
 # 起動時ニュース無視期間（秒）
 STARTUP_NEWS_IGNORE_SEC: int = int(os.environ.get("STARTUP_NEWS_IGNORE_SEC", "60"))
@@ -18516,7 +18548,12 @@ async def process_headlines(
                 await asyncio.sleep(1)  # 決済後に少し待機
 
             # ② 空売り新規エントリー
-            log.info(f"{tag} → ネガティブシグナル: ショート新規エントリー {short_targets}")
+            # ★ v3.9.190: 行頭の {tag} はニュースの紐づき先（記事が SPY の記事なら
+            #   【SPY】）で、発注先 short_targets とは別物。victims=['QQQ'] なのに
+            #   【SPY】と出るため「SPYの話なのにQQQが見送られた」と読めていた
+            #   （認定サポーター2名の指摘）。発注先を行の中で名指しする。
+            log.info(f"{tag} → ネガティブシグナル: ショート新規エントリー {short_targets}"
+                     f"（【】はニュースの紐づき先・発注先は {'/'.join(short_targets)}）")
             ordered_short = []
             # ★ v3.9.29: 「既存ショートあり or 余力不足」を分離して表示
             # 5/20 PAN ログで「余力不足」表示が実は既存 SHORT 保有中のケースだった事例。
@@ -21285,7 +21322,14 @@ async def ovn_overnight_loop(trd_env) -> None:
                           entry_at=datetime.datetime.now().isoformat(timespec="seconds"))
                 # ★ v3.9.157: orderId をログに残す（認定サポーターの指摘——
                 #   受付1行だけでは約定可否をログから追えなかった）。
-                _ovn_say(f"買い注文を受け付けました。QQQ {qty}株（{last:.2f} / 200日線 {sma:.2f} / VIXY {vchg:+.2%}）"
+                # ★ v3.9.190: 括弧内の値に名前を付ける（認定サポーター3名が同じ質問）。
+                #   先頭は日足の直近確定足（＝前営業日の終値）で、200日線と比べる
+                #   ためだけに使う値。建値は別に取った直前の気配から作るので、
+                #   日中に大きく動いた日は $9 ほど開く。名前が無いと現在値または
+                #   建値に読め、「建値が違う」という問い合わせになっていた。
+                _ovn_say(f"買い注文を受け付けました。QQQ {qty}株"
+                         f"（前日終値 {last:.2f} / 200日線 {sma:.2f} / VIXY {vchg:+.2%}"
+                         f"／発注直前の気配 {entry_price:.2f}）"
                          f"\n翌営業日の寄り付きで売ります。（orderId={oid}）")
                 if not _ovn_save(st):
                     # BUY_INTENT はディスクに残るので再起動時に口座照会から回収可能。
@@ -24707,6 +24751,8 @@ async def main(live: bool) -> None:
                 _mon_syms.add(OVN_SYMBOL)
             _orphan_real = sorted(_account_symbols_seen - _mon_syms)
             if _orphan_real:
+                # ★ v3.9.190: 建玉不明フラグを解除するときに照合する（下記参照）
+                globals()["_startup_unmonitored_symbols"] = set(_orphan_real)
                 log.warning(
                     f"  ⚠️ [整合性警告] 口座の建玉 {_orphan_real} が監視対象に含まれていません。"
                     f" 損切り・時間切れ・週末決済のいずれも効きません。"
