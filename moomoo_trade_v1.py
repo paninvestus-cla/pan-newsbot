@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.190d"
+BOT_VERSION = "v3.9.191"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -2916,6 +2916,11 @@ def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
         #   「botバージョン」列へ書くため、決済記録からプロファイル選択が判別できる。
         "bot_version":   BOT_VERSION_TAGGED,
         "strategy_profile": MOMENTUM_STRATEGY_PROFILE,   # ★ v3.9.116（将来のGAS列追加用）
+        # ★ v3.9.191: デモか実口座かを記録に残す。シートにはこれまで区別が無く、
+        #   「Bot のこれまでの損益」を出そうとすると、デモの成績が混ざったまま
+        #   足し合わせてしまう（実際に切り分けできず、証券会社側から取り直した）。
+        #   後から復元できない情報なので、送る側で持たせる。
+        "trade_env":     _RUN_TRADE_ENV,
     }
     # ★ v3.9.175: 監視ループが実際に適用した出口条件（あるときだけ載せる）
     if isinstance(enforced_exit, dict):
@@ -6395,6 +6400,70 @@ _stream_handler = logging.StreamHandler(sys.stdout)
 _stream_handler.setFormatter(logging.Formatter(_log_fmt))
 _stream_handler.setLevel(logging.INFO)   # コンソール: INFO以上のみ（RAWログ・パターン詳細は非表示）
 _stream_handler.addFilter(_secret_filter)  # ★ v3.9.44: 機密マスキング
+
+# ★ v3.9.191: コンソールへの書き込みを**別スレッドのキュー経由**にする
+#   （認定サポーターの実測: Windows コンソールの QuickEdit で標準出力が塞がれ、
+#   Bot が 8時間25分 無言で凍結した。py-spy で全スレッドが emit() の stdout 書き込み
+#   待ちだった）。logging のハンドラは順に呼ばれるので、コンソールが詰まると
+#   後ろのファイルにも届かず、ログが途中でぷつりと切れる形になっていた。
+#
+#   キューに積むだけなら logging 側は一切待たない。コンソールが詰まっても
+#   詰まるのは書き出しスレッドだけで、売買・監視・ファイルログは動き続ける。
+#   キューが満杯なら黙って捨て、復帰したときに捨てた件数を1行だけ出す
+#   （満杯で例外を出すと handleError が stderr へ書きに行き、そこでまた詰まる）。
+import queue as _queue_mod
+from logging.handlers import QueueHandler as _QueueHandler, QueueListener as _QueueListener
+_CONSOLE_QUEUE_MAX = 50_000      # 約 8時間の凍結でも溢れない量（実測 ~2,000行/時）
+_console_queue: "_queue_mod.Queue" = _queue_mod.Queue(maxsize=_CONSOLE_QUEUE_MAX)
+
+
+class _DroppingQueueHandler(_QueueHandler):
+    """満杯なら捨てる QueueHandler。捨てた件数を持ち、復帰時に1行で知らせる。"""
+    def __init__(self, q):
+        super().__init__(q)
+        self.dropped = 0
+
+    def enqueue(self, record):
+        try:
+            self.queue.put_nowait(record)
+        except _queue_mod.Full:
+            self.dropped += 1
+
+    def handleError(self, record):   # stderr へ書きに行かない（そこで詰まる）
+        pass
+
+
+class _ConsoleListener(_QueueListener):
+    """書き出しスレッド。捨てた件数があれば、次に書けたときに1行だけ知らせる。"""
+    def __init__(self, q, handler, qh):
+        super().__init__(q, handler, respect_handler_level=True)
+        self._qh = qh
+
+    def handle(self, record):
+        super().handle(record)
+        _n = self._qh.dropped
+        if _n:
+            self._qh.dropped = 0
+            try:
+                _rec = logging.LogRecord(
+                    "moomoo_trade_v1", logging.WARNING, __file__, 0,
+                    f"[ログ] コンソールが詰まっていたため、画面への出力を {_n} 件捨てました"
+                    f"（ファイルのログには全件残っています）", None, None)
+                for _h in self.handlers:
+                    _h.handle(_rec)
+            except Exception:
+                pass
+
+
+_console_qh = _DroppingQueueHandler(_console_queue)
+_console_qh.setLevel(logging.INFO)       # DEBUG はキューに入れない（画面に出さないので積む意味がない）
+# ★ キュー側の書式は「本文だけ」に固定する。QueueHandler.prepare() は自分の書式で
+#   本文を作り直してから積むので、ここが未設定だと basicConfig が既定の
+#   "%(levelname)s:%(name)s:%(message)s" を割り当て、画面側で時刻と水準をもう一度
+#   付けて「[INFO] INFO:moomoo_trade_v1:…」と二重になる（実際になった）。
+_console_qh.setFormatter(logging.Formatter("%(message)s"))
+_console_listener = _ConsoleListener(_console_queue, _stream_handler, _console_qh)
+_console_listener.start()                # デーモンスレッド。終了時に待たない
 # ★ v3.8.7: 週次ログアーカイブ (logbackup/ + 8 週保持) に対応した FileHandler。
 # 旧版 (v3.8.6 以前) の logging.FileHandler はローテーションなしでログが
 # 無限肥大化していたため、WeeklyLogbackupHandler に置き換え。
@@ -6422,7 +6491,9 @@ _file_handler = WeeklyLogbackupHandler(
 _file_handler.setFormatter(_PlainFormatter(_log_fmt))  # ファイルはANSIなし
 _file_handler.setLevel(logging.DEBUG)    # ファイル: DEBUG以上をすべて記録（RAWログ含む）
 _file_handler.addFilter(_secret_filter)   # ★ v3.9.44: 機密マスキング
-logging.basicConfig(level=logging.DEBUG, handlers=[_stream_handler, _file_handler])
+# ★ v3.9.191: **ファイルを先に**。コンソール側はキューなので詰まらないが、
+#   万一に備えて「記録が残る側」を先頭にする（読み手は run_daily_data_collect ほか）。
+logging.basicConfig(level=logging.DEBUG, handlers=[_file_handler, _console_qh])
 log = logging.getLogger(__name__)
 
 # ── サードパーティライブラリの DEBUG ログを抑制 ────────────────────────────
@@ -6753,6 +6824,35 @@ class _FilteredStream:
 sys.stdout = _FilteredStream(sys.stdout)
 sys.stderr = _FilteredStream(sys.stderr)
 
+
+def _disable_console_quickedit() -> str:
+    """★ v3.9.191: 自分のコンソールの簡易編集モード（QuickEdit）を切る。
+
+    Windows のコンソールは QuickEdit が有効だと、画面をクリック／ドラッグしただけで
+    「選択」状態になり、**そのプロセスの標準出力への書き込みが止まる**。認定サポーターの
+    環境で Bot が 8時間25分 無言で凍結し、Enter 1回で復帰した（原因はこれ・py-spy で確認）。
+    コンソールを持たない起動（サービス・リダイレクト）では何もしない。戻り値は表示用。
+    """
+    if os.name != "nt":
+        return "対象外（Windows ではない）"
+    try:
+        import ctypes
+        _k = ctypes.windll.kernel32
+        _h = _k.GetStdHandle(-10)                     # STD_INPUT_HANDLE
+        _mode = ctypes.c_uint32()
+        if not _k.GetConsoleMode(_h, ctypes.byref(_mode)):
+            return "取得できず（コンソール無し）"
+        _ENABLE_QUICK_EDIT = 0x0040
+        _ENABLE_EXTENDED   = 0x0080
+        _new = (_mode.value | _ENABLE_EXTENDED) & ~_ENABLE_QUICK_EDIT
+        if _new == _mode.value:
+            return "もともと無効"
+        if not _k.SetConsoleMode(_h, _new):
+            return "設定できず（このまま続行）"
+        return "無効にしました（画面をクリックしても止まりません）"
+    except Exception as _e:
+        return f"設定できず（このまま続行）: {type(_e).__name__}"
+
 # ② logging.Filter（logging.Handler 経由の出力を除去）
 class _MoomooLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -6765,7 +6865,7 @@ _mlf = _MoomooLogFilter()
 #    StreamHandler の stream を filtered 版に差し替える
 def _suppress_sdk_logs():
     """全ロガー・全ハンドラーを走査して moomoo SDK ログを完全抑制する。"""
-    _our = {_stream_handler, _file_handler}
+    _our = {_stream_handler, _file_handler, _console_qh}   # ★ v3.9.191: キュー側も自分のもの
     _orig_err = sys.__stderr__
     _orig_out = sys.__stdout__
 
@@ -12558,6 +12658,9 @@ def _make_trade_ctx() -> OpenSecTradeContext:
 # `with _trade_ctx() as ctx:` で例外時も確実に close される。
 import contextlib as _contextlib
 
+_thread_loop_local = threading.local()   # ★ v3.9.191: スレッドごとの asyncio ループ
+
+
 def _ensure_thread_event_loop() -> None:
     """★ v3.9.71: 現スレッドに asyncio イベントループを保証する。
 
@@ -12574,15 +12677,21 @@ def _ensure_thread_event_loop() -> None:
         return  # 実行中ループあり (メインスレッド等) → 何もしない
     except RuntimeError:
         pass
+    # ★ v3.9.191: asyncio.get_event_loop_policy() を使わない（認定サポーターの指摘）。
+    #   Python 3.14 で非推奨になり、**照会・発注・OVN 巡回のたびに stderr へ警告**が
+    #   出ていた。標準出力が塞がれた凍結では、この警告の書き込みでワーカースレッドが
+    #   先に止まる（py-spy で sync_positions と OVN 照会がこの行で停止していた）。
+    #   代わりに「このスレッドで作ったループ」をスレッドローカルに覚えておく。
+    #   to_thread のワーカーは使い回されるので、スレッドごとに1つで足りる。
+    _lp = getattr(_thread_loop_local, "loop", None)
+    if _lp is not None and not _lp.is_closed():
+        return
     try:
-        _ev = asyncio.get_event_loop_policy().get_event_loop()
-        if _ev is None or _ev.is_closed():
-            raise RuntimeError("no usable loop")
+        _lp = asyncio.new_event_loop()
+        asyncio.set_event_loop(_lp)
+        _thread_loop_local.loop = _lp
     except Exception:
-        try:
-            asyncio.set_event_loop(asyncio.new_event_loop())
-        except Exception:
-            pass
+        pass
 
 
 @_contextlib.contextmanager
@@ -18913,11 +19022,16 @@ async def process_headlines(
 
     if ordered:
         ordered_str = ", ".join(ordered)
-        log.info(f"{tag} ✅ 連動買い完了: {ordered_str}")
+        # ★ v3.9.191: 行頭の {tag} と「トリガー」はカテゴリに対応づけた銘柄で、
+        #   発注先とは別物（beneficiaries があればそちらが優先される）。
+        #   「【SMH】連動買い完了: QQQ」と出て「SMH の話なのに QQQ を買った」と
+        #   読めていた（認定サポーターの指摘）。両方を名指しする。
+        log.info(f"{tag} ✅ 連動買い完了: {ordered_str}"
+                 f"（カテゴリ {category} の対応銘柄={trigger_sym}／発注先={ordered_str}）")
         _threadsafe_future(asyncio.to_thread(
             send_discord_message,
-            f"[Bot] 【トリガー】{trigger_sym} のニュースにより\n"
-            f"関連する {ordered_str} の注文を実行しました ▲\n"
+            f"[Bot] 【{category}】のニュース（カテゴリの対応銘柄: {trigger_sym}）により\n"
+            f"発注先 {ordered_str} の注文を実行しました ▲\n"
             f"confidence: {confidence:.2f}  horizon: {horizon}\n"
             f"理由: {reason}\n"
             f"--- ニュース ---\n" + "\n".join(f"・{t}" for t in texts[:3])
@@ -20376,12 +20490,16 @@ def _heartbeat_watchdog_thread() -> None:
                     _mins = int(stale // 60)
                     msg = (f"🚨 Bot応答なし: 約{_mins}分間、内部の鼓動(ログ)が更新されていません。"
                            f"イベントループ凍結／OpenD無応答の可能性。OpenDの起動・接続とネットワークをご確認ください。")
+                    # ★ v3.9.191: **Discord を先に、画面を後に**（認定サポーターの指摘）。
+                    #   標準出力が塞がれた凍結では、手前の print で止まり _hb_dispatch に
+                    #   届かず、検知は済んでいたのに 8時間25分 Discord がゼロだった。
+                    #   _hb_dispatch は使い捨てスレッドで POST → logging の順なので、
+                    #   出力が塞がっていても Discord 自体は届く。
+                    _hb_dispatch(msg, is_error=True)
                     try:
-                        # print は logging ロックを取らない＝病的状態でも出る
                         print(f"\033[91m\033[1m[HEARTBEAT] {msg}\033[0m", flush=True)
                     except Exception:
                         pass
-                    _hb_dispatch(msg, is_error=True)
             elif _hb_alerted:
                 # 鼓動が再開＝凍結から復帰。凍結時間つきで1回だけ通知してリセット。
                 _hb_alerted = False
@@ -20393,11 +20511,11 @@ def _heartbeat_watchdog_thread() -> None:
                 rmsg = (f"✅ Bot応答が復帰しました（約{_fmin}分の無応答がありました）。"
                         f"時間切れを超過した建玉があれば直ちに決済されます。"
                         f"ポジション・注文状態を念のためご確認ください。")
+                _hb_dispatch(rmsg, is_error=False)   # ★ v3.9.191: 同上・Discord を先に
                 try:
                     print(f"\033[92m[HEARTBEAT] {rmsg}\033[0m", flush=True)
                 except Exception:
                     pass
-                _hb_dispatch(rmsg, is_error=False)
         except Exception:
             pass
 
@@ -24230,6 +24348,18 @@ async def main(live: bool) -> None:
     exec_syms = sorted({sym for syms in EXECUTION_MAP.values() for sym in syms})
     log.info("=" * 60)
     log.info(f"  moomoo_trade_v1.py  {BOT_VERSION}  {mode_label}")
+    # ★ v3.9.191: 環境差の切り分け用。Python 3.14 では非推奨警告が出る経路があった
+    #   （配布物は 3.13 前提）。版が違うと分かるだけで、原因の当たりがつく。
+    log.info(f"  Python {sys.version.split()[0]}  {sys.platform}")
+    log.info(f"  コンソールの簡易編集モード: {_disable_console_quickedit()}")
+    # ★ v3.9.191: カテゴリ→発注銘柄の対応を最初に出す（認定サポーターの指摘）。
+    #   対応は TRIGGER_TICKERS の**位置**で決まる（先頭=MACRO・2番目=TECH）。
+    #   既定の SPY,QQQ,SMH を前提にした作りなので、QQQ,SMH のような並びでは
+    #   TECH のニュースが SMH に出る。誤りではないが、意図せずそうなる人がいる。
+    _map_note = ""
+    if _macro_sym != "SPY" or _tech_sym != "QQQ":
+        _map_note = "  ⚠️ 既定（SPY,QQQ,SMH）と対応が違います。意図どおりかご確認ください"
+    log.info(f"  カテゴリ→発注銘柄: MACRO→{_macro_sym}  TECH→{_tech_sym}  SEMI_STRONG→{_semi_sym}{_map_note}")
     log.info(f"  OpenD: {MOOMOO_HOST}:{MOOMOO_PORT}")
     log.info(f"  {_opend_state_line()}")
 
