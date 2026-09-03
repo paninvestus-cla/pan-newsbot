@@ -6462,8 +6462,29 @@ _console_qh.setLevel(logging.INFO)       # DEBUG はキューに入れない（�
 #   "%(levelname)s:%(name)s:%(message)s" を割り当て、画面側で時刻と水準をもう一度
 #   付けて「[INFO] INFO:moomoo_trade_v1:…」と二重になる（実際になった）。
 _console_qh.setFormatter(logging.Formatter("%(message)s"))
+# ★ 配布前レビュー（Gemini）: マスクはファイル側のフィルタが先に走る「順序」に頼っていた。
+#   順序が変わる・ファイル側が外れると、生の鍵がキューに滞留する。積む前に自分で消す。
+_console_qh.addFilter(_secret_filter)
 _console_listener = _ConsoleListener(_console_queue, _stream_handler, _console_qh)
-_console_listener.start()                # デーモンスレッド。終了時に待たない
+_console_listener.start()                # デーモンスレッド
+
+
+def _console_listener_stop_at_exit() -> None:
+    """★ 配布前レビュー（Gemini）: デーモンスレッドは終了時に待たれないので、最後の数行
+    （「終了しました」など）が画面に出ないまま落ちる。終了時に吐き出す。ただし
+    QueueListener.stop() は無期限に待つので、コンソールが詰まったまま終了すると
+    プロセスが固まる。番兵を積んで **2秒だけ** 待つ（ファイルのログには全件残っている）。"""
+    try:
+        _console_listener.enqueue_sentinel()
+        _t = getattr(_console_listener, "_thread", None)
+        if _t is not None:
+            _t.join(2.0)
+    except Exception:
+        pass
+
+
+import atexit as _atexit
+_atexit.register(_console_listener_stop_at_exit)
 # ★ v3.8.7: 週次ログアーカイブ (logbackup/ + 8 週保持) に対応した FileHandler。
 # 旧版 (v3.8.6 以前) の logging.FileHandler はローテーションなしでログが
 # 無限肥大化していたため、WeeklyLogbackupHandler に置き換え。
@@ -6838,7 +6859,14 @@ def _disable_console_quickedit() -> str:
     try:
         import ctypes
         _k = ctypes.windll.kernel32
+        # ★ 配布前レビュー（Gemini）: 戻り値の型を宣言しないと 64bit のハンドルが
+        #   32bit に切り捨てられ、不正なハンドルで失敗しうる。引数の型も揃える。
+        _k.GetStdHandle.restype = ctypes.c_void_p
+        _k.GetConsoleMode.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+        _k.SetConsoleMode.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
         _h = _k.GetStdHandle(-10)                     # STD_INPUT_HANDLE
+        if not _h or _h == ctypes.c_void_p(-1).value:
+            return "取得できず（コンソール無し）"
         _mode = ctypes.c_uint32()
         if not _k.GetConsoleMode(_h, ctypes.byref(_mode)):
             return "取得できず（コンソール無し）"
@@ -12685,6 +12713,13 @@ def _ensure_thread_event_loop() -> None:
     #   to_thread のワーカーは使い回されるので、スレッドごとに1つで足りる。
     _lp = getattr(_thread_loop_local, "loop", None)
     if _lp is not None and not _lp.is_closed():
+        # ★ 配布前レビュー（Gemini）: 他のライブラリが set_event_loop(None) で束縛を
+        #   外していると、ループは生きているのに SDK 側で「ループが無い」が再発する。
+        #   束縛は毎回張り直す（スレッドローカルへの代入なので軽い）。
+        try:
+            asyncio.set_event_loop(_lp)
+        except Exception:
+            pass
         return
     try:
         _lp = asyncio.new_event_loop()
@@ -20465,11 +20500,29 @@ def _hb_dispatch(msg: str, is_error: bool = True) -> None:
         pass
 
 
+def _hb_print(text: str) -> None:
+    """★ 配布前レビュー（Gemini）: 画面への print を監視スレッドで行うと、標準出力が
+    塞がれた凍結では **監視スレッド自身がそこで止まり**、30分ごとの再通知も復帰の検知も
+    以後できない。使い捨てスレッドに逃がす（詰まるのはそのスレッドだけ）。"""
+    def _p():
+        try:
+            print(text, flush=True)
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=_p, name="hb-print", daemon=True).start()
+    except Exception:
+        pass
+
+
 def _heartbeat_watchdog_thread() -> None:
     """★ v3.9.131: 独立OSスレッド。イベントループ凍結(型B)を『最後の鼓動からの経過』で検知。
     asyncio が止まっても OS スレッドは動くため「通知ゼロ(型B)」を破れる。通知のみ・自動再起動なし。
-    ・端末表示(print=loggingロック非依存)を即時に出し、Discord/log は使い捨てスレッドへ
-      分離（監視本体はどんな病的状態でも塞がれない）。
+    ・Discord/log は使い捨てスレッド（_hb_dispatch）へ、端末表示も使い捨てスレッド
+      （_hb_print）へ分離（監視本体はどんな病的状態でも塞がれない）。
+      ★ v3.9.191: 以前は print を監視スレッドで直接行い「即時に出す」としていたが、
+        標準出力が塞がれた凍結では監視スレッド自身がそこで止まる（認定サポーターの実測・
+        配布前レビュー）。Discord を先に、画面は別スレッドへ。
     ・鼓動が再開したら「約N分の無応答があった」と凍結時間つきで復帰を1回通知する
       （凍結中の警告がネットワーク断で届かなかった場合でも、復帰通知だけで全容が伝わる）。
     ・monotonic のスリープ横断はOS依存（macOS=スリープ除外/Windows=包含）。Windows では
@@ -20496,10 +20549,7 @@ def _heartbeat_watchdog_thread() -> None:
                     #   _hb_dispatch は使い捨てスレッドで POST → logging の順なので、
                     #   出力が塞がっていても Discord 自体は届く。
                     _hb_dispatch(msg, is_error=True)
-                    try:
-                        print(f"\033[91m\033[1m[HEARTBEAT] {msg}\033[0m", flush=True)
-                    except Exception:
-                        pass
+                    _hb_print(f"\033[91m\033[1m[HEARTBEAT] {msg}\033[0m")
             elif _hb_alerted:
                 # 鼓動が再開＝凍結から復帰。凍結時間つきで1回だけ通知してリセット。
                 _hb_alerted = False
@@ -20512,10 +20562,7 @@ def _heartbeat_watchdog_thread() -> None:
                         f"時間切れを超過した建玉があれば直ちに決済されます。"
                         f"ポジション・注文状態を念のためご確認ください。")
                 _hb_dispatch(rmsg, is_error=False)   # ★ v3.9.191: 同上・Discord を先に
-                try:
-                    print(f"\033[92m[HEARTBEAT] {rmsg}\033[0m", flush=True)
-                except Exception:
-                    pass
+                _hb_print(f"\033[92m[HEARTBEAT] {rmsg}\033[0m")
         except Exception:
             pass
 
