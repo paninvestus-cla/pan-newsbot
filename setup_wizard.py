@@ -3027,7 +3027,7 @@ def _build_env_lines(config):
         f"MOMENTUM_TRAIL_FROM_ENTRY={config.get('MOMENTUM_TRAIL_FROM_ENTRY', 'true')}",
         # ★ v1.38: フォールバックも Wizard 既定の select_v1 に統一（経路による既定の食い違い解消）
         f"MOMENTUM_STRATEGY_PROFILE={config.get('MOMENTUM_STRATEGY_PROFILE', 'select_v1')}",
-        f"MOMENTUM_ENABLED_SIDES={config.get('MOMENTUM_ENABLED_SIDES', 'SPY:BUY,SPY:SELL_SHORT,QQQ:BUY,QQQ:SELL_SHORT,SMH:BUY,SMH:SELL_SHORT')}",
+        f"MOMENTUM_ENABLED_SIDES={config.get('MOMENTUM_ENABLED_SIDES', 'SPY:BUY,SPY:SELL_SHORT,QQQ:BUY,QQQ:SELL_SHORT,SMH:SELL_SHORT')}",
         f"MOMENTUM_SHADOW_ENABLED={config.get('MOMENTUM_SHADOW_ENABLED', 'true')}",
         f"MOMENTUM_LIVE_TRADING={config.get('MOMENTUM_LIVE_TRADING', 'false')}",
         "# ── 反対シグナルでの転換 (上級者向け・v3.9.89) ──────────",

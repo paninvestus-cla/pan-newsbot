@@ -1243,7 +1243,7 @@ def _log_observation(
             #   settings の断面から同じ式で作る（trade 側の config_id と一致する）。
             "model":             CLAUDE_MODEL,
             "prompt_ver":        _PROMPTS_VERSION,
-            "config_id":         _config_fingerprint(json.loads(_get_settings_snapshot())),
+            "config_id":         _obs_config_id(),
             "decision_time":     now_et.strftime("%Y-%m-%d %H:%M:%S"),
             "symbol":            symbol,
             "side":              side,
@@ -2931,6 +2931,22 @@ def _config_fingerprint(snap: dict) -> str:
         return _hl.sha256(_txt.encode("utf-8")).hexdigest()[:12]
     except Exception:
         return ""
+
+
+_OBS_CONFIG_ID: Optional[str] = None
+
+
+def _obs_config_id() -> str:
+    """観察 payload 用の設定の指紋。★ 配布前レビュー（Gemini）: 観察のたびに設定を
+    JSON 化→読み戻し→再 JSON 化→ハッシュと3重に組み直していた。設定はプロセス中
+    不変なので、最初の1回だけ計算して持つ（trade 側の config_id と同じ式・同じ値）。"""
+    global _OBS_CONFIG_ID
+    if _OBS_CONFIG_ID is None:
+        try:
+            _OBS_CONFIG_ID = _config_fingerprint(json.loads(_get_settings_snapshot()))
+        except Exception:
+            return ""
+    return _OBS_CONFIG_ID
 
 
 def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
