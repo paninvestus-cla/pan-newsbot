@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.191"
+BOT_VERSION = "v3.9.192"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -1239,6 +1239,11 @@ def _log_observation(
         payload_data = {
             "observation_id":    obs_id,
             "bot_version":       BOT_VERSION_TAGGED,   # ★ v3.9.116: select_v1有効時は "+select_v1" 付き
+            # ★ v3.9.192: 何で判定したか（認定サポーターの提案②）。設定の指紋は
+            #   settings の断面から同じ式で作る（trade 側の config_id と一致する）。
+            "model":             CLAUDE_MODEL,
+            "prompt_ver":        _PROMPTS_VERSION,
+            "config_id":         _config_fingerprint(json.loads(_get_settings_snapshot())),
             "decision_time":     now_et.strftime("%Y-%m-%d %H:%M:%S"),
             "symbol":            symbol,
             "side":              side,
@@ -1927,6 +1932,26 @@ async def shadow_short_exit_loop() -> None:
 
 
 # ── ★ v3.9.12: モメンタムシャドー観察ループ (Phase 0) ──────────────────────────
+def _smh_buy_unreachable_note() -> str:
+    """★ v3.9.192: 標準プロファイルで SMH の買いを実発注対象にしていても、モメンタム経由
+    では実発注に届かないことを起動時に言う（認定サポーターの指摘⑥）。
+
+    モメンタム経由の買いは confidence を 0.70 固定で渡すが、SMH の買いには 0.78 の関門
+    （730件の分析で SMH の買いが最大の損失源だったための固定値）がある。設定画面では
+    「出る」ように見えるのに1件も出ない。Wizard v1.45 からは選択肢に出さない。
+    関門を通す変更は発注対象が変わるので、この版ではしない（PAN 判断・2026-09-04）。"""
+    try:
+        if MOMENTUM_PROFILE_SELECT:
+            return ""            # 選抜v1 は買い自体を実発注しない
+        if "SMH:BUY" not in {sd.upper() for sd in MOMENTUM_ENABLED_SIDES}:
+            return ""
+        return ("[モメンタム] ⚠️ 設定に SMH の買い（SMH:BUY）がありますが、モメンタム経由の買いは"
+                f" confidence 0.70 固定のため、SMH の買いの関門 {SMH_CONFIDENCE_THRESHOLD} に届かず"
+                "実発注されません（観察のみになります）。Wizard STEP 2-c で SMH は売りのみを選んでください。")
+    except Exception:
+        return ""
+
+
 def _momentum_effective_live_sides(trd_env: TrdEnv) -> list:
     """口座別ゲートまで適用した「実際に実発注され得るサイド」の一覧（表示用の正）。
 
@@ -2040,8 +2065,13 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
     _mom_mode_label = "実発注モード (Phase 1)" if MOMENTUM_LIVE_TRADING else "シャドー観察モード (Phase 0)"
     # ★ v3.9.116: 戦略プロファイルの適用状態を起動時に明示
     if MOMENTUM_PROFILE_SELECT:
+        # ★ v3.9.192: Phase 0（シャドー観察）で起動したときは、その旨を先に言う
+        #   （認定サポーターの指摘——同じミリ秒に「実発注は SHORT のみ」と
+        #   「シャドー観察モード ループ開始」が並び、逆のことを言っていた）。
+        _sel_note = "" if MOMENTUM_LIVE_TRADING else "（いまはシャドー観察モード (Phase 0) なので、実発注はありません。実発注にした場合の絞り込み: ）"
         log.warning(
             "[モメンタム] 🎛 戦略プロファイル: 選抜プロファイル v1 (select_v1) が有効です。"
+            f"{_sel_note}"
             " 実発注は SHORTのみ / SPY除外 / ET 9・10・12・13時台のみ に絞り、"
             "建玉トレールは無効（固定損切り）になります。"
             "シャドー観察は全銘柄・全サイド・全時間帯で継続します。"
@@ -2885,6 +2915,24 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
     #   → GAS送信 週約840行削減。復活させる場合は CHANGELOG v3.9.16/17 を参照。
 
 
+_CONFIG_ID_EXCLUDE = frozenset({
+    "bot_version", "trade_env", "strategy", "model", "prompt_ver", "config_id",
+    "effective_stop_loss_pct", "effective_timeout_min", "effective_trail_trigger_pct",
+    "effective_trail_drop_pct", "effective_stop_mode", "effective_basis",
+})
+
+
+def _config_fingerprint(snap: dict) -> str:
+    """設定の指紋。判定に効く鍵だけを鍵順に並べ、sha256 の先頭12桁を返す。"""
+    import hashlib as _hl, json as _j
+    try:
+        _core = {k: v for k, v in snap.items() if k not in _CONFIG_ID_EXCLUDE}
+        _txt = _j.dumps(_core, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return _hl.sha256(_txt.encode("utf-8")).hexdigest()[:12]
+    except Exception:
+        return ""
+
+
 def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
                            strategy: str = "") -> str:
     """ルール改善分析用に設定値を文字列化（センシティブ情報は含まない）
@@ -2921,6 +2969,10 @@ def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
         #   足し合わせてしまう（実際に切り分けできず、証券会社側から取り直した）。
         #   後から復元できない情報なので、送る側で持たせる。
         "trade_env":     _RUN_TRADE_ENV,
+        # ★ v3.9.192: 「何で判定したか」を記録に残す（認定サポーターの提案②）。
+        #   モデルやプロンプトを変えた前後を、記録から分けて比べられるようにする。
+        "model":         CLAUDE_MODEL,
+        "prompt_ver":    _PROMPTS_VERSION,
     }
     # ★ v3.9.175: 監視ループが実際に適用した出口条件（あるときだけ載せる）
     if isinstance(enforced_exit, dict):
@@ -2937,7 +2989,11 @@ def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
     snap.update({
         # 以下は共通設定（default_*）。env の直読みをやめ、起動時に解決済みの
         # 定数を使う（既定値の取り残しを防ぐ）。キー名は互換のため据え置き。
-        "budget_usd":    int(os.environ.get("BUDGET_USD", "50000") or 50000),
+        # ★ v3.9.192: env の直読みをやめ、起動時に解決済みの定数を使う（認定サポーターの指摘）。
+        #   この1行だけが直読みで、BUDGET_USD=10000.0 や 1e4 と書くと int() が ValueError になり、
+        #   決済の記録が再送キューに入る前に**静かに消えていた**（この関数は payload を組む途中で
+        #   呼ばれ、例外は別スレッドの外側で吸われる）。_BUDGET_USD は起動時に検証済み。
+        "budget_usd":    int(_BUDGET_USD),
         "max_loss_pct":  round(MAX_LOSS_PCT * 100.0, 4),
         "trail_trigger": round(TRAIL_TRIGGER_PCT * 100.0, 4),
         "trail_drop":    round(TRAIL_DROP_PCT * 100.0, 4),
@@ -2960,6 +3016,10 @@ def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
             ] if k
         ),
     })
+    # ★ v3.9.192: 設定の指紋（認定サポーターの提案②）。判定に効く設定だけを並べて sha256 の
+    #   先頭12桁にする。版・口座区分・その場の適用値・モデル/プロンプト版は含めない
+    #   （それらは別の列で持つ）。同じ設定なら再起動しても同じ ID、1つ変えれば変わる。
+    snap["config_id"] = _config_fingerprint(snap)
     return _json.dumps(snap, ensure_ascii=False, separators=(",", ":"))
 
 # ── セットアップウィザード完了チェック ─────────────────────────────────────────
@@ -4387,6 +4447,10 @@ SPY_MAJOR_COMPANIES: set = QQQ_MAJOR_COMPANIES | {
 
 # SPY 通過用マクロキーワード (これらが含まれれば SPY の影響を許可)
 _MACRO_KEYWORDS: set = {
+    # ★ v3.9.192: ISM の非製造業（サービス業）指数。認定サポーターの実測で、MACRO
+    #   ネガティブ5件が「ISM Non-Manufacturing Prices…」等で SPY 厳格モードに落ち、
+    #   victims が空になって既存ロングの決済にも届いていなかった（PAN 判断で追加・様子見）。
+    "ism non-manufacturing",
     # ── FED / 金融政策 ──
     "fed ", "fomc", "federal reserve", "interest rate", "rate cut", "rate hike",
     "powell", "yield curve",
@@ -8679,7 +8743,11 @@ def _ext_set_held(symbol: str, held: bool, reason: str = "",
         return
     ts.externally_held = held
     if held:
-        _ext_last_remind[symbol] = datetime.datetime.now()
+        # ★ v3.9.192: 鍵を (銘柄, 理由) に揃える（認定サポーターの指摘・v3.9.190d の欠陥）。
+        #   190d で _ext_remind_if_due の鍵だけを (銘柄, 理由) に変え、同じ辞書を読み書きする
+        #   ここを素の銘柄名のまま残した。停止直後の刻印が読まれず、「🛡️ 見つけました」の
+        #   直後の同期で「⏸️ 停止したままです」が数十秒差で並び、解除後も古い鍵が残っていた。
+        _ext_last_remind[(symbol, "blocked")] = datetime.datetime.now()
         log.warning(f"[建玉台帳] 🛡️ 【{symbol}】 {reason} → 自動売買を停止します（決済も新規発注もしません）")
         _threadsafe_future(asyncio.to_thread(
             send_discord_message,
@@ -8691,7 +8759,8 @@ def _ext_set_held(symbol: str, held: bool, reason: str = "",
             f"決済されれば自動的に再開します。"
         ))
     else:
-        _ext_last_remind.pop(symbol, None)
+        _ext_last_remind.pop((symbol, "blocked"), None)
+        _ext_last_remind.pop(symbol, None)   # 旧形式の鍵が残っていれば掃除
         setattr(place_close_all, f"_ext_close_notified_{symbol}", False)
         setattr(_skip_if_externally_held, f"_ext_entry_notified_{symbol}", False)
         log.info(f"[建玉台帳] ✅ 【{symbol}】 {resume_reason} → 自動売買を再開します")
@@ -18843,7 +18912,7 @@ async def process_headlines(
                             state.get(sym).entry_time = None
                         sold.append(sym)
             if sold:
-                log.info(f"{tag} 既存ロング決済: {', '.join(sold)}")
+                log.info(f"{tag} 既存ロング決済: {', '.join(sold)}（カテゴリ {category} の対応銘柄={trigger_sym}／決済した銘柄={', '.join(sold)}）")
                 await asyncio.sleep(1)  # 決済後に少し待機
 
             # ② 空売り新規エントリー
@@ -18917,7 +18986,7 @@ async def process_headlines(
                         ordered_short.append(sym)
             if ordered_short:
                 ordered_str = ", ".join(ordered_short)
-                log.info(f"{tag} ✅ ショートエントリー完了: {ordered_str}")
+                log.info(f"{tag} ✅ ショートエントリー完了: {ordered_str}（カテゴリ {category} の対応銘柄={trigger_sym}／発注先={ordered_str}）")
                 _threadsafe_future(asyncio.to_thread(
                     send_discord_message,
                     f"[Bot] 【ショート】{trigger_sym} ネガティブニュースにより\n"
@@ -18940,7 +19009,7 @@ async def process_headlines(
                 if not _reasons:
                     # 上記いずれにも該当しない場合 = place_short() 内で却下 (余力不足/急変動/トレンドガード等)
                     _reasons.append("place_short() 内でブロック (詳細は直前ログ参照)")
-                log.info(f"{tag} → 空売り試行: 全銘柄スキップ ({' / '.join(_reasons)})")
+                log.info(f"{tag} → 空売り試行: 全銘柄スキップ ({' / '.join(_reasons)})（カテゴリ {category} の対応銘柄={trigger_sym}）")
 
             # ★ v3.9.169: 見送りの記録はパニックセルの後・ロックの外で出す。
             #   先に出すと同期の照会がイベントループを塞ぎ、いちばん急ぐ緊急退避を遅らせる。
@@ -20041,8 +20110,8 @@ async def process_dynamic_stock(
         return
     if confidence < DYNAMIC_STOCKS_CONFIDENCE:
         log.info(
-            f"[動的銘柄] 【{symbol}】 confidence={confidence:.2f}"
-            f" < {DYNAMIC_STOCKS_CONFIDENCE:.2f} → 見送り"
+            f"[動的銘柄] 【{symbol}】 confidence={confidence:.3f}"
+            f" < {DYNAMIC_STOCKS_CONFIDENCE:.3f} → 見送り"
         )
         return
 
@@ -20705,6 +20774,9 @@ def _ovn_save(st: dict) -> bool:
             st["acc_id"] = int(REAL_ACC_ID) if (_RUN_TRADE_ENV == "REAL" and REAL_ACC_ID) else 0
         except (TypeError, ValueError):
             pass
+        # ★ v3.9.192: どの版が書いた状態かを残す（認定サポーターの提案⑨）。
+        #   版を跨いで持ち越した建玉の切り分けに使う。読み手は無い（余分な鍵は無視される）。
+        st["bot_version"] = BOT_VERSION
         # ★ v3.9.183: 共通の書き手へ（一時ファイル名にスレッドIDが入る・
         #   ディレクトリの fsync もそちらが持つ）。ここは `.tmp` 固定名だったため、
         #   同一プロセスの2つの書き手が互いの書きかけを消しうる状態だった。
@@ -24398,6 +24470,19 @@ async def main(live: bool) -> None:
     # ★ v3.9.191: 環境差の切り分け用。Python 3.14 では非推奨警告が出る経路があった
     #   （配布物は 3.13 前提）。版が違うと分かるだけで、原因の当たりがつく。
     log.info(f"  Python {sys.version.split()[0]}  {sys.platform}")
+    # ★ v3.9.192: 読んだ .env の場所と moomoo-api の版（認定サポーターの提案⑧）。
+    #   load_dotenv はスクリプトの位置を基準に探すので、複製フォルダやリンク経由では
+    #   「同じコードが別の設定で走る」ことが無警告で起きる。起動ログで見分けられるようにする。
+    try:
+        from dotenv import find_dotenv as _find_dotenv
+        _env_path = _find_dotenv(usecwd=False) or "(見つからず・既定値で起動)"
+    except Exception:
+        _env_path = "(不明)"
+    _moomoo_ver = getattr(sys.modules.get("moomoo"), "__version__", "不明")
+    log.info(f"  .env: {_env_path}  moomoo-api {_moomoo_ver}")
+    _smh_note = _smh_buy_unreachable_note()
+    if _smh_note:
+        log.warning(_smh_note)
     log.info(f"  コンソールの簡易編集モード: {_disable_console_quickedit()}")
     # ★ v3.9.191: カテゴリ→発注銘柄の対応を最初に出す（認定サポーターの指摘）。
     #   対応は TRIGGER_TICKERS の**位置**で決まる（先頭=MACRO・2番目=TECH）。
@@ -24435,7 +24520,6 @@ async def main(live: bool) -> None:
     except Exception as _e_credit:
         log.debug(f"[起動時] クレジット切れチェック失敗 (黙殺): {_e_credit}")
 
-    log.info(f"  トリガー銘柄: {', '.join(TRIGGER_TICKERS)}")
     log.info(f"  トリガー銘柄: {', '.join(TRIGGER_TICKERS)}")
     log.info(f"  発注銘柄:     {', '.join(exec_syms)}")
     log.info(f"  セッション制御: 月〜金 04:00〜翌04:00  週末のみ停止")
@@ -26020,6 +26104,17 @@ def _acquire_single_instance(tag: str = "bot"):
     return True
 
 
+_AI_LABEL_SCORE = {"📈 ポジティブ": 1, "➡️ 中立": 0, "📉 ネガティブ": -1}
+
+
+def _ai_score_from_match(m) -> int:
+    """★ v3.9.192: 日次集計用。score= があればそれを、無ければラベルから -1/0/1 を返す。"""
+    _sc = m.groupdict().get("score")
+    if _sc is not None:
+        return int(_sc)
+    return _AI_LABEL_SCORE[m.group("label")]
+
+
 def run_daily_data_collect(log_path: str = _LOG_PATH,
                            target_date=None) -> None:
     """
@@ -26140,7 +26235,10 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
         "risk":  re.compile(rf"{TS}.*?【{SYM}】.*?\[リスク\].*?PnL=(?P<pnl>[+-]?\$?[\d.]+)\((?P<pct>[+-]?[\d.]+)%\)", re.I),
         "eod":   re.compile(rf"{TS}.*?(?:強制クローズ発動|EOD|close_all_for_|15:45)", re.I),
         "err":   re.compile(rf"{TS}.*?\[(ERROR|WARN(?:ING)?)\]\s+(?P<msg>.+)", re.I),
-        "ai":    re.compile(rf"{TS}.*?(?:AI判定|\[AI\]).*?score=(?P<score>[+-]?\d).*?confidence=(?P<conf>[\d.]+)", re.I),
+        # ★ v3.9.192: 実際のログは「[AI判定] 📉 ネガティブ  confidence=0.68」で、score= は出ない。
+        #   従来の score= 要求では1行も当たらず、AI信頼度・強気・弱気・中立の4列が
+        #   **構造的に常に空**だった（認定サポーターの指摘）。ラベルでも拾う。
+        "ai":    re.compile(rf"{TS}.*?(?:AI判定|\[AI\]).*?(?:score=(?P<score>[+-]?\d)|(?P<label>📈 ポジティブ|➡️ 中立|📉 ネガティブ)).*?confidence=(?P<conf>[\d.]+)", re.I),
         # ★ v3.9.137: 夜間持ち越しの「記録のみ」結果。実発注の確定損益とは別枠。
         "ovnsh": re.compile(rf"{TS}.*?\[夜間持ち越し\]\[記録のみ\].*?qty=(?P<qty>\d+).*?"
                             rf"shadow_pnl=(?P<pnl>[+-][\d.]+).*?shadow_pct=(?P<pct>[+-][\d.]+)", re.I),
@@ -26227,7 +26325,7 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
                 continue
             maj=pats["ai"].search(line)
             if maj:
-                try: ai_scores.append(int(maj.group("score"))); ai_confs.append(float(maj.group("conf")))
+                try: ai_scores.append(_ai_score_from_match(maj)); ai_confs.append(float(maj.group("conf")))
                 except (ValueError, AttributeError, TypeError): pass
                 continue
             if not eod_time and pats["eod"].search(line):

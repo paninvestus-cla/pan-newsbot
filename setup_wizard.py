@@ -618,7 +618,7 @@ TOTAL = 14   # ★ v1.21: 11→14（データ収集12・モメンタム13・ア�
 
 # 既知ETFリスト（STOCK_TICKERS入力時のバリデーション用）
 # ★ v1.38: 版数は必ずここを更新する（起動バナー・ヘッダ表示で共用。取り残し防止）
-WIZARD_VERSION = "v1.44"
+WIZARD_VERSION = "v1.45"
 
 _KNOWN_ETFS = {
     "SPY", "QQQ", "SMH", "SPXL", "SPXS", "TQQQ", "SQQQ", "SOXL", "SOXS",
@@ -1863,11 +1863,11 @@ def step_momentum(existing, budget):
 
     # ★ v1.21 (点3): まず「標準セット一括 / 個別選択」で分岐。大半は1画面で抜けられる。
     setup_choices = [
-        ("1", "標準セットでまとめて設定（SPY・QQQ・SMH = 買い+売りの両方）← まずここから"),
+        ("1", "標準セットでまとめて設定（SPY・QQQ = 買い+売り、SMH = 売りのみ）← まずここから"),
         ("2", "1銘柄ずつ方向を選ぶ（上級者向け）"),
     ]
     # ★ v1.42: 既存が標準セット以外のカスタムなら既定を[2]個別選択にし、Enterで上書きしない
-    _std_sides_set = {f"{s}:{d}" for s in _SIDE_SYMS for d in ("BUY", "SELL_SHORT")}
+    _std_sides_set = {f"{s}:{d}" for s in _SIDE_SYMS for d in ("BUY", "SELL_SHORT")} - {"SMH:BUY"}
     _setup_default = "2" if (cur_sides_set and cur_sides_set != _std_sides_set) else "1"
     _sm_hint = "現在の個別設定を維持" if _setup_default == "2" else "標準セット"
     setup_mode = ask_choice(f"番号を選択（Enter={_sm_hint}）", setup_choices, default=_setup_default)
@@ -1875,9 +1875,13 @@ def step_momentum(existing, budget):
     enabled_pairs = []
     if setup_mode == "1":
         for sym in _SIDE_SYMS:
-            enabled_pairs.append(f"{sym}:BUY")
+            # ★ v1.45: SMH の買いは選択肢から外す（PAN 判断・2026-09-04）。
+            #   モメンタム経由の買いは confidence 0.70 固定で、SMH の買いの関門 0.78 に
+            #   届かないため、選んでも1件も実発注されない（設定と実態の食い違い）。
+            if sym != "SMH":
+                enabled_pairs.append(f"{sym}:BUY")
             enabled_pairs.append(f"{sym}:SELL_SHORT")
-        ok("標準セットを適用: SPY・QQQ・SMH の買い+売りを実発注対象にしました。")
+        ok("標準セットを適用: SPY・QQQ は買い+売り、SMH は売りのみを実発注対象にしました。")
         print()
     else:
         for sym in _SIDE_SYMS:
@@ -1888,7 +1892,17 @@ def step_momentum(existing, budget):
                 ("4", "なし（観察のみ・発注しない）"),
             ]
             _d = _cur_mode_for(sym)
-            print(f"  {bold(sym)}")
+            if sym == "SMH":
+                # ★ v1.45: SMH の買いはモメンタム経由では実発注に届かない（上の注記と同じ理由）
+                side_choices = [
+                    ("3", "売りのみ（SHORT）"),
+                    ("4", "なし（観察のみ・発注しない）"),
+                ]
+                if _d in ("1", "2"):
+                    _d = "3"
+                print(f"  {bold(sym)}  {dim('※ SMH の買いはモメンタム経由では実発注されないため、選択肢にありません')}")
+            else:
+                print(f"  {bold(sym)}")
             m = ask_choice(f"  {sym} の実発注サイド（Enter=現在値・未設定は両方）", side_choices, default=_d)
             if m in ("1", "2"):
                 enabled_pairs.append(f"{sym}:BUY")
