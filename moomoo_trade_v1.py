@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.192"
+BOT_VERSION = "v3.9.193"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -978,6 +978,9 @@ _OBS_FULL_STAGES = {
     #   「フィルタが良いニュースを弾いていないか」を後から検証するための母数なので、
     #   サンプリングすると検証そのものができなくなる。
     "news_select_v1",
+    # ★ v3.9.193: ETF影響ガードで発注先が空になった回。語の表を足すべきかを実データで
+    #   判断するための母数なので間引かない（認定サポーターの提案）。
+    "etf_guard_empty",
     # peak_retrace_sim / timeout_extension は v3.9.116 で計測終了・撤去
 }
 
@@ -1135,6 +1138,9 @@ def _log_observation(
     pct_5m: Optional[float] = None,        # モメンタム 5 分変化率%
     pct_15m: Optional[float] = None,       # モメンタム 15 分変化率%
     quote_sanity: Optional[int] = None,    # 1=健全 / 0=異常クォートで遮断 / None=未チェック
+    # ★ v3.9.193: True なら価格が無くても気配を取りに行かない（同期 get_quote を避ける・
+    #   配布前レビュー Codex/Gemini の指摘）。価格が無い行は損益の追跡だけが付かない。
+    skip_quote: bool = False,
 ) -> None:
     """観察イベントを GAS に送信し Phase 2 用に pending 登録する。
 
@@ -1174,7 +1180,7 @@ def _log_observation(
         #   Unknown stock のエラーが出ていた（認定サポーターの報告）。
         #   売買には影響しないが、OpenD 障害と紛らわしく、観察データにも
         #   実在しない銘柄が混じる。
-        if price_at_decision <= 0 and symbol not in _PSEUDO_SYMBOLS:
+        if price_at_decision <= 0 and not skip_quote and symbol not in _PSEUDO_SYMBOLS:
             try:
                 _q = get_quote(symbol)
                 price_at_decision = float(_q.get("last", 0)) or float(_q.get("ask", 0)) or 0.0
@@ -1189,7 +1195,8 @@ def _log_observation(
 
         # ── Phase 2 用 pending 登録 (price > 0 のときのみ・PnL 計算可能なケース) ──
         if price_at_decision > 0:
-            side_sign = 1 if side == "BUY" else -1
+            # ★ v3.9.193: 方向が決まる前の記録（side="-"）は買い方向の符号で持つ
+            side_sign = -1 if side == "SELL_SHORT" else 1
             # メモリ上限管理 (FIFO)
             if len(_PENDING_OBSERVATIONS) >= _PENDING_OBSERVATIONS_MAX:
                 try:
@@ -1260,6 +1267,10 @@ def _log_observation(
             "block_stage":       block_stage,
             "block_reason":      (block_reason or "")[:300],
             "price_at_decision": round(price_at_decision, 2),
+            # ★ v3.9.193: 口座区分（REAL/DEMO）。決済記録は v3.9.99 から持っていたが
+            #   観察ログには無く、実口座とデモを分けられなかった（認定サポーターの指摘）。
+            #   GAS v9.32 が末尾 51 列目「口座区分」で受ける。
+            "trade_env":         _RUN_TRADE_ENV,
         }
         if _momentum_meta:
             payload_data.update(_momentum_meta)
@@ -1670,6 +1681,35 @@ _SHADOW_SHORT_POSITIONS: Dict[str, Dict[str, Any]] = {}
 _SHADOW_SHORT_LOCK = threading.Lock()
 
 
+def _shadow_short_order_usd(symbol: str, confidence: float) -> Tuple[float, str]:
+    """★ v3.9.193: シャドー SHORT の仮想発注額。place_short と同じ
+    「山型配分 → 高ボラ銘柄の ÷倍率（下限あり）→ 個別株の1銘柄上限」を通す。
+    残余力キャップだけは口座の状態が要るので掛けない（記録側では再現できない）。
+    戻り値は (金額, 何を掛けたかの短い注記)。"""
+    usd = calc_order_size(confidence)
+    notes = []
+    try:
+        _mult = _symbol_loss_mult(symbol)
+    except Exception:
+        _mult = 1.0
+    if _mult > 1.0:
+        usd = max(ORDER_SIZE_MIN_USD, usd / _mult)
+        notes.append(f"÷{_mult:.1f}")
+    _is_stock = (symbol in STOCK_TICKERS
+                 or symbol in EARNINGS_PRE_TICKERS
+                 or symbol in EARNINGS_AFTER_TICKERS)
+    if _is_stock and STOCK_MAX_USD > 0:
+        # place_short と同じく「上限 − 既存の建玉コスト」の残余
+        try:
+            _rem = STOCK_MAX_USD - float(_tracked_position_cost.get(symbol, 0.0) or 0.0)
+        except Exception:
+            _rem = STOCK_MAX_USD
+        if usd > _rem:
+            usd = max(0.0, _rem)
+            notes.append(f"個別株上限${STOCK_MAX_USD:,.0f}（残余${_rem:,.0f}）")
+    return usd, "・".join(notes)
+
+
 def _shadow_short_open(
     *,
     symbol: str,
@@ -1679,6 +1719,7 @@ def _shadow_short_open(
     headlines: Optional[List[str]] = None,
     beneficiaries: Optional[List[str]] = None,
     victims: Optional[List[str]] = None,
+    qty: Optional[int] = None,       # ★ v3.9.193: 数量明示の経路（モメンタム等）は実発注と同じ qty
 ) -> None:
     """シャドー SHORT のエントリー記録。
     place_short() の TrdEnv.SIMULATE 分岐から呼び出される。
@@ -1697,9 +1738,23 @@ def _shadow_short_open(
             log.debug(f"[シャドーSHORT] {symbol} エントリー価格取得失敗 → スキップ")
             return
 
-        # ── 仮想株数 (LONG と同じ山型サイズ配分を流用) ──
-        order_usd = calc_order_size(confidence)
-        qty = max(1, int(order_usd / entry_price))
+        # ── 仮想株数 ──
+        # ★ v3.9.193: 実発注（place_short）と同じ縮小を掛ける（認定サポーターの指摘）。
+        #   従来は山型配分だけで、高ボラ銘柄の ÷倍率 と個別株の1銘柄上限を通っておらず、
+        #   仮想発注額が実発注より大きく出ていた（観察ログの SMH 中央値 $6,000 に対し、
+        #   実発注なら ÷3.0 と下限 30% で $3,000）。
+        if qty is not None and qty > 0:
+            # 配布前レビュー（Claude 別人格 2周目）: 数量明示の実発注は「予算×比率」で決めた qty を
+            # そのまま送る（÷倍率なし）。仮想側も同じ qty × 気配を金額にする。
+            order_usd, _size_note = float(qty) * entry_price, "数量指定"
+        else:
+            order_usd, _size_note = _shadow_short_order_usd(symbol, confidence)
+            if order_usd <= 0:
+                log.debug(f"[シャドーSHORT] {symbol} 個別株上限の残余なし → スキップ")
+                return
+            qty = max(1, int(order_usd / entry_price))
+        if _size_note:
+            log.debug(f"[シャドーSHORT] {symbol} 仮想発注額 ${order_usd:,.0f}（{_size_note}）")
 
         # ── 観察ログ記録 (entry) ──
         obs_id = _new_observation_id()
@@ -1758,6 +1813,7 @@ def _shadow_short_open(
                 "price_at_decision": round(entry_price, 2),
                 "shadow_short_qty":  qty,
                 "shadow_short_usd":  round(order_usd, 2),
+                "trade_env":         _RUN_TRADE_ENV,   # ★ v3.9.193: 口座区分（直送経路にも）
             }
         }, ensure_ascii=False)
 
@@ -1941,6 +1997,8 @@ def _smh_buy_unreachable_note() -> str:
     「出る」ように見えるのに1件も出ない。Wizard v1.45 からは選択肢に出さない。
     関門を通す変更は発注対象が変わるので、この版ではしない（PAN 判断・2026-09-04）。"""
     try:
+        if not MOMENTUM_LIVE_TRADING:
+            return ""            # ★ v3.9.193: Phase 0 は何も実発注しないので、この注記も出さない
         if MOMENTUM_PROFILE_SELECT:
             return ""            # 選抜v1 は買い自体を実発注しない
         if "SMH:BUY" not in {sd.upper() for sd in MOMENTUM_ENABLED_SIDES}:
@@ -2068,11 +2126,13 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
         # ★ v3.9.192: Phase 0（シャドー観察）で起動したときは、その旨を先に言う
         #   （認定サポーターの指摘——同じミリ秒に「実発注は SHORT のみ」と
         #   「シャドー観察モード ループ開始」が並び、逆のことを言っていた）。
-        _sel_note = "" if MOMENTUM_LIVE_TRADING else "（いまはシャドー観察モード (Phase 0) なので、実発注はありません。実発注にした場合の絞り込み: ）"
+        # ★ v3.9.193: 括弧の閉じが案内した中身の前に来ていた（認定サポーターの指摘）。
+        _sel_head = ("" if MOMENTUM_LIVE_TRADING
+                     else "いまはシャドー観察モード (Phase 0) なので実発注はありません。実発注にした場合は、")
         log.warning(
             "[モメンタム] 🎛 戦略プロファイル: 選抜プロファイル v1 (select_v1) が有効です。"
-            f"{_sel_note}"
-            " 実発注は SHORTのみ / SPY除外 / ET 9・10・12・13時台のみ に絞り、"
+            f" {_sel_head}"
+            "実発注は SHORTのみ / SPY除外 / ET 9・10・12・13時台のみ に絞り、"
             "建玉トレールは無効（固定損切り）になります。"
             "シャドー観察は全銘柄・全サイド・全時間帯で継続します。"
             " 従来どおりに戻すには Wizard STEP 13 [0] で「標準」を選んでください。"
@@ -2989,6 +3049,20 @@ def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
         #   モデルやプロンプトを変えた前後を、記録から分けて比べられるようにする。
         "model":         CLAUDE_MODEL,
         "prompt_ver":    _PROMPTS_VERSION,
+        # ★ v3.9.193: 判定に効くのに指紋に入っていなかった設定（認定サポーターの指摘）。
+        #   セッション別しきい値・決算しきい値・モメンタムの実発注有無と対象サイド・
+        #   実口座の空売り可否・夜間持ち越し。これらを変えても config_id が同じだった。
+        "confidence_rth":         _CONF_RTH,
+        "confidence_premarket":   _CONF_PREMARKET,
+        "confidence_afterhours":  _CONF_AFTERHOURS,
+        "confidence_overnight":   _CONF_OVERNIGHT,
+        "earnings_confidence":    EARNINGS_CONFIDENCE,
+        "momentum_live_trading":  MOMENTUM_LIVE_TRADING,
+        "momentum_enabled_sides": sorted(str(x) for x in MOMENTUM_ENABLED_SIDES),
+        "real_short_enabled":     REAL_SHORT_ENABLED,
+        "ovn_enabled":            OVN_ENABLED,
+        "ovn_mode":               OVN_MODE,
+        "ovn_vix_level":          OVN_VIX_LEVEL,
     }
     # ★ v3.9.175: 監視ループが実際に適用した出口条件（あるときだけ載せる）
     if isinstance(enforced_exit, dict):
@@ -4414,52 +4488,66 @@ def _is_failed_close_locked(symbol: str) -> tuple[bool, float]:
 # 見出しに含まれているか照合して妥当性検証 (Azenta 小型株の決算ミスを QQQ 影響
 # と誤判定するケース等への二重防御)。SPY のみマクロキーワード (Fed/CPI/金利等)
 # の例外処理あり。
-QQQ_MAJOR_COMPANIES: set = {
-    # ティッカーシンボル (大文字も小文字も判定するため lower で)
-    "aapl", "msft", "googl", "goog", "amzn", "meta", "nvda", "tsla", "avgo",
-    "amd", "intc", "csco", "qcom", "amat", "lrcx", "klac", "mu", "mchp",
-    "snps", "cdns", "intu", "adbe", "nflx", "cmcsa", "pep", "cost", "tmus",
-    "sbux", "txn", "isrg", "regn", "vrtx", "gild", "panw", "crwd", "abnb",
-    # 企業名 (lower)
-    "apple", "microsoft", "google", "alphabet", "amazon", "meta platforms",
-    "facebook", "nvidia", "tesla", "broadcom", "advanced micro devices",
-    "intel", "cisco", "qualcomm", "applied materials", "lam research",
-    "kla corp", "micron", "microchip", "synopsys", "cadence design",
-    "intuit", "adobe", "netflix", "comcast", "pepsi", "pepsico", "costco",
-    "t-mobile", "tmobile", "starbucks", "texas instruments",
-    "intuitive surgical", "regeneron", "vertex pharma", "gilead",
-    "palo alto networks", "crowdstrike", "airbnb", "booking",
+# ★ v3.9.193: ティッカーと社名を分けて持つ（配布前レビュー・認定サポーターの提案）。
+#   ティッカーは**原文で大文字の独立トークン**（`MU` `(MU)` `$MU`）にだけ当てる。小文字化した
+#   本文に単語境界で当てるだけでは、SMH の `on`（ON Semiconductor）が前置詞の on に、QQQ の
+#   `cost`（Costco）が「cost of living」に当たり、SMH の関門は依然ほぼ素通しだった。
+#   社名は小文字化した本文に単語境界つきで当てる。`meta`（Meta's earnings）と `arm`
+#   （Arm reports）は社名としても持つ。`kla corporation` `vertex pharmaceuticals`
+#   `nxp semiconductors` は、境界を入れると `kla corp` 等の前方一致が効かなくなるため足した。
+QQQ_MAJOR_TICKERS: set = {
+    "aapl", "msft", "googl", "goog", "amzn", "meta", "nvda", "tsla", "avgo", "amd", "intc",
+    "csco", "qcom", "amat", "lrcx", "klac", "mu", "mchp", "snps", "cdns", "intu", "adbe",
+    "nflx", "cmcsa", "pep", "cost", "tmus", "sbux", "txn", "isrg", "regn", "vrtx", "gild",
+    "panw", "crwd", "abnb",
 }
+QQQ_MAJOR_NAMES: set = {
+    "apple", "microsoft", "google", "alphabet", "amazon", "meta platforms", "facebook",
+    "nvidia", "tesla", "broadcom", "advanced micro devices", "intel", "cisco", "qualcomm",
+    "applied materials", "lam research", "kla corp", "micron", "microchip", "synopsys",
+    "cadence design", "intuit", "adobe", "netflix", "comcast", "pepsi", "pepsico", "costco",
+    "t-mobile", "tmobile", "starbucks", "texas instruments", "intuitive surgical",
+    "regeneron", "vertex pharma", "gilead", "palo alto networks", "crowdstrike", "airbnb",
+    "kla corporation", "vertex pharmaceuticals",
+}
+# 配布前レビュー（Gemini/Codex 2周目）: 一般語と同じ綴りの社名は、原文で先頭が大文字のときだけ当てる
+#   （"Meta's earnings" "Arm reports" "Booking shares" は通り、"meta-analysis" "investment arm"
+#   "record bookings" は通らない）。ハイフン続き（meta-）は除外。
+QQQ_MAJOR_PROPER: set = {"Meta", "Booking"}
+QQQ_MAJOR_COMPANIES: set = QQQ_MAJOR_TICKERS | QQQ_MAJOR_NAMES | {n.lower() for n in QQQ_MAJOR_PROPER}   # 互換
 
-SMH_MAJOR_COMPANIES: set = {
-    # ティッカー
-    "nvda", "tsm", "avgo", "asml", "amd", "qcom", "intc", "mu", "amat",
-    "lrcx", "klac", "mrvl", "adi", "nxpi", "stm", "mchp", "snps", "cdns",
-    "arm", "mpwr", "on", "swks", "qrvo", "tmc", "ter", "entg",
-    # 企業名
-    "nvidia", "taiwan semiconductor", "tsmc", "broadcom", "asml",
-    "advanced micro devices", "qualcomm", "intel", "micron",
-    "applied materials", "lam research", "kla corp", "marvell",
-    "analog devices", "nxp semi", "stmicroelectronics", "microchip",
-    "synopsys", "cadence design", "monolithic power", "onsemi",
-    "on semiconductor", "skyworks", "qorvo", "teradyne", "entegris",
+SMH_MAJOR_TICKERS: set = {
+    "nvda", "tsm", "avgo", "asml", "amd", "qcom", "intc", "mu", "amat", "lrcx", "klac",
+    "mrvl", "adi", "nxpi", "stm", "mchp", "snps", "cdns", "arm", "mpwr", "swks",
+    "qrvo", "tmc", "ter", "entg",
 }
+SMH_MAJOR_NAMES: set = {
+    "nvidia", "taiwan semiconductor", "tsmc", "broadcom", "advanced micro devices",
+    "qualcomm", "intel", "micron", "applied materials", "lam research", "kla corp",
+    "marvell", "analog devices", "nxp semi", "stmicroelectronics", "microchip", "synopsys",
+    "cadence design", "monolithic power", "onsemi", "on semiconductor", "skyworks", "qorvo",
+    "teradyne", "entegris", "kla corporation", "nxp semiconductors",
+}
+SMH_MAJOR_PROPER: set = {"Arm"}
+SMH_MAJOR_COMPANIES: set = SMH_MAJOR_TICKERS | SMH_MAJOR_NAMES | {n.lower() for n in SMH_MAJOR_PROPER}
 
 # SPY は構成銘柄 500 社で広いため、QQQ + 主要金融/ヘルスケア/エネルギー大型株を加える
-SPY_MAJOR_COMPANIES: set = QQQ_MAJOR_COMPANIES | {
-    # ティッカー
-    "brk.b", "brk-b", "brkb", "jpm", "v", "ma", "unh", "lly", "pg", "jnj",
-    "xom", "cvx", "wmt", "hd", "bac", "mrk", "abbv", "pfe", "ko", "wfc",
-    "dis", "crm", "orcl", "gs", "ms", "ba", "cat", "axp", "mcd", "nke",
-    # 企業名
-    "berkshire", "jpmorgan", "jp morgan", "visa", "mastercard",
-    "unitedhealth", "united health", "eli lilly", "lilly", "procter & gamble",
-    "procter and gamble", "johnson & johnson", "johnson and johnson",
-    "exxon", "chevron", "walmart", "home depot", "bank of america",
-    "merck", "abbvie", "pfizer", "coca-cola", "coca cola", "wells fargo",
-    "disney", "salesforce", "oracle", "goldman sachs", "morgan stanley",
-    "boeing", "caterpillar", "american express", "mcdonald", "nike",
+# （SPY 厳格モードは構成銘柄名を見ないので、この表は互換のためだけに残る）
+SPY_MAJOR_TICKERS: set = QQQ_MAJOR_TICKERS | {
+    "brk.b", "brk-b", "brkb", "jpm", "unh", "lly", "pg", "jnj", "xom", "cvx",
+    "wmt", "hd", "bac", "mrk", "abbv", "pfe", "ko", "wfc", "dis", "crm", "orcl", "gs", "ms",
+    "ba", "cat", "axp", "mcd", "nke",
 }
+SPY_MAJOR_NAMES: set = QQQ_MAJOR_NAMES | {
+    "berkshire", "jpmorgan", "jp morgan", "visa", "mastercard", "unitedhealth",
+    "united health", "eli lilly", "lilly", "procter & gamble", "procter and gamble",
+    "johnson & johnson", "johnson and johnson", "exxon", "chevron", "walmart", "home depot",
+    "bank of america", "merck", "abbvie", "pfizer", "coca-cola", "coca cola", "wells fargo",
+    "disney", "salesforce", "oracle", "goldman sachs", "morgan stanley", "boeing",
+    "caterpillar", "american express", "mcdonald", "nike",
+}
+SPY_MAJOR_PROPER: set = set(QQQ_MAJOR_PROPER)
+SPY_MAJOR_COMPANIES: set = SPY_MAJOR_TICKERS | SPY_MAJOR_NAMES | {n.lower() for n in SPY_MAJOR_PROPER}
 
 # SPY 通過用マクロキーワード (これらが含まれれば SPY の影響を許可)
 _MACRO_KEYWORDS: set = {
@@ -4468,7 +4556,7 @@ _MACRO_KEYWORDS: set = {
     #   victims が空になって既存ロングの決済にも届いていなかった（PAN 判断で追加・様子見）。
     "ism non-manufacturing",
     # ── FED / 金融政策 ──
-    "fed ", "fomc", "federal reserve", "interest rate", "rate cut", "rate hike",
+    "fed", "fomc", "federal reserve", "interest rate", "rate cut", "rate hike",
     "powell", "yield curve",
     # ★ v3.9.11 追加: FOMC 関連シノニム + dot plot
     "dot plot", "fomc minutes", "fed minutes", "rate decision",
@@ -4518,6 +4606,85 @@ _ETF_MAJOR_MAP: Dict[str, set] = {
     "SPY": SPY_MAJOR_COMPANIES,
 }
 
+
+# ★ v3.9.193: 構成銘柄名の照合を単語境界つきにする。
+#   v3.9.192 まで `name in combined` の部分一致だったため、短いティッカーが英単語の
+#   中に当たっていた（`autoimmune` の mu / `marathons` の on / `faster` の ter /
+#   `Trading` の adi / `investment` の stm / `Artificial intelligence` の intel）。
+#   認定サポーターの観察ログ集計では、QQQ/SMH/SPY がガードを通過した 10,480 行の
+#   うち 1,276 行（12.2%・SMH は 43.8%）がこの誤一致だけで通っていた。
+#   ETF ごとに正規表現を1回だけ組み、以後は使い回す（毎回の組み立てを避ける）。
+#   マクロ語（_MACRO_KEYWORDS）も語頭境界つきにし、複数形・形容詞形の接尾辞
+#   （s / es / ary）だけを許す（`tariffs` `interest rates` `inflationary` を落とさず、
+#   `federal` の中の `fed` は拾わない）。従来 `"fed "`（末尾空白）だったため `Fed's` を
+#   取り逃していた。セクター語（_ETF_SECTOR_WORDS）は部分一致のまま。
+def _build_major_name_pattern(names: set) -> "re.Pattern":
+    """構成銘柄名の集合から、単語境界つきの照合パターンを1つ組む。
+
+    名前は lower 済み・re.escape する。長い順に並べるのは、一致した名前を
+    ログに出すときに `onsemi` を `on` より先に報告させるため（正誤には影響しない）。
+    境界は `\\b` ではなく `(?<![a-z0-9])` / `(?![a-z0-9])` を使う。`brk.b` `t-mobile`
+    `coca-cola` のように記号で終わる/始まる名前があり、`\\b` だと境界の判定が
+    記号の側で起きて意図とずれるため。
+    """
+    _alts = "|".join(re.escape(n) for n in sorted(names, key=lambda s: (-len(s), s)))
+    return re.compile(rf"(?<![a-z0-9])(?:{_alts})(?![a-z0-9])")
+
+
+def _build_ticker_pattern(tickers: set) -> "re.Pattern":
+    """ティッカーの照合パターン。原文（小文字化しない）に対し、大文字の独立トークンにだけ当てる。
+    `(MU)` `$MU` `MU's` は当たり、`autoimmune` `Mu` `on` `cost` は当たらない。"""
+    _alts = "|".join(re.escape(t.upper()) for t in sorted(tickers, key=lambda x: (-len(x), x)))
+    return re.compile(rf"(?<![A-Za-z0-9])(?:{_alts})(?![A-Za-z0-9])")
+
+
+_ETF_MAJOR_TICKERS_MAP: Dict[str, set] = {
+    "QQQ": QQQ_MAJOR_TICKERS, "SMH": SMH_MAJOR_TICKERS, "SPY": SPY_MAJOR_TICKERS,
+}
+_ETF_MAJOR_NAMES_MAP: Dict[str, set] = {
+    "QQQ": QQQ_MAJOR_NAMES, "SMH": SMH_MAJOR_NAMES, "SPY": SPY_MAJOR_NAMES,
+}
+_ETF_MAJOR_PROPER_MAP: Dict[str, set] = {
+    "QQQ": QQQ_MAJOR_PROPER, "SMH": SMH_MAJOR_PROPER, "SPY": SPY_MAJOR_PROPER,
+}
+
+
+def _build_proper_name_pattern(names: set) -> "re.Pattern":
+    """先頭大文字の固有名（Meta / Arm / Booking）。原文に対し大文字小文字を区別して当てる。
+    後ろにハイフンが続く形（meta-analysis）は除く。"""
+    _alts = "|".join(re.escape(n) for n in sorted(names, key=lambda x: (-len(x), x))) or "(?!x)x"
+    return re.compile(rf"(?<![A-Za-z0-9])(?:{_alts})(?![A-Za-z0-9-])")
+
+
+# (ティッカー用・原文に当てる, 社名用・小文字化した本文に当てる, 固有名用・原文に当てる)
+_ETF_MAJOR_PATTERNS: Dict[str, tuple] = {
+    _sym: (_build_ticker_pattern(_ETF_MAJOR_TICKERS_MAP[_sym]),
+           _build_major_name_pattern(_ETF_MAJOR_NAMES_MAP[_sym]),
+           _build_proper_name_pattern(_ETF_MAJOR_PROPER_MAP[_sym]))
+    for _sym in _ETF_MAJOR_MAP
+}
+
+
+def _is_all_caps_headline(h: str) -> bool:
+    """見出しが全部大文字（"STOCKS FALL ON TARIFF WORRIES"）か。英字が3文字以上あり、
+    小文字が1つも無いとき。全部大文字だとティッカーの「大文字の独立トークン」という手掛かりが
+    消えるので、その見出しにはティッカーと固有名のパターンを当てない（社名・セクター語は当てる）。"""
+    _letters = [c for c in h if c.isalpha()]
+    return len(_letters) >= 3 and not any(c.islower() for c in _letters)
+
+
+def _build_macro_keyword_pattern(keywords: set) -> "re.Pattern":
+    """マクロ語の照合パターン。語頭境界つき・接尾辞は s / es / ary だけ許す。
+
+    `ary` は `inflationary` `recessionary` のため（辞書 23万語の悉皆確認で巻き添えは
+    この2語だけ・どちらも通すべき側）。`(?:s|es)?` だけだと本物のインフレ材料が落ちる。
+    """
+    _alts = "|".join(re.escape(k) for k in sorted(keywords, key=lambda x: (-len(x), x)))
+    return re.compile(rf"(?<![a-z0-9])(?:{_alts})(?:s|es|ary)?(?![a-z0-9])")
+
+
+_MACRO_KEYWORD_PATTERN: "re.Pattern" = _build_macro_keyword_pattern(_MACRO_KEYWORDS)
+
 # ETF セクター語 (構成銘柄に加えて通過させるブロード語)
 _ETF_SECTOR_WORDS: Dict[str, set] = {
     "QQQ": {"qqq", "nasdaq", "nasdaq 100", "nasdaq composite",
@@ -4551,8 +4718,13 @@ def _validate_etf_impact(
     if not etf_list:
         return etf_list
 
-    combined = " ".join(headlines).lower()
-    has_macro = any(kw in combined for kw in _MACRO_KEYWORDS)
+    combined_raw = " ".join(headlines)      # ★ v3.9.193: ティッカーは原文の大文字トークンに当てる
+    combined = combined_raw.lower()
+    # 配布前レビュー（Gemini 2周目）: 全部大文字の見出しでは "ON" "MA" が前置詞・移動平均と
+    # 区別できない。そういう見出しはティッカー/固有名の照合から外す（社名・セクター語は残す）。
+    combined_cased = " ".join(h for h in headlines if not _is_all_caps_headline(h))
+    # ★ v3.9.193: マクロ語も語頭境界つき（接尾辞 s/es/ary のみ許容）
+    has_macro = _MACRO_KEYWORD_PATTERN.search(combined) is not None
 
     validated: List[str] = []
     rejected: List[str] = []
@@ -4580,10 +4752,22 @@ def _validate_etf_impact(
             continue
 
         # SPY 以外 (QQQ / SMH) は従来通り: 主要構成銘柄 / セクター語のいずれか
-        majors  = _ETF_MAJOR_MAP[sym]
+        # ★ v3.9.193: 構成銘柄名だけ単語境界つきの照合にする（セクター語は部分一致のまま）
+        _pats = _ETF_MAJOR_PATTERNS.get(sym)
         sectors = _ETF_SECTOR_WORDS.get(sym, set())
-        if any(name in combined for name in majors) or any(w in combined for w in sectors):
+        _major_hit = None
+        if _pats is not None:
+            _major_hit = (_pats[0].search(combined_cased) or _pats[1].search(combined)
+                          or _pats[2].search(combined_cased))
+        _sector_hit = next((w for w in sectors if w in combined), None)
+        if _major_hit is not None or _sector_hit is not None:
             validated.append(sym)
+            # ★ v3.9.193: 何で通ったかを debug に残す（除外側は従来どおり info）
+            log.debug(
+                f"[ETF影響ガード] {list_label} の {sym} を通過: "
+                + (f"構成銘柄名 {_major_hit.group(0)!r}" if _major_hit is not None
+                   else f"セクター語 {_sector_hit!r}")
+            )
         else:
             rejected.append(sym)
             rejected_reasons[sym] = "主要構成銘柄/セクター語が記事に登場しないため"
@@ -4598,6 +4782,54 @@ def _validate_etf_impact(
             )
 
     return validated
+
+
+# カテゴリ → 対応銘柄（SEMI は SEMI_STRONG と同じ銘柄。発注はしないが記録の銘柄はこれ）
+_CATEGORY_SYM_MAP: Dict[str, str] = {
+    "SEMI_STRONG": _semi_sym, "SEMI": _semi_sym, "TECH": _tech_sym, "MACRO": _macro_sym,
+}
+_LAST_PRICE_MAX_AGE_SEC = 300   # 記録価格を「判定時価格」に使ってよい鮮度
+
+
+def _last_recorded_price(symbol: str) -> float:
+    """★ v3.9.193: 監視ループが約60秒ごとに記録している価格の最新値（無ければ 0.0）。
+    観察ログの「判定時価格」に使い、記録のためだけに同期の気配取得をしない。
+    配布前レビュー: 5分より古い値（監視が止まっていた・起動時の埋め戻し）は使わない。"""
+    try:
+        _h = _INDEX_PRICE_HISTORY.get(symbol) or []
+        if not _h:
+            return 0.0
+        _ts, _px = _h[-1]
+        if (datetime.datetime.now() - _ts).total_seconds() > _LAST_PRICE_MAX_AGE_SEC:
+            return 0.0
+        return float(_px)
+    except Exception:
+        return 0.0
+
+
+def _log_etf_guard_empty(*, category: str, score: int, confidence: float,
+                         texts: List[str], orig_etfs: List[str], reason: str) -> None:
+    """★ v3.9.193: ETF影響ガードで発注先が空になった回を観察ログに1行残す（結果は変えない）。
+
+    SPY 厳格モードで victims が空になった回は、`_log_observation` より手前で return して
+    いたため 22,235 行のどこにも無く、「語を1つ足すと何件回復するか」を実データで
+    数えられなかった（認定サポーターの指摘）。銘柄はカテゴリの対応銘柄。
+    """
+    try:
+        _sym = _CATEGORY_SYM_MAP.get(category, _macro_sym)
+        _why = (f"ETF影響ガードで除外 (元AI指定 {','.join(orig_etfs)})" if orig_etfs
+                else "AI の指定が元から空")
+        _log_observation(
+            symbol=_sym, side=("BUY" if score == 1 else "SELL_SHORT"),
+            confidence=confidence, score=score, category=category, headlines=texts,
+            beneficiaries=(list(orig_etfs) if score == 1 else []),
+            victims=(list(orig_etfs) if score == -1 else []),
+            outcome="blocked", block_stage="etf_guard_empty",
+            block_reason=f"{_why}  reason={reason}"[:300],
+            price_at_decision=_last_recorded_price(_sym), skip_quote=True,
+        )
+    except Exception:
+        pass
 
 
 # ── ニュースソース表示ヘルパー（v2.99）────────────────────────────────────────
@@ -4622,7 +4854,7 @@ _BUDGET_USD: float
 #   未設定（空欄）のみ従来どおり既定 $50,000。
 try:
     _BUDGET_USD = float(_BUDGET_USD_RAW) if _BUDGET_USD_RAW.strip() else 50_000.0
-    if _BUDGET_USD <= 0:
+    if not math.isfinite(_BUDGET_USD) or _BUDGET_USD <= 0:   # ★ v3.9.193: inf/nan も止める
         raise ValueError("BUDGET_USD は正の数を指定してください")
 except ValueError:
     print(f"[ERROR] BUDGET_USD の値が無効です（{_BUDGET_USD_RAW!r}）。")
@@ -8717,6 +8949,12 @@ def _ext_remind_if_due() -> None:
     _blocked = _ext_blocked_symbols()
     _unmon = [s for s in _unmonitored_holding_symbols() if s not in _blocked]
     _b = [(s, "blocked") for s in _blocked] + [(s, "unmonitored") for s in _unmon]
+    # ★ v3.9.193: いま該当しない鍵は理由を問わず落とす（認定サポーターの指摘）。
+    #   192 は解除時に (銘柄, "blocked") だけを pop していたため、監視対象外
+    #   （"unmonitored"）側の刻印が残り、6時間以内に再該当しても通知が出なかった。
+    #   理由が増えても同じ抜けが起きないよう、ここで毎回そろえる。
+    for _k in [k for k in _ext_last_remind if isinstance(k, tuple) and k not in _b]:
+        _ext_last_remind.pop(_k, None)
     if not _b:
         return
     _now = datetime.datetime.now()
@@ -10036,7 +10274,7 @@ def is_anthropic_credit_exhausted() -> bool:
 # SYSTEM_PROMPT (UNIFIED テンプレ + _semi_sym/_tech_sym/_macro_sym 置換済) は後段。
 
 # プロンプト本体のメタ情報 (ログ確認用)
-_PROMPTS_VERSION      = "1.13.0"  # v3.9.60: 政治家の関税批判・特定企業批判は中立 (5/28 Alpaca AMZN -$94.77 の対応)
+_PROMPTS_VERSION      = "1.14.0"  # v3.9.193: ETFモードに evidence（根拠にした見出しの番号）を追加
 _PROMPTS_LAST_UPDATED = "2026-05-21"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -10572,18 +10810,22 @@ SPY-LONG を 4 件発火、全敗 (-$5.16) した事例への対策。
   - JSON の `}` を出力したら **直ちに応答終了** すること（追加文字はゼロ）。
 - 複数のニュースがある場合は最も重要な 1 件に絞って 1 つの JSON のみ返す。
 - 両モード共通の必須キー: score（1 / 0 / -1）, confidence（0.0〜1.0、小数 2 桁）, horizon（5min / 15min / 60min）, reason（日本語 12 字以内）
-- ETFモード追加必須キー: category（SEMI_STRONG / SEMI / TECH / MACRO）, beneficiaries（[]）, victims（[]）
-- 個別株モード: category / beneficiaries / victims は **出力しない**（JSON 軽量化のため省略を厳守）
+- ETFモード追加必須キー: category（SEMI_STRONG / SEMI / TECH / MACRO）, beneficiaries（[]）, victims（[]）, evidence（整数）
+- evidence には「判定の根拠にした見出しの番号」を 1 つだけ、1 始まりの整数で入れる
+  （渡された見出しは "1. …" "2. …" と番号付きで並んでいる）。
+  複数の見出しを見た場合でも、最も強い根拠 1 件の番号を入れること。
+  どの見出しも根拠にしていない場合（score=0 等）も、最も関係の近い見出しの番号を入れる。
+- 個別株モード: category / beneficiaries / victims / evidence は **出力しない**（JSON 軽量化のため省略を厳守）
 
 【ETFモードの出力例】(reason は 12 字以内厳守)
-SEMI_STRONG買い: {"score":1,"confidence":0.82,"horizon":"15min","reason":"NVDA大型契約","category":"SEMI_STRONG","beneficiaries":["{semi_sym}"],"victims":[]}
-MACRO買い: {"score":1,"confidence":0.88,"horizon":"60min","reason":"FRB利下げ確定","category":"MACRO","beneficiaries":["{macro_sym}"],"victims":[]}
-MACRO売り: {"score":-1,"confidence":0.78,"horizon":"15min","reason":"CPI上振れ","category":"MACRO","beneficiaries":[],"victims":["{macro_sym}"]}
-TECH売り: {"score":-1,"confidence":0.75,"horizon":"30min","reason":"AAPL生産停止","category":"TECH","beneficiaries":[],"victims":["{tech_sym}"]}
-却下FP: {"score":0,"confidence":0.05,"horizon":"5min","reason":"PT変更のみ","category":"TECH","beneficiaries":[],"victims":[]}
-却下警告語: {"score":0,"confidence":0.05,"horizon":"5min","reason":"warns方向不明","category":"TECH","beneficiaries":[],"victims":[]}
-却下小型株: {"score":0,"confidence":0.05,"horizon":"5min","reason":"非ETF構成銘柄","category":"TECH","beneficiaries":[],"victims":[]}
-SellTheNews抑制: {"score":1,"confidence":0.60,"horizon":"60min","reason":"織込済","category":"TECH","beneficiaries":[],"victims":[]}
+SEMI_STRONG買い: {"score":1,"confidence":0.82,"horizon":"15min","reason":"NVDA大型契約","category":"SEMI_STRONG","beneficiaries":["{semi_sym}"],"victims":[],"evidence":1}
+MACRO買い: {"score":1,"confidence":0.88,"horizon":"60min","reason":"FRB利下げ確定","category":"MACRO","beneficiaries":["{macro_sym}"],"victims":[],"evidence":2}
+MACRO売り: {"score":-1,"confidence":0.78,"horizon":"15min","reason":"CPI上振れ","category":"MACRO","beneficiaries":[],"victims":["{macro_sym}"],"evidence":1}
+TECH売り: {"score":-1,"confidence":0.75,"horizon":"30min","reason":"AAPL生産停止","category":"TECH","beneficiaries":[],"victims":["{tech_sym}"],"evidence":3}
+却下FP: {"score":0,"confidence":0.05,"horizon":"5min","reason":"PT変更のみ","category":"TECH","beneficiaries":[],"victims":[],"evidence":1}
+却下警告語: {"score":0,"confidence":0.05,"horizon":"5min","reason":"warns方向不明","category":"TECH","beneficiaries":[],"victims":[],"evidence":1}
+却下小型株: {"score":0,"confidence":0.05,"horizon":"5min","reason":"非ETF構成銘柄","category":"TECH","beneficiaries":[],"victims":[],"evidence":1}
+SellTheNews抑制: {"score":1,"confidence":0.60,"horizon":"60min","reason":"織込済","category":"TECH","beneficiaries":[],"victims":[],"evidence":1}
 
 【個別株モードの出力例】(reason は 12 字以内厳守、category/beneficiaries/victims は出さない)
 強買い: {"score":1,"confidence":0.85,"horizon":"15min","reason":"決算EPS大幅Beat"}
@@ -12155,7 +12397,7 @@ async def analyze_news(
         try:
             _log_observation(
                 symbol=(target_symbol or trigger_symbol),
-                side="BUY", confidence=0.0, score=0,
+                side="-", confidence=0.0, score=0,   # ★ v3.9.193: 方向は未定（BUY 直書きをやめる）
                 category="MACRO", headlines=headlines,
                 beneficiaries=[], victims=[],
                 outcome="blocked", block_stage="market_commentary",
@@ -12193,7 +12435,7 @@ async def analyze_news(
             # 観察ログ記録 (集計用)。pnl60 バックフィルでフィルタの妥当性を後で検証可能。
             try:
                 _log_observation(
-                    symbol=trigger_symbol, side="BUY", confidence=0.0, score=0,
+                    symbol=trigger_symbol, side="-", confidence=0.0, score=0,   # ★ v3.9.193: 方向は未定
                     category="MACRO", headlines=headlines,
                     beneficiaries=[], victims=[],
                     outcome="blocked", block_stage=_stage,
@@ -12212,7 +12454,10 @@ async def analyze_news(
                 "victims":       [],
             }
 
-    combined = "\n".join(f"- {h}" for h in headlines[:5])
+    # ★ v3.9.193: 見出しに 1 始まりの番号を振る。AI が返す evidence（根拠にした
+    #   見出しの番号）を、こちらで同じ見出しに引き当てられるようにするため。
+    _sent_headlines = headlines[:5]
+    combined = "\n".join(f"{_i + 1}. {_h}" for _i, _h in enumerate(_sent_headlines))
     # ★ v1.3.0 統合版: 判定モードを user メッセージ冒頭で指定する。
     # システムプロンプト側に {symbol} を埋めずに済むため、全リクエストが同一の
     # SYSTEM_PROMPT キャッシュをヒットする (ETF/個別株すべて共通キャッシュ)。
@@ -12442,6 +12687,26 @@ async def analyze_news(
         result.setdefault("beneficiaries", [])
         result.setdefault("victims", [])
         result.setdefault("category", "MACRO")   # SEMI / TECH / MACRO
+        # ── ★ v3.9.193: evidence（AI が根拠にした見出しの番号）を正規化 ──────────
+        # 1〜送った見出し数 の整数に直せたときだけ採用し、それ以外は None にする。
+        # None のときは呼び出し側が従来どおりバッチ全体で ETF 影響ガードを掛ける
+        # （番号が無い/壊れているだけで判定が止まることはない）。
+        # 番号そのものに加えて見出しの本文も持たせる。AI 判定キャッシュの鍵は
+        # 「並べ替えた見出しのハッシュ」なので、同じ内容が別の順序で届いた回に
+        # 番号だけを流用すると別の見出しを指しかねないため。
+        _ev_raw = result.get("evidence")
+        _ev_no: Optional[int] = None
+        if not isinstance(_ev_raw, bool):
+            try:
+                # 配布前レビュー（Codex）: JSON の数値は 2 と 2.0 が同値なので、整数値の浮動小数も通す
+                _ev_f = float(str(_ev_raw).strip())
+                _ev_int = int(_ev_f) if _ev_f.is_integer() else None
+            except (TypeError, ValueError, OverflowError):
+                _ev_int = None
+            if _ev_int is not None and 1 <= _ev_int <= len(_sent_headlines):
+                _ev_no = _ev_int
+        result["evidence"] = _ev_no
+        result["evidence_headline"] = _sent_headlines[_ev_no - 1] if _ev_no else ""
         exec_syms = {sym for syms in EXECUTION_MAP.values() for sym in syms}
         result["beneficiaries"] = [s for s in result["beneficiaries"] if s in exec_syms]
         result["victims"]       = [s for s in result["victims"]       if s in exec_syms]
@@ -15292,8 +15557,8 @@ def place_buy(
             #   実値 0.779 と定数の側が :.2f では両方 0.78 に見え、
             #   「0.78 < 0.78」という成立しない不等式がログに残っていた。
             log.info(
-                f"{tag} 🚫 [SMH 専用厳格化] confidence={confidence:.3f} "
-                f"< {SMH_CONFIDENCE_THRESHOLD} → SMH の新規買いをスキップ"
+                f"{tag} 🚫 [SMH 専用厳格化] confidence={confidence:.4f} "
+                f"< {SMH_CONFIDENCE_THRESHOLD:.4f} → SMH の新規買いをスキップ"
                 f"（この関門は買いのみ・空売りには適用されません）"
             )
             _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
@@ -15407,7 +15672,7 @@ def place_buy(
             _order_size_before = order_size
             order_size = max(ORDER_SIZE_MIN_USD, order_size / _hv_mult)
             log.info(
-                f"{tag} 発注額計算: confidence={confidence:.2f}  [{_size_label}]"
+                f"{tag} 発注額計算: confidence={confidence:.4f}  [{_size_label}]"
                 f"  → 高ボラ銘柄サイズ調整 ${_order_size_before:,.0f} ÷ {_hv_mult:.1f}"
                 f" = ${order_size:,.0f}"
                 f"  (損切り幅 {MAX_LOSS_PCT*100:.2f}%→{MAX_LOSS_PCT*_hv_mult*100:.2f}% / "
@@ -15415,7 +15680,7 @@ def place_buy(
             )
         else:
             log.info(
-                f"{tag} 発注額計算: confidence={confidence:.2f}  [{_size_label}]"
+                f"{tag} 発注額計算: confidence={confidence:.4f}  [{_size_label}]"
                 f"  → ${order_size:,.0f}"
                 f"  （min=${ORDER_SIZE_MIN_USD:,.0f} max=${ORDER_SIZE_MAX_USD:,.0f}）"
             )
@@ -15436,6 +15701,13 @@ def place_buy(
             f"現在合計: ${portfolio_total:,.0f} / 上限: ${_BUDGET_USD:,.0f}\n"
             f"→ 新規発注をブロックしました"
         ))
+        # ★ v3.9.193: 観察ログに残す（記録されない4種の1つ）
+        _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                         category=category, headlines=headlines,
+                         beneficiaries=beneficiaries, victims=victims,
+                         outcome="blocked", block_stage="portfolio_cap",
+                         block_reason=f"合計${portfolio_total:,.0f} ≥ 上限${_BUDGET_USD:,.0f}",
+                         price_at_decision=quote_price(quote))
         return False
 
     # ② 残余力を計算（BUDGET_USD - 自前管理の合計コスト）
@@ -15448,6 +15720,12 @@ def place_buy(
                 f"{tag} 残余力不足: ${remaining_budget:,.0f} < 1株${limit_price:.2f}"
                 f" → 発注スキップ"
             )
+            _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                             category=category, headlines=headlines,
+                             beneficiaries=beneficiaries, victims=victims,
+                             outcome="blocked", block_stage="insufficient_budget",
+                             block_reason=f"残余力${remaining_budget:,.0f} < 1株${limit_price:.2f}",
+                         price_at_decision=quote_price(quote))
             return False
         log.info(
             f"{tag} 余力調整: ${order_size:,.0f}"
@@ -15518,6 +15796,13 @@ def place_buy(
                     f"{tag} 残余力不足（既存建玉込み）→ 発注スキップ"
                     f"（残余力 ${_rb_buy:,.0f} < 1株 ${limit_price:.2f}）"
                 )
+                # 配布前レビュー（Codex）: 数量明示の経路も記録する
+                _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                                 category=category, headlines=headlines,
+                                 beneficiaries=beneficiaries, victims=victims,
+                                 outcome="blocked", block_stage="insufficient_budget",
+                                 block_reason=f"残余力${_rb_buy:,.0f} < 1株${limit_price:.2f}（数量指定）",
+                                 price_at_decision=quote_price(quote))
                 return False
             if qty > _max_qty_budget:
                 log.info(
@@ -15730,7 +16015,7 @@ def place_short(
         log.info(f"{tag} 実口座: SHORT をスキップ（REAL_SHORT_ENABLED=false・買い専用運用）{_shadow_msg}")
         try:
             _shadow_short_open(
-                symbol=symbol, confidence=confidence, category=category,
+                symbol=symbol, qty=qty, confidence=confidence, category=category,
                 news_source=news_source, headlines=headlines,
                 beneficiaries=beneficiaries, victims=victims,
             )
@@ -15744,7 +16029,7 @@ def place_short(
         # シャドー SHORT エントリー記録 (DATA_COLLECT=true 環境でのみ実体動作)
         try:
             _shadow_short_open(
-                symbol=symbol,
+                symbol=symbol, qty=qty,
                 confidence=confidence,
                 category=category,
                 news_source=news_source,
@@ -15921,6 +16206,13 @@ def place_short(
     log.info(f"{tag} [空売り上限チェック] ポートフォリオ合計=${portfolio_total:,.0f} / 上限=${_BUDGET_USD:,.0f}")
     if portfolio_total >= _BUDGET_USD:
         log.info(f"{tag} ポートフォリオ上限到達 → 空売りブロック")
+        # ★ v3.9.193: 観察ログに残す（記録されない4種の1つ）
+        _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
+                         category=category, headlines=headlines,
+                         beneficiaries=beneficiaries, victims=victims,
+                         outcome="blocked", block_stage="portfolio_cap",
+                         block_reason=f"合計${portfolio_total:,.0f} ≥ 上限${_BUDGET_USD:,.0f}",
+                         price_at_decision=quote_price(quote))
         return False
 
     remaining_budget = _BUDGET_USD - portfolio_total
@@ -15948,19 +16240,25 @@ def place_short(
             _order_size_before = order_size
             order_size = max(ORDER_SIZE_MIN_USD, order_size / _hv_mult)
             log.info(
-                f"{tag} [空売り発注額] confidence={confidence:.2f} [{_size_label}]"
+                f"{tag} [空売り発注額] confidence={confidence:.4f} [{_size_label}]"
                 f" → 高ボラ銘柄サイズ調整 ${_order_size_before:,.0f} ÷ {_hv_mult:.1f}"
                 f" = ${order_size:,.0f}"
                 f" (損切り幅 {MAX_LOSS_PCT*100:.2f}%→{MAX_LOSS_PCT*_hv_mult*100:.2f}%)"
             )
         else:
             log.info(
-                f"{tag} [空売り発注額] confidence={confidence:.2f} [{_size_label}]"
+                f"{tag} [空売り発注額] confidence={confidence:.4f} [{_size_label}]"
                 f" → ${order_size:,.0f}"
             )
         if order_size > remaining_budget:
             if remaining_budget < limit_price:
                 log.info(f"{tag} 残余力不足 → 空売りスキップ")
+                _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
+                                 category=category, headlines=headlines,
+                                 beneficiaries=beneficiaries, victims=victims,
+                                 outcome="blocked", block_stage="insufficient_budget",
+                                 block_reason=f"残余力${remaining_budget:,.0f} < 1株${limit_price:.2f}",
+                         price_at_decision=quote_price(quote))
                 return False
             order_size = remaining_budget
         # ── ★ v3.9.169b: 個別株の1銘柄上限を空売り側にも適用する ────────────
@@ -16015,6 +16313,13 @@ def place_short(
                 f"{tag} 残余力不足（既存建玉込み）→ 空売りスキップ"
                 f"（残余力 ${remaining_budget:,.0f} < 1株 ${limit_price:.2f}）"
             )
+            # 配布前レビュー（Codex）: 数量明示（モメンタム等）の経路も記録する
+            _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
+                             category=category, headlines=headlines,
+                             beneficiaries=beneficiaries, victims=victims,
+                             outcome="blocked", block_stage="insufficient_budget",
+                             block_reason=f"残余力${remaining_budget:,.0f} < 1株${limit_price:.2f}（数量指定）",
+                             price_at_decision=quote_price(quote))
             return False
         if qty > _max_qty_budget:
             log.info(
@@ -18702,8 +19007,28 @@ async def process_headlines(
     # ★ v3.8.1: 強化版で空リスト検知に使用 (元AI指定があったか / 元から空かのログ用)
     _orig_beneficiaries_etfs = [s for s in (beneficiaries or []) if s in _ETF_MAJOR_MAP]
     _orig_victims_etfs       = [s for s in (victims       or []) if s in _ETF_MAJOR_MAP]
-    beneficiaries = _validate_etf_impact(texts, beneficiaries, "beneficiaries")
-    victims       = _validate_etf_impact(texts, victims,       "victims")
+    # ── ★ v3.9.193: AI が根拠にした見出しが分かる回は、その1本だけで検証する ──
+    # 従来はバッチの見出しを全部つないで照合していたため、AI が読んですらいない
+    # 別の記事に構成銘柄名があるだけでガードを通っていた（認定サポーターの実例:
+    # AI の採用記事とは別の 9 件目の見出しの `Hormuz` が根拠になっていた）。
+    # 番号が無い回・壊れている回は従来どおりバッチ全体で検証する（悪くならない）。
+    _ev_headline = result.get("evidence_headline") or ""
+    # 配布前レビュー（Gemini）: キャッシュ経由などで根拠見出しが今回の見出しに無いときは
+    # バッチ全体に戻す（別のバッチの1本だけで検証しない）。
+    if isinstance(_ev_headline, str) and _ev_headline and _ev_headline in texts:
+        _guard_texts = [_ev_headline]
+    else:
+        _guard_texts = texts
+    if beneficiaries or victims:
+        if _guard_texts is texts:
+            log.info("[ETF影響ガード] 根拠見出しなし → バッチ全体で検証")
+        else:
+            log.info(
+                f"[ETF影響ガード] 根拠見出し #{result.get('evidence')} で検証: "
+                f"{_ev_headline[:120]!r}"
+            )
+    beneficiaries = _validate_etf_impact(_guard_texts, beneficiaries, "beneficiaries")
+    victims       = _validate_etf_impact(_guard_texts, victims,       "victims")
 
     # ── ④ ニュースソースの信頼度重み付け ─────────────────────────────────────
     # ★ v2.93: 730件の実トレード分析で重み再調整 (STEP1, 1-2週後 STEP2 判断)。
@@ -18749,7 +19074,7 @@ async def process_headlines(
     # 📈/📉 と統一されていなかったため、"➡️" に変更して 3 種類とも emoji 表示に。
     score_label = {1: "📈 ポジティブ", 0: "➡️ 中立", -1: "📉 ネガティブ"}.get(score, "?")
     log.info(
-        f"[AI判定] {score_label}  confidence={confidence:.2f}"
+        f"[AI判定] {score_label}  confidence={confidence:.4f}"
         f"  horizon={horizon}  category={category}  reason={reason}"
         f"  beneficiaries={beneficiaries}  victims={victims}"
     )
@@ -18771,9 +19096,10 @@ async def process_headlines(
                 block_reason=_reason_full[:300],
             )
         elif "META疑問形" in _reason_full:
-            # 疑問形は score=±1 両方ありえるが、BUY 側が圧倒的に多いため BUY 仮定で記録
+            # 疑問形は score=±1 両方ありえる。★ v3.9.193: 方向は未定として記録する
+            #   （BUY 仮定だと方向で層別する分析がこの行を BUY に数える）
             _log_observation(
-                symbol=_would_be_sym, side="BUY", confidence=confidence, score=1,
+                symbol=_would_be_sym, side="-", confidence=confidence, score=1,
                 category=category, headlines=texts,
                 beneficiaries=beneficiaries, victims=victims,
                 outcome="blocked", block_stage="meta_question",
@@ -18797,6 +19123,11 @@ async def process_headlines(
             f"[ETFガード強化] beneficiaries 空 → カテゴリ単独発動を停止{_detail}  "
             f"reason={reason}"
         )
+        # ★ v3.9.193: この回は観察ログのどこにも残っていなかった（認定サポーターの指摘）。
+        #   配布前レビュー: AI が元から空を返した回（SellTheNews 抑制など）は対象外。
+        if _orig_beneficiaries_etfs:
+            _log_etf_guard_empty(category=category, score=1, confidence=confidence, texts=texts,
+                                 orig_etfs=_orig_beneficiaries_etfs, reason=reason)
         return
     if score == -1 and not victims:
         _detail = f" (元AI指定ETF: {_orig_victims_etfs})" if _orig_victims_etfs else ""
@@ -18804,6 +19135,9 @@ async def process_headlines(
             f"[ETFガード強化] victims 空 → カテゴリ単独発動を停止{_detail}  "
             f"reason={reason}"
         )
+        if _orig_victims_etfs:
+            _log_etf_guard_empty(category=category, score=-1, confidence=confidence, texts=texts,
+                                 orig_etfs=_orig_victims_etfs, reason=reason)
         return
 
     # ── ★ v2.94: SEMI_STRONG/SEMI の二段階カテゴリ判定 ─────────────────────────
@@ -18958,6 +19292,15 @@ async def process_headlines(
                             f"(SHORT スキップ)"
                         )
                         _skipped_etf_reentry.append(sym)
+                        # ★ v3.9.193: 観察ログに残す（記録されない4種の1つ）
+                        _log_observation(
+                            symbol=sym, side="SELL_SHORT", confidence=confidence, score=-1,
+                            category=category, headlines=texts,
+                            beneficiaries=beneficiaries, victims=victims,
+                            outcome="blocked", block_stage="etf_reentry_lock",
+                            block_reason=f"{_elapsed:.1f}分前に決済済・あと{_remaining:.1f}分",
+                            price_at_decision=_last_recorded_price(sym), skip_quote=True,
+                        )
                         continue
                 async with _get_sym_lock(sym):
                     _cur_qty = state.get(sym).position_qty
@@ -19005,7 +19348,7 @@ async def process_headlines(
                 log.info(f"{tag} ✅ ショートエントリー完了: {ordered_str}（カテゴリ {category} の対応銘柄={trigger_sym}／発注先={ordered_str}）")
                 _threadsafe_future(asyncio.to_thread(
                     send_discord_message,
-                    f"[Bot] 【ショート】{trigger_sym} ネガティブニュースにより\n"
+                    f"[Bot] 【ショート】カテゴリ {category}（対応銘柄 {trigger_sym}）のネガティブニュースにより\n"
                     f"{ordered_str} を空売り（新規SELL）しました ▼\n"
                     f"confidence: {confidence:.2f}  horizon: {horizon}\n"
                     f"理由: {reason}\n"
@@ -19047,7 +19390,7 @@ async def process_headlines(
                 _has_long = any(state.get(sym).position_qty > 0 for sym in short_targets)
                 if _has_long:
                     log.info(
-                        f"{tag} → ショートシグナルだが confidence={confidence:.3f} < {_thresh:.3f}"
+                        f"{tag} → ショートシグナルだが confidence={confidence:.4f} < {_thresh:.3f}"
                         f"（{get_session_info()[0].upper()} しきい値）→ 決済・空売りともスキップ"
                     )
                 else:
@@ -19083,7 +19426,7 @@ async def process_headlines(
         return
     _thresh = get_confidence_threshold()
     if confidence < _thresh:
-        log.info(f"{tag} → confidence={confidence:.3f} < {_thresh:.3f} 発注見送り（セッション別しきい値）")
+        log.info(f"{tag} → confidence={confidence:.4f} < {_thresh:.4f} 発注見送り（セッション別しきい値・発注先={','.join(exec_targets) or '-'}）")
         # ★ v3.9.7: 観察ログ — confidence 閾値ブロック (BUY)
         for _sym in exec_targets:
             _log_observation(symbol=_sym, side="BUY", confidence=confidence, score=1,
@@ -19110,6 +19453,15 @@ async def process_headlines(
                     f"【{sym}】 [ETF再エントリー禁止] "
                     f"{_elapsed:.1f}分前に決済済 → あと{_remaining:.1f}分待機 "
                     f"(BUY スキップ)"
+                )
+                # ★ v3.9.193: 観察ログに残す（記録されない4種の1つ）
+                _log_observation(
+                    symbol=sym, side="BUY", confidence=confidence, score=1,
+                    category=category, headlines=texts,
+                    beneficiaries=beneficiaries, victims=victims,
+                    outcome="blocked", block_stage="etf_reentry_lock",
+                    block_reason=f"{_elapsed:.1f}分前に決済済・あと{_remaining:.1f}分",
+                    price_at_decision=_last_recorded_price(sym), skip_quote=True,
                 )
                 continue
         # ★ v2.86: 銘柄単位ロックで「ショート決済→BUY」一連を atomic に
@@ -19167,7 +19519,7 @@ async def process_headlines(
             + "）"
         )
     else:
-        log.info(f"{tag} → 発注試行したが全銘柄スキップ（余力不足または価格取得失敗）")
+        log.info(f"{tag} → 発注試行したが全銘柄スキップ（余力不足または価格取得失敗・発注先={','.join(exec_targets) or '-'}）")
     # ★ v3.9.169: 見送りの記録はロックの外・全銘柄の処理が終わってから出す。
     _news_select_v1_flush_skips(
         _skipped_select_v1, category=category, score=score, confidence=confidence,
@@ -19532,7 +19884,7 @@ async def process_stock_news(
     # v3.9.2: 中立絵文字に VS-16 を付与 (詳細はファイル先頭側の同型行コメント参照)
     score_label = {1: "📈 ポジティブ", 0: "➡️ 中立", -1: "📉 ネガティブ"}.get(score, "?")
     log.info(
-        f"{tag} [個別株AI判定] {score_label}  confidence={confidence:.2f}"
+        f"{tag} [個別株AI判定] {score_label}  confidence={confidence:.4f}"
         f"  horizon={horizon}  reason={reason}"
     )
 
@@ -19549,7 +19901,7 @@ async def process_stock_news(
             )
         elif "META疑問形" in _reason_full:
             _log_observation(
-                symbol=symbol, side="BUY", confidence=confidence, score=1,
+                symbol=symbol, side="-", confidence=confidence, score=1,
                 category="STOCK", headlines=texts,
                 outcome="blocked", block_stage="meta_question",
                 block_reason=_reason_full[:300],
@@ -19566,7 +19918,7 @@ async def process_stock_news(
     else:
         _thresh = get_confidence_threshold()
     if confidence < _thresh:
-        log.info(f"{tag} [個別株] confidence={confidence:.3f} < {_thresh:.3f} → 発注見送り")
+        log.info(f"{tag} [個別株] confidence={confidence:.4f} < {_thresh:.3f} → 発注見送り")
         # ★ v3.9.7: 個別株 confidence 閾値ブロックを観察ログ記録
         _side = "BUY" if score == 1 else "SELL_SHORT"
         _log_observation(
@@ -19586,7 +19938,15 @@ async def process_stock_news(
         log.info(
             f"{tag} [個別株クールダウン] "
             f"{_cool_elapsed:.1f}分前に発注済 → あと{_cool_remaining:.1f}分待機 "
-            f"(score={score} confidence={confidence:.2f} スキップ)"
+            f"(score={score} confidence={confidence:.4f} スキップ)"
+        )
+        # ★ v3.9.193: 観察ログに残す（認定サポーターの指摘・記録されない4種の1つ）
+        _log_observation(
+            symbol=symbol, side=("BUY" if score == 1 else "SELL_SHORT"),
+            confidence=confidence, score=score, category="STOCK", headlines=texts,
+            outcome="blocked", block_stage="stock_cooldown",
+            block_reason=f"{_cool_elapsed:.1f}分前に発注済・あと{_cool_remaining:.1f}分",
+            price_at_decision=_last_recorded_price(symbol), skip_quote=True,
         )
         return
 
@@ -20119,14 +20479,14 @@ async def process_dynamic_stock(
     score_label = {1: "📈 ポジティブ", 0: "➡️ 中立", -1: "📉 ネガティブ"}.get(score, "?")
     log.info(
         f"[動的銘柄] 【{symbol}】 {score_label}"
-        f"  confidence={confidence:.2f}  reason={reason}"
+        f"  confidence={confidence:.4f}  reason={reason}"
     )
 
     if score == 0:
         return
     if confidence < DYNAMIC_STOCKS_CONFIDENCE:
         log.info(
-            f"[動的銘柄] 【{symbol}】 confidence={confidence:.3f}"
+            f"[動的銘柄] 【{symbol}】 confidence={confidence:.4f}"
             f" < {DYNAMIC_STOCKS_CONFIDENCE:.3f} → 見送り"
         )
         return
@@ -20792,7 +21152,10 @@ def _ovn_save(st: dict) -> bool:
             pass
         # ★ v3.9.192: どの版が書いた状態かを残す（認定サポーターの提案⑨）。
         #   版を跨いで持ち越した建玉の切り分けに使う。読み手は無い（余分な鍵は無視される）。
-        st["bot_version"] = BOT_VERSION
+        # ★ v3.9.193: 観察ログ・決済記録・日次と同じ TAGGED（"+select_v1" 等）に揃える。
+        #   注: 旧版がこの状態を読んで書き戻すと値が残る（「最後に保存した版」ではなく
+        #   「最後に保存した 192 以上の版」）。版を下げた切り分けには使えない。
+        st["bot_version"] = BOT_VERSION_TAGGED
         # ★ v3.9.183: 共通の書き手へ（一時ファイル名にスレッドIDが入る・
         #   ディレクトリの fsync もそちらが持つ）。ここは `.tmp` 固定名だったため、
         #   同一プロセスの2つの書き手が互いの書きかけを消しうる状態だった。
@@ -26131,6 +26494,15 @@ def _ai_score_from_match(m) -> int:
     return _AI_LABEL_SCORE[m.group("label")]
 
 
+# ★ v3.9.193: 日次集計が「最大益/最大損」を拾う行の形（`[ポジション] $700.00  PnL=$+1.89(+0.27%)`）。
+#   検査から直接当てられるよう関数の外に置く。ANSI の色指定はファイル側では除去済みだが、
+#   あっても通る形にしておく。
+_DAILY_POSITION_PNL_RE_TAIL = (
+    r"\[ポジション\].*?PnL=(?:\x1b\[[0-9;]*m)?(?P<pnl>\$?[+-]?[\d.]+)"
+    r"(?:\x1b\[[0-9;]*m)?\((?:\x1b\[[0-9;]*m)?(?P<pct>[+-]?[\d.]+)%"
+)
+
+
 def run_daily_data_collect(log_path: str = _LOG_PATH,
                            target_date=None) -> None:
     """
@@ -26248,7 +26620,12 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
         #   括弧の中身は問わず、realized_pnl と qty だけを見る。
         "rpnl":  re.compile(rf"{TS}.*?【{SYM}】.*?\[確定損益(?:\([^\]]*\))?\]"
                             rf".*?realized_pnl=(?P<pnl>[+-]?[\d.]+).*?qty=(?P<qty>\d+)", re.I),
-        "risk":  re.compile(rf"{TS}.*?【{SYM}】.*?\[リスク\].*?PnL=(?P<pnl>[+-]?\$?[\d.]+)\((?P<pct>[+-]?[\d.]+)%\)", re.I),
+        # ★ v3.9.193: 最大益/最大損が v3.9.133 以降ずっと 0.00 だった（認定サポーターの指摘）。
+        #   ① `[リスク]` というタグを出す行はどの版にも無く、実際は `[ポジション]`。
+        #   ② 金額は `$+1.89`（$ が符号の前）で、`+$1.89` を期待する形では当たらない。
+        #   片方だけ直しても 0 件のまま（実ログ 64,196 行で 0/0/0/576）。両方直す。
+        #   ANSI の色指定はファイル側では除去済みだが、あっても通る形にしておく。
+        "risk":  re.compile(rf"{TS}.*?【{SYM}】.*?" + _DAILY_POSITION_PNL_RE_TAIL, re.I),
         "eod":   re.compile(rf"{TS}.*?(?:強制クローズ発動|EOD|close_all_for_|15:45)", re.I),
         "err":   re.compile(rf"{TS}.*?\[(ERROR|WARN(?:ING)?)\]\s+(?P<msg>.+)", re.I),
         # ★ v3.9.192: 実際のログは「[AI判定] 📉 ネガティブ  confidence=0.68」で、score= は出ない。
@@ -26261,7 +26638,10 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
     }
 
     buy_orders=sell_orders=filled=cancelled=trade_count=0
-    rpnl_total=best_pnl=worst_pnl=0.0
+    rpnl_total=0.0
+    # ★ v3.9.193: None から始める。0.0 始まりの max/min だと全敗の日の最大益・
+    #   全勝の日の最大損が 0.00 のままになる。
+    best_pnl=worst_pnl=None
     ai_scores,ai_confs,errors=[],[],[]
     sym_orders=defaultdict(int)
     settings_line=eod_time=""
@@ -26327,7 +26707,8 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
             if mrk:
                 try:
                     pv=float(re.sub(r"[$,]","",mrk.group("pnl")))
-                    best_pnl=max(best_pnl,pv); worst_pnl=min(worst_pnl,pv)
+                    best_pnl=pv if best_pnl is None else max(best_pnl,pv)
+                    worst_pnl=pv if worst_pnl is None else min(worst_pnl,pv)
                 except (ValueError, AttributeError, TypeError): pass
                 continue
             msh=pats["ovnsh"].search(line)
@@ -26377,7 +26758,8 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
         "filled_count":filled,"cancelled_count":cancelled,
         "realized_pnl":round(rpnl_total,2) if trade_count>0 else "N/A",
         "trade_count":trade_count,
-        "best_pnl_usd":round(best_pnl,2),"worst_pnl_usd":round(worst_pnl,2),
+        "best_pnl_usd":round(best_pnl if best_pnl is not None else 0.0,2),
+        "worst_pnl_usd":round(worst_pnl if worst_pnl is not None else 0.0,2),
         "avg_confidence":round(sum(ai_confs)/len(ai_confs),3) if ai_confs else "N/A",
         "ai_bull_count":ai_scores.count(1),"ai_bear_count":ai_scores.count(-1),"ai_neutral_count":ai_scores.count(0),
         "top_symbol":max(sym_orders,key=sym_orders.get) if sym_orders else "—",
