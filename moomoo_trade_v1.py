@@ -171,7 +171,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.193"
+BOT_VERSION = "v3.9.194"
 
 # ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
 #   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
@@ -1999,15 +1999,60 @@ def _smh_buy_unreachable_note() -> str:
     try:
         if not MOMENTUM_LIVE_TRADING:
             return ""            # ★ v3.9.193: Phase 0 は何も実発注しないので、この注記も出さない
-        if MOMENTUM_PROFILE_SELECT:
-            return ""            # 選抜v1 は買い自体を実発注しない
+        if MOMENTUM_PROFILE_SELECT or MOMENTUM_PROFILE_SELECT_V2:
+            return ""            # 選抜v1 は買い自体を実発注しない・v2 は SMH の買いを対象から外している
         if "SMH:BUY" not in {sd.upper() for sd in MOMENTUM_ENABLED_SIDES}:
             return ""
         return ("[モメンタム] ⚠️ 設定に SMH の買い（SMH:BUY）がありますが、モメンタム経由の買いは"
                 f" confidence 0.70 固定のため、SMH の買いの関門 {SMH_CONFIDENCE_THRESHOLD} に届かず"
-                "実発注されません（観察のみになります）。Wizard STEP 2-c で SMH は売りのみを選んでください。")
+                "実発注されません（観察のみになります）。Wizard STEP 14 [2-c] で SMH は売りのみを選んでください。")
     except Exception:
         return ""
+
+
+def _select_profile_block_reason(symbol: str, side: str, now_et_hour: int,
+                                 pct_5: Optional[float] = None, pct_15: Optional[float] = None,
+                                 qqq_60m: Optional[float] = None) -> Optional[str]:
+    """★ v3.9.194: 戦略プロファイル（v1 / v2）が実発注を止める理由。止めなければ None。
+    v1 の条件は v3.9.116 のまま（方向・銘柄・時間帯）。v2 は方向ごとの時間帯・強度・相場との整合を足す。
+    シャドー観察はどちらでも全件続く（呼び出し側は実発注の可否だけを変える）。"""
+    if MOMENTUM_PROFILE_SELECT:
+        if side == "BUY":
+            return "LONGは実発注対象外（SHORTのみ）"
+        if symbol in _SELECT_V1_EXCLUDED_SYMBOLS:
+            return f"{symbol}は実発注対象外銘柄"
+        if now_et_hour not in _SELECT_V1_ENTRY_HOURS_ET:
+            return f"時間帯対象外（ET {now_et_hour}時台・対象は9/10/12/13時台）"
+        return None
+    if MOMENTUM_PROFILE_SELECT_V2:
+        # 配布前レビュー: 数値でない値（文字列・NaN）は「不明」として扱い、例外でループの周回を落とさない
+        def _num(v):
+            try:
+                _x = float(v)
+            except (TypeError, ValueError):
+                return None
+            return _x if _x == _x else None
+        pct_5, pct_15, qqq_60m = _num(pct_5), _num(pct_15), _num(qqq_60m)
+        if symbol in _SELECT_V2_EXCLUDED_SYMBOLS:
+            return f"{symbol}は実発注対象外銘柄"
+        if f"{symbol}:{side}" in _SELECT_V2_EXCLUDED_SIDES:
+            return f"{symbol}の{'買い' if side == 'BUY' else '売り'}は実発注対象外（関門 {SMH_CONFIDENCE_THRESHOLD} に届かない）"
+        _hours = _SELECT_V2_LONG_HOURS_ET if side == "BUY" else _SELECT_V2_SHORT_HOURS_ET
+        if now_et_hour not in _hours:
+            return (f"時間帯対象外（ET {now_et_hour}時台・"
+                    f"{'買い' if side == 'BUY' else '売り'}の対象は{'/'.join(str(h) for h in sorted(_hours))}時台）")
+        try:
+            _t5, _t15 = _MOMENTUM_LEVEL_PRESETS[_SELECT_V2_MIN_LEVEL].get(
+                symbol, (MOMENTUM_TREND_5M_PCT, MOMENTUM_TREND_15M_PCT))
+        except Exception:
+            _t5, _t15 = MOMENTUM_TREND_5M_PCT, MOMENTUM_TREND_15M_PCT
+        if pct_5 is not None and pct_15 is not None and (abs(pct_5) < _t5 or abs(pct_15) < _t15):
+            return (f"シグナルが弱い（5分 {pct_5:+.2f}% / 15分 {pct_15:+.2f}%・"
+                    f"対象は Level {_SELECT_V2_MIN_LEVEL} の {_t5:.2f}%/{_t15:.2f}% 以上）")
+        if side == "SELL_SHORT" and qqq_60m is not None and qqq_60m > _SELECT_V2_SHORT_QQQ_60M_MAX:
+            return f"相場が上げている中のショート（QQQ 60分 {qqq_60m:+.2f}% > +{_SELECT_V2_SHORT_QQQ_60M_MAX:.2f}%）"
+        return None
+    return None
 
 
 def _momentum_effective_live_sides(trd_env: TrdEnv) -> list:
@@ -2025,6 +2070,11 @@ def _momentum_effective_live_sides(trd_env: TrdEnv) -> list:
         sides = [sd for sd in sides
                  if sd.endswith(":SELL_SHORT")
                  and sd.split(":", 1)[0] not in _SELECT_V1_EXCLUDED_SYMBOLS]
+    elif MOMENTUM_PROFILE_SELECT_V2:
+        # ★ v3.9.194: v2 は買いも対象。SPY と SMH の買いだけ外す
+        sides = [sd for sd in sides
+                 if sd.split(":", 1)[0] not in _SELECT_V2_EXCLUDED_SYMBOLS
+                 and sd not in _SELECT_V2_EXCLUDED_SIDES]
     if trd_env == TrdEnv.REAL and not REAL_SHORT_ENABLED:
         sides = [sd for sd in sides if not sd.endswith(":SELL_SHORT")]
     if trd_env == TrdEnv.SIMULATE and not DEMO_SHORT_ENABLED:
@@ -2135,14 +2185,27 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
             "実発注は SHORTのみ / SPY除外 / ET 9・10・12・13時台のみ に絞り、"
             "建玉トレールは無効（固定損切り）になります。"
             "シャドー観察は全銘柄・全サイド・全時間帯で継続します。"
-            " 従来どおりに戻すには Wizard STEP 13 [0] で「標準」を選んでください。"
+            " 従来どおりに戻すには Wizard STEP 1 で「カスタマイズ設定」を選んでください。"
+        )
+    elif MOMENTUM_PROFILE_SELECT_V2:
+        _sel_head2 = ("" if MOMENTUM_LIVE_TRADING
+                      else "いまはシャドー観察モード (Phase 0) なので実発注はありません。実発注にした場合は、")
+        log.warning(
+            "[モメンタム] 🎛 戦略プロファイル: 選抜プロファイル v2 (select_v2・検証中) が有効です。"
+            f" {_sel_head2}"
+            "実発注は 買い=ET 9〜11時台 / 売り=ET 9・12時台 / SPY と SMH の買いは対象外 /"
+            f" Level {_SELECT_V2_MIN_LEVEL} 以上の強さ / 直近60分で QQQ が +{_SELECT_V2_SHORT_QQQ_60M_MAX:.2f}% より上げているときは売り見送り に絞り、"
+            "建玉トレールは無効（固定損切り）になります。"
+            "シャドー観察は全銘柄・全サイド・全時間帯で継続します。"
+            " ※ Wizard v1.46 は v2 を知らないため、Wizard を再実行して Enter で進めると select_v1 に戻ります。"
+            "v2 を試す間は Wizard を再実行しないでください（v1.47 で選べるようにします）。"
         )
     elif _PROFILE_TAG == "+flatstop":
         log.warning(
             "[モメンタム] 🎛 戦略プロファイル: 標準＋固定損切り（検証中）。"
             " 建玉トレールを無効化し、固定の損切り（既定0.5%・高ボラ倍率は従来どおり）で運用します。"
             " シートの botバージョン列に \"+flatstop\" が付き、標準との比較集計に使われます。"
-            " 従来の建玉トレールに戻すには Wizard STEP 13 [6] で「建玉トレール（標準）」を選んでください。"
+            " 従来の建玉トレールに戻すには Wizard STEP 14 [6] で「建玉トレール（既定）」を選んでください。"
         )
     else:
         log.info("[モメンタム] 🎛 戦略プロファイル: 標準（従来どおり・プロファイルによる絞り込みなし）")
@@ -2166,7 +2229,9 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
         _demo_short_note = _momentum_demo_short_note(trd_env)
         # ★ v3.9.154: ここも絞り込み後の実効サイドを出す（認定サポーターの指摘§4）。
         _live_sides_disp = _momentum_effective_live_sides(trd_env)
-        _live_sides_note = "（select_v1 絞り込み後・口座別ゲート適用後）" if MOMENTUM_PROFILE_SELECT else "（口座別ゲート適用後）"
+        _live_sides_note = ("（select_v1 絞り込み後・口座別ゲート適用後）" if MOMENTUM_PROFILE_SELECT
+                            else "（select_v2 絞り込み後・口座別ゲート適用後）" if MOMENTUM_PROFILE_SELECT_V2
+                            else "（口座別ゲート適用後）")
         log.warning(
             f"[モメンタム] ⚡ 実発注モード有効: live-eligible サイド {_live_sides_disp}"
             f"{_live_sides_note} "
@@ -2335,7 +2400,10 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                 #   `max(1, int(0 / price))` で **必ず1株**しか発注していなかった
                 #   （ログにも `想定発注=$0` と出たまま実発注が通る）。
                 #   順番を入れ替え、係数 → 発注額 → ログ文言を1回だけ通す形にする。
-                _long_range_ok = (
+                # ★ v3.9.194: 選抜 v2 はプロファイルが強度（Level 2 以上）を決めるので、[2-d] のロング
+                #   レンジ（既定 0.70〜0.80%）は掛けない（配布前レビュー: 掛けたままだと v2 の買いは
+                #   一度も実発注に届かず、Wizard の「プロファイルが [2-d] より優先」とも食い違う）。
+                _long_range_ok = MOMENTUM_PROFILE_SELECT_V2 or (
                     side != "BUY"
                     or (
                         (MOMENTUM_LONG_MIN_SIGNAL_PCT <= 0 or pct_5 >= MOMENTUM_LONG_MIN_SIGNAL_PCT)
@@ -2432,19 +2500,15 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     except Exception:
                         pass
 
-                # ★ v3.9.116: 戦略プロファイル select_v1（Wizard STEP 13 [0]・既定OFF）。
+                # ★ v3.9.116: 戦略プロファイル select_v1（Wizard STEP 1・既定OFF）。
                 #   実発注だけを絞り、シャドー観察は全件継続（trend/premarketフィルタと同型）。
                 _profile_block_reason = None
-                if _will_live_order and MOMENTUM_PROFILE_SELECT:
+                if _will_live_order and (MOMENTUM_PROFILE_SELECT or MOMENTUM_PROFILE_SELECT_V2):
+                    # ★ v3.9.194: v1/v2 の絞り込みは _select_profile_block_reason に一本化
                     _now_et_hour = datetime.datetime.now(_ET).hour
-                    if side == "BUY":
-                        _profile_block_reason = "LONGは実発注対象外（SHORTのみ）"
-                    elif symbol in _SELECT_V1_EXCLUDED_SYMBOLS:
-                        _profile_block_reason = f"{symbol}は実発注対象外銘柄"
-                    elif _now_et_hour not in _SELECT_V1_ENTRY_HOURS_ET:
-                        _profile_block_reason = (
-                            f"時間帯対象外（ET {_now_et_hour}時台・対象は9/10/12/13時台）"
-                        )
+                    _qqq_60m = get_index_pct_change("QQQ", 60) if MOMENTUM_PROFILE_SELECT_V2 else None
+                    _profile_block_reason = _select_profile_block_reason(
+                        symbol, side, _now_et_hour, pct_5=pct_5, pct_15=pct_15, qqq_60m=_qqq_60m)
                     if _profile_block_reason:
                         _will_live_order = False
 
@@ -2964,7 +3028,8 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
     if _gas_send_with_retry(cfg_url, payload, kind="trade", key=trade_id,
                             timeout=60, jitter_max=_jit):
         log.info(f"[データ収集] ✅ トレード送信完了  {symbol}  pnl={realized_pnl:+.2f}"
-                 + ("  [選抜プロファイルv1]" if MOMENTUM_PROFILE_SELECT else ""))   # ★ v3.9.116
+                 + ("  [選抜プロファイルv1]" if MOMENTUM_PROFILE_SELECT
+                    else "  [選抜プロファイルv2]" if MOMENTUM_PROFILE_SELECT_V2 else ""))   # ★ v3.9.116
 
     # ── ★ v3.9.116: 決済時シミュレーション2種を計測終了・撤去 ─────────────────
     # ①peakリトレース微利確sim(v3.9.17/peak_retrace_sim・週470行) は「含み益をどう守るか」
@@ -3156,7 +3221,7 @@ except ValueError:
     sys.exit(1)
 
 # ── トリガー銘柄（ニュース監視専用）────────────────────────────────────────────
-# setup_wizard.py の STEP4 で設定した銘柄を読み込む
+# setup_wizard.py の STEP7 で設定した銘柄を読み込む
 _trigger_raw = os.environ.get("TRIGGER_TICKERS", "").strip()
 TRIGGER_TICKERS = [t.strip() for t in _trigger_raw.split(",") if t.strip()] if _trigger_raw else ["SPY", "QQQ"]
 
@@ -4071,7 +4136,7 @@ MOMENTUM_PREMARKET_FILTER_ENABLED: bool = (
 _mom_syms_raw = os.environ.get("MOMENTUM_SYMBOLS", "QQQ,SPY,SMH,IWM,DRAM").strip()
 MOMENTUM_SYMBOLS: tuple = tuple(s.strip().upper() for s in _mom_syms_raw.split(",") if s.strip())
 
-# ── ★ v3.9.116: 戦略プロファイル（Wizard STEP 13 [0] で選択・既定 standard=従来どおり）──
+# ── ★ v3.9.116: 戦略プロファイル（Wizard STEP 1 で選択・既定 standard=従来どおり）──
 # select_v1（選抜プロファイル）: 実発注5週間+シャドー観察（2026/6/9〜7/10・ユニーク
 #   シグナル4,952件）の集計で、全期間・前半/後半スプリット・週別のいずれでも
 #   期待値がプラスだった条件の組み合わせ（過去観察に基づく設定であり将来を保証しない）:
@@ -4097,12 +4162,33 @@ MOMENTUM_SYMBOLS: tuple = tuple(s.strip().upper() for s in _mom_syms_raw.split("
 MOMENTUM_STRATEGY_PROFILE: str = (
     os.environ.get("MOMENTUM_STRATEGY_PROFILE", "standard").strip().lower() or "standard"
 )
-if MOMENTUM_STRATEGY_PROFILE not in ("standard", "select_v1"):
+if MOMENTUM_STRATEGY_PROFILE not in ("standard", "select_v1", "select_v2"):
     MOMENTUM_STRATEGY_PROFILE = "standard"   # 不正値は従来どおり（他configと同じ静かなfallback）
 MOMENTUM_PROFILE_SELECT: bool = (MOMENTUM_STRATEGY_PROFILE == "select_v1")
+# ★ v3.9.194: 選抜プロファイル v2（既定オフ・opt-in・.env に MOMENTUM_STRATEGY_PROFILE=select_v2）。
+#   v1 の中身は変えない（版管理の規約）。v2 は 8/1〜9/3 の観察ログ（重複除去 1,512 シグナル）と
+#   7〜9 月の実取引（選抜 v1 2,355 件）の再集計から作った。v1 との違い:
+#     ・方向を固定しない（買いも対象）。8〜9 月は QQQ/SMH の買いが +0.06〜+0.08%、ショートが −0.06〜−0.10%
+#     ・時間帯（ET）: ショートは 9・12 時台、買いは 9〜11 時台。13 時台は実取引の勝率 17%（n=58）で外す。
+#       10 時台のショートは 8〜9 月に −0.10%（n=433）で最大の損失源だったため外す
+#     ・弱いシグナルを捨てる: 5 分・15 分の変化率が Level 2 の閾値以上のときだけ実発注
+#       （5 分 0.3% 未満のショートが −0.18%・勝率 31%）
+#     ・相場との整合: 直近 60 分で QQQ が +0.15% より上げているときはショートを見送る（−0.21%・勝率 22%・n=27）
+#     ・SPY は v1 と同じく対象外。SMH の買いは関門 0.78 に届かないため対象外
+#     ・固定損切り・日次損失予算 1.5% は v1 と同じ。時間切れは利用者の設定のまま
+#   これは 5 週間の相場から作った仮説で、v1 と同じ「その期間に合わせただけ」の危険がある。
+#   まずシャドーで v1 と並走させ（tools/eval_select_v2.py で観察ログから評価）、実発注は PAN の判断で。
+MOMENTUM_PROFILE_SELECT_V2: bool = (MOMENTUM_STRATEGY_PROFILE == "select_v2")
+MOMENTUM_PROFILE_ANY: bool = MOMENTUM_PROFILE_SELECT or MOMENTUM_PROFILE_SELECT_V2
 _SELECT_V1_ENTRY_HOURS_ET: frozenset = frozenset({9, 10, 12, 13})
 _SELECT_V1_EXCLUDED_SYMBOLS: frozenset = frozenset({"SPY"})
-if MOMENTUM_PROFILE_SELECT:
+_SELECT_V2_SHORT_HOURS_ET: frozenset = frozenset({9, 12})
+_SELECT_V2_LONG_HOURS_ET: frozenset = frozenset({9, 10, 11})
+_SELECT_V2_EXCLUDED_SYMBOLS: frozenset = frozenset({"SPY"})
+_SELECT_V2_EXCLUDED_SIDES: frozenset = frozenset({"SMH:BUY"})
+_SELECT_V2_MIN_LEVEL: int = 2                 # シグナル強度の下限（Level 2 の閾値以上）
+_SELECT_V2_SHORT_QQQ_60M_MAX: float = 0.15    # 直近60分の QQQ 変化率がこれより大きいときショートを見送る（%）
+if MOMENTUM_PROFILE_ANY:
     # ④ プロファイルは検証済みルール一式のため、建玉トレールは env の値に関わらず無効化
     MOMENTUM_TRAIL_FROM_ENTRY = False
     # ⑤ 日次損失予算: env 未指定なら 1.5% に強化（明示指定はそのまま尊重）
@@ -4119,6 +4205,8 @@ if MOMENTUM_PROFILE_SELECT:
 #   として2週以上比較して検証する。select_v1 は別タグ優先（内部で建玉トレールOFFのため）。
 if MOMENTUM_PROFILE_SELECT:
     _PROFILE_TAG = "+select_v1"
+elif MOMENTUM_PROFILE_SELECT_V2:
+    _PROFILE_TAG = "+select_v2"
 elif not MOMENTUM_TRAIL_FROM_ENTRY:
     _PROFILE_TAG = "+flatstop"     # 標準プロファイル × 建玉トレールOFF（固定損切り）
 else:
@@ -4134,8 +4222,9 @@ _NEWS_PROFILE_TAG: str = "+news_v1" if NEWS_PROFILE_SELECT else ""
 BOT_VERSION_TAGGED: str = BOT_VERSION + _PROFILE_TAG + _NEWS_PROFILE_TAG
 _PROFILE_DISPLAY: str = (
     "選抜プロファイル v1（絞り込み運転）" if MOMENTUM_PROFILE_SELECT
-    else ("標準＋固定損切り（建玉トレールOFF・検証中）" if _PROFILE_TAG == "+flatstop"
-          else "標準（今まで通り）")
+    else ("選抜プロファイル v2（検証中）" if MOMENTUM_PROFILE_SELECT_V2
+          else ("標準＋固定損切り（建玉トレールOFF・検証中）" if _PROFILE_TAG == "+flatstop"
+                else "カスタマイズ設定（今まで通り）"))
 ) + (
     # ★ v3.9.169: 日次サマリ（端末・Discord）はこの文字列だけを見せているため、
     #   ニュース選抜が効いているのに「標準（今まで通り）」と出ていた。
@@ -4872,7 +4961,7 @@ ORDER_SIZE_MIN_USD  = max(500.0, _BUDGET_USD * 0.30)       # 予算の30%（弱�
 STOCK_MAX_USD: float = _BUDGET_USD * _STOCK_MAX_PCT if _STOCK_MAX_PCT > 0 else 0.0
 
 # ── 損切りライン（MAX_LOSS_PCT）─────────────────────────────────────────────
-# setup_wizard.py の STEP2 で設定した「ポジションの何%損したら撤退するか」。
+# setup_wizard.py の STEP3 で設定した「ポジションの何%損したら撤退するか」。
 # .env の MAX_LOSS_PCT を読み込む（例: 0.3 → 0.3%）。未設定時はデフォルト 0.3%。
 # ★ v3.9.46: デフォルトを 0.50% → 0.30% に引き下げ (TRAIL とセットで損益非対称性
 # を 5:1 → 2:1 に改善・損益分岐 WR 67% を目標)。
@@ -5000,7 +5089,7 @@ except ValueError:
 # 引け際に QQQ を買い、翌営業日の寄り付きで売る。日中のニュース売買とは別物で、
 # 昼のBotが動いていない時間だけを使う。
 #
-# 既定は無効。.env に OVN_ENABLED=true と書いた人だけが動く（Wizard v1.46 から STEP14 で選べる）。
+# 既定は無効。.env に OVN_ENABLED=true と書いた人だけが動く（Wizard v1.46 から STEP15 で選べる）。
 # 有効にした人は実際に売買したいはずなので、モードの既定は live にしている。
 #
 #   OVN_ENABLED        true で有効（既定 false）
@@ -5412,7 +5501,7 @@ _hb_freeze_start_mono = None                      # 凍結開始時点の鼓動 
 RISK_CHECK_SEC = 15
 
 # ── トレイリングストップ ──────────────────────────────────────────────────────
-# setup_wizard.py STEP3 で設定。
+# setup_wizard.py STEP4 で設定。
 # ★ v3.9.46: デフォルトを TRIGGER 1.0% → 0.30% / DROP 0.5% → 0.15% に引き下げ。
 # MAX_LOSS_PCT (0.30%) とセットで損益非対称性を改善:
 #   旧: 損 -0.50% / 利 最小 +0.50% (1.0 - 0.5) → 1:1 だが TRIGGER に到達せず timeout が大半
@@ -24981,7 +25070,9 @@ async def main(live: bool) -> None:
             #   すぐ上の「SPY除外」の行と食い違って見えた。
             # ★ v3.9.157 (A-2): シャドーループ側と同じヘルパー（口座別ゲート適用後）。
             _eff_sides = _momentum_effective_live_sides(trd_env)
-            _prof_note = "（select_v1 絞り込み後・口座別ゲート適用後）" if MOMENTUM_PROFILE_SELECT else "（口座別ゲート適用後）"
+            _prof_note = ("（select_v1 絞り込み後・口座別ゲート適用後）" if MOMENTUM_PROFILE_SELECT
+                          else "（select_v2 絞り込み後・口座別ゲート適用後）" if MOMENTUM_PROFILE_SELECT_V2
+                          else "（口座別ゲート適用後）")
             _mom_note = f"実発注対象サイド={_eff_sides}{_prof_note} (それ以外はシャドー記録のみ)"
             # ★ v3.9.155/156: select_v1（SHORTのみ）×デモのSHORT無効 では実発注が
             #   発生しない（デモ限定・ヘルパーが環境で分岐する）。
