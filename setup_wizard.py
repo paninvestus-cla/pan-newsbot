@@ -2,7 +2,7 @@
 setup_wizard.py
 ===============
 moomoo_trade_v1.py 用 .env セットアップウィザード（完全版）
-最新バージョン: v1.41  最終更新日: 2026-07-25
+最新バージョン: v1.46  最終更新日: 2026-09-06
 
 使い方:
   python3 setup_wizard.py   # Mac
@@ -18,6 +18,16 @@ moomoo_trade_v1.py 用 .env セットアップウィザード（完全版）
 # 更新履歴
 # =============================================================================
 #
+# v1.46 2026-09-06  戦略プロファイルを STEP1 に・OVN取引機能・時間帯は「発注しない」が標準（Bot v3.9.193 連動・PAN 指示）。
+#   ①STEP1「戦略プロファイル」を新設。モメンタム（MOMENTUM_STRATEGY_PROFILE）とニュース選抜 v1
+#     （NEWS_STRATEGY_PROFILE: 新規エントリーを TECH/SEMI_STRONG かつ RTH に限る・決済は止めない）をまとめて選ぶ。
+#     プロファイルが優先する項目は以降に出さない: 両方が選抜なら STEP6 の時間帯は RTH 以外を「発注しない」で自動
+#     （既存で RTH 以外に値がある人には尋ねる）、STEP14 のモメンタム詳細は従来どおりスキップ。全 STEP を +1（16 STEP）。
+#   ②STEP6 の標準は「発注しない」（【標準】表記・旧「標準」の水準は「通常」に改名）。
+#   ③STEP15「OVN取引機能（夜間持ち越し・任意）」を新設（アラート音は STEP16 へ）。既定は「使う」。OVN_ENABLED / OVN_MODE /
+#     OVN_BUDGET_USD / OVN_VIX_LEVEL / OVN_SKIP_LONG_HOLIDAY / OVN_SKIP_WEEKEND を対話で設定。実売買は Y/N で確認。
+#     金額は必須（b で「使わない」に戻れる）。QQQ 1株に届かない金額では買わないことを明記。
+#   ④書き出し（新規/差し替え）・確認画面・設定チェック（prompt/validate/normalize つき）に上記キーを追加。
 # v1.42 2026-08-06  Codexレビュー対応（表示番号の不整合5件）。①[0]戦略プロファイルの説明文とメニュー番号の逆転を解消（標準を[1]・選抜を[2]に並べ替え）。②ask_choiceのcustom_range指定時は「位置番号」ではなく「値そのもの」で選択（タイムアウトで「5」＝5分・指値バッファで「1」＝1%等の衝突を解消。表示も〔入力: 値〕形式に）。③トレール発動/幅・指値バッファの数値直接入力を正しく反映。④[2-c]setup_modeの既定を動的化（既存がカスタムなら[2]個別選択を既定にしEnterで上書きしない）。⑤番号参照ヒント（[2]/[4]を選択→値を入力）を修正。
 # v1.41 2026-07-25  [6]損切りの方式に「+flatstop 検証群」の説明を追加（Bot v3.9.128 連動）。標準プロファイルで[2]固定損切りを選ぶと
 #                   シートに+flatstopタグが付き、建玉トレール群との実データ比較に使われる（段階導入・Codex/週次レビュー優先度1）。設定挙動は不変。
@@ -614,11 +624,11 @@ def _backup_env():
         print(f"  {dim(f'既存の .env をバックアップしました: {os.path.basename(backup_path)}')}")
         print()
 
-TOTAL = 14   # ★ v1.21: 11→14（データ収集12・モメンタム13・アラート音14を正式STEP化）
+TOTAL = 16   # ★ v1.46: 14→16（戦略プロファイルを STEP1 に・OVN取引機能を STEP15 に新設・アラート音は16へ）
 
 # 既知ETFリスト（STOCK_TICKERS入力時のバリデーション用）
 # ★ v1.38: 版数は必ずここを更新する（起動バナー・ヘッダ表示で共用。取り残し防止）
-WIZARD_VERSION = "v1.45"
+WIZARD_VERSION = "v1.46"
 
 _KNOWN_ETFS = {
     "SPY", "QQQ", "SMH", "SPXL", "SPXS", "TQQQ", "SQQQ", "SOXL", "SOXS",
@@ -631,13 +641,78 @@ _KNOWN_ETFS = {
 # 発注しない設定の sentinel 値（AI confidence は 0.0〜1.0 なので 2.0 は絶対に超えない）
 _DISABLED_CONF = "2.00"
 
+def step_profiles(existing):
+    """★ v1.46: 戦略プロファイルを最初に決める。ここで「選抜」を選ぶと、プロファイルが優先する
+    項目（STEP 6 の時間帯・STEP 14 のモメンタム詳細）は以降の STEP に出ない。"""
+    header(1, TOTAL, "🎯 STEP 1 ── 戦略プロファイル（実発注の絞り込み・最初に決める設定）")
+    print(f"  {bold('概要')}")
+    print(f"  {dim('過去の全取引データの集計に基づく「絞り込み運転」を、モメンタムとニュースのそれぞれで選びます。')}")
+    print(f"  {dim('選抜を選ぶと、プロファイルが優先する項目（時間帯・モメンタムの詳細設定）は以降の STEP に出ません。')}")
+    print()
+    # ── [0] モメンタムの戦略プロファイル ★ v1.35 / Bot v3.9.116（v1.46 で STEP 1 へ移動）──
+    print(f"  {bold('A. モメンタムの戦略プロファイル（実発注の絞り込み）')}")
+    print(f"  {dim('過去の全取引データの集計に基づく「絞り込み運転」を選べます。')}")
+    # ★ v1.38: 既定は[2]選抜プロファイル。「Enter＝従来どおり」ではない点を正しく表記（Codexレビュー対応）
+    print(f"  {dim('[1] カスタマイズ設定 を選ぶと、これまでと同じく STEP 14 で細かく決めます。')}")
+    print(f"  {dim('Enter を押すと ▶ の付いている項目（現在の設定）がそのまま使われます。初回は [2] が既定です。')}")
+    print()
+    # ★ v1.37: 既定を「選抜プロファイル v1」に変更。過去集計で標準より相対的に成績が良好かつ、
+    #   実発注が少なく1トレードのリスクも小さい（より保守的な）運転のため。未設定の新規は select_v1。
+    #   （注）戦略全体はまだ黒字化していない。あくまで“標準よりマシ・低リスク”の位置づけで、利益は非保証。
+    _cur_profile = str(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).strip().lower()
+    _cur_prof_mode = "1" if _cur_profile == "standard" else "2"
+    print(f"  {green('▶') if _cur_prof_mode == '2' else ' '} [2] 選抜プロファイル v1（絞り込み運転・既定）")
+    print( "        約5週間の全取引データ（実発注 4,266件＋シャドー観察のユニークシグナル 4,952件）")
+    print( "        を集計し、カスタマイズ設定（絞り込みなし）より相対的に成績が良好だった条件だけに実発注を絞ります。")
+    print( "        （＝実発注が少なく、1トレードのリスクも小さい保守的な運転。成績は変動し利益は保証しません）")
+    print( "        絞り込みの内容（5つ）:")
+    print( "          ① 方向    … 空売り（ショート）のみ実発注。買い（ロング）は記録のみ")
+    print( "          ② 銘柄    … SPY を実発注から除外（対象は QQQ / SMH）")
+    print( "          ③ 時間帯  … 米国東部時間 9・10・12・13時台のみ新規発注")
+    print( "                       （11時台と14時以降は過去集計で損失が続いた時間帯のため見送り）")
+    print( "          ④ 損切り  … 固定の損切りライン（建玉トレールは使わない）")
+    print( "                       利益が伸びたときのトレール利確は今まで通り働きます")
+    print( "          ⑤ 安全網  … 1日の損失が上限（リスク許容度・既定なら予算の 0.5%）に達したら、その日の新規発注を自動停止")
+    print( "                       （プロファイルは予算の 1.5% の上限も重ねてかけます。先に当たった方で止まります）")
+    print()
+    print(f"  {green('▶') if _cur_prof_mode == '1' else ' '} [1] カスタマイズ設定（今まで通り）")
+    print( "        プロファイルによる絞り込みなし。STEP 14 の [1]〜[6] で自分で決めた設定がそのまま使われます。")
+    print( "        （買い・売り両方や全時間帯で実発注するぶん、実発注は多く1トレードのリスクも相対的に大きめ）")
+    print()
+    print(f"  {dim('・見送ったシグナルもすべてシャドー記録に残るため、絞り込みの効果は毎週の集計で確認できます。')}")
+    print(f"  {dim('・過去データの傾向に基づく設定であり、将来の成績を保証するものではありません。')}")
+    print(f"  {dim('・[2]を選んだ場合、STEP 14 の [2-c]銘柄サイド・[2-d]ロングレンジ・[6]損切り方式よりも、')}")
+    print(f"  {dim('  プロファイルの絞り込みが優先されます（実発注のみ。シャドー記録は全件そのまま）。')}")
+    print(f"  {dim('・いつでも Wizard を再実行して [1] カスタマイズ設定に戻せます。')}")
+    print()
+    profile_choices = [
+        ("1", "カスタマイズ設定（今まで通り）"),
+        ("2", "選抜プロファイル v1（絞り込み運転）← 既定"),
+    ]
+    _prof_sel = ask_choice("番号を選択（Enter=現在値を維持）", profile_choices, default=_cur_prof_mode)
+    strategy_profile = "select_v1" if _prof_sel == "2" else "standard"
+    is_select_profile = (strategy_profile == "select_v1")
+    ok("戦略プロファイル: " + ("選抜プロファイル v1（絞り込み運転）" if is_select_profile else "カスタマイズ設定（今まで通り）"))
+    print()
+
+    # ── [0-b] ニュース選抜プロファイル v1 ★ v1.46 / Bot v3.9.169 ──
+    news_profile = _ask_news_profile(existing)
+    print()
+    ok_box([
+        ("MOMENTUM_STRATEGY_PROFILE", "選抜プロファイル v1" if is_select_profile else "カスタマイズ設定（今まで通り）"),
+        ("NEWS_STRATEGY_PROFILE",     "ニュース選抜 v1（TECH / SEMI_STRONG・RTH のみ新規建て）" if news_profile == "select_v1" else "カスタマイズ設定（今まで通り）"),
+    ])
+    next_step_pause()
+    return {"MOMENTUM_STRATEGY_PROFILE": strategy_profile, "NEWS_STRATEGY_PROFILE": news_profile}
+
+
 def step1_budget(existing):
-    header(1, TOTAL, "💰 STEP 1 ── 予算（BUDGET_USD）")
+    header(2, TOTAL, "💰 STEP 2 ── 予算（BUDGET_USD）")
     print("  最大投資上限額（ドル）を設定します。\n")
     box("目安", [
         "$10,000 未満だと、1回の発注額が小さくなり手数料負けのリスクが大きくなります。",
         "（金額はご自身の資金計画に合わせて設定してください）",
-        "実口座（--live）で使う場合は、口座の実際の信用余力の範囲内に設定してください。",
+        "実口座（02_Real で起動）で使う場合は、口座の実際の信用余力の範囲内に設定してください。",
         "余力を超えると、複数銘柄の同時保有時に発注が拒否されます（信用余力不足）。",
     ])
     cur = existing.get("BUDGET_USD", "10000")
@@ -656,7 +731,7 @@ def step1_budget(existing):
         warn("正の数値で入力してください（例: 30000）")
 
 def step2_risk(existing, budget):
-    header(2, TOTAL, "🛡 STEP 2 ── リスク管理")
+    header(3, TOTAL, "🛡 STEP 3 ── リスク管理")
     budget_val = float(budget)
 
     print("  【損切りライン（MAX_LOSS_PCT）】\n")
@@ -664,7 +739,7 @@ def step2_risk(existing, budget):
     box("目安", [
         "0.30%  標準型（タイト・小さな損失で素早く撤退）← まずここから",
         "0.50%  ゆとりあり（旧 v3.9.45 以前の標準）",
-        "1.00%  保守的（損失額は大きくなる）",
+        "1.00%  ゆるめ（切られにくいが、1回の損失は大きくなる）",
     ])
     cur_loss = existing.get("MAX_LOSS_PCT", "0.30")
     while True:
@@ -758,9 +833,13 @@ def _pct_to_percent_str(raw, default_percent_str):
 
 
 def step3_trailing(existing):
-    header(3, TOTAL, "📈 STEP 3 ── トレイリングストップ")
+    header(4, TOTAL, "📈 STEP 4 ── トレイリングストップ")
     print("  利益が出たポジションを守るための自動追跡決済です。\n")
-    print("  ① 発動しきい値: 投下額からこの%上昇したらトレール開始")
+    if str(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).strip().lower() == "select_v1":
+        # ★ v1.46: 選抜プロファイルのモメンタム建玉は固定の損切りで、この設定は使われない（ニュース連動の建玉には使われる）
+        print(f"  {dim('※ STEP 1 の選抜プロファイルが置き換えるのは損切り側（建玉トレール→固定の損切りライン）だけです。')}")
+        print(f"  {dim('   ここで決める利確トレールは、ニュース連動・モメンタムの両方の建玉に効きます。')}\n")
+    print("  ① 発動しきい値: 建値から有利な方向にこの%動いたらトレール開始")
     print("  ② トレール幅:   最高値からこの%下落したら決済\n")
     box("例（BUDGET $10,000 の場合）", [
         "発動+0.22% → $10,022 に到達したらトレール開始",
@@ -824,7 +903,7 @@ def step3_trailing(existing):
     return {"TRAIL_TRIGGER_PCT": trig, "TRAIL_DROP_PCT": drop}
 
 def step4_confidence(existing):
-    header(4, TOTAL, "🤖 STEP 4 ── AIしきい値（ベース）")
+    header(5, TOTAL, "🤖 STEP 5 ── AIしきい値（ベース）")
     print("  AIが0.0〜1.0のスコアでニュースを評価します。\n")
 
     print("  【発注しきい値（STRONG_BUY_CONFIDENCE）】\n")
@@ -853,7 +932,7 @@ def step4_confidence(existing):
     info("通常は発注しきい値と同じで問題ありません。Enterでスキップ。")
     cur_panic = existing.get("PANIC_CONFIDENCE", base_conf)
     while True:
-        val = ask("PANIC_CONFIDENCE（Enterで発注しきい値と同じ）", default=cur_panic)
+        val = ask("PANIC_CONFIDENCE（Enter=現在値を維持・未設定なら発注しきい値と同じ）", default=cur_panic)
         try:
             v = float(val)
             if 0.5 <= v <= 1.0:
@@ -872,10 +951,60 @@ def step4_confidence(existing):
     return {"STRONG_BUY_CONFIDENCE": base_conf, "PANIC_CONFIDENCE": panic_conf}
 
 def step5_session(existing, base_conf):
-    header(5, TOTAL, "⏰ STEP 5 ── 時間帯別トレード設定")
+    header(6, TOTAL, "⏰ STEP 6 ── 時間帯別トレード設定")
     base = float(base_conf)
-    print(f"  RTH ベースしきい値（STEP 4）: {base_conf}\n")
-    print("  各セッションの発注方針を選択します。")
+    # ★ v1.46: モメンタムとニュースの両方が選抜プロファイルなら、新規建ては RTH だけ（プロファイルが
+    #   優先）なので、RTH 以外の時間帯は「発注しない」を自動で書き、この STEP は尋ねない（PAN 指示）。
+    _mom_sel  = str(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).strip().lower() == "select_v1"
+    _news_sel = str(existing.get("NEWS_STRATEGY_PROFILE", "")).strip().lower() == "select_v1"
+    _prev_saved = existing.get("_SESSION_PREV") or {}
+    def _sess_val(k):
+        _v = str(existing.get(k, "") or "")
+        if isinstance(_prev_saved, dict) and _v == _DISABLED_CONF and k in _prev_saved:
+            _v = str(_prev_saved.get(k, "") or "")
+        return _v
+    _has_live_session = any(
+        _sess_val(k) not in ("", _DISABLED_CONF)
+        for k in ("CONFIDENCE_PREMARKET", "CONFIDENCE_AFTERHOURS", "CONFIDENCE_OVERNIGHT"))
+    if _mom_sel and _news_sel and _has_live_session:
+        # 配布前レビュー（Claude 別人格）: モメンタムの選抜は ET 9時台を含むので 9:00〜9:29 のプリマーケットに
+        #   発注しうる。既存で RTH 以外に値がある人の設定を黙って「発注しない」に変えない（尋ねる）。
+        print(f"  {yellow('選抜プロファイルを選んでいますが、RTH 以外の時間帯に設定値があるため、そのまま維持するか確認します。')}")
+        print(f"  {dim('（標準は「発注しない」です。Enter で現在値を維持できます）')}")
+        print()
+    if _news_sel and not _mom_sel:
+        print(f"  {dim('※ ニュース選抜プロファイルでは、ニュース連動の新規建ては通常取引時間（RTH）だけです。')}")
+        print(f"  {dim('   ここの設定は、それ以外の時間帯にモメンタムを動かすか（発注しない＝その時間帯は止まる）に効きます。')}\n")
+    if _mom_sel and _news_sel and not _has_live_session:
+        print(f"  {green('選抜プロファイル（モメンタム・ニュースとも）を選択 → 時間帯の設定はプロファイルが優先します。')}")
+        print(f"  {dim('新規建ては通常取引時間（RTH）だけなので、プリマーケット／アフターアワーズ／オーバーナイトは')}")
+        print(f"  {dim('「発注しない」（標準）を自動で書き出します。その時間帯はニュース取得・AI判定も止まります。')}")
+        print()
+        # 配布前レビュー（Gemini）: 自動で「発注しない」を書いたあと「戻る」で標準に変えたとき、
+        #   元の時間帯設定が既定に出るよう、上書き前の値を state に退避する（.env には書かれない）。
+        _prev = _prev_saved or {
+            k: existing.get(k, "") for k in ("CONFIDENCE_PREMARKET", "CONFIDENCE_AFTERHOURS", "CONFIDENCE_OVERNIGHT")
+        }
+        _r = {
+            "CONFIDENCE_PREMARKET":  _DISABLED_CONF,
+            "CONFIDENCE_AFTERHOURS": _DISABLED_CONF,
+            "CONFIDENCE_OVERNIGHT":  _DISABLED_CONF,
+            "CLOSE_BEFORE_INACTIVE": ("false" if str(existing.get("CLOSE_BEFORE_INACTIVE", "true")).strip().lower() == "false" else "true"),
+            "CONFIDENCE_RTH":        existing.get("CONFIDENCE_RTH", ""),
+            "_SESSION_PREV":         _prev,
+        }
+        if _r["CLOSE_BEFORE_INACTIVE"] != "true":
+            warn("移行前全決済が OFF です。RTH 以外が「発注しない」だと、16:00 以降の建玉は翌朝まで Bot が監視しません。")
+        ok_box([
+            ("プリマーケット",   "発注しない（標準・自動）"),
+            ("アフターアワーズ", "発注しない（標準・自動）"),
+            ("オーバーナイト",   "発注しない（標準・自動）"),
+            ("移行前全決済",     "ON" if _r["CLOSE_BEFORE_INACTIVE"] == "true" else "OFF（16:00 以降の建玉は翌朝まで無監視）"),
+        ])
+        next_step_pause()
+        return _r
+    print(f"  RTH ベースしきい値（STEP 5）: {base_conf}\n")
+    print("  各セッションの発注方針を選択します。標準は「発注しない」です（RTH 以外は流動性が薄く不利なため）。")
     print("  数値が高いほど発注条件が厳しく、発注頻度が下がります。\n")
     # ★ v1.39: 「発注しない」の実際の動作を明記（Bot v3.9.6 実装済み）
     print(f"  {dim('※ [1] 発注しない を選んだセッション中は、発注だけでなくニュース取得・AI判定も')}")
@@ -954,6 +1083,10 @@ def step5_session(existing, base_conf):
         defmode = sess["default_mode"]
 
         cur_val  = existing.get(key, "")
+        # 自動スキップで上書きした値なら、退避してあった元の値を既定に戻す
+        _prev_vals = existing.get("_SESSION_PREV") or {}
+        if isinstance(_prev_vals, dict) and cur_val == _DISABLED_CONF and key in _prev_vals:
+            cur_val = _prev_vals.get(key, "") or ""
         cur_mode = _detect_mode(cur_val, vals) if cur_val else defmode
 
         print(f"  {cyan('─'*54)}")
@@ -961,9 +1094,9 @@ def step5_session(existing, base_conf):
         print(f"  {dim(note)}\n")
 
         choices_display = [
-            ("disabled",     f"発注しない          （このセッションは完全停止）"),
+            ("disabled",     f"発注しない【標準】  （このセッションは完全停止）"),
             ("conservative", f"慎重  {vals['conservative']}   重要ニュースのみ"),
-            ("standard",     f"標準  {vals['standard']}   スプレッドを考慮した水準"),
+            ("standard",     f"通常  {vals['standard']}   スプレッドを考慮した水準"),
             ("aggressive",   f"積極  {vals['aggressive']}   RTHと同じ条件で発注"),
         ]
 
@@ -1015,7 +1148,7 @@ def step5_session(existing, base_conf):
         else:
             label_map = {
                 "conservative": "慎重",
-                "standard":     "標準",
+                "standard":     "通常",
                 "aggressive":   "積極",
             }
             ok(f"{short_name}: {label_map[chosen_mode]}（{result[key]}）")
@@ -1039,6 +1172,7 @@ def step5_session(existing, base_conf):
 
     # RTHはベースと同じ（変更しない）
     result["CONFIDENCE_RTH"] = existing.get("CONFIDENCE_RTH", "")
+    result["_SESSION_PREV"] = {}   # 尋ねた回の値が正。退避は捨てる（.env には書かれない）
 
     def _sess_disp(v):
         if not v or v == "":   return "ベースと同じ"
@@ -1057,6 +1191,34 @@ def step5_session(existing, base_conf):
     ])
     next_step_pause()
     return result
+
+def _effective_select_sides(raw):
+    """★ v1.46: 選抜プロファイルが絞り込んだ後に残る実発注サイド（Bot の _momentum_effective_live_sides と同じ式:
+    空売りだけ・SPY は外す）。"""
+    pairs = [p.strip().upper() for p in (raw or "").split(",") if ":" in p]
+    return ",".join(p for p in pairs if p.endswith(":SELL_SHORT") and not p.startswith("SPY:"))
+
+
+def _fmt_momentum_live(config):
+    """★ v1.46: 確認画面の「MOMENTUM実発注」。実発注しない／選抜の絞り込み後／カスタマイズの生値。"""
+    if str(config.get("MOMENTUM_LIVE_TRADING", "true")).strip().lower() == "false":
+        return "実発注しない（シャドー観察のみ・記録だけ）"
+    raw = config.get("MOMENTUM_ENABLED_SIDES", "")
+    if str(config.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).strip().lower() == "select_v1":
+        eff = _effective_select_sides(raw)
+        if not eff:
+            return "（選抜の絞り込み後、実発注の対象なし。STEP 14 の設定に QQQ / SMH の空売りがありません）"
+        return _fmt_momentum_sides(eff) + "（選抜プロファイルが空売りだけに絞り込み・買いと SPY は記録のみ）"
+    return _fmt_momentum_sides(raw)
+
+
+def _fmt_account(config):
+    """★ v1.46: 確認画面に「実口座かデモか」を出す。"""
+    acc = str(config.get("MOOMOO_ACC_ID", "") or "").strip()
+    if not acc:
+        return "デモのみ（実口座は未設定）"
+    return f"実口座 ***{acc[-4:]} を設定済み"
+
 
 def _fmt_momentum_sides(raw):
     """MOMENTUM_ENABLED_SIDES を『SPY-売 / QQQ-売買 / IWM-売』形式に整形して返す。"""
@@ -1078,10 +1240,10 @@ def _fmt_momentum_sides(raw):
 
 
 def step6_symbols(existing):
-    header(6, TOTAL, "📊 STEP 6 ── 売買銘柄の選択（ニュース駆動）")
+    header(7, TOTAL, "📊 STEP 7 ── 売買銘柄の選択（ニュース駆動）")
     print("  ここで選ぶのは【ニュース駆動（AIニュース）】の対象ETFです。買い・空売りの両方に対応します。")
-    print(f"  {dim('※ モメンタム戦略の実発注銘柄は STEP 13「モメンタム発注設定」の[2-c]で別に選びます（別系統）。')}")
-    print(f"  {dim('  現在のモメンタム実発注: ' + _fmt_momentum_sides(existing.get('MOMENTUM_ENABLED_SIDES', '')))}\n")
+    print(f"  {dim('※ モメンタム戦略の実発注銘柄は STEP 14「モメンタム発注設定」の[2-c]で別に選びます（別系統）。')}")
+    print(f"  {dim('  現在のモメンタム実発注: ' + (_fmt_momentum_live(existing) if existing.get('MOMENTUM_ENABLED_SIDES') else '（STEP 14 で決めます）'))}\n")
 
     # ── プリセット選択 ────────────────────────────────────────────────────
     presets = [
@@ -1177,7 +1339,7 @@ def step6_symbols(existing):
     }
 
 def step7_order_detail(existing):
-    header(7, TOTAL, "⚙️  STEP 7 ── 発注詳細設定")
+    header(8, TOTAL, "⚙️  STEP 8 ── 発注詳細設定")
     print("  上級者向け設定です。Enterですべてデフォルト値でスキップできます。\n")
     result = {}
 
@@ -1260,9 +1422,10 @@ def step7_order_detail(existing):
     return result
 
 def step8_anthropic(existing):
-    header(8, TOTAL, "🔑 STEP 8 ── Anthropic APIキー（必須）")
+    header(9, TOTAL, "🔑 STEP 9 ── Anthropic APIキー（必須）")
     print("  Claude AIでニュースを判断するために必須です。\n")
     info("console.anthropic.com → API Keys → Create Key")
+    info("あらかじめクレジット（前払い）を購入しておいてください。残高がゼロだと AI 判定が全件失敗します。")
     cur = existing.get("ANTHROPIC_API_KEY", "")
 
     if cur:
@@ -1296,12 +1459,12 @@ def step8_anthropic(existing):
         warn("APIキーは 'sk-ant-' から始まる形式です。コピー元を確認してください。")
 
 def step9_alpaca(existing):
-    header(9, TOTAL, "📡 STEP 9 ── Alpaca News API（任意）")
+    header(10, TOTAL, "📡 STEP 10 ── Alpaca News API（任意）")
     print("  設定すると Benzinga のリアルタイムニュースが追加されます。")
     print("  設定しない場合は RSS のみで動作します。\n")
     box("取得方法", [
         "1. https://alpaca.markets でアカウント作成（無料）",
-        "2. Paper Trading / Live どちらでもOK",
+        "2. 無料の Paper Trading（模擬取引）口座で十分です（Live は不要）",
         "3. 「API Keys」メニューから Key ID と Secret Key を取得",
     ])
 
@@ -1344,7 +1507,7 @@ def step9_alpaca(existing):
 
 
 def step10_finnhub(existing):
-    header(10, TOTAL, "📰 STEP 10 ── Finnhub API（ニュース）＋ Discord 通知（任意）")
+    header(11, TOTAL, "📰 STEP 11 ── Finnhub API（ニュース）＋ Discord 通知（任意）")
     print("  Finnhub を設定するとリアルタイムニュースが追加されます。")
     print("  無料プランで利用可能。標準のニュースソースとして利用できます。\n")
     info("finnhub.io → 無料登録 → Dashboard に API Key が表示されます。")
@@ -1510,9 +1673,9 @@ def _setup_real_acc_id(host, port, cur_acc):
                 aid, atype = accs[idx]
                 if "MARGIN" not in str(atype).upper():
                     print()
-                    warn(f"⚠ 選んだ口座の種別は「{atype}」です（信用＝MARGIN ではありません）。")
-                    warn("　このBotは『信用取引口座（米国株の信用・ショート）』を前提に設計されています。")
-                    warn("　CASH（現物）や DERIVATIVES（デリバティブ）では正しく動作しない可能性があります。")
+                    warn(f"⚠ 選んだ口座の種別は「{atype}」です（信用口座＝MARGIN ではありません）。")
+                    warn("　このBotは『信用取引口座（MARGIN・米国株の信用取引と空売りができる口座）』を前提に設計されています。")
+                    warn("　現物口座（CASH）や先物・オプション用の口座（DERIVATIVES）では、空売りの注文が通らないなど正しく動きません。")
                     if not ask_yn("それでもこの口座を使いますか？", default=False):
                         info("別の口座を選び直してください。")
                         continue
@@ -1528,7 +1691,8 @@ def _setup_real_acc_id(host, port, cur_acc):
         warn("実口座の一覧を取得できませんでした（OpenD未起動／実口座に未ログイン等）。")
         info("OpenD を起動し、moomoo の実口座にログイン（「Connected」表示）してから再試行してください。")
         print(f"    {bold('[1]')} 再試行（OpenD を起動・実口座にログインしてから）")
-        print(f"    {bold('[2]')} いまは設定しない（デモのみ／既存値を保持）")
+        print(f"    {bold('[2]')} いまは設定しない（デモ口座だけで動かす／既存の値があれば保持）")
+        print(f"         {dim('※ 実口座は 02_Real（Windows は Start-Bot-Real）で起動したときだけ使われます。01_Demo で起動すればお金は動きません。')}")
         retry = ask("番号を選択", default="1")
         if retry == "2":
             info("実口座IDは設定しません（デモのみ／既存値があれば保持）。")
@@ -1538,8 +1702,8 @@ def _setup_real_acc_id(host, port, cur_acc):
 
 
 def step11_connection(existing):
-    header(11, TOTAL, "🔌 STEP 11 ── moomoo OpenD 接続設定")
-    print("  通常はそのまま Enter 2回でOKです。\n")
+    header(12, TOTAL, "🔌 STEP 12 ── moomoo OpenD 接続設定")
+    print("  デモだけで使う方は、そのまま Enter 3回でOKです（接続先2つ＋実口座 N）。\n")
     info("OpenD はローカルPC上で動作します（127.0.0.1:11111 がデフォルト）。")
     info("取引ロックが発生した場合は、moomooアプリで手動でアンロックしてください。")
     cur_host = existing.get("MOOMOO_HOST", "127.0.0.1")
@@ -1555,9 +1719,9 @@ def step11_connection(existing):
         warn(f"MOOMOO_PORT が不正です（{port!r}）。1〜65535 の数値で入力してください（既定 11111）。")
     ok(f"接続先: {host}:{port}")
 
-    # ── ★ v1.24: 実口座（--live）用 acc_id 設定。デモのみなら不要・スキップ可 ──
+    # ── ★ v1.24: 実口座（02_Real / --live）用 acc_id 設定。デモのみなら不要・スキップ可 ──
     print()
-    print(f"  {bold('実口座（--live）で取引しますか？')}")
+    print(f"  {bold('実口座（02_Real で起動）で取引しますか？')}")
     print(f"  {dim('デモ（シミュレーション）だけで使う方は「いいえ」でOK（後でWizard再実行で設定できます）。')}")
     cur_acc = existing.get("MOOMOO_ACC_ID", "").strip()
     if cur_acc:
@@ -1566,7 +1730,7 @@ def step11_connection(existing):
     if use_live:
         acc_id = _setup_real_acc_id(host, port, cur_acc)
     else:
-        info("デモのみ。MOOMOO_ACC_ID は設定しません（--live は使えません／既存値があれば保持）。")
+        info("デモのみ。実口座IDは設定しません（02_Real での起動はできません／既存値があれば保持）。")
         acc_id = cur_acc
 
     ok_box([
@@ -1579,7 +1743,7 @@ def step11_connection(existing):
 
 
 def step_data_collect(existing):
-    header(12, TOTAL, "📊 STEP 12 ── 取引データ収集への参加（任意）")
+    header(13, TOTAL, "📊 STEP 13 ── 取引データ収集への参加（任意）")
 
     print(f"  {bold('目的')}")
     print(f"  {dim('AIしきい値・時間帯・損切り幅などのルール改善に活用します。')}")
@@ -1643,7 +1807,8 @@ def step_data_collect(existing):
 def step_momentum(existing, budget):
     """★ v3.9.25/v1.8: モメンタム発注設定。★ v1.21: 実発注の対象を決める重要STEPとして格上げ。
 
-    [0] MOMENTUM_STRATEGY_PROFILE: 戦略プロファイル (select_v1=選抜[既定・v1.37〜] / standard=今まで通り) ★ v1.35
+    戦略プロファイル (MOMENTUM_STRATEGY_PROFILE / NEWS_STRATEGY_PROFILE) は ★ v1.46 から STEP 1 で選ぶ。
+    ここでは選んだ結果を読み、選抜なら [1]〜[6] を尋ねずに実発注の Y/N だけ確認する。
     [1] MOMENTUM_LEVEL          : シグナル発火頻度 (1=最厳格 〜 5=最緩和)
     [2] 動作モード               : シャドー観察のみ / 実発注も行う (既定: 実発注)
     [2-b] デモ口座のショート       : ON / OFF (既定: ON・v3.9.68)
@@ -1655,7 +1820,7 @@ def step_momentum(existing, budget):
 
     その他の細かい設定 (銘柄・時間帯フィルタ等) は .env 直接編集で対応。
     """
-    header(13, TOTAL, "⚡ STEP 13 ── モメンタム発注設定（実発注の対象を決める重要設定）")
+    header(14, TOTAL, "⚡ STEP 14 ── モメンタム発注設定（実発注の対象を決める重要設定）")
     print(f"  {yellow('⚠ このSTEPで「実際に発注するか」「どの銘柄・方向を実発注するか」が決まります。')}")
     print(f"  {yellow('  Enter連打で飛ばさず、各項目を確認してください。')}")
     print()
@@ -1675,48 +1840,15 @@ def step_momentum(existing, budget):
     print(f"  {dim('・IWM / DRAM … シャドー観察のみ（実発注対象外。検証データを収集中）。')}")
     print()
 
-    # ── [0] 戦略プロファイル ★ v1.35 / Bot v3.9.116 ──────────────────────
-    print(f"  {bold('[0] 戦略プロファイル（実発注の絞り込み・任意）')}")
-    print(f"  {dim('過去の全取引データの集計に基づく「絞り込み運転」を選べます。')}")
-    # ★ v1.38: 既定は[2]選抜プロファイル。「Enter＝従来どおり」ではない点を正しく表記（Codexレビュー対応）
-    print(f"  {dim('[1] 標準 を選ぶと、これまでと完全に同じ動作です（Enter＝既定の[2]選抜プロファイル）。')}")
-    print()
-    # ★ v1.37: 既定を「選抜プロファイル v1」に変更。過去集計で標準より相対的に成績が良好かつ、
-    #   実発注が少なく1トレードのリスクも小さい（より保守的な）運転のため。未設定の新規は select_v1。
-    #   （注）戦略全体はまだ黒字化していない。あくまで“標準よりマシ・低リスク”の位置づけで、利益は非保証。
-    _cur_profile = str(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).strip().lower()
-    _cur_prof_mode = "1" if _cur_profile == "standard" else "2"
-    print(f"  {green('▶') if _cur_prof_mode == '2' else ' '} [2] 選抜プロファイル v1（絞り込み運転・既定）")
-    print( "        約5週間の全取引データ（実発注 4,266件＋シャドー観察のユニークシグナル 4,952件）")
-    print( "        を集計し、標準より相対的に成績が良好だった条件だけに実発注を絞ります。")
-    print( "        （＝実発注が少なく、1トレードのリスクも小さい保守的な運転。成績は変動し利益は保証しません）")
-    print( "        絞り込みの内容（5つ）:")
-    print( "          ① 方向    … 空売り（ショート）のみ実発注。買い（ロング）は記録のみ")
-    print( "          ② 銘柄    … SPY を実発注から除外（対象は QQQ / SMH）")
-    print( "          ③ 時間帯  … 米国東部時間 9・10・12・13時台のみ新規発注")
-    print( "                       （11時台と14時以降は過去集計で損失が続いた時間帯のため見送り）")
-    print( "          ④ 損切り  … 固定の損切りライン（建玉トレールは使わない）")
-    print( "                       利益が伸びたときのトレール利確は今まで通り働きます")
-    print( "          ⑤ 安全網  … 1日の損失が予算の1.5%に達したら、その日の新規発注を自動停止")
-    print()
-    print(f"  {green('▶') if _cur_prof_mode == '1' else ' '} [1] 標準（今まで通り）")
-    print( "        プロファイルによる絞り込みなし。このSTEPの [1]〜[6] の設定がそのまま使われます。")
-    print( "        （買い・売り両方や全時間帯で実発注するぶん、実発注は多く1トレードのリスクも相対的に大きめ）")
-    print()
-    print(f"  {dim('・見送ったシグナルもすべてシャドー記録に残るため、絞り込みの効果は毎週の集計で確認できます。')}")
-    print(f"  {dim('・過去データの傾向に基づく設定であり、将来の成績を保証するものではありません。')}")
-    print(f"  {dim('・[2]を選んだ場合、下の[2-c]銘柄サイド・[2-d]ロングレンジ・[6]損切り方式よりも、')}")
-    print(f"  {dim('  プロファイルの絞り込みが優先されます（実発注のみ。シャドー記録は全件そのまま）。')}")
-    print(f"  {dim('・いつでも Wizard を再実行して [1] 標準に戻せます。')}")
-    print()
-    profile_choices = [
-        ("1", "標準（今まで通り）"),
-        ("2", "選抜プロファイル v1（絞り込み運転）← 既定"),
-    ]
-    _prof_sel = ask_choice("番号を選択（Enter=現在値を維持）", profile_choices, default=_cur_prof_mode)
-    strategy_profile = "select_v1" if _prof_sel == "2" else "standard"
+    # ★ v1.46: 戦略プロファイルは STEP 1 で選ぶ。ここでは選んだ結果を読むだけ。
+    strategy_profile = str(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).strip().lower()
+    if strategy_profile not in ("standard", "select_v1"):
+        strategy_profile = "select_v1"
     is_select_profile = (strategy_profile == "select_v1")
-    ok("戦略プロファイル: " + ("選抜プロファイル v1（絞り込み運転）" if is_select_profile else "標準（今まで通り）"))
+    news_profile = str(existing.get("NEWS_STRATEGY_PROFILE", "standard")).strip().lower()
+    if news_profile not in ("standard", "select_v1"):
+        news_profile = "standard"
+    print(f"  {dim('戦略プロファイル（STEP 1 で選択）: ' + ('選抜プロファイル v1（絞り込み運転）' if is_select_profile else 'カスタマイズ設定（今まで通り）'))}")
     print()
 
     # ── ★ v1.36: 選抜プロファイル選択時は詳細設定([1]〜[6])をスキップして次STEPへ ──
@@ -1732,11 +1864,22 @@ def step_momentum(existing, budget):
         print(f"  {dim('  ・SPYは対象外（QQQ / SMH を実発注）')}")
         print(f"  {dim('  ・米国東部時間 9・10・12・13時台のみ新規発注')}")
         print(f"  {dim('  ・固定の損切りライン（建玉トレールは使わない）')}")
-        print(f"  {dim('  ・1日の損失が予算の1.5%に達したら自動停止')}")
-        # ★ v1.38: 新規（未設定）の場合は「現在値の維持」ではなく既定値の書き出しである旨を明記
-        print(f"  {dim('  ※ 発火頻度・リスク・最大発注%・損切り幅は現在値を維持します')}")
-        print(f"  {dim('    （未設定の新規は既定値: 発火Lv3 / リスクLv3 / 最大80% / 損切り0.50% を書き出します）。')}")
-        print(f"  {dim('  ※ 標準（今まで通り）に戻すと、これらの詳細を個別に設定できます。')}")
+        print(f"  {dim('  ・1日の損失が上限（リスク許容度・既定なら予算の 0.5%）に達したら自動停止')}")
+        # ★ v1.46（配布前レビュー）: プロファイルが決めない数字は実発注に効くので、金額つきで見せる
+        _lv_keep   = str(existing.get("MOMENTUM_LEVEL", "3"))
+        _rk_keep   = str(existing.get("MOMENTUM_RISK_LEVEL", "3"))
+        _mx_keep   = str(existing.get("MOMENTUM_MAX_PCT", "80"))
+        try:
+            _mx_usd = budget_val * float(_mx_keep) / 100.0
+        except (ValueError, TypeError):
+            _mx_usd = 0.0
+        print()
+        print(f"  {bold('プロファイルが決めないもの（実発注に効きます・いまの値）')}")
+        print(f"  {dim(f'  ・1回の最大発注額: 予算の {_mx_keep}%（約 ${_mx_usd:,.0f}）')}")
+        print(f"  {dim(f'  ・固定の損切りライン: {_mom_stop_keep}%')}")
+        print(f"  {dim(f'  ・シグナルの発火頻度 Lv{_lv_keep} / リスク許容度 Lv{_rk_keep}（1日の損失上限）')}")
+        print(f"  {dim('  ※ 変えたいときは STEP 1 でカスタマイズ設定（今まで通り）を選ぶと、ここで個別に設定できます。')}")
+        print(f"  {dim('  ※ STEP 1 でカスタマイズ設定（今まで通り）を選ぶと、これらの詳細を個別に設定できます。')}")
         print()
         # ★ v1.38: スキップ時でも「実際に発注するか」だけは必ず確認する（Codexレビュー対応）。
         #   従来はスキップで既定 true のまま通過し、実発注の明示確認が行われなかった。
@@ -1746,7 +1889,7 @@ def step_momentum(existing, budget):
         _live_mode_cur = "1" if _live_cur == "false" else "2"
         _live_choices = [
             ("1", "シャドー観察のみ   実発注なし・「もし注文していたら」を記録のみ"),
-            ("2", "実発注も行う      実際に注文する（デモ口座→デモ発注 / 実口座→実発注）← 標準"),
+            ("2", "実発注も行う      実際に注文する（デモ口座→デモ発注 / 実口座→実発注）← 既定"),
         ]
         _live_sel = ask_choice("番号を選択（Enter=現在値）", _live_choices, default=_live_mode_cur)
         _is_live = (_live_sel == "2")
@@ -1763,6 +1906,7 @@ def step_momentum(existing, budget):
         next_step_pause()
         return {
             "MOMENTUM_STRATEGY_PROFILE": "select_v1",
+            "NEWS_STRATEGY_PROFILE":  news_profile,           # ★ v1.46
             "MOMENTUM_LEVEL":         existing.get("MOMENTUM_LEVEL", "3"),
             "MOMENTUM_RISK_LEVEL":    existing.get("MOMENTUM_RISK_LEVEL", "3"),
             "MOMENTUM_MAX_PCT":       existing.get("MOMENTUM_MAX_PCT", "80"),
@@ -1800,7 +1944,7 @@ def step_momentum(existing, budget):
     print()
     mode_choices = [
         ("1", "シャドー観察   実発注なし・「もし注文していたら」を記録のみ"),
-        ("2", "実発注も行う   実際に注文する（デモ口座→デモ発注 / 実口座→実発注）← 標準"),
+        ("2", "実発注も行う   実際に注文する（デモ口座→デモ発注 / 実口座→実発注）← 既定"),
     ]
     # 既存設定から現在モードを推定 (MOMENTUM_LIVE_TRADING=true なら 2)
     # ★ v3.9.68: 既定を 2(実発注) に変更 (記載が無ければ実発注)
@@ -1826,7 +1970,7 @@ def step_momentum(existing, budget):
     print(f"  {dim('成績の良いショート側をデモでも検証でき、信用口座に近い成績を確認できます。')}")
     print()
     demo_short_choices = [
-        ("1", "ON   デモでもショートを実発注する ← 標準"),
+        ("1", "ON   デモでもショートを実発注する ← 既定"),
         ("2", "OFF  デモのショートは記録のみ（シャドー）"),
     ]
     cur_ds = existing.get("DEMO_SHORT_ENABLED", "true").strip().lower()
@@ -1842,8 +1986,6 @@ def step_momentum(existing, budget):
     print(f"  {dim('銘柄ごとに、実際に発注する方向を選びます。選ばない方向は記録のみ。')}")
     print(f"  {dim('「両方」を選ぶと買い・売り両方のデータが取得できます。デモ口座でも空売りに対応します。')}")
     print(f"  {dim('（IWM / DRAM はシャドー観察のみ・実発注対象外のため、ここには出ません）')}")
-    if is_select_profile:
-        print(f"  {dim('※ 選抜プロファイル v1 選択中は、ここで選んだ組み合わせのうち「QQQ / SMH の売り」だけが実発注されます。')}")
     print()
     # 各銘柄の既定は「両方(1)」。IWM/DRAM はシャドー観察のみのため実発注選択肢から除外。
     _SIDE_SYMS = ["SPY", "QQQ", "SMH"]
@@ -1913,8 +2055,8 @@ def step_momentum(existing, budget):
     # ★ v1.21 (点3): 1日の損失上限の目安をドル額で提示（%の羅列より実感が湧く）
     try:
         _cb_usd = budget_val * 0.03   # BUDGET比3%の自動停止（サーキットブレーカー上限）
-        print(f"  {dim('1日の損失がBUDGETの約3%（≒ $' + format(_cb_usd, ',.0f') + '）に達するとモメンタムは自動停止します。')}")
-        print(f"  {dim('（次の[3]リスク許容度で、これより小さい上限にも設定できます）')}")
+        print(f"  {dim('1日の損失上限は次の[3]リスク許容度で決まります（既定 Lv3 は予算の 0.5%・約 $' + format(budget_val * 0.005, ',.0f') + '）。')}")
+        print(f"  {dim('別に予算の約3%（≒ $' + format(_cb_usd, ',.0f') + '）の上限も重ねてありますが、通常は[3]の方が先に効きます。')}")
         print()
     except Exception:
         pass
@@ -1925,8 +2067,6 @@ def step_momentum(existing, budget):
     # ── ★ v1.34 [2-d] ロング発注のシグナル強度レンジ（5分モメンタム）─────────
     print(f"  {bold('[2-d] ロング発注のシグナル強度レンジ（5分モメンタム）')}")
     print(f"  {dim('買い(ロング)を実発注する5分モメンタムの範囲を選びます。ショートは対象外です。')}")
-    if is_select_profile:
-        print(f"  {dim('※ 選抜プロファイル v1 選択中はロングを実発注しないため、この設定は「標準」に戻したとき用です。')}")
     print(f"  {dim('参考（過去20日の観察・将来の成績を保証するものではありません）:')}")
     print(f"  {dim('  0.70%未満は平均リターンが低調／0.70〜1.50%はプラス寄り／1.50%超は反転しやすく低調でした。')}")
     print()
@@ -2092,17 +2232,13 @@ def step_momentum(existing, budget):
     print()
     print(f"  {green('▶') if not _is_tfe else ' '} [2] 従来方式：固定の損切りライン（★現在の検証対象）")
     print(f"        建値から -{mom_stop}% に達したら損切り（v3.9.89 以前の動作）。")
-    print(f"        {dim('選抜プロファイル v1 と同じ出口。標準プロファイルでこれを選ぶと')}")
+    print(f"        {dim('選抜プロファイル v1 と同じ出口。カスタマイズ設定でこれを選ぶと')}")
     print(f"        {dim('シートに「+flatstop」の印が付き、建玉トレール群との比較検証に使われます（Bot v3.9.128〜）。')}")
     print()
-    print(f"  {dim('※ 標準の既定は [1] 建玉トレール。ただし建玉トレールは集計上の最大の出血源で、')}")
-    print(f"  {dim('   [2] 固定損切りへ置換する効果を段階導入で検証中です（協力いただける方は [2] を選択）。')}")
+    print(f"  {dim('※ 既定は [1] 建玉トレール。ただし過去の集計では、細かく往復する場面で損切りが早まり、')}")
+    print(f"  {dim('   損失の大きな部分を占めていました。[2] 固定損切りに替える効果を検証中です（協力いただける方は [2]）。')}")
     print(f"  {dim('※ 下方向へ一直線に動く場合は、[1] でも [2] と同じ損切り幅で守られます（不利になりません）。')}")
     print()
-    if is_select_profile:
-        print(f"  {yellow('※ 選抜プロファイル v1 を選択中は、実発注では常に [2] 固定の損切りラインが適用されます。')}")
-        print(f"  {dim('   （ここでの選択は、プロファイルを「標準」に戻したときに使われます）')}")
-        print()
     _tfe_default = "1" if _is_tfe else "2"
     while True:
         _sel = ask("番号を選択（Enter=現在値）", default=_tfe_default)
@@ -2120,7 +2256,7 @@ def step_momentum(existing, budget):
     mode_name  = "実発注も行う" if is_live else "シャドー観察のみ"
     ds_name    = "ON（実発注）" if demo_short else "OFF（シャドー）"
     _profile_disp = ("選抜プロファイル v1（SHORTのみ・SPY除外・ET 9/10/12/13時台・固定損切り・日次1.5%停止）"
-                     if is_select_profile else "標準（今まで通り・絞り込みなし）")
+                     if is_select_profile else "カスタマイズ設定（今まで通り・絞り込みなし）")
     ok(f"モメンタム設定: {mode_name} / 発火 Lv{mom_level}({level_name}) / "
        f"リスク Lv{risk_level}({risk_name}) / 最大 {max_pct}% / 損切り {mom_stop}% / デモ空売り {ds_name}")
     ok_box([
@@ -2139,6 +2275,7 @@ def step_momentum(existing, budget):
     next_step_pause()
     return {
         "MOMENTUM_STRATEGY_PROFILE": strategy_profile,   # ★ v1.35 戦略プロファイル (Bot v3.9.116)
+        "NEWS_STRATEGY_PROFILE":  news_profile,          # ★ v1.46 ニュース選抜プロファイル (Bot v3.9.169)
         "MOMENTUM_LEVEL":         mom_level,
         "MOMENTUM_RISK_LEVEL":    risk_level,
         "MOMENTUM_MAX_PCT":       max_pct,
@@ -2156,9 +2293,226 @@ def step_momentum(existing, budget):
     }
 
 
+def _ask_news_profile(existing):
+    """★ v1.46: ニュース選抜プロファイル v1（Bot v3.9.169）。戻り値は "select_v1" / "standard"。
+
+    6週間（7/13〜8/21・設定資金 $100k 未満）の実データで、ニュース売買の損失源は MACRO だけ
+    （平均 −0.015%・t=−5.8）。TECH＋SEMI_STRONG に絞ると平均 +0.018%（t=+3.0）で、優位性は
+    RTH に集中していた。選ぶと新規エントリーを TECH / SEMI_STRONG かつ RTH に限る。
+    決済（既存ロングの決済・ショートの買い戻し・パニックセル）は止めない。
+    未設定の新規は select_v1 を既定表示（モメンタムの [0] と同じ考え方。利益は非保証）。"""
+    print(f"  {bold('B. ニュース選抜プロファイル v1（ニュース連動の新規エントリーの絞り込み）')}")
+    print(f"  {dim('ニュース連動の売買（STEP 7 の銘柄）にも、モメンタムと同じ発想の絞り込みを選べます。')}")
+    print()
+    # 配布前レビュー（Claude 別人格）: キーが無い＝Bot の既定 standard で動いている人。Enter で
+    #   動作が変わらないよう、既存 .env がある場合の既定は standard。新規セットアップだけ select_v1。
+    _raw_news = str(existing.get("NEWS_STRATEGY_PROFILE", "")).strip().lower()
+    if _raw_news in ("standard", "select_v1"):
+        _cur_news = _raw_news
+    else:
+        _cur_news = "select_v1" if not existing else "standard"
+    _cur_news_mode = "1" if _cur_news == "standard" else "2"
+    print(f"  {green('▶') if _cur_news_mode == '2' else ' '} [2] ニュース選抜プロファイル v1（新規セットアップの既定）")
+    print( "        6週間の実データ（7/13〜8/21）で、ニュース売買の損失源はカテゴリ MACRO だけでした")
+    print( "        （平均 −0.015%）。TECH と SEMI_STRONG に絞ると平均 +0.018% で、優位性は RTH に集中。")
+    print( "        絞り込みの内容:")
+    print( "          ① カテゴリ … 新規エントリーは TECH / SEMI_STRONG のニュースだけ（MACRO は新規建てしない）")
+    print( "          ② 時間帯   … 新規エントリーは通常取引時間（RTH）のみ")
+    print( "          ③ 決済     … 既存建玉の決済・買い戻し・パニックセルは今まで通り（止めません）")
+    print( "                       （通常取引時間の外は STEP 6 の設定で Bot が止まり、その 5 分前に建玉を全決済します）")
+    print( "        見送ったニュースは全件シャドー記録に残り、毎週の集計で効果を確認できます。")
+    print( "        （成績は変動し、利益は保証しません。個別株・決算ニュース由来の発注は対象外です）")
+    print()
+    print(f"  {green('▶') if _cur_news_mode == '1' else ' '} [1] カスタマイズ設定（今まで通り）")
+    print( "        カテゴリ・時間帯の絞り込みなし。STEP 6 で自分で決めた時間帯設定がそのまま使われます。")
+    print()
+    _choices = [
+        ("1", "カスタマイズ設定（今まで通り）"),
+        ("2", "ニュース選抜プロファイル v1（TECH / SEMI_STRONG・RTH のみ）"),
+    ]
+    _sel = ask_choice("番号を選択（Enter=現在値を維持）", _choices, default=_cur_news_mode)
+    news_profile = "select_v1" if _sel == "2" else "standard"
+    ok("ニュース選抜プロファイル: " + ("v1（TECH / SEMI_STRONG・RTH のみ新規建て）" if news_profile == "select_v1"
+                                     else "カスタマイズ設定（今まで通り）"))
+    return news_profile
+
+
+_OVN_VIX_CHOICES = [
+    ("loose",  "ゆるめ   … VIXY が前日比で上がっていなければ買う（0% 以下）"),
+    ("normal", "標準     … VIXY が前日比 −2% 以下のときだけ買う（既定。過去データで成績を確かめたときの条件）"),
+    ("strict", "きびしめ … VIXY が前日比 −3% 以下のときだけ買う"),
+]
+
+
+def _ovn_set_by(enabled: bool) -> str:
+    """★ v1.46: 「自分で OVN を設定した」記録。Wizard の版・日付・使う/使わない（Bot は読まない）。"""
+    return f"Wizard {WIZARD_VERSION} {datetime.date.today().isoformat()} " + ("使う" if enabled else "使わない")
+
+
+def step_ovn(existing, budget):
+    """★ v1.46: OVN取引機能（夜間持ち越し・Bot v3.9.13x〜）。Wizard の既定は「使う」・実売買の確認は Y 既定（PAN 指示）。
+    自分で設定したことが後から分かるよう、OVN_SET_BY（Wizard の版・日付・使う/使わない）を .env に残す。
+
+    引け際（15:55 ET）に条件がそろえば QQQ を買い、翌営業日の寄り付き（9:31 ET）で売る。
+    条件は「QQQ の終値が 200 日線より上」かつ「VIXY の前日比が設定以下」。連休の前は既定で見送る。
+    日中のニュース売買・モメンタムとは別枠の金額（OVN_BUDGET_USD）で動く。"""
+    header(15, TOTAL, "🌙 STEP 15 ── OVN取引機能（夜間持ち越し・任意）")
+    try:
+        budget_val = float(budget)
+    except (ValueError, TypeError):
+        budget_val = 0.0
+
+    print(f"  {bold('概要')}")
+    print(f"  {dim('米国市場が閉まっている夜のあいだ QQQ を持つ、日中の売買とは別枠の機能です（時刻は米国東部時間）。')}")
+    print(f"  {dim('・引け際（15:55）に条件がそろえば、[3] の金額で買える株数の QQQ を買い、翌営業日の開始直後（9:31）に売って現金に戻します')}")
+    print(f"  {dim('・条件: QQQ の終値が過去 200 日の平均より上、かつ VIXY（相場の不安の強さを表す ETF）の前日比が設定以下')}")
+    print(f"  {dim('・損益の目安: $800 で持ち越して翌朝 1% 下がれば約 −$8、3% 下がれば約 −$24（上がれば同じだけ利益）')}")
+    print(f"  {dim('  （判定は前日の終値までのデータで行います。当日の一時的な値動きに振り回されないためで、')}")
+    print(f"  {dim('   当日 15:55 までの値動きは条件に入りません）')}")
+    print(f"  {dim('・実口座では引け後（16:05）に「翌朝の開始直後に売る」注文を予約します。予約が通れば Bot を止めても売れます')}")
+    print(f"  {dim('  （予約を置く時刻に Bot が動いている必要があります。予約が通らなかった日は翌朝 9:31 に Bot が売るので、')}")
+    print(f"  {dim('   翌朝も Bot を動かしておいてください。デモ口座は常に翌朝 9:31 に Bot が売ります）')}")
+    print(f"  {dim('・買った・売った・見送った理由は Discord（STEP 11 で設定）と画面の [夜間持ち越し] の行で確認できます')}")
+    print(f"  {dim('・早引けの日（感謝祭の翌日など）は買いません。引け際に Bot 本体が QQQ の建玉や注文を持っている日も見送ります')}")
+    print(f"  {dim('・1回に使う金額は Bot 本体の予算（BUDGET_USD）とは別枠です')}")
+    print()
+    print(f"  {yellow('⚠ 夜間は損切りが効きません。翌朝の寄り付きが大きく下げた日は、そのまま損失になります。')}")
+    print(f"  {yellow('  試すときは、失っても困らない金額から始めてください。')}")
+    print()
+
+    # ★ v1.46: 既定は「使う」（PAN 指示）。既存 .env で false と書いてある人だけ「使わない」が既定
+    _cur_enabled = str(existing.get("OVN_ENABLED", "true")).strip().lower() != "false"
+    _cur_mode    = str(existing.get("OVN_MODE", "live")).strip().lower() or "live"
+    _cur_vix     = str(existing.get("OVN_VIX_LEVEL", "normal")).strip().lower() or "normal"
+    _cur_budget  = str(existing.get("OVN_BUDGET_USD", "")).strip()
+    _cur_hol     = str(existing.get("OVN_SKIP_LONG_HOLIDAY", "true")).strip().lower() != "false"
+    _cur_wknd    = str(existing.get("OVN_SKIP_WEEKEND", "false")).strip().lower() == "true"
+
+    print(f"  {bold('[1] OVN取引機能を使いますか？')}")
+    _en_choices = [
+        ("1", "使わない"),
+        ("2", "使う（既定）"),
+    ]
+    _en_sel = ask_choice("番号を選択（Enter=現在値を維持）", _en_choices, default=("2" if _cur_enabled else "1"))
+    if _en_sel != "2":
+        ok("OVN取引機能: 使わない")
+        ok_box([("OVN_ENABLED", "false（使わない）"), ("OVN_SET_BY", _ovn_set_by(False))])
+        next_step_pause()
+        return {
+            "OVN_ENABLED":           "false",
+            "OVN_SET_BY":            _ovn_set_by(False),
+            # 以前の設定は残す（再び有効にしたときに引き継ぐ）
+            "OVN_MODE":              _cur_mode if _cur_mode in ("live", "shadow") else "live",
+            "OVN_VIX_LEVEL":         _cur_vix if _cur_vix in ("loose", "normal", "strict") else "normal",
+            "OVN_BUDGET_USD":        (_cur_budget if _ovn_budget_ok(_cur_budget) else "0"),
+            "OVN_SKIP_LONG_HOLIDAY": "true" if _cur_hol else "false",
+            "OVN_SKIP_WEEKEND":      "true" if _cur_wknd else "false",
+        }
+
+    # [2] 実際に売買するか
+    print()
+    print(f"  {bold('[2] 実際に売買しますか？')}")
+    _mode_choices = [
+        ("1", "記録のみ      買った場合の結果だけを記録する（注文しない）"),
+        ("2", "実際に売買    引け際に買い、翌寄りで売る（デモ口座→デモ発注 / 実口座→実発注）"),
+    ]
+    # 配布前レビュー: OVN_MODE が live 以外（shadow や不正値）なら Enter の既定は「記録のみ」（Bot と同じ扱い）
+    _mode_sel = ask_choice("番号を選択（Enter=現在値を維持）", _mode_choices, default=("2" if _cur_mode == "live" else "1"))
+    _live = (_mode_sel == "2")
+    if _live:
+        print()
+        print(f"  {yellow('⚠ 実際に売買します。実口座なら実資金が動きます（デモ口座ならデモ発注）。')}")
+        # PAN 指示（2026-09-07）: 確認の既定は Y（Enter で実売買）。金額の入力は必須なので Enter だけでは進まない。
+        if not ask_yn("OVN取引機能の実売買を有効にします。よろしいですか？", default=True):
+            _live = False
+            print()
+            info("記録のみに切り替えました。注文はしません。")
+    mode = "live" if _live else "shadow"
+
+    # [3] 1回に使う金額
+    print()
+    print(f"  {bold('[3] 1回に使う金額（ドル・OVN_BUDGET_USD）')}")
+    print(f"  {dim('QQQ 1株ぶん（おおよそ $700〜800）に届かない金額では買いません。')}")
+    print(f"  {dim('1株だけ試すなら、1株より少し多い金額を入れてください（例: 800）。')}")
+    if budget_val > 0:
+        print(f"  {dim(f'Bot 本体の予算 BUDGET_USD は ${budget_val:,.0f} です。この金額はそれとは別枠で、合計が口座の余力に収まる必要があります。')}")
+    print()
+    _default_budget = _cur_budget if _cur_budget not in ("", "0", "0.0") else ""
+    while True:
+        raw = ask("金額を入力（例: 800 ／ b で「使わない」に戻る）", default=_default_budget)
+        if str(raw).strip().lower() in ("b", "back", "戻る"):
+            # 配布前レビュー（Claude 別人格）: 必須入力のループに出口が無かった（Ctrl+C しかない）
+            info("OVN取引機能を「使わない」にします。")
+            ok_box([("OVN_ENABLED", "false（使わない）"), ("OVN_SET_BY", _ovn_set_by(False))])
+            next_step_pause()
+            return {
+                "OVN_ENABLED":           "false",
+                "OVN_SET_BY":            _ovn_set_by(False),
+                "OVN_MODE":              mode,
+                "OVN_VIX_LEVEL":         _cur_vix if _cur_vix in ("loose", "normal", "strict") else "normal",
+                "OVN_BUDGET_USD":        (_cur_budget if _ovn_budget_ok(_cur_budget) else "0"),
+                "OVN_SKIP_LONG_HOLIDAY": "true" if _cur_hol else "false",
+                "OVN_SKIP_WEEKEND":      "true" if _cur_wknd else "false",
+            }
+        try:
+            val = float(_normalize_amount(raw))
+        except (ValueError, TypeError):
+            warn("数値で入力してください（例: 800。カンマ・$・全角も可）"); continue
+        if not (val > 0) or val != val or val in (float("inf"), float("-inf")):
+            warn("0 より大きい金額を入力してください（0 以下だと買いません）"); continue
+        if val > 1_000_000_000:
+            warn("金額が大きすぎます"); continue
+        ovn_budget = _fmt_amount(val)   # 1234567 → "1234567"（指数表記にしない）
+        break
+    if val < 700:
+        warn(f"${val:,.0f} は QQQ 1株の値段（目安 $700〜800）に届かない可能性があります。")
+        warn("QQQ は1株単位なので、届かない日は何も買いません（エラーにもなりません）。1株から試すなら 800 以上が目安です。")
+
+    # [4] 買う日の厳しさ
+    print()
+    print(f"  {bold('[4] 買う日の厳しさ（VIXY の前日比で判定・OVN_VIX_LEVEL）')}")
+    vix = ask_choice("番号を選択（Enter=現在値を維持）", _OVN_VIX_CHOICES,
+                     default=(_cur_vix if _cur_vix in ("loose", "normal", "strict") else "normal"))
+
+    # [5] 連休・週末
+    print()
+    print(f"  {bold('[5] 連休の前は持ち越さない（OVN_SKIP_LONG_HOLIDAY）')}")
+    print(f"  {dim('3連休など、市場が3日以上閉まる前日は買いません（既定: 見送る）。通常の週末は次の [6] で決めます。')}")
+    skip_hol = ask_yn("連休の前は見送りますか？", default=_cur_hol)
+    print()
+    print(f"  {bold('[6] 週末（土日）も持ち越さない（OVN_SKIP_WEEKEND）')}")
+    print(f"  {dim('既定は「持ち越す」（過去データで成績を確かめたときの条件）。金曜は Bot 本体の週末決済のあとに建てます。')}")
+    skip_wknd = ask_yn("週末の前も見送りますか？", default=_cur_wknd)
+
+    print()
+    ok("OVN取引機能: " + ("実際に売買" if _live else "記録のみ") + f" / 1回 ${val:,.0f} / 買う日の厳しさ " + {"loose": "ゆるめ", "normal": "標準", "strict": "きびしめ"}.get(vix, vix))
+    ok_box([
+        ("OVN_ENABLED",           "true（使う）"),
+        ("OVN_MODE",              f"{'実際に売買' if _live else '記録のみ'}（{mode}）"),
+        ("OVN_BUDGET_USD",        f"${val:,.0f}（Bot 本体の予算とは別枠）"),
+        ("OVN_VIX_LEVEL",         {"loose": "ゆるめ（VIXY 前日比 0% 以下）", "normal": "標準（VIXY 前日比 −2% 以下）", "strict": "きびしめ（VIXY 前日比 −3% 以下）"}.get(vix, vix)),
+        ("OVN_SKIP_LONG_HOLIDAY", "true（連休の前は見送る）" if skip_hol else "false（連休の前も持ち越す）"),
+        ("OVN_SKIP_WEEKEND",      "true（週末の前も見送る）" if skip_wknd else "false（週末も持ち越す）"),
+        ("OVN_SET_BY",            _ovn_set_by(True) + "（自分で設定した記録・.env に残ります）"),
+    ])
+    print(f"  {dim('※ この設定はあなた自身が Wizard で選んだものです。.env の OVN_SET_BY に版と日付を残します。')}")
+    print(f"  {dim('※ 止めたいときは、この Wizard をもう一度実行して STEP 15 で [1] 使わない を選んで保存してください。')}")
+    print(f"  {dim('   持ち越し中の建玉は Bot が翌朝に売ります（デモはその時刻に Bot が動いている必要があります）。')}")
+    next_step_pause()
+    return {
+        "OVN_ENABLED":           "true",
+        "OVN_SET_BY":            _ovn_set_by(True),
+        "OVN_MODE":              mode,
+        "OVN_BUDGET_USD":        ovn_budget,
+        "OVN_VIX_LEVEL":         vix,
+        "OVN_SKIP_LONG_HOLIDAY": "true" if skip_hol else "false",
+        "OVN_SKIP_WEEKEND":      "true" if skip_wknd else "false",
+    }
+
+
 def step_alert_sound(existing):
     """★ v3.9.19: 上級者向け — 重大エラー時のアラート音設定 (デフォルト無効)。"""
-    header(14, TOTAL, "🔔 STEP 14 ── 重大エラー時のアラート音（上級者向け・任意）")
+    header(16, TOTAL, "🔔 STEP 16 ── 重大エラー時のアラート音（上級者向け・任意）")
 
     print(f"  {bold('概要')}")
     print(f"  {dim('Bot に重大なエラーが発生した瞬間に OS の音を鳴らして即座に気づける')}")
@@ -2231,8 +2585,8 @@ def step_alert_sound(existing):
 
     # ── 有効化 → 詳細設定 ──
     print()
-    print(f"  {dim('夜間ミュート時間帯（JST、HH:MM-HH:MM 形式、日跨ぎ可）')}")
-    print(f"  {dim('例: 23:00-06:00  （未入力で常時有効）')}")
+    print(f"  {dim('夜間ミュート時間帯（ここだけは、あなたのいる日本時間で「寝ている時間」を書きます。HH:MM-HH:MM・日跨ぎ可）')}")
+    print(f"  {dim('例: 23:00-06:00  （日本の夜11時〜朝6時は音を鳴らさない。未入力で常時有効）')}")
     # ★ v1.38: HH:MM-HH:MM 形式を検証（不正形式は Bot 側で黙って「ミュートなし」扱いになるため）
     _QH_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d-([01]?\d|2[0-3]):[0-5]\d$")
     while True:
@@ -2273,6 +2627,19 @@ def step_alert_sound(existing):
     }
 
 
+def _fmt_ovn(config):
+    """★ v1.46: 確認画面用の夜間持ち越しの1行"""
+    if str(config.get("OVN_ENABLED", "false")).strip().lower() != "true":
+        return "使わない"
+    _mode = "実際に売買" if str(config.get("OVN_MODE", "live")).strip().lower() != "shadow" else "記録のみ"
+    try:
+        _b = float(config.get("OVN_BUDGET_USD", "0") or 0)
+    except (ValueError, TypeError):
+        _b = 0.0
+    _by = str(config.get("OVN_SET_BY", "") or "").strip()
+    return f"使う（{_mode} / 1回 ${_b:,.0f} / 条件 {config.get('OVN_VIX_LEVEL', 'normal')}）" + (f"　設定: {_by}" if _by else "")
+
+
 def _pad(text, width):
     """ANSIエスケープコードを除いた実表示幅でパディングする"""
     visible_len = len(re.sub(r'\033\[[0-9;]*m', '', text))
@@ -2298,6 +2665,7 @@ _NUMERIC_KEY_RANGES = {
     "BUDGET_USD":        (0.0, 1_000_000_000.0),
     "STOCK_MAX_PCT":     (0.0, 100.0),
     "LIMIT_BUFFER_PCT":  (0.0, 10.0),
+    # OVN_BUDGET_USD は設定チェック側の validate（_ovn_budget_ok）で検証する
 }
 
 def _default_validator_for(key):
@@ -2309,6 +2677,28 @@ def _default_validator_for(key):
         # 0.5〜1.0、または「発注しない」sentinel 2.00 を許容
         return lambda v: (0.5 <= float(v) <= 1.0) or float(v) == 2.0
     return None
+
+def _normalize_amount(raw):
+    """★ v1.46: 金額入力の正規化（カンマ・$・全角数字/カンマ/ドル・空白を除く）"""
+    import unicodedata as _ud
+    _t = _ud.normalize("NFKC", str(raw or ""))
+    return _t.replace(",", "").replace("$", "").replace("＄", "").strip()
+
+
+def _fmt_amount(val):
+    """★ v1.46: .env に書く金額。指数表記にせず、小数はあれば2桁まで"""
+    _t = f"{float(val):.2f}"
+    return _t.rstrip("0").rstrip(".") if "." in _t else _t
+
+
+def _ovn_budget_ok(v):
+    """★ v1.46: 夜間持ち越しの金額の再入力検証（0 より大きい有限の数値）"""
+    try:
+        _x = float(_normalize_amount(v))
+    except (ValueError, TypeError):
+        return False
+    return _x > 0 and _x == _x and _x not in (float("inf"), float("-inf")) and _x <= 1_000_000_000
+
 
 def _collect_warnings(config):
     warnings = []
@@ -2334,6 +2724,58 @@ def _collect_warnings(config):
     if 0 < trail_trig < 0.05:  trail_trig *= 100
     if 0 < trail_drop < 0.05:  trail_drop *= 100
     if 0 < earn_maxloss < 0.05: earn_maxloss *= 100
+
+    # ★ v1.46（配布前レビュー）: RTH 以外が全部「発注しない」なのに移行前全決済が OFF
+    try:
+        _all_off = all(float(_s(k, "0") or 0) >= 2.0 for k in ("CONFIDENCE_PREMARKET", "CONFIDENCE_AFTERHOURS", "CONFIDENCE_OVERNIGHT"))
+    except (ValueError, TypeError):
+        _all_off = False
+    if _all_off and _s("CLOSE_BEFORE_INACTIVE", "true").lower() == "false":
+        warnings.append({
+            "level": "warning", "key": "CLOSE_BEFORE_INACTIVE",
+            "message": ["RTH 以外が「発注しない」なのに移行前全決済が OFF です。",
+                        "16:00 以降に残った建玉は翌朝 9:30 まで Bot が監視しません（損切り・時間切れが効きません）。"],
+            "prompt": "移行前全決済を有効にしますか？（はい=Y / いいえ=N）",
+            "validate": lambda v: str(v).strip().lower() in ("y", "n", "yes", "no", "true", "false", "はい", "いいえ"),
+            "normalize": lambda v: "true" if str(v).strip().lower() in ("y", "yes", "true", "はい") else "false",
+        })
+
+    # ★ v1.46: 夜間持ち越し（有効なのに金額が無い／1株に届かない／モードが不正）
+    if _s("OVN_ENABLED", "false").lower() == "true":
+        _ovn_b = _f("OVN_BUDGET_USD", 0.0)
+        if _ovn_b <= 0:
+            warnings.append({
+                "level": "error", "key": "OVN_BUDGET_USD",
+                "message": ["夜間持ち越しが有効なのに 1回に使う金額が 0 です（この設定では買いません）。",
+                            "STEP 15 で金額を入れるか、OVN取引機能を「使わない」にしてください。"],
+                # 配布前レビュー（Gemini）: 修正を選ぶ経路は prompt/validate を必ず使う
+                "prompt": "OVN_BUDGET_USD（1回に使う金額・ドル）を再入力",
+                "validate": _ovn_budget_ok,
+                "normalize": lambda v: _fmt_amount(float(_normalize_amount(v))),
+            })
+        elif _ovn_b < 700:
+            warnings.append({
+                "level": "warning", "key": "OVN_BUDGET_USD",
+                "message": [f"夜間持ち越しの 1回の金額 ${_ovn_b:,.0f} は QQQ 1株の値段に届かない可能性があります。",
+                            "届かない日は買いません。1株だけ試すなら 800 程度を目安にしてください。"],
+                "prompt": "OVN_BUDGET_USD（1回に使う金額・ドル）を再入力",
+                "validate": _ovn_budget_ok,
+                "normalize": lambda v: _fmt_amount(float(_normalize_amount(v))),
+            })
+        if _s("OVN_MODE", "live").lower() not in ("live", "shadow"):
+            warnings.append({
+                "level": "warning", "key": "OVN_MODE",
+                "message": [f"OVN_MODE の値 {_s('OVN_MODE')!r} は live / shadow 以外です（Bot は記録のみとして扱います）。"],
+                "prompt": "OVN_MODE を再入力（live / shadow）",
+                "validate": lambda v: str(v).strip().lower() in ("live", "shadow"),
+            })
+        if _s("OVN_VIX_LEVEL", "normal").lower() not in ("loose", "normal", "strict"):
+            warnings.append({
+                "level": "warning", "key": "OVN_VIX_LEVEL",
+                "message": [f"OVN_VIX_LEVEL の値 {_s('OVN_VIX_LEVEL')!r} は loose / normal / strict 以外です（Bot は normal として扱います）。"],
+                "prompt": "OVN_VIX_LEVEL を再入力（loose / normal / strict）",
+                "validate": lambda v: str(v).strip().lower() in ("loose", "normal", "strict"),
+            })
 
     # ① クォートで囲まれたAPIキー
     for key in ["ANTHROPIC_API_KEY", "FINNHUB_API_KEY",
@@ -2648,8 +3090,11 @@ def step_review_warnings(config):
         print()
 
         while True:
-            raw = ask("番号を入力", default="")
+            raw = ask("番号を入力（エラーが無ければ Enter か 0 でこのまま保存）", default="")
+            if not raw and not errors:
+                return config
             if not raw:
+                warn("エラーがあるので、直す項目の番号を入力してください")
                 continue
             if raw == "0" and not errors:
                 return config
@@ -2692,6 +3137,14 @@ def step_review_warnings(config):
                 except Exception:
                     valid = False
             if valid:
+                # ★ v1.46（配布前レビュー Codex 2周目）: 検証を通った値を正規化してから保存する。
+                #   "1,000" をそのまま保存すると次の再検査で float() が失敗し、修正ループから抜けられない。
+                _norm = target.get("normalize")
+                if _norm:
+                    try:
+                        new_val = _norm(new_val)
+                    except Exception:
+                        pass
                 config[key] = new_val
                 display_val = _mask_key(new_val) if key in _SENSITIVE_KEYS else new_val
                 ok(key + " を更新しました → " + display_val)
@@ -2759,7 +3212,7 @@ def step_confirm(config):
         ("MAX_LOSS_PCT",          f"{config.get('MAX_LOSS_PCT','')} %",               "損切りライン"),
         ("TIMEOUT_EXIT_MINUTES",  timeout_label,                                          "時間切れ決済"),
         # ★ v1.44: .1f だと 0.22%→"0.2%"・0.15%→"0.1%" と丸まり、設定した値と
-        #   食い違って見える（本体のバナーと同じ不具合。STEP3 の入力画面は
+        #   食い違って見える（本体のバナーと同じ不具合。STEP4 の入力画面は
         #   もともと .2f なので、同じ実行の中で表示が矛盾していた）。
         ("TRAIL_TRIGGER_PCT",     f"+{trig_pct:.2f}% でトレール開始",                    "トレール発動"),
         ("TRAIL_DROP_PCT",        f"最高値から {drop_pct:.2f}% 下落で決済",              "トレール幅"),
@@ -2775,11 +3228,16 @@ def step_confirm(config):
             "移行前全決済"),
         ("── 銘柄・発注詳細 ──────────────────────────", None, None),
         ("TRIGGER_TICKERS",       config.get("TRIGGER_TICKERS",""),                      "ニュース駆動の銘柄"),
-        ("MOMENTUM実発注",        _fmt_momentum_sides(config.get("MOMENTUM_ENABLED_SIDES","")), "モメンタムの売買銘柄（別系統）"),
+        ("MOMENTUM実発注",        _fmt_momentum_live(config), "モメンタムの売買銘柄（別系統）"),
+        ("口座",                  _fmt_account(config), "実口座は 02_Real（Windows は Start-Bot-Real）で起動したときだけ"),
         ("STOCK_TICKERS",         config.get("STOCK_TICKERS","") or "なし",               "個別銘柄監視"),
         ("LIMIT_BUFFER_PCT",      ("ETF 0.30% / 個別株 0.50%" if buf_pct is None else f"{buf_pct:.2f}%（一律）"), "指値バッファ"),
         ("ORDER_CANCEL_MINUTES",  f"{config.get('ORDER_CANCEL_MINUTES','1')}分",     "未約定キャンセル"),
         ("発注サイズ",            "confに応じて発注額を自動配分（山型）",                  "v3.9.20"),
+        ("── 戦略プロファイル・夜間持ち越し ────────────", None, None),
+        ("MOMENTUM_STRATEGY_PROFILE", ("選抜プロファイル v1" if str(config.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).lower() == "select_v1" else "カスタマイズ設定（今まで通り）"), "モメンタム"),
+        ("NEWS_STRATEGY_PROFILE",     ("ニュース選抜 v1（TECH/SEMI_STRONG・RTH）" if str(config.get("NEWS_STRATEGY_PROFILE", "select_v1")).lower() == "select_v1" else "カスタマイズ設定（今まで通り）"), "ニュース連動"),
+        ("OVN_ENABLED",               _fmt_ovn(config), "OVN取引機能（夜間持ち越し）"),
         ("── APIキー ─────────────────────────────────", None, None),
         ("ANTHROPIC_API_KEY",     "✅ 設定済み" if config.get("ANTHROPIC_API_KEY") else "❌ 未設定", ""),
         ("ALPACA_API_KEY_ID",     "✅ 設定済み" if config.get("ALPACA_API_KEY_ID") else "— 未設定（任意）", ""),
@@ -2828,6 +3286,11 @@ _WIZARD_MANAGED_KEYS = {
     "STOCK_UPTREND_15M_PCT", "STOCK_UPTREND_60M_PCT",
     # v1.35 (v3.9.116): 戦略プロファイル (standard / select_v1)
     "MOMENTUM_STRATEGY_PROFILE",
+    # v1.46 (v3.9.169): ニュース選抜プロファイル (standard / select_v1)
+    "NEWS_STRATEGY_PROFILE",
+    # v1.46 (v3.9.13x〜): 夜間持ち越し
+    "OVN_ENABLED", "OVN_MODE", "OVN_BUDGET_USD", "OVN_VIX_LEVEL",
+    "OVN_SKIP_LONG_HOLIDAY", "OVN_SKIP_WEEKEND", "OVN_SET_BY",
     "MOMENTUM_SHADOW_ENABLED", "MOMENTUM_LIVE_TRADING",
     # v1.12 (v3.9.65): デモ・ネッティング空売り (上級者向け・.env 直接編集)
     "DEMO_SHORT_ENABLED", "REAL_SHORT_ENABLED",
@@ -2847,7 +3310,7 @@ def _get_wizard_value(key, config):
     if key == "WIZARD_COMPLETED":
         return "true"
     if key == "PANIC_CONFIDENCE":
-        base = config.get("STRONG_BUY_CONFIDENCE", "0.70")  # ★ v1.38: STEP4 の既定 0.70 に統一
+        base = config.get("STRONG_BUY_CONFIDENCE", "0.70")  # ★ v1.38: STEP5 の既定 0.70 に統一
         return config.get("PANIC_CONFIDENCE", base)
     return config.get(key, "")
 
@@ -3007,7 +3470,7 @@ def _build_env_lines(config):
         "#   MOMENTUM_TRAIL_FROM_ENTRY  損切りの方式 (true=建玉トレール[標準・既定 v1.23〜] /",
         "#                              false=従来の固定損切り・Wizard [6] で選択)",
         "#   MOMENTUM_STRATEGY_PROFILE  戦略プロファイル (select_v1=選抜プロファイル v1[既定 v1.37〜] /",
-        "#                              standard=今まで通り・Wizard [0] で選択。",
+        "#                              standard=今まで通り・Wizard STEP1 で選択。",
         "#                              select_v1: SHORTのみ/SPY除外/ET 9・10・12・13時台のみ",
         "#                              実発注/固定損切り/日次損失1.5%停止。シャドー記録は全件継続)",
         "#   MOMENTUM_STOP_LOSS_PCT     モメンタム建玉の強制損切りライン (% ・Wizard [5] で設定)",
@@ -3027,6 +3490,9 @@ def _build_env_lines(config):
         f"MOMENTUM_TRAIL_FROM_ENTRY={config.get('MOMENTUM_TRAIL_FROM_ENTRY', 'true')}",
         # ★ v1.38: フォールバックも Wizard 既定の select_v1 に統一（経路による既定の食い違い解消）
         f"MOMENTUM_STRATEGY_PROFILE={config.get('MOMENTUM_STRATEGY_PROFILE', 'select_v1')}",
+        "#   NEWS_STRATEGY_PROFILE  ニュース選抜プロファイル (select_v1=TECH/SEMI_STRONG かつ RTH のみ新規建て /",
+        "#                          standard=今まで通り・Wizard STEP1 で選択。決済は止めない・見送りは全件記録)",
+        f"NEWS_STRATEGY_PROFILE={config.get('NEWS_STRATEGY_PROFILE', 'select_v1')}",
         f"MOMENTUM_ENABLED_SIDES={config.get('MOMENTUM_ENABLED_SIDES', 'SPY:BUY,SPY:SELL_SHORT,QQQ:BUY,QQQ:SELL_SHORT,SMH:SELL_SHORT')}",
         f"MOMENTUM_SHADOW_ENABLED={config.get('MOMENTUM_SHADOW_ENABLED', 'true')}",
         f"MOMENTUM_LIVE_TRADING={config.get('MOMENTUM_LIVE_TRADING', 'false')}",
@@ -3034,6 +3500,23 @@ def _build_env_lines(config):
         "#   false: 保有中に反対シグナルが出ても転換せず見送る (既定・実データで転換は勝率が低いため)",
         "#   true : 従来どおり反対シグナルで強制転換する",
         f"MOMENTUM_REVERSE_EXIT={config.get('MOMENTUM_REVERSE_EXIT', 'false')}",
+        "",
+        "# ── OVN取引機能 (夜間持ち越し・Wizard STEP15 で選択・任意) ──",
+        "#   OVN_ENABLED            true で有効（Wizard の既定は「使う」・.env 直書きの場合の Bot 既定は false）。",
+        "#                          引け際(15:55 ET)に条件がそろえば QQQ を買い、翌寄り(9:31 ET)で売る",
+        "#   OVN_MODE               live=実際に売買 / shadow=記録だけ",
+        "#   OVN_BUDGET_USD         1回に使う金額（Bot 本体の BUDGET_USD とは別枠）。QQQ 1株に届かない金額では買わない",
+        "#   OVN_VIX_LEVEL          loose / normal / strict（VIXY 前日比 0% / -2% / -3% 以下で買う）",
+        "#   OVN_SKIP_LONG_HOLIDAY  連休の前は持ち越さない（既定 true）",
+        "#   OVN_SKIP_WEEKEND       週末の前も持ち越さない（既定 false）",
+        f"OVN_ENABLED={config.get('OVN_ENABLED', 'false')}",
+        f"OVN_MODE={config.get('OVN_MODE', 'live')}",
+        f"OVN_BUDGET_USD={config.get('OVN_BUDGET_USD', '0')}",
+        f"OVN_VIX_LEVEL={config.get('OVN_VIX_LEVEL', 'normal')}",
+        f"OVN_SKIP_LONG_HOLIDAY={config.get('OVN_SKIP_LONG_HOLIDAY', 'true')}",
+        f"OVN_SKIP_WEEKEND={config.get('OVN_SKIP_WEEKEND', 'false')}",
+        "#   OVN_SET_BY             自分で設定した記録（Wizard の版・日付・使う/使わない。Bot は読まない）",
+        f"OVN_SET_BY={config.get('OVN_SET_BY', '')}",
         "",
         "# ── アラート音 (v3.9.19 から、上級者向け・任意) ──",
         f"ENABLE_ALERT_SOUND={config.get('ENABLE_ALERT_SOUND', 'false')}",
@@ -3133,20 +3616,22 @@ def main():
     print(f"  {dim('変更しない項目は Enter でスキップできます。')}\n")
 
     step_labels = [
-        " 1  BUDGET        発注上限額",
-        " 2  RISK          損切り・リスク管理",
-        " 3  TRAILING      トレイリングストップ",
-        " 4  AI THRESHOLD  AIしきい値（ベース・RTH）",
-        " 5  SESSION       時間帯別トレード設定",
-        " 6  SYMBOLS       銘柄選択",
-        " 7  ORDER         発注詳細",
-        " 8  ANTHROPIC     Claude APIキー",
-        " 9  ALPACA        Alpaca News API",
-        "10  FINNHUB       Finnhub（ニュース）＋ Discord通知（任意）",
-        "11  MOOMOO        moomoo OpenD 接続",
-        "12  DATA COLLECT  取引データ収集への参加（任意）",
-        "13  MOMENTUM      モメンタム発注設定（実発注の対象を決める重要設定）",
-        "14  ALERT SOUND   重大エラー時のアラート音（任意）",
+        " 1  PROFILE       戦略プロファイル（実発注の絞り込み・最初に決める）",
+        " 2  BUDGET        発注上限額",
+        " 3  RISK          損切り・リスク管理",
+        " 4  TRAILING      トレイリングストップ",
+        " 5  AI THRESHOLD  AIしきい値（ベース・RTH）",
+        " 6  SESSION       時間帯別トレード設定（選抜プロファイルなら自動）",
+        " 7  SYMBOLS       銘柄選択",
+        " 8  ORDER         発注詳細",
+        " 9  ANTHROPIC     Claude APIキー",
+        "10  ALPACA        Alpaca News API",
+        "11  FINNHUB       Finnhub（ニュース）＋ Discord通知（任意）",
+        "12  MOOMOO        moomoo OpenD 接続",
+        "13  DATA COLLECT  取引データ収集への参加（任意）",
+        "14  MOMENTUM      モメンタム発注設定（実発注の確認・選抜プロファイルなら詳細は自動）",
+        "15  OVN           OVN取引機能（引け際に QQQ を買い翌寄りで売る・任意）",
+        "16  ALERT SOUND   重大エラー時のアラート音（任意）",
     ]
     for lbl in step_labels:
         print(f"  {dim(lbl)}")
@@ -3169,26 +3654,28 @@ def main():
     # ─────────────────────────────────────────────────────────────
     global _WIZARD_CAN_GO_BACK
 
-    def _step1(s):  return {"BUDGET_USD": step1_budget(s)}
-    def _step2(s):  return step2_risk(s, s.get("BUDGET_USD", 0))
-    def _step3(s):  return step3_trailing(s)
-    def _step4(s):  return step4_confidence(s)
-    def _step5(s):  return step5_session(s, s.get("STRONG_BUY_CONFIDENCE", ""))
-    def _step6(s):  return step6_symbols(s)
-    def _step7(s):  return step7_order_detail(s)
-    def _step8(s):  return {"ANTHROPIC_API_KEY": step8_anthropic(s)}
-    def _step9(s):  return step9_alpaca(s)
-    def _step10(s): return step10_finnhub(s)
-    def _step11(s):
+    def _step1(s):  return step_profiles(s)                      # ★ v1.46: 戦略プロファイルを最初に
+    def _step2(s):  return {"BUDGET_USD": step1_budget(s)}
+    def _step3(s):  return step2_risk(s, s.get("BUDGET_USD", 0))
+    def _step4(s):  return step3_trailing(s)
+    def _step5(s):  return step4_confidence(s)
+    def _step6(s):  return step5_session(s, s.get("STRONG_BUY_CONFIDENCE", ""))
+    def _step7(s):  return step6_symbols(s)
+    def _step8(s):  return step7_order_detail(s)
+    def _step9(s):  return {"ANTHROPIC_API_KEY": step8_anthropic(s)}
+    def _step10(s): return step9_alpaca(s)
+    def _step11(s): return step10_finnhub(s)
+    def _step12(s):
         r = step11_connection(s)
         r["MOOMOO_RSA_KEY"] = s.get("MOOMOO_RSA_KEY", "")
         return r
-    def _step12(s): return step_data_collect(s)
-    def _step13(s): return step_momentum(s, s.get("BUDGET_USD", 0))
-    def _step14(s): return step_alert_sound(s)
+    def _step13(s): return step_data_collect(s)
+    def _step14(s): return step_momentum(s, s.get("BUDGET_USD", 0))
+    def _step15(s): return step_ovn(s, s.get("BUDGET_USD", 0))
+    def _step16(s): return step_alert_sound(s)
 
-    _steps = [_step1, _step2, _step3, _step4, _step5, _step6, _step7,
-              _step8, _step9, _step10, _step11, _step12, _step13, _step14]
+    _steps = [_step1, _step2, _step3, _step4, _step5, _step6, _step7, _step8,
+              _step9, _step10, _step11, _step12, _step13, _step14, _step15, _step16]
 
     state = dict(existing)   # 直前までの入力値（既定値の供給元）
     try:

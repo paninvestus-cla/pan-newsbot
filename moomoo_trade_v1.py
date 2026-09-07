@@ -5000,7 +5000,7 @@ except ValueError:
 # 引け際に QQQ を買い、翌営業日の寄り付きで売る。日中のニュース売買とは別物で、
 # 昼のBotが動いていない時間だけを使う。
 #
-# 既定は無効。.env に OVN_ENABLED=true と書いた人だけが動く（Wizardには出さない）。
+# 既定は無効。.env に OVN_ENABLED=true と書いた人だけが動く（Wizard v1.46 から STEP14 で選べる）。
 # 有効にした人は実際に売買したいはずなので、モードの既定は live にしている。
 #
 #   OVN_ENABLED        true で有効（既定 false）
