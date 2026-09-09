@@ -2,7 +2,7 @@
 setup_wizard.py
 ===============
 moomoo_trade_v1.py 用 .env セットアップウィザード（完全版）
-最新バージョン: v1.47  最終更新日: 2026-09-08
+最新バージョン: v1.48  最終更新日: 2026-09-08
 
 使い方:
   python3 setup_wizard.py   # Mac
@@ -18,6 +18,18 @@ moomoo_trade_v1.py 用 .env セットアップウィザード（完全版）
 # 更新履歴
 # =============================================================================
 #
+# v1.48 2026-09-08  認定サポーター4名の v1.47 レビュー反映。
+#   ①最重要: .env の読み取りを Bot（python-dotenv）と同じ規則に揃える（_read_env_value）。値のクォートと
+#     「空白＋#」以降の行末コメントを落とし、export 接頭辞も外す。これを読まずにいたため、手編集の .env で
+#     Bot と Wizard が同じ行を違う値として読み、9キーは Enter で先へ進めず、3キーは黙って別の値で保存されていた
+#     （OVN_MODE→shadow / NEWS_STRATEGY_PROFILE→standard / TRIGGER_TICKERS の SMH 脱落）。
+#   ②現在値が検証を通らないときは既定として出さない（ask に validate）。Enter の無限ループを断つ。
+#   ③STEP7: 読めない TRIGGER_TICKERS のとき Enter が通っていた（v1.47 の穴）。番号選択を必須にし、
+#     「未設定なので」→「読み取れなかったので」。個別株欄は全角・全角/半角セミコロン・読点・空白区切りも受ける。
+#   ④STEP12: MARGIN を既定にし、CASH を断ったあとは MARGIN が現在値になる（同じ警告の繰り返しを断つ）。
+#     OpenD がポートだけ開いて無応答のときに口座取得が戻らない件は、別スレッドで待って見切る。
+#   ⑤確認画面: OVN の条件を日本語に（normal→標準）。桁揃えを表示幅で数える（全角ラベルの行のずれ）。
+#   ⑥STEP6: 「OVN は別枠」の注記を、RTH 以外に値がある人の分岐にも出す。STEP14 の重複説明を1行に。
 # v1.47 2026-09-08  認定サポーター2名の v1.46 レビュー反映。
 #   ①STEP7: 既存の TRIGGER_TICKERS がプリセットと一致しない（例 QQQ,SMH・順序違い）とき、Enter で SPY,QQQ に
 #     置き換わっていた → 現在値をそのまま（順序も）維持する選択肢を出し、Enter はそれを選ぶ。プリセットは番号で明示。
@@ -222,6 +234,8 @@ import re
 import platform  # v1.4: アラート音 STEP で OS 判定に使用
 import subprocess  # v1.8: アラート音テスト再生で OS コマンド呼出に使用
 import socket  # v1.27: OpenD 自動取得前の到達性チェック（SDKの長い再試行/ログ汚染を回避）
+import unicodedata  # v1.48: 個別株ティッカーの全角→半角の正規化
+import atexit  # v1.48: 応答しない OpenD を見切ったあとに終了できなくなるのを防ぐ
 
 
 def _play_test_sound(macos_file: str = "/System/Library/Sounds/Sosumi.aiff") -> bool:
@@ -381,7 +395,17 @@ def _read_masked_input() -> str:
     return getpass.getpass("")
 
 
-def ask(prompt, default="", secret=False, allow_clear=False):
+def ask(prompt, default="", secret=False, allow_clear=False, validate=None):
+    # ★ v1.48: 現在値が検証を通らないときは既定として出さない（Enter を押し続けても
+    #   同じ問いに戻り続ける、という報告への対応。出口を「入力するだけ」にする）。
+    if default and validate is not None:
+        try:
+            _ok = bool(validate(default))
+        except Exception:
+            _ok = False
+        if not _ok:
+            print(f"  {yellow('!')} {dim(f'現在の値「{default}」はこの項目では使えないため、Enter では進めません。入力してください。')}")
+            default = ""
     disp = f"  {cyan('?')} {prompt}"
     if default and not secret:
         # secret=True の場合はデフォルト値を表示しない（APIキー漏洩防止）
@@ -412,6 +436,26 @@ def ask(prompt, default="", secret=False, allow_clear=False):
             return val
         if not default:
             return ""
+
+def _num_in_range(v, lo, hi, allow_comma=False, integer_only=False, exclude_lo=False):
+    """★ v1.48: ask(validate=) 用。数値として読めて範囲内なら True。
+
+    配布前レビュー（Codex）: ここの条件は、その問いの後段の検証と同じでなければならない。
+    緩いと壊れた既定を残してしまい（Enter の繰り返し）、厳しいと通るはずの現在値を落とす。
+    """
+    t = str(v).strip()
+    if allow_comma:
+        t = t.replace(",", "")
+    if integer_only and not t.isdigit():
+        return False
+    try:
+        f = float(t)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(f):
+        return False
+    return (lo < f if exclude_lo else lo <= f) and f <= hi
+
 
 def ask_yn(prompt, default=True):
     # ★ v1.21 (点5b): 日本語「はい/いいえ」も受け付ける。従来は「いいえ」が True(=はい)
@@ -450,6 +494,13 @@ def ask_choice(prompt, choices, default="", custom_range=None):
             print(f"  {marker} {label}　〔入力: {key}〕")
         else:
             print(f"  {marker} [{i}] {label}")
+    # ★ v1.48（配布前レビュー Claude 別人格）: ask 側と作法を揃える。既定が選択肢にも範囲にも
+    #   当てはまらないなら「Enter で維持できる」と見せない（見せると Enter が空回りする）。
+    _default_ok = bool(default) and (matched or (
+        custom_range is not None and _num_in_range(default, custom_range[0], custom_range[1])))
+    if default and not _default_ok:
+        print(f"  {yellow('!')} {dim(f'現在の値「{default}」はこの項目では使えないため、Enter では進めません。入力してください。')}")
+        default = ""
     if custom_range is not None and not matched and default:
         print(f"  {green('▶')} [Enter] 現在の値 {default} を維持")
     print()
@@ -615,6 +666,28 @@ def next_step_pause():
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
+def _read_env_value(v):
+    """★ v1.48: Bot が使う python-dotenv と同じ規則で値を読む（認定サポーターの掃引報告）。
+
+    Bot は load_dotenv() で読むので、クォートで囲まれていれば外し、囲まれていなければ
+    「空白＋#」以降を落とす。Wizard がここを揃えていなかったため、手で編集した .env で
+    Bot と Wizard が同じ行を違う値として読み、Enter で進めない／黙って別の値が保存される、
+    という食い違いが起きていた（OVN_MODE→shadow・NEWS_STRATEGY_PROFILE→standard など）。"""
+    v = (v or "").strip()
+    if v[:1] in ("\"", "'"):
+        # 引用符で始まる値は、閉じ引用符までが値。その後ろ（コメント等）は無視する。
+        _q = v[0]
+        _end = v.find(_q, 1)
+        if _end == -1:
+            return None                       # 閉じない引用符 → dotenv はこの行を読み捨てる
+        _rest = v[_end + 1:].strip()
+        if _rest and not _rest.startswith("#"):
+            return None                       # 閉じたあとに続きがある → dotenv はこの行を読み捨てる
+        return v[1:_end]
+    m = re.search(r"\s#", v)
+    return v[:m.start()].rstrip() if m else v
+
+
 def _load_existing_env():
     if not os.path.exists(ENV_PATH):
         return {}
@@ -624,7 +697,13 @@ def _load_existing_env():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, _, v = line.partition("=")
-                values[k.strip()] = v.strip()
+                k = k.strip()
+                if k.startswith("export "):          # export KEY=value も dotenv は KEY として読む
+                    k = k[len("export "):].strip()
+                _val = _read_env_value(v)
+                if _val is None:
+                    continue                         # dotenv が読み捨てる行は Wizard も未設定として扱う
+                values[k] = _val
     return values
 
 def _backup_env():
@@ -642,7 +721,7 @@ TOTAL = 16   # ★ v1.46: 14→16（戦略プロファイルを STEP1 に・OVN�
 
 # 既知ETFリスト（STOCK_TICKERS入力時のバリデーション用）
 # ★ v1.38: 版数は必ずここを更新する（起動バナー・ヘッダ表示で共用。取り残し防止）
-WIZARD_VERSION = "v1.47"
+WIZARD_VERSION = "v1.48"
 
 _KNOWN_ETFS = {
     "SPY", "QQQ", "SMH", "SPXL", "SPXS", "TQQQ", "SQQQ", "SOXL", "SOXS",
@@ -728,9 +807,10 @@ def step1_budget(existing):
         "実口座（02_Real で起動）で使う場合は、口座の実際の信用余力の範囲内に設定してください。",
         "余力を超えると、複数銘柄の同時保有時に発注が拒否されます（信用余力不足）。",
     ])
-    cur = existing.get("BUDGET_USD", "10000")
+    cur = existing.get("BUDGET_USD") or "10000"          # ★ v1.48: KEY= の空値でも既定に落とす
     while True:
-        val = ask("BUDGET_USD（ドル）", default=cur)
+        val = ask("BUDGET_USD（ドル）", default=cur,
+                  validate=lambda _v: _num_in_range(_v, 0, 1_000_000_000, allow_comma=True, exclude_lo=True))
         try:
             v = float(val.replace(",", ""))
             # ★ v1.38: inf / nan / 極端値ガード（int(inf) の OverflowError でクラッシュしないように）
@@ -754,9 +834,9 @@ def step2_risk(existing, budget):
         "0.50%  ゆとりあり（以前の標準）",
         "1.00%  ゆるめ（切られにくいが、1回の損失は大きくなる）",
     ])
-    cur_loss = existing.get("MAX_LOSS_PCT", "0.30")
+    cur_loss = existing.get("MAX_LOSS_PCT") or "0.30"
     while True:
-        val = ask("MAX_LOSS_PCT（%）", default=cur_loss)
+        val = ask("MAX_LOSS_PCT（%）", default=cur_loss, validate=lambda _v: _num_in_range(_v, 0, 10, exclude_lo=True))
         try:
             v = float(val)
             if 0 < v <= 10:
@@ -815,7 +895,7 @@ def step2_risk(existing, budget):
         ("0",  " 無効（時間切れ決済しない）"),
     ]
     print(f"  {dim('※ 番号のほか、数字を直接入力すれば任意の分数も設定できます（例: 15 / 範囲 0〜240・0=無効）。')}")
-    cur_timeout = existing.get("TIMEOUT_EXIT_MINUTES", "10")
+    cur_timeout = existing.get("TIMEOUT_EXIT_MINUTES") or "10"
     # ★ v1.38: カスタム分数(例:15)も許容（0〜240分・0=無効）
     timeout = ask_choice("値を入力（Enter=現在値）", choices, default=cur_timeout,
                          custom_range=(0, 240))
@@ -931,9 +1011,9 @@ def step4_confidence(existing):
         "0.70  標準：バランス重視  ← 既定",
         "0.65  発注多め：反応は増えるが外れも増える",
     ])
-    cur_conf = existing.get("STRONG_BUY_CONFIDENCE", "0.70")
+    cur_conf = existing.get("STRONG_BUY_CONFIDENCE") or "0.70"
     while True:
-        val = ask("STRONG_BUY_CONFIDENCE（0.5〜1.0）", default=cur_conf)
+        val = ask("STRONG_BUY_CONFIDENCE（0.5〜1.0）", default=cur_conf, validate=lambda _v: _num_in_range(_v, 0.5, 1.0))
         try:
             v = float(val)
             if 0.5 <= v <= 1.0:
@@ -948,9 +1028,10 @@ def step4_confidence(existing):
     print("  【パニック売りしきい値（PANIC_CONFIDENCE）】\n")
     print("  強いネガティブシグナル時にロングを即時全決済するしきい値です。\n")
     info("通常は発注しきい値と同じで問題ありません。Enterでスキップ。")
-    cur_panic = existing.get("PANIC_CONFIDENCE", base_conf)
+    cur_panic = existing.get("PANIC_CONFIDENCE") or base_conf
     while True:
-        val = ask("PANIC_CONFIDENCE（Enter=現在値を維持・未設定なら発注しきい値と同じ）", default=cur_panic)
+        val = ask("PANIC_CONFIDENCE（Enter=現在値を維持・未設定なら発注しきい値と同じ）", default=cur_panic,
+                  validate=lambda _v: _num_in_range(_v, 0.5, 1.0))
         try:
             v = float(val)
             if 0.5 <= v <= 1.0:
@@ -1003,6 +1084,7 @@ def step5_session(existing, base_conf):
         #   発注しうる。既存で RTH 以外に値がある人の設定を黙って「発注しない」に変えない（尋ねる）。
         print(f"  {yellow('選抜プロファイルを選んでいますが、RTH 以外の時間帯に設定値があるため、そのまま維持するか確認します。')}")
         print(f"  {dim('（標準は「発注しない」です。Enter で現在値を維持できます）')}")
+        print(f"  {dim('STEP 15 の OVN取引機能は別枠で、この設定では止まりません。')}")
         print()
     if _news_sel and not _mom_sel:
         print(f"  {dim('※ ニュース選抜プロファイルでは、ニュース連動の新規建ては通常取引時間（RTH）だけです。')}")
@@ -1296,9 +1378,11 @@ def step6_symbols(existing):
             break
     _is_custom = bool(cur_tickers) and cur_preset is None
     # 壊れた現在値（カンマ区切りでない・ティッカーの形でない）は維持の対象にせず、番号選択に倒す（レビュー Claude 別人格）
+    _unreadable = False
     if _is_custom and not all(re.fullmatch(r"[A-Z][A-Z0-9.]{0,5}", t) for t in cur_tickers.split(",")):
         warn(f"現在の TRIGGER_TICKERS「{existing.get('TRIGGER_TICKERS', '')}」はカンマ区切りのティッカーとして読めないため、番号で選び直してください。")
         _is_custom = False
+        _unreadable = True          # ★ v1.48: 値はある。Enter で既定に流さず番号を必須にする
         cur_tickers = ""
 
     for i, (key, label, detail) in enumerate(presets, 1):
@@ -1309,13 +1393,18 @@ def step6_symbols(existing):
             print(f"  {marker} [{i}] {bold(label)}  {dim(detail)}")
     if _is_custom:
         print(f"  {green('▶')} [Enter] 現在の設定 {bold(cur_tickers)} をそのまま維持（順序も変えません）")
+    elif _unreadable:
+        print(f"  {yellow('!')} {dim('現在の設定は読み取れなかったので、[1]〜[3] の番号を入力してください（Enter では進めません）。')}")
     elif not cur_tickers:
         print(f"  {green('▶')} [Enter] 未設定なので [2] SPY ＋ QQQ を使います")
     print()
     print(f"  {dim('※ 先頭の銘柄がマクロ系ニュースの発注先、2番目がテック系ニュースの発注先になります。')}")
-    info("（Enter = 現在値を維持）" if cur_tickers else "（Enter = [2] SPY ＋ QQQ）")
+    if _unreadable:
+        info("（番号を入力してください）")
+    else:
+        info("（Enter = 現在値を維持）" if cur_tickers else "（Enter = [2] SPY ＋ QQQ）")
 
-    if _is_custom:
+    if _is_custom or _unreadable:
         default_idx = ""
     else:
         default_idx = next((str(i) for i, (k, _l, _d) in enumerate(presets, 1) if k == cur_preset), "2")
@@ -1358,8 +1447,18 @@ def step6_symbols(existing):
                 info("個別株追加: なし")
             break
 
-        # ETFバリデーション
-        input_list  = [t.strip().upper() for t in stock_raw.split(",") if t.strip()]
+        # ★ v1.48: 全角の「ＮＶＤＡ」やセミコロン・読点・空白区切りも受ける（認定サポーターの報告）。
+        #   Bot は STOCK_TICKERS をカンマで分けて大文字にするだけなので、ここで同じ形に直しておく。
+        input_list  = [t.strip().upper() for t in _split_tickers(stock_raw) if t.strip()]
+        # ★ v1.48（配布前レビュー Claude 別人格）: 区切りを広げたぶん、ティッカーでない語が
+        #   複数銘柄に化けやすい。形が合わないものは落として画面に出す。
+        _bad = [t for t in input_list if not re.fullmatch(r"[A-Z][A-Z0-9.]{0,5}", t)]
+        if _bad:
+            warn("ティッカーとして読めない語は外します: " + ", ".join(_bad))
+            input_list = [t for t in input_list if t not in _bad]
+            if not input_list:
+                warn("有効なティッカーがありません。半角英字で入力してください（例: NVDA,TSLA）")
+                continue
         etf_found   = [t for t in input_list if t in _KNOWN_ETFS]
         valid_stocks = [t for t in input_list if t not in _KNOWN_ETFS]
 
@@ -1441,7 +1540,7 @@ def step7_order_detail(existing):
         ("5", " 5分（ゆっくり約定を待つ）"),
     ]
     cancel = ask_choice("番号を選択（Enter=現在値を維持）", cancel_choices,
-                        default=existing.get("ORDER_CANCEL_MINUTES", "1"))
+                        default=existing.get("ORDER_CANCEL_MINUTES") or "1")
     ok(f"未約定キャンセル: {cancel}分")
     result["ORDER_CANCEL_MINUTES"] = cancel
 
@@ -1660,6 +1759,65 @@ def _detect_real_acc_ids(host, port):
     # ★ v1.27: OpenD 未起動なら SDK を生成せず即座に失敗（再試行ログの汚染・ハングを防ぐ）。
     if not _opend_port_open(host, port):
         return []
+    # ★ v1.48: ポートは開くが応答しない OpenD（起動済みだが未ログイン・固まっている）では
+    #   SDK が接続確立まで待ち続け、画面が無言のまま止まる（認定サポーターの計測で150秒でも戻らず）。
+    #   別スレッドに置いて見切り、戻らなければ「取得できませんでした」の画面に倒す。
+    import threading as _threading
+    global _ACC_PROBE_ABANDONED, _ACC_PROBE_THREAD
+    if _acc_probe_stuck():
+        # 配布前レビュー（Gemini・Claude 別人格）: 見切ったスレッドは SDK の接続処理を握ったまま残る。
+        #   増やさないよう、前回のスレッドが動いている間は即座に失敗にする（終わっていれば再挑戦できる）。
+        return []
+    _box = {}
+    _th = _threading.Thread(target=lambda: _box.setdefault("v", _detect_real_acc_ids_blocking(host, port)),
+                            daemon=True)
+    _ACC_PROBE_THREAD = _th
+    _th.start()
+    _th.join(_DETECT_ACC_TIMEOUT_SEC)
+    if _th.is_alive():
+        _ACC_PROBE_ABANDONED = True
+        # 配布前レビュー（Codex）: 取得本体は logging をプロセス全体で止めてから SDK に入る。
+        #   見切るとその finally に到達しないので、ここで戻しておく（以降のログが消えたままになる）。
+        import logging as _logging
+        _logging.disable(_logging.NOTSET)
+        # 配布前レビュー（Claude 別人格）: 全面抑制を戻すと、残ったスレッドの SDK ログが
+        #   このあとの画面（マスク入力・確認画面）に割り込む。SDK のロガーだけ黙らせる。
+        for _name in ("moomoo", "futu"):
+            _lg = _logging.getLogger(_name)
+            _lg.setLevel(_logging.CRITICAL); _lg.propagate = False; _lg.disabled = True
+        return []
+    return _box.get("v", [])
+
+
+_DETECT_ACC_TIMEOUT_SEC = 20.0
+_ACC_PROBE_ABANDONED = False
+_ACC_PROBE_THREAD = None
+_WIZARD_FINISHED_OK = False
+
+
+def _acc_probe_stuck():
+    """★ v1.48: 見切った口座取得スレッドがまだ SDK を握ったままか。"""
+    return bool(_ACC_PROBE_THREAD is not None and _ACC_PROBE_THREAD.is_alive())
+
+
+def _exit_now_if_probe_abandoned():
+    """★ v1.48 配布前レビュー（Gemini）: 応答しない OpenD に接続したまま残ったスレッドがあると、
+    SDK の後片付け（atexit）で終了できなくなることがある。保存も表示も終わったあとなので、
+    出力を流し切ってからプロセスを落とす。"""
+    if not (_ACC_PROBE_ABANDONED and _WIZARD_FINISHED_OK):
+        return                                   # 途中終了や検査プロセスでは終了コードを触らない
+    try:
+        sys.stdout.flush(); sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(0)
+
+
+atexit.register(_exit_now_if_probe_abandoned)
+
+
+def _detect_real_acc_ids_blocking(host, port):
+    """OpenD から実口座一覧を取る本体（呼び出し側で見切るのでここは待ち続けてよい）。"""
     # ★ v1.39: moomoo SDK の内部ログ（New connect ready / on_disconnect 等）は受講生に
     #   不要なため、取得中は logging を全面的に抑制する。close() 後の切断ログは別スレッド
     #   から少し遅れて出るため、復帰前に短い待ちを挟む。
@@ -1713,9 +1871,21 @@ def _setup_real_acc_id(host, port, cur_acc):
             for i, (aid, atype) in enumerate(accs, 1):
                 print(f"    [{i}] acc_id={green(_mask_acc(aid))}  種別={atype}")
             print(f"    {dim('※ このBotは「信用取引（MARGIN）」の口座を選んでください。')}")
+            # ★ v1.48: 既定は MARGIN の番号にする（従来は常に [1]。CASH が [1] だと、断っても
+            #   また [1] が現在値になり、Enter を押し続けると同じ警告を繰り返していた）。
+            _margin_idx = next((str(i) for i, (_a, _t) in enumerate(accs, 1)
+                                if "MARGIN" in str(_t).upper()), "")
+            # ★ v1.48（配布前レビュー Claude 別人格）: いま .env にある口座があればそれが現在値。
+            #   Enter で実口座IDが黙って別の口座に変わってはいけない。無ければ MARGIN を薦める。
+            _cur_idx = next((str(i) for i, (_a, _t) in enumerate(accs, 1) if str(_a) == str(cur_acc).strip()), "")
+            _pick_default = _cur_idx or _margin_idx or "1"
+            if _margin_idx and not _cur_idx:
+                print(f"    {dim('（Enter で [' + _margin_idx + '] の MARGIN 口座を選びます）')}")
+            elif _cur_idx:
+                print(f"    {dim('（Enter で現在の設定 [' + _cur_idx + '] を維持します）')}")
             # ★ v1.24: 選択ループ。MARGIN(信用)以外は警告＋再確認。
             while True:
-                pick = ask("使用する口座の番号", default="1")
+                pick = ask("使用する口座の番号", default=_pick_default)
                 try:
                     idx = int(pick) - 1
                 except ValueError:
@@ -1729,7 +1899,12 @@ def _setup_real_acc_id(host, port, cur_acc):
                     warn("　このBotは『信用取引口座（MARGIN・米国株の信用取引と空売りができる口座）』を前提に設計されています。")
                     warn("　現物口座（CASH）や先物・オプション用の口座（DERIVATIVES）では、空売りの注文が通らないなど正しく動きません。")
                     if not ask_yn("それでもこの口座を使いますか？", default=False):
-                        info("別の口座を選び直してください。")
+                        if _margin_idx and _margin_idx != str(idx + 1):
+                            _pick_default = _margin_idx
+                            info(f"別の口座を選び直してください（Enter で [{_margin_idx}] の MARGIN 口座を選びます）。")
+                        else:
+                            _pick_default = ""      # MARGIN が無い一覧では番号の入力を求める
+                            info("別の口座を選び直してください（番号を入力してください）。")
                         continue
                 acc_id = str(aid)
                 ok(f"自動取得：MOOMOO_ACC_ID = {_mask_acc(acc_id)} に設定（種別={atype}）")
@@ -1741,6 +1916,16 @@ def _setup_real_acc_id(host, port, cur_acc):
         # ── 取得失敗（OpenD未起動／実口座に未ログイン等）──
         print()
         warn("実口座の一覧を取得できませんでした（OpenD未起動／実口座に未ログイン等）。")
+        if _acc_probe_stuck():
+            # ★ v1.48（配布前レビュー Claude 別人格）: 応答しない OpenD を見切ったあとは、
+            #   同じ画面で再試行しても必ず失敗する。案内を変えて、ここで空回りさせない。
+            warn("OpenD がポートを開いたまま応答しません（未ログイン・起動途中・固まっている等）。")
+            info("いったん Wizard を終了し、moomoo アプリと OpenD を起動し直して「Connected」を確認してから、")
+            info("もう一度 Wizard を実行してください。ここでは実口座IDを設定できません。")
+            print(f"    {bold('[2]')} いまは設定しない（デモ口座だけで動かす／既存の値があれば保持）")
+            ask("Enter で次に進みます", default="2")
+            info("実口座IDは設定しません（デモのみ／既存値があれば保持）。")
+            return cur_acc
         info("OpenD を起動し、moomoo の実口座にログイン（「Connected」表示）してから再試行してください。")
         print(f"    {bold('[1]')} 再試行（OpenD を起動・実口座にログインしてから）")
         print(f"    {bold('[2]')} いまは設定しない（デモ口座だけで動かす／既存の値があれば保持）")
@@ -1758,13 +1943,14 @@ def step11_connection(existing):
     print("  デモだけで使う方は、そのまま Enter 3回でOKです（接続先2つ＋実口座 N）。\n")
     info("OpenD はローカルPC上で動作します（127.0.0.1:11111 がデフォルト）。")
     info("取引ロックが発生した場合は、moomooアプリで手動でアンロックしてください。")
-    cur_host = existing.get("MOOMOO_HOST", "127.0.0.1")
-    cur_port = existing.get("MOOMOO_PORT", "11111")
+    cur_host = existing.get("MOOMOO_HOST") or "127.0.0.1"
+    cur_port = existing.get("MOOMOO_PORT") or "11111"
     host = ask("MOOMOO_HOST", default=cur_host) or cur_host
     # ★ v1.30: PORT を検証（数値・1〜65535）。無検証保存だとボット本体が
     #   モジュール読込時の int() で即トレースバック死するため、ここで弾く。
     while True:
-        port = ask("MOOMOO_PORT", default=cur_port) or cur_port
+        port = ask("MOOMOO_PORT", default=cur_port,
+                   validate=lambda _v: _num_in_range(_v, 1, 65535, integer_only=True))
         port = str(port).strip()
         if port.isdigit() and 1 <= int(port) <= 65535:
             break
@@ -1931,7 +2117,6 @@ def step_momentum(existing, budget):
         print(f"  {dim(f'  ・固定の損切りライン: {_mom_stop_keep}%')}")
         print(f"  {dim(f'  ・シグナルの発火頻度 Lv{_lv_keep} / リスク許容度 Lv{_rk_keep}（1日の損失上限）')}")
         print(f"  {dim('  ※ 変えたいときは STEP 1 でカスタマイズ設定（今まで通り）を選ぶと、ここで個別に設定できます。')}")
-        print(f"  {dim('  ※ STEP 1 でカスタマイズ設定（今まで通り）を選ぶと、これらの詳細を個別に設定できます。')}")
         print()
         # ★ v1.38: スキップ時でも「実際に発注するか」だけは必ず確認する（Codexレビュー対応）。
         #   従来はスキップで既定 true のまま通過し、実発注の明示確認が行われなかった。
@@ -2495,7 +2680,8 @@ def step_ovn(existing, budget):
     print()
     _default_budget = _cur_budget if _cur_budget not in ("", "0", "0.0") else ""
     while True:
-        raw = ask("金額を入力（例: 800 ／ b で Q1 の「使わない」に戻る）", default=_default_budget)
+        raw = ask("金額を入力（例: 800 ／ b で Q1 の「使わない」に戻る）", default=_default_budget,
+                  validate=_ovn_budget_ok)
         if str(raw).strip().lower() in ("b", "back", "戻る"):
             # 配布前レビュー（Claude 別人格）: 必須入力のループに出口が無かった（Ctrl+C しかない）
             info("OVN取引機能を「使わない」にします。")
@@ -2685,6 +2871,13 @@ def step_alert_sound(existing):
     }
 
 
+_OVN_VIX_LEVEL_LABELS = {
+    "loose":  "ゆるめ（VIXY 前日比 0% 以下）",
+    "normal": "標準（VIXY 前日比 −2% 以下）",
+    "strict": "きびしめ（VIXY 前日比 −3% 以下）",
+}
+
+
 def _fmt_ovn(config):
     """★ v1.46: 確認画面用の夜間持ち越しの1行"""
     if str(config.get("OVN_ENABLED", "false")).strip().lower() != "true":
@@ -2695,12 +2888,20 @@ def _fmt_ovn(config):
     except (ValueError, TypeError):
         _b = 0.0
     _by = str(config.get("OVN_SET_BY", "") or "").strip()
-    return f"使う（{_mode} / 1回 ${_b:,.0f} / 条件 {config.get('OVN_VIX_LEVEL', 'normal')}）" + (f"　設定: {_by}" if _by else "")
+    _raw_lv = str(config.get("OVN_VIX_LEVEL", "normal")).strip().lower()
+    _lv = _OVN_VIX_LEVEL_LABELS.get(_raw_lv, f"{_raw_lv}（読めない値のため Bot は標準として扱います）")
+    return f"使う（{_mode} / 1回 ${_b:,.0f} / 買う日の厳しさ {_lv}）" + (f"　設定: {_by}" if _by else "")
+
+
+def _disp_width(text):
+    """★ v1.48: 端末での表示幅。全角（East Asian Wide/Fullwidth）は2桁として数える。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
 
 
 def _pad(text, width):
-    """ANSIエスケープコードを除いた実表示幅でパディングする"""
-    visible_len = len(re.sub(r'\033\[[0-9;]*m', '', text))
+    """ANSIエスケープコードを除いた実表示幅でパディングする
+    ★ v1.48: 文字数ではなく表示幅で数える（全角を含むラベルの行だけ値がずれていた）。"""
+    visible_len = _disp_width(re.sub(r'\033\[[0-9;]*m', '', text))
     return text + ' ' * max(0, width - visible_len)
 
 
@@ -2747,6 +2948,12 @@ def _fmt_amount(val):
     """★ v1.46: .env に書く金額。指数表記にせず、小数はあれば2桁まで"""
     _t = f"{float(val):.2f}"
     return _t.rstrip("0").rstrip(".") if "." in _t else _t
+
+
+def _split_tickers(raw):
+    """★ v1.48: 全角英数を半角に直し、カンマ／セミコロン／読点／空白のどれで区切っても同じに読む。"""
+    s = unicodedata.normalize("NFKC", str(raw or ""))
+    return [t for t in re.split(r"[,;、，；\s]+", s) if t]
 
 
 def _ovn_budget_ok(v):
@@ -3409,6 +3616,10 @@ def _build_env_lines_merged(config):
         if "=" in line and not line.strip().startswith("#"):
             key, _, _ = line.partition("=")
             key = key.strip()
+            # ★ v1.48: 読み取り側と同じく export 接頭辞を外す（外さないと同じキーが
+            #   「export KEY=…（古い値）」と「KEY=…（新しい値）」の2行に増えてしまう）。
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
 
             if key in _WIZARD_MANAGED_KEYS:
                 new_val = _get_wizard_value(key, config)
@@ -3758,6 +3969,9 @@ def main():
         else:
             print()
             warn("保存をキャンセルしました。ウィザードを再度実行してください。")
+        # ★ v1.48: ここまで来たら画面も保存も終わり。応答しない OpenD を見切っていた場合だけ、
+        #   SDK を握ったままのスレッドで終了できなくなるのを避けてプロセスを落とす（_exit_now_if_probe_abandoned）。
+        globals()["_WIZARD_FINISHED_OK"] = True
     except (KeyboardInterrupt, EOFError):
         print("\n\n  " + yellow("キャンセルしました。"))
         sys.exit(0)
