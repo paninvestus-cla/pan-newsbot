@@ -165,17 +165,23 @@ except ImportError:
         )
         sys.exit(1)
 
+# OpenD が応答しなくなると、SDK のコールバック待ちスレッド（期限の無い queue.get で待つ非 daemon スレッド）が
+# プロセスの終了を止め、Ctrl+C で終われずタスクの強制終了が要った（利用者の報告・2晩連続）。
+# Bot は push ハンドラを登録していないので、このスレッドを daemon にしても失う仕事は無い。
+# SDK は Thread を作るときにこの値を読むので、最初の context を作るより前（import の直後）に切り替える。
+try:
+    ft.SysConfig.set_all_thread_daemon(True)
+except Exception:
+    pass
+
 load_dotenv()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.194"
+BOT_VERSION = "v3.9.197"
 
-# ★ v3.9.99: 実取引/デモの判別用。1プロセス=1環境（--liveか否か）で固定。
-#   main() で確定し、トレード送信ペイロードに "trade_env"(REAL/DEMO) として付与する。
-#   既定は安全側の "DEMO"（--live を付けない限りデモ）。
 _RUN_TRADE_ENV: str = "DEMO"
 
 
@@ -209,19 +215,22 @@ def _gas_post(url: str, payload: str, timeout: int = 60) -> dict:
             ]
             with no_redirect_opener.open(req, timeout=timeout) as resp:
                 body = resp.read().decode("utf-8")
-                # ★ v3.9.80: GAS が空 / 非JSON(HTMLエラーページ等)を返すケースを明示化。
-                #   過負荷・権限/デプロイ不備時に発生し、従来は「Expecting value: line 1
-                #   column 1 (char 0)」という不透明な JSONDecodeError になっていた。
-                #   分かりやすい例外にして分類(_classify_gas_error)→再送キューへ退避させる。
-                #   応答は不達でも GAS 側で書込済の可能性があるため、再送時は retry フラグで
-                #   trade_id / observation_id 重複排除され二重登録しない (v3.9.78 / GAS v9.4)。
                 _b = (body or "").strip()
                 if not _b:
                     raise RuntimeError("GAS 応答が空 (empty response)")
                 try:
-                    return _json.loads(_b)
+                    _res = _json.loads(_b)
                 except ValueError:
                     raise RuntimeError(f"GAS 非JSON応答 (non-JSON response len={len(_b)}): {_b[:80]!r}")
+                # ★ 配布前レビュー（Codex）: 条件が広いと、将来 status を持つ正常な書き込み応答を
+                #   誤って未書き込み扱いにする。doGet が返す形（ok が無く sheets がある）に絞る。
+                if (isinstance(_res, dict) and _res.get("status") == "alive"
+                        and "ok" not in _res and "sheets" in _res):
+                    raise RuntimeError(
+                        "GAS が読み取り用の応答を返しました（書き込みは行われていません・"
+                        f"version={_res.get('version', '?')}）"
+                    )
+                return _res
 
         except _uerr.HTTPError as e:
             if e.code in (301, 302, 303, 307, 308):
@@ -235,7 +244,6 @@ def _gas_post(url: str, payload: str, timeout: int = 60) -> dict:
     raise RuntimeError(f"GAS POST: リダイレクト上限（10回）到達 最終URL={current_url}")
 
 
-# ── ★ v3.9.75: GAS送信の堅牢化（分類ログ + インラインリトライ + 永続再送キュー）──
 # 認定サポーター報告（記録系で read timeout 多発）への対応。すべて best-effort で、
 # 送信は別スレッド/別タスク実行のため売買ロジック（asyncio本体）には一切影響しない。
 #   ・失敗を分類（DATA_COLLECT_TIMEOUT / OBSERVATION_TIMEOUT / ...）してログ文言を明確化。
@@ -243,8 +251,6 @@ def _gas_post(url: str, payload: str, timeout: int = 60) -> dict:
 #   ・gas_retry_loop が定期再送。再送時は retry フラグを立て、GAS 側が
 #     trade_id / observation_id で重複排除（read timeout の二重登録を防ぐ）。
 # ══════════════════════════════════════════════════════════════════════════
-# ★ v3.9.183: 実行時の状態ファイルの「置き場所・口座区分・書き方・引き継ぎ」を
-#   1箇所に集約する。
 #
 #   これまでは状態ファイルを足すたびに同じ轍を踏んでいた——本体スクリプトの隣に
 #   置く（配布フォルダを差し替える運用で消える・git の作業ツリーを汚して
@@ -336,11 +342,6 @@ _STATE_MIGRATE_LOCK = threading.RLock()
 def _state_migration_skipped() -> bool:
     """引き継ぎの停止スイッチ（検査用）。
 
-    ★ v3.9.182 の教訓: モジュール変数だけの防御は**プロセス境界を越えない**。
-      検査が起動する子プロセスは cwd がリポジトリなので、実機の状態を
-      使い捨てフォルダへ持ち去り、元に「済み」の印を付けていた。
-      環境変数なら子まで届く。`BOT_SKIP_HISTORY_MIGRATION` は v3.9.182 で
-      配った名前なので、そのまま受け続ける。
     """
     return (os.environ.get("BOT_SKIP_STATE_MIGRATION") == "1"
             or os.environ.get("BOT_SKIP_HISTORY_MIGRATION") == "1")
@@ -431,12 +432,6 @@ _STATE_LEGACY_DIRS: list = [
 def _gas_queue_path() -> str:
     """GAS 再送キューの保存先（口座区分ごと）。
 
-    ★ v3.9.183: 本体スクリプトの隣に置いていた（配布前レビューの一致指摘）。
-      (a) 版の更新でフォルダごと差し替える運用で、`trade` の未送信分
-      （実質破棄しない設計・上限480回）が消える。
-      (b) git の追跡下にあり、Bot 機の `git pull --ff-only` を止める。
-      (c) REAL と DEMO が1本を共有し、片方の排出がもう片方の記録を消す
-      （読んで空にしてから追記で戻す作りなので、併走すると取りこぼす）。
     """
     return _state_path("gas_retry_queue.jsonl")
 
@@ -455,10 +450,7 @@ def _gas_queue_migrate() -> None:
 
 _GAS_QUEUE_LOCK = threading.Lock()
 _GAS_QUEUE_MAX = 3000             # 退避上限（超過は重要度の低い順に破棄）
-_GAS_RETRY_MAX_ATTEMPTS = 48      # ★ v3.9.82: 24→48（過負荷日でも翌セッションまで粘る）
-# ★ v3.9.88: 種別ごとの再送上限。重要度: トレード/サマリ(成績) > 観察(シャドー) > 観察PnL更新。
-#   トレードは実質破棄しない(高上限で粘る)。observation_pnl は最低優先で最初に諦める。
-#   退避超過(_GAS_QUEUE_MAX)・諦め破棄の両方でこの優先度を使う。
+_GAS_RETRY_MAX_ATTEMPTS = 48
 _GAS_RETRY_MAX_BY_KIND = {
     "trade":           480,   # 重要・少数。実質破棄しない（翌日以降も粘る）
     "summary":         240,
@@ -469,24 +461,16 @@ _GAS_RETRY_MAX_BY_KIND = {
 _GAS_DROP_PRIORITY = {"trade": 0, "summary": 1, "observation": 2, "observation_pnl": 3}
 _GAS_RETRY_BACKOFF = [5, 15]      # インライン再送の待機（秒）
 
-# ── ★ v3.9.82 (A群): 160人スケール対策（Bot側のみ・GAS変更なし）─────────────
 # ① 送信ジッター: 各送信前に小ランダム遅延を入れ、市場イベントで全受講生が同時刻に
 #    GASへ殺到する相関バーストを散らす（GAS同時実行30枠の超過＝timeout/空応答を低減）。
 # ② 送信側オートバックオフ: 連続失敗が続いたら一定時間「直接送信を見送りキューへ退避」
 #    に切り替え、過負荷GASへの追い打ちを止める。回復は再送ループ(プローブ)が検知。
-_GAS_SEND_JITTER_SEC = 5.0            # ★ v3.9.97: 2.0→5.0（相関バーストを更に分散）送信前ジッター上限（秒）
-# ★ v3.9.126: 一斉決済（デモ日次 15:45 ET 等）は全台が同一秒に決済→送信するため、通常の
-#   5秒ジッターでは GAS の書き込みロックが逼迫する（2026-07-23 に GAS 側で行の上書き欠落が
-#   発生）。GAS v9.20 で欠落自体は fail-closed + 再送で防いだが、競合そのものを減らすため
-#   一斉決済由来の送信だけジッターを広げる。日次レポートは翌朝生成のため遅延の実害はない。
+_GAS_SEND_JITTER_SEC = 5.0
 _GAS_SEND_JITTER_SEC_BULK = 30.0      # 一斉決済トレードの送信前ジッター上限（秒）
 _BULK_CLOSE_REASON_HINTS = ("デモ日次決済", "週末前強制決済", "移行前全決済")
 _GAS_FAIL_COOLDOWN_THRESHOLD = 5      # 連続失敗この回数でクールダウン突入
 _GAS_FAIL_COOLDOWN_SEC = 180          # 初回クールダウン秒（以後・過負荷継続で指数的に延長）
-_GAS_FAIL_COOLDOWN_MAX_SEC = 1800     # ★ v3.9.95: クールダウンの上限（30分）
-# ★ v3.9.96: クールダウン中でも「直送を試みる」最重要種別。トレード記録/成績サマリは
-#   最優先で必ず送信機会を与える（低頻度・最重要）。観察/観察PnL（高頻度・低優先）だけを
-#   クールダウンで退避させ、過負荷の主因を絞る。トレードが先・エラー(観察)は後、を担保。
+_GAS_FAIL_COOLDOWN_MAX_SEC = 1800
 _GAS_COOLDOWN_EXEMPT_KINDS = {"trade", "summary"}
 _gas_send_health = {"consecutive_fail": 0, "cooldown_until": 0.0, "last_cd_log": 0.0}
 
@@ -506,8 +490,6 @@ def _gas_mark_failure() -> None:
     _gas_send_health["consecutive_fail"] = int(_gas_send_health.get("consecutive_fail", 0)) + 1
     cf = _gas_send_health["consecutive_fail"]
     if cf >= _GAS_FAIL_COOLDOWN_THRESHOLD:
-        # ★ v3.9.95: 過負荷が長引くほどクールダウンを指数的に延長（180s→…→上限1800s）。
-        #   共有GASへの無駄な追い打ち（連投・HTML応答の量産）を抑える。回復は再送ループが検知。
         _extra = min(cf - _GAS_FAIL_COOLDOWN_THRESHOLD, 4)   # 0,1,2,3,4
         _cd = min(_GAS_FAIL_COOLDOWN_SEC * (2 ** _extra), _GAS_FAIL_COOLDOWN_MAX_SEC)
         _gas_send_health["cooldown_until"] = _t.time() + _cd
@@ -520,7 +502,7 @@ def _classify_gas_error(exc, kind: str) -> str:
         base = "TIMEOUT"
     elif ("non-json" in msg or "empty response" in msg or "expecting value" in msg
           or "応答が空" in msg or "非json" in msg):
-        base = "EMPTYRESP"   # ★ v3.9.80: GAS が空/非JSON(HTMLエラーページ等)を返した
+        base = "EMPTYRESP"
     elif "urlopen" in msg or "connection" in msg or "refused" in msg or "reset" in msg:
         base = "CONN"
     else:
@@ -532,6 +514,54 @@ def _classify_gas_error(exc, kind: str) -> str:
         "observation_pnl": "OBSERVATION",
     }.get(kind, "GAS")
     return f"{tag}_{base}"
+
+
+_BLOCK_REASON_MAX = 300       # 観察ログの block_reason の上限（書き手と _clip_block_reason で共有）
+_GAS_LABEL_MAX = 8
+_GAS_LABEL_VALUE_MAX = 16     # ラベル1要素の文字数上限（超えたら … を付ける）
+
+
+def _gas_record_label(rec: dict) -> str:
+    """
+
+    従来 `[GAS再送] 再送成功 1件` には銘柄名が無く、LOCK_BUSY で退避した回が
+    どの銘柄だったのかを Discord と突き合わせられなかった（認定サポーターの指摘）。
+    payload から銘柄を、日次集計は鍵の日付を拾う。読めないときは種別だけ返す。
+    """
+    # 配布前レビュー（Gemini）: 値の型も長さも保証が無いので、必ず文字列にして短く切る。
+    #   長大な値や想定外の構造がそのままログ行に出ないようにする（秘密の混入時の被害も抑える）。
+    #   配布前レビュー（Codex）: 壊れたキューには URL や鍵が入り得るので、必ず _mask_secrets を通す。
+    def _short(v) -> str:
+        # 改行・復帰・制御文字はログの行を割るので落とす（配布前レビュー Claude 別人格）。
+        _t = re.sub(r"[\x00-\x1f\x7f]+", " ", str(v))
+        _t = _mask_secrets(_t[:64])
+        return _t[:_GAS_LABEL_VALUE_MAX] + ("…" if len(_t) > _GAS_LABEL_VALUE_MAX else "")
+
+    kind = _short(rec.get("kind", "") or "?")
+    try:
+        pj = json.loads(rec.get("payload", "") or "{}")
+        _items = pj.get("items") if isinstance(pj, dict) else None
+        if isinstance(_items, list):
+            _head = ""
+            if _items and isinstance(_items[0], dict):
+                _hv = _items[0].get("symbol")
+                if isinstance(_hv, (str, int, float)):
+                    _head = f":{_short(_hv)}"
+            return f"{kind}×{len(_items)}{_head}"
+        data = pj.get("data") if isinstance(pj, dict) and isinstance(pj.get("data"), dict) else pj
+        for _k in ("symbol", "ticker"):
+            _v = data.get(_k) if isinstance(data, dict) else None
+            if _v and isinstance(_v, (str, int, float)):
+                return f"{kind}:{_short(_v)}"
+    except Exception:
+        pass
+    _key = str(rec.get("key", "") or "")
+    if kind == "summary" and "|" in _key:
+        # 鍵の形式が変わったときに生徒名を出さないよう、日付として読めるときだけ出す。
+        _tail = _key.rsplit("|", 1)[-1]
+        if _re_date_key.fullmatch(_tail):
+            return f"{kind}:{_short(_tail)}"
+    return kind
 
 
 def _gas_enqueue(url: str, payload_str: str, kind: str, key: str) -> None:
@@ -549,8 +579,6 @@ def _gas_enqueue(url: str, payload_str: str, kind: str, key: str) -> None:
                 with open(_gas_queue_path(), "r", encoding="utf-8") as f:
                     lines = f.readlines()
             # 同一 key の既存退避は置き換え（重複退避を防ぐ）
-            # ★ v3.9.120: 生テキストの部分一致 → JSON パース比較へ（エスケープを含む
-            #   キーや空白差で一致漏れし重複が残る問題の修正・外部AIレビュー指摘）。
             if key:
                 def _same_key(_ln: str) -> bool:
                     try:
@@ -560,9 +588,6 @@ def _gas_enqueue(url: str, payload_str: str, kind: str, key: str) -> None:
                 lines = [ln for ln in lines if not _same_key(ln)]
             lines.append(json.dumps(rec, ensure_ascii=False) + "\n")
             if len(lines) > _GAS_QUEUE_MAX:
-                # ★ v3.9.88: 単純な最古破棄でなく重要度順に保持。
-                #   トレード/サマリを最優先で残し、observation_pnl から先に捨てる
-                #   （同優先度内では新しいものを残す）。原ファイル順は維持。
                 def _drop_prio(_ln):
                     try:
                         return _GAS_DROP_PRIORITY.get(json.loads(_ln).get("kind", ""), 2)
@@ -570,6 +595,19 @@ def _gas_enqueue(url: str, payload_str: str, kind: str, key: str) -> None:
                         return 2
                 _order = sorted(range(len(lines)), key=lambda i: (_drop_prio(lines[i]), -i))
                 _keep = set(_order[:_GAS_QUEUE_MAX])
+                _lost = []
+                for i in range(len(lines)):
+                    if i not in _keep:
+                        try:
+                            _lost.append(_gas_record_label(json.loads(lines[i])))
+                        except Exception:
+                            _lost.append("?")
+                if _lost:
+                    log.warning(
+                        f"[GAS再送] 退避キューが上限 {_GAS_QUEUE_MAX} 件を超えたため "
+                        f"{len(_lost)}件を破棄（再送されません）: "
+                        f"{', '.join(_lost[:_GAS_LABEL_MAX])}{'…' if len(_lost) > _GAS_LABEL_MAX else ''}"
+                    )
                 lines = [lines[i] for i in range(len(lines)) if i in _keep]
             with open(_gas_queue_path(), "w", encoding="utf-8") as f:
                 f.writelines(lines)
@@ -580,12 +618,7 @@ def _gas_enqueue(url: str, payload_str: str, kind: str, key: str) -> None:
 def _gas_queue_purge_key(key: str) -> None:
     """指定キーの退避レコードをキューから取り除く（best-effort）。
 
-    ★ v3.9.174: 新しい内容の送信が成功した後、古い退避レコードが残っていると、
-      あとから gas_retry_loop がそれを送り、GAS v9.25 の「生徒名＋日付で上書き」が
-      **新しい行を古いスナップショットで上書きしてしまう**（最後に届いた方が勝つ
-      ため）。日次集計は 15:45 ET 時点の断面を退避し、翌朝の追いかけは1日ぶんを
-      再集計するので、両者は同一内容ではない（レビュー4レーンが独立に指摘）。
-      成功した時点で同じ鍵の残骸を消し、古い方が後から届く経路を断つ。"""
+      """
     if not key:
         return
     _gas_queue_migrate()
@@ -618,10 +651,6 @@ def _gas_send_with_retry(url: str, payload_str: str, kind: str,
     呼び出し側は別スレッド/別タスクのため、ここでの待機は売買本体を止めない。"""
     import time as _t
     import random as _rnd
-    # ★ v3.9.82 (A群②): クールダウン中は直接送信せずキューへ退避（過負荷GASへの追い打ち停止）。
-    #   回復は gas_retry_loop（プローブ）が検知し、成功でクールダウン解除。
-    # ★ v3.9.96: ただし最重要種別（trade/summary）はクールダウン中でも直送を試みる。
-    #   過負荷で退避させるのは高頻度・低優先の観察/観察PnLに限定し、トレード記録を最優先する。
     if _gas_in_cooldown() and kind not in _GAS_COOLDOWN_EXEMPT_KINDS:
         _gas_enqueue(url, payload_str, kind, key)
         _now = _t.time()
@@ -632,23 +661,16 @@ def _gas_send_with_retry(url: str, payload_str: str, kind: str,
                 f" → {kind} はキューへ退避し回復後に自動再送（売買影響なし）"
             )
         return False
-    # ★ v3.9.82 (A群①): 送信前ジッターで相関バーストを散らす
-    # ★ v3.9.126: 一斉決済由来は jitter_max=_GAS_SEND_JITTER_SEC_BULK で更に広く散らす
     try:
         _jmax = _GAS_SEND_JITTER_SEC if jitter_max is None else float(jitter_max)
         _t.sleep(_rnd.uniform(0, max(0.0, _jmax)))
     except Exception:
         pass
     last_exc = None
-    _retry_payload = None  # ★ v3.9.78: 2回目以降は retry フラグ付きを送る
+    _retry_payload = None
     for _i, wait in enumerate([0] + _GAS_RETRY_BACKOFF):
         if wait:
             _t.sleep(wait)
-        # ★ v3.9.78: インライン再送（2回目以降）は retry=true を付与する。
-        #   初回送信がGASに書き込み成功したのに応答だけ timeout で消失した場合、
-        #   同一 payload をフラグ無しで再送すると GAS が二重登録してしまう
-        #   (6/8-6/9 のトレード重複122件の根本原因)。retry=true を立てることで
-        #   GAS 側の trade_id / observation_id 重複排除を確実に発火させる。
         if _i == 0:
             _send_payload = payload_str
         else:
@@ -665,12 +687,12 @@ def _gas_send_with_retry(url: str, payload_str: str, kind: str,
         try:
             result = _gas_post(url, _send_payload, timeout=timeout)
             if isinstance(result, dict) and result.get("ok"):
-                _gas_mark_success()   # ★ v3.9.82: 成功で健全性リセット（クールダウン解除）
+                _gas_mark_success()
                 return True
             last_exc = RuntimeError(f"ng_response: {result}")
         except Exception as e:
             last_exc = e
-    _gas_mark_failure()   # ★ v3.9.82: 連続失敗カウント→閾値超でクールダウン突入
+    _gas_mark_failure()
     cls = _classify_gas_error(last_exc, kind)
     _gas_enqueue(url, payload_str, kind, key)
     log.warning(
@@ -680,20 +702,32 @@ def _gas_send_with_retry(url: str, payload_str: str, kind: str,
     return False
 
 
-# ★ v3.9.181: 再送成功時に鍵の末尾から日付を取り出すときの検査。
-#   生徒名に "|" が入っていても、末尾が YYYY-MM-DD でなければ記録しない。
 _re_date_key = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _requeue_after_error(ln: str, now: float) -> str:
+    """
+
+    配布前レビュー（Claude 別人格）: 元の行をそのまま戻すと attempts が増えず
+    next_at も据え置きになり、種別別の上限による破棄が永久に発火しない。
+    読めない行（JSON でない等）は、そのまま残す以外にできることが無いので原文を返す。"""
+    import random as _rnd3
+    try:
+        _rec = json.loads(ln)
+        if not isinstance(_rec, dict):
+            raise ValueError("dict ではない")
+        _rec["attempts"] = int(_rec.get("attempts", 0) or 0) + 1
+        _b = min(3600, 60 * (2 ** min(_rec["attempts"], 6)))
+        _rec["next_at"] = now + _b + _rnd3.uniform(0, min(60, _b * 0.25))
+        return json.dumps(_rec, ensure_ascii=False) + "\n"
+    except Exception:
+        return ln if ln.endswith("\n") else ln + "\n"
 
 
 def _gas_queue_drain_once() -> None:
     """退避キューを1巡再送（同期・asyncio.to_thread から呼ばれる前提）。
 
-    ★ v3.9.120: 上書き競合の修正（外部AIレビュー指摘）。
-    旧実装は「ロック内で読む → ロック外で送信 → ロック内で古いスナップショットを
-    全上書き」だったため、送信中に別スレッドが _gas_enqueue した新規レコードが
-    書き戻しで消失し得た。読み取り時にファイルを空にし（新規 enqueue はその後の
-    空ファイルへ安全に追記される）、送信後は「追記」で残件を戻す方式に変更。
-    途中で予期しない例外が出ても finally で未処理分ごと必ず書き戻す。"""
+    """
     import time as _t
     _gas_queue_migrate()
     if not os.path.exists(_gas_queue_path()):
@@ -710,44 +744,65 @@ def _gas_queue_drain_once() -> None:
     now = _t.time()
     kept: list = []
     sent = 0; dropped = 0
-    for ln in lines:
+    sent_labels: list = []; dropped_labels: list = []
+
+    def _label(rec: dict) -> str:
+        # 配布前レビュー（Codex）: ラベル作りで例外が出ても、残件の書き戻しまで必ず到達させる。
         try:
-            rec = json.loads(ln)
+            return _gas_record_label(rec)
         except Exception:
-            continue
-        if rec.get("next_at", 0) > now:
-            kept.append(ln if ln.endswith("\n") else ln + "\n")
-            continue
-        payload = rec.get("payload", "")
-        # 再送は GAS 側 dedup のため retry フラグを付与（二重登録防止）。
-        # トップレベルにも立てる（observation_batch 等 data を持たない型に対応）。
+            return "?"
+    _idx = 0
+    _err_n = 0
+    _settled = True
+    try:
+      for _idx, ln in enumerate(lines):
+        _settled = False
         try:
+          try:
+            rec = json.loads(ln)
+            if not isinstance(rec, dict):
+                raise ValueError("dict ではない")
+          except Exception:
+            kept.append(ln if ln.endswith("\n") else ln + "\n")
+            _settled = True
+            continue
+          _kind = rec.get("kind", "")
+          if not isinstance(_kind, str):
+            _kind = str(_kind)
+          try:
+            _next_at = float(rec.get("next_at", 0) or 0)
+          except (TypeError, ValueError, OverflowError):
+            _next_at = 0.0
+          if _next_at > now:
+            kept.append(ln if ln.endswith("\n") else ln + "\n")
+            _settled = True
+            continue
+          payload = rec.get("payload", "")
+          # 再送は GAS 側 dedup のため retry フラグを付与（二重登録防止）。
+          # トップレベルにも立てる（observation_batch 等 data を持たない型に対応）。
+          try:
             pj = json.loads(payload)
             pj["retry"] = True
             if isinstance(pj.get("data"), dict):
                 pj["data"]["retry"] = True
             payload = json.dumps(pj, ensure_ascii=False)
-        except Exception:
+          except Exception:
             pass
-        ok = False
-        try:
-            # ★ v3.9.174: summary は本文が大きく GAS 側の上書き探索も重いため
-            #   短い timeout だと「混雑時ほど直らない」形になる（レビュー指摘）。
-            _to = 30 if rec.get("kind") == "summary" else 20
+          ok = False
+          try:
+            _to = 30 if _kind == "summary" else 20
             r = _gas_post(rec.get("url", ""), payload, timeout=_to)
             ok = isinstance(r, dict) and r.get("ok")
-        except Exception:
+          except Exception:
             ok = False
-        if ok:
+          if ok:
             sent += 1
-            _gas_mark_success()   # ★ v3.9.82: プローブ成功でクールダウン解除（送信再開）
-            # ★ v3.9.181: 日次集計の再送が通ったら、送信済み日付を記録する
-            #   （認定サポーターの指摘）。従来は直接送信の成功経路でしか記録して
-            #   おらず、「再送で届いているのに履歴上は未送信」となって翌起動で
-            #   無駄な追いかけが走っていた。鍵は "生徒名|YYYY-MM-DD"。
-            #   GAS は生徒名＋日付の上書きなので二重行にはならないが、
-            #   通信と診断の両方で紛らわしい。
-            if rec.get("kind") == "summary":
+            _settled = True
+            if len(sent_labels) < _GAS_LABEL_MAX:
+                sent_labels.append(_label(rec))
+            _gas_mark_success()
+            if _kind == "summary":
                 try:
                     _k = str(rec.get("key", ""))
                     _d = _k.rsplit("|", 1)[-1] if "|" in _k else ""
@@ -756,28 +811,60 @@ def _gas_queue_drain_once() -> None:
                 except Exception as _e:
                     log.debug(f"[GAS再送] 送信済み日付の記録に失敗(黙殺): {_mask_secrets(_e)}")
             continue
-        rec["attempts"] = int(rec.get("attempts", 0)) + 1
-        # ★ v3.9.88: 種別別の上限で破棄（トレードは高上限＝実質破棄しない／observation_pnlは最初に諦める）
-        _max_att = _GAS_RETRY_MAX_BY_KIND.get(rec.get("kind", ""), _GAS_RETRY_MAX_ATTEMPTS)
-        if rec["attempts"] >= _max_att:
+          try:
+            rec["attempts"] = int(rec.get("attempts", 0) or 0) + 1
+          except (TypeError, ValueError, OverflowError):
+            rec["attempts"] = 1
+          _max_att = _GAS_RETRY_MAX_BY_KIND.get(_kind, _GAS_RETRY_MAX_ATTEMPTS)
+          if rec["attempts"] >= _max_att:
             dropped += 1
+            _settled = True
+            if len(dropped_labels) < _GAS_LABEL_MAX:
+                dropped_labels.append(_label(rec))
             continue
-        # ★ v3.9.82: 指数バックオフ＋ジッター（160台の再送が同時バーストしないよう散らす）
-        import random as _rnd2
-        _base = min(3600, 60 * (2 ** min(rec["attempts"], 6)))
-        rec["next_at"] = now + _base + _rnd2.uniform(0, min(60, _base * 0.25))
-        kept.append(json.dumps(rec, ensure_ascii=False) + "\n")
-    with _GAS_QUEUE_LOCK:
+          import random as _rnd2
+          _base = min(3600, 60 * (2 ** min(rec["attempts"], 6)))
+          rec["next_at"] = now + _base + _rnd2.uniform(0, min(60, _base * 0.25))
+          kept.append(json.dumps(rec, ensure_ascii=False) + "\n")
+          _settled = True
+        except Exception as _e_line:
+          # ★ 配布前レビュー（Claude 別人格）: そのまま戻すと attempts もバックオフも付かず、
+          #   毒のある行が 120 秒ごとに実 POST と警告を出し続ける（「静かに消える」を
+          #   「永久に鳴り続ける」に置き換えただけになる）。救済の回数も数えて上限で諦める。
+          _rescued = not _settled
+          if _rescued:
+            kept.append(_requeue_after_error(ln, now))
+            _settled = True
+          # ★ 配布前レビュー（Claude 別人格）: 送信できた行に「残して次へ」と出ると、
+          #   次巡に無いことが今回直した不具合と同じ形に見える。文言を分ける。
+          _err_n += 1
+          if _err_n <= 3:
+            log.warning(
+                "[GAS再送] 1行の処理で予期しない例外"
+                f"（{'この行は残して次へ' if _rescued else 'この行は送信済みなので残しません'}）"
+                f": {_mask_secrets(_e_line)}"
+            )
+          continue
+    finally:
+      if not _settled and _idx < len(lines):
+        kept.append(lines[_idx] if lines[_idx].endswith("\n") else lines[_idx] + "\n")
+      if _idx + 1 < len(lines):
+        kept.extend(ln if ln.endswith("\n") else ln + "\n" for ln in lines[_idx + 1:])
+      with _GAS_QUEUE_LOCK:
         try:
-            # ★ v3.9.120: 全上書き("w")ではなく追記("a")。読み取り時にファイルは空化済みで、
-            #   送信中に enqueue された新規レコードはその空ファイルに追記されているため、
-            #   ここで上書きすると消えてしまう。残件（kept）は後ろに足す。
             with open(_gas_queue_path(), "a", encoding="utf-8") as f:
                 f.writelines(kept)
         except Exception as _e:
-            log.debug(f"[GAS再送] キュー書き戻し失敗(黙殺): {_mask_secrets(_e)}")
+            log.error(f"[GAS再送] キューの書き戻しに失敗（{len(kept)}件が失われます）: {_mask_secrets(_e)}")
     if sent or dropped:
-        log.info(f"[GAS再送] 再送成功 {sent}件 / 諦め破棄 {dropped}件 / 残 {len(kept)}件")
+        def _fmt_labels(labels: list, total: int) -> str:
+            if not labels:
+                return ""
+            return f"({', '.join(labels)}{'…' if total > len(labels) else ''})"
+        log.info(
+            f"[GAS再送] 再送成功 {sent}件{_fmt_labels(sent_labels, sent)} / "
+            f"諦め破棄 {dropped}件{_fmt_labels(dropped_labels, dropped)} / 残 {len(kept)}件"
+        )
 
 
 async def gas_retry_loop() -> None:
@@ -785,7 +872,6 @@ async def gas_retry_loop() -> None:
     if not _is_data_collect_enabled():
         return
     log.debug("[GAS再送] ループ開始 (120秒間隔)")
-    # ★ v3.9.81 (P1-3): 起動直後に1回即ドレイン（翌朝の再起動で未送信分を素早く回収）
     try:
         await asyncio.to_thread(_gas_queue_drain_once)
     except Exception as _e0:
@@ -800,7 +886,6 @@ async def gas_retry_loop() -> None:
             log.debug(f"[GAS再送] ループ例外(黙殺): {_mask_secrets(_e)}")
 
 
-# ── ★ v3.9.7: 観察ログ機能 (認定サポーター集計用・受講生は無感) ───────────────────
 # AI が score=±1 を返したのに発注に至らなかった「near-miss ケース」を GAS の
 # 「観察ログ」シートに自動収集する。受講生 .env に DATA_COLLECT=true + STUDENT_NAME
 # が設定されていれば自動有効化 (既存トレード送信と同じガード)。
@@ -817,7 +902,6 @@ _PENDING_OBSERVATIONS: Dict[str, Dict[str, Any]] = {}
 _PENDING_OBSERVATIONS_MAX: int = 5000   # メモリ上限 (FIFO で最古を捨てる)
 _OBSERVATION_PNL_DELAY_SEC: int = 3600  # +60min 後に PnL を取得
 
-# ── ★ v3.9.81 (P1-1): pending観察のディスク永続化 ─────────────────────────────
 # _PENDING_OBSERVATIONS はメモリのみで、ボット停止/再起動で消えていた (+60分PnL・
 # Step0仮想exit が朝レポートに欠落)。ファイルにも保存し、起動時に読み戻して
 # 「+60分経過済み」分を履歴K線から算出→送信することで、停止/翌朝再起動でも回収する。
@@ -827,10 +911,6 @@ _PENDING_OBS_LOCK = threading.Lock()
 def _pending_obs_path() -> str:
     """pending観察の保存先（口座区分ごと）。
 
-    ★ v3.9.183: 本体スクリプトの隣に置いていた（配布前レビューの一致指摘）。
-      版の更新でフォルダごと差し替える運用で消え、git の追跡下にあるため
-      Bot 機の `git pull --ff-only` も止めていた。REAL/DEMO で1本を共有すると、
-      片方の除去処理がもう片方の観察を消す。
     """
     return _state_path("pending_observations.jsonl")
 
@@ -854,7 +934,7 @@ def _persist_pending_obs(obs_id: str, info: dict) -> None:
             "price_at_decision": info.get("price_at_decision", 0.0),
             "side_sign":         info.get("side_sign", 1),
             "side":              info.get("side", "BUY"),
-            "entry":             info.get("entry"),   # ★ v3.9.98: 統合送信用の観察エントリ
+            "entry":             info.get("entry"),
         }
         with _PENDING_OBS_LOCK:
             with open(_pending_obs_path(), "a", encoding="utf-8") as f:
@@ -875,8 +955,6 @@ def _unpersist_pending_obs(obs_id: str) -> None:
             _needle = f'"obs_id": "{obs_id}"'
             kept = [ln for ln in lines if _needle not in ln]
             if len(kept) != len(lines):
-                # ★ v3.9.183: 全上書きだと、書いている途中で落ちた回に
-                #   pending観察が丸ごと消える。一時ファイル→置換にする。
                 _atomic_write_text(_pending_obs_path(), "".join(kept))
     except Exception as _e:
         log.debug(f"[観察永続化] 除去失敗(黙殺): {_mask_secrets(_e)}")
@@ -905,7 +983,7 @@ def _load_pending_observations() -> int:
                     "price_at_decision":   float(rec.get("price_at_decision", 0.0)),
                     "side_sign":           int(rec.get("side_sign", 1)),
                     "side":                rec.get("side", "BUY"),
-                    "entry":               rec.get("entry"),   # ★ v3.9.98: 復元時も統合送信用エントリを保持
+                    "entry":               rec.get("entry"),
                 }
                 n += 1
             except Exception:
@@ -941,17 +1019,15 @@ def _gas_webhook_url() -> str:
     return os.environ.get("WEBHOOK_URL", "").strip() or DEFAULT_URL
 
 
-# ── ★ v3.9.76: 観察ログ/PnL のバッチ送信（GAS POST 回数・同時接続を削減）──────
 # 1件ずつ送らず数件まとめて送る。フラッシュは「件数到達」or「30秒間隔ループ」。
 # 送信は observation_batch_flush_loop（単一タスク）に集約＝直列化され、同時接続も抑制。
 # 失敗時は既存の _gas_send_with_retry 経由でローカル再送キューへ退避。
-_OBS_BATCH_MAX     = 200  # ★ v3.9.95: 100→200（1ペイロードで全件送信・POST数を更に削減）
-_OBS_PNL_BATCH_MAX = 200  # ★ v3.9.95: 100→200
+_OBS_BATCH_MAX     = 200
+_OBS_PNL_BATCH_MAX = 200
 _obs_entry_buffer: list = []
 _obs_pnl_buffer:   list = []
 _obs_buffer_lock = threading.Lock()
 
-# ── ★ v3.9.110: ニュース系“文脈”観察のサンプリング（GAS負荷削減）──────────────
 # 戦略改善の本体シャドー（下記STAGES）と実発注(outcome="ordered")は常に100%記録する。
 # ニュースの見送り文脈（conf_threshold / observation_headline / meta_question 等）は
 # 母数が大きく較正には全件不要のため、OBS_NEWS_SAMPLE_PCT% だけを確率的に記録する。
@@ -959,32 +1035,22 @@ _obs_buffer_lock = threading.Lock()
 def _parse_pct_env(key: str, default: float) -> float:
     try:
         _v = float(os.environ.get(key, "").strip())
-        if not math.isfinite(_v):   # ★ v3.9.152: NaN が clamp を素通りする（Codexレビュー指摘）
+        if not math.isfinite(_v):
             return default
         return max(0.0, min(100.0, _v))
     except (ValueError, TypeError):
         return default
 OBS_NEWS_SAMPLE_PCT = _parse_pct_env("OBS_NEWS_SAMPLE_PCT", 30.0)
-# ★ v3.9.152: 仮想損切り 狭/広 の計測サンプリング率（認定サポーターNの提案）。
-#   v3.9.110 で撤去した仮想列を、損切り幅プロファイルの実発注適用（P1-1）の
-#   判断根拠を作るために期間限定で復活させる。GAS 負荷を抑えるため既定30%。
-#   0 で停止・100 で全件。列は GAS 側に残っているので受け皿はそのまま。
 OBS_VEXIT_SAMPLE_PCT = _parse_pct_env("OBS_VEXIT_SAMPLE_PCT", 30.0)
 # 常に全件記録する（サンプリング対象外の）シャドー段階。
 _OBS_FULL_STAGES = {
     "momentum_shadow", "trend_filter_ab", "premarket_filter_ab", "forced_stop_ab",
     "shadow_short_entry", "shadow_short_exit",
-    # ★ v3.9.169: ニュース選抜で見送った分は間引かず全件記録する。
-    #   「フィルタが良いニュースを弾いていないか」を後から検証するための母数なので、
-    #   サンプリングすると検証そのものができなくなる。
     "news_select_v1",
-    # ★ v3.9.193: ETF影響ガードで発注先が空になった回。語の表を足すべきかを実データで
-    #   判断するための母数なので間引かない（認定サポーターの提案）。
     "etf_guard_empty",
     # peak_retrace_sim / timeout_extension は v3.9.116 で計測終了・撤去
 }
 
-# ── ★ v3.9.116: momentum_shadow の重複送信削減（日替わり当番制）─────────────
 # モメンタムのシャドー観察は「同じ市場シグナル×同じ結果」を全受講生（直近週99名）が
 # 重複送信しており、GAS負荷とシート肥大の主因になっていた（実測: 5週間で13,536行に
 # 対しユニークシグナルは4,952件）。市場結果は誰が送っても同一のため、日替わりの
@@ -1064,12 +1130,11 @@ def _buffer_obs_pnl(data: dict) -> None:
 
 async def observation_batch_flush_loop() -> None:
     """約45秒ごとに観察エントリ/PnL のバッファをフラッシュ（送信を直列化）。
-    ★ v3.9.82: 間隔を45秒へ拡大＋ジッターで、160台の一斉フラッシュ(相関バースト)を散らす。"""
+    """
     if not _is_data_collect_enabled():
         return
     import random as _rnd
     # 起動時のランダムオフセット（全受講生のフラッシュ時刻をばらす）
-    # ★ v3.9.88: 0〜30秒 → 0〜60秒（160台の相関バーストを更に分散）
     try:
         await asyncio.sleep(_rnd.uniform(0, 60))
     except Exception:
@@ -1078,13 +1143,6 @@ async def observation_batch_flush_loop() -> None:
     _loop_i = 0
     while True:
         try:
-            # ★ v3.9.95: 90〜120秒 → 150〜210秒（POST数を削減し共有GASの過負荷を緩和。
-            #   シャドーは緊急性が低くバッファ全件を一括送信するためデータ欠落はしない）
-            # ★ v3.9.97: 適応スロットル — GASが不調なら送信間隔を自動で延ばしPOSTを更に間引く。
-            # ★ v3.9.110: 平常間隔を 150〜210秒 → 300〜450秒へ拡大。1POSTあたりの束ね行数を
-            #   増やしPOST数を約半減（160台スケール時のGAS負荷を先回りで軽減）。シャドーは
-            #   緊急性が低くバッファ全件を一括送信するためデータ欠落は起きない。
-            #   平常=300〜450秒／不調の兆し=約1.8倍／混雑=約3倍(最大10分)。
             _base_sec = 300 + _rnd.uniform(0, 150)
             _cf = int(_gas_send_health.get("consecutive_fail", 0))
             if _gas_in_cooldown() or _cf >= _GAS_FAIL_COOLDOWN_THRESHOLD:
@@ -1096,8 +1154,6 @@ async def observation_batch_flush_loop() -> None:
             await asyncio.sleep(_interval)
             _loop_i += 1
             await asyncio.to_thread(_flush_obs_entry_buffer)
-            # ★ v3.9.95: observation_pnl（最低優先）は隔回フラッシュ＝POST数を半減。
-            #   バッファ全件を一括送信するため欠落はしない（次回ループでまとめて送る）。
             if _loop_i % 2 == 0:
                 await asyncio.to_thread(_flush_obs_pnl_buffer)
         except asyncio.CancelledError:
@@ -1111,8 +1167,6 @@ async def observation_batch_flush_loop() -> None:
             log.debug(f"[観察バッチ] ループ例外(黙殺): {_mask_secrets(_e)}")
 
 
-# ★ v3.9.172: 実在しない内部識別子。銘柄列に入ることがあるが、
-#   OpenD へ照会してはいけないもの。
 _PSEUDO_SYMBOLS: frozenset = frozenset({"SHARED", ""})
 
 
@@ -1130,16 +1184,12 @@ def _log_observation(
     block_stage: str = "",                 # conf_threshold / smh_strict / macro_downtrend / ...
     block_reason: str = "",                # 詳細メッセージ
     price_at_decision: float = 0.0,
-    # ★ v3.9.83: 発注判断の文脈を観察ログへ追加（運営が後から「なぜ発注/見送りか」を検証）。
-    #   いずれも任意。None の項目はペイロードに含めず GAS 側で空欄になる。
     live_allowed: Optional[bool] = None,   # この銘柄サイドが実発注対象か (実発注可否)
     size_pct: Optional[float] = None,      # 実効投入サイズ%（budget 比）
     eff_stop_loss_pct: Optional[float] = None,  # 実効損切り%（この判定で使われる損切り幅）
     pct_5m: Optional[float] = None,        # モメンタム 5 分変化率%
     pct_15m: Optional[float] = None,       # モメンタム 15 分変化率%
     quote_sanity: Optional[int] = None,    # 1=健全 / 0=異常クォートで遮断 / None=未チェック
-    # ★ v3.9.193: True なら価格が無くても気配を取りに行かない（同期 get_quote を避ける・
-    #   配布前レビュー Codex/Gemini の指摘）。価格が無い行は損益の追跡だけが付かない。
     skip_quote: bool = False,
 ) -> None:
     """観察イベントを GAS に送信し Phase 2 用に pending 登録する。
@@ -1150,8 +1200,6 @@ def _log_observation(
     if not _is_data_collect_enabled():
         return
 
-    # ★ v3.9.110: ニュース系“文脈”観察のサンプリング（本体シャドー・実発注は全記録）。
-    #   母数の大きい見送り文脈のみ OBS_NEWS_SAMPLE_PCT% に間引き、GAS POST数を削減。
     if (outcome != "ordered"
             and block_stage not in _OBS_FULL_STAGES
             and OBS_NEWS_SAMPLE_PCT < 100):
@@ -1162,9 +1210,6 @@ def _log_observation(
         except Exception:
             pass
 
-    # ★ v3.9.116: momentum_shadow は日替わり当番のみ GAS 送信（重複データ削減）。
-    #   非当番はここで打ち切り＝pending登録も+60分PnL計測も行わない（CPU/POSTゼロ）。
-    #   端末/Discord の日次サマリは呼び出し元で別途記録されるため全員表示される。
     if (block_stage == "momentum_shadow"
             and outcome != "ordered"
             and not _momentum_shadow_is_reporter()):
@@ -1173,13 +1218,6 @@ def _log_observation(
 
     try:
         # 価格未指定の場合は get_quote で取得を試みる (失敗時は 0 のまま)
-        # ★ v3.9.172: 疑似銘柄は照会しない。ETF モードの AI 判定は
-        #   analyze_news(..., trigger_symbol="SHARED") で呼ばれ、その値が
-        #   そのまま symbol として観察ログに渡る（引数のコメントは「ログ用」
-        #   だが実際には銘柄列にも入る）。結果 US.SHARED を OpenD に照会し、
-        #   Unknown stock のエラーが出ていた（認定サポーターの報告）。
-        #   売買には影響しないが、OpenD 障害と紛らわしく、観察データにも
-        #   実在しない銘柄が混じる。
         if price_at_decision <= 0 and not skip_quote and symbol not in _PSEUDO_SYMBOLS:
             try:
                 _q = get_quote(symbol)
@@ -1195,7 +1233,6 @@ def _log_observation(
 
         # ── Phase 2 用 pending 登録 (price > 0 のときのみ・PnL 計算可能なケース) ──
         if price_at_decision > 0:
-            # ★ v3.9.193: 方向が決まる前の記録（side="-"）は買い方向の符号で持つ
             side_sign = -1 if side == "SELL_SHORT" else 1
             # メモリ上限管理 (FIFO)
             if len(_PENDING_OBSERVATIONS) >= _PENDING_OBSERVATIONS_MAX:
@@ -1215,12 +1252,10 @@ def _log_observation(
                 "side_sign":           side_sign,
                 "side":                side,
             }
-            # ★ v3.9.98: 永続化は payload_data(entry) を含めて下で実施（統合送信用）。
 
         # ── Phase 1 ペイロード送信 (daemon thread・Bot 動作非阻害) ──
         cfg_name = os.environ.get("STUDENT_NAME", "").strip()
 
-        # ★ v3.9.26: モメンタム関連の実プリセット値を併記 (レポート集計のバージョン跨ぎ一貫性)
         # 観察ログには bot_version と LEVEL の番号だけでなく、当時の実効しきい値も保存。
         # これでレポート側は「Lv 番号」ではなく「実効プロファイル」基準で連結集計できる。
         _momentum_meta: Dict[str, Any] = {}
@@ -1245,9 +1280,7 @@ def _log_observation(
 
         payload_data = {
             "observation_id":    obs_id,
-            "bot_version":       BOT_VERSION_TAGGED,   # ★ v3.9.116: select_v1有効時は "+select_v1" 付き
-            # ★ v3.9.192: 何で判定したか（認定サポーターの提案②）。設定の指紋は
-            #   settings の断面から同じ式で作る（trade 側の config_id と一致する）。
+            "bot_version":       BOT_VERSION_TAGGED,
             "model":             CLAUDE_MODEL,
             "prompt_ver":        _PROMPTS_VERSION,
             "config_id":         _obs_config_id(),
@@ -1256,8 +1289,6 @@ def _log_observation(
             "side":              side,
             "session":           session,
             "ai_score":          score,
-            # ★ v3.9.190b: 第2位に丸めると、しきい値ぎわの実値（0.779 としきい値 0.78）を
-            #   観察シートから復元できない。判定は実値で行うので記録も実値に寄せる。
             "ai_confidence":     round(confidence, 4),
             "ai_category":       category,
             "beneficiaries":     beneficiaries or [],
@@ -1265,17 +1296,13 @@ def _log_observation(
             "headline_first":    headline_first,
             "outcome":           outcome,
             "block_stage":       block_stage,
-            "block_reason":      (block_reason or "")[:300],
+            "block_reason":      (block_reason or "")[:_BLOCK_REASON_MAX],
             "price_at_decision": round(price_at_decision, 2),
-            # ★ v3.9.193: 口座区分（REAL/DEMO）。決済記録は v3.9.99 から持っていたが
-            #   観察ログには無く、実口座とデモを分けられなかった（認定サポーターの指摘）。
-            #   GAS v9.32 が末尾 51 列目「口座区分」で受ける。
             "trade_env":         _RUN_TRADE_ENV,
         }
         if _momentum_meta:
             payload_data.update(_momentum_meta)
 
-        # ★ v3.9.83: 発注判断の文脈列（任意・None は送らない）。
         if live_allowed is not None:
             payload_data["live_allowed"] = 1 if live_allowed else 0
         if size_pct is not None:
@@ -1289,11 +1316,6 @@ def _log_observation(
         if quote_sanity is not None:
             payload_data["quote_sanity"] = 1 if quote_sanity else 0
 
-        # ★ v3.9.98: シャドー(観察)は最低優先。POST半減のため「エントリ単独送信」をやめ、
-        #   pending(価格>0=+60分PnLが取れるケース)はエントリを即送らず保持し、+60分PnLが
-        #   出た時点で『エントリ＋PnL』を1回の追記(observation_batch)にまとめて送る。
-        #   GAS側の「行を探して更新」処理も不要になる。トレード記録(最優先)は対象外で不変。
-        #   価格不明(+60分PnLが出ない)観察のみ、従来どおり即時にエントリだけ送る。
         if obs_id in _PENDING_OBSERVATIONS:
             _PENDING_OBSERVATIONS[obs_id]["entry"] = payload_data
             _persist_pending_obs(obs_id, _PENDING_OBSERVATIONS[obs_id])  # entry込みで1行保存
@@ -1308,18 +1330,7 @@ def _log_observation(
 
 
 # ============================================================
-#  ★ v3.9.74/110: Step0 シャドー計測 — 仮想exit算出（実決済は不変・観測ログ専用）
-#  「もし～で決済していたら」の仮想 PnL(%) を 1分足リプレイで算出し、観測ログへ列追加する。
-#  発注・決済ロジックには一切影響しない。
-#  ★ v3.9.110: 下流(レポート/集計)で未使用の①MFE可変トレール・②RSI(5分)反転・
-#    高ボラ損切り狭/広(v3.9.32で実装済＝検証完了)・④金曜フラグ・基準PnL列を撤去し、
-#    継続計測する「③15分撤退」のみ残した。関連ヘルパー(_wilder_rsi/_vexit_trail_drop/
-#    _VEXIT_TRAIL_* /_VEXIT_RSI_PERIOD)も併せて削除。
 # ============================================================
-# ★ v3.9.116: MFE可変トレールの段階幅（含み益ピーク% → トレール幅%）。
-#   v3.9.110 で「下流未使用」として撤去したが、戦略プロファイル select_v1 の選定・
-#   継続検証の基幹指標（週次レポートのシャドー検証で使用）になったため復活させる。
-#   ピークが伸びるほど狭く追従＝利益を守る。ピーク0.30%未満はトレール未起動。
 _VEXIT_TRAIL_TIERS = ((1.00, 0.08), (0.50, 0.12), (0.30, 0.20))
 
 
@@ -1335,24 +1346,11 @@ def _compute_virtual_exits(entry_price: float, side_sign: int,
                            decision_time_et: "datetime.datetime", bars: list,
                            symbol: str = "", is_momentum: bool = False) -> dict:
     """仮想exit算出（観測ログ専用・実決済は不変）。bars=[{"ts":datetime(ET naive),"close":float}]。
-    ★ v3.9.110: シャドー軽量化（RSI反転/損切り狭・広/金曜フラグ/計測メモ等を撤去）。
-    ★ v3.9.116: 「③15分撤退」も計測終了（5週集計で最下位＝不採用と結論）。
-    ★ v3.9.116: 「①MFE可変トレール」を復活。戦略プロファイル select_v1 の根拠かつ
-      継続検証の基幹指標（週次レポートで全シグナル vs 選抜条件を比較）になったため、
-      mfe_trail_pnl_pct / mfe_trail_min を再び算出・送信する（GAS列は既存のまま）。
-      例外は投げない（黙殺）。"""
-    # ★ v3.9.116: 「③15分撤退」は計測終了（5週集計で勝率43%と全出口方式中最下位＝
-    #   採用しないと結論。select_v1 検証でも不使用）。列はGAS側に残るが今後は空欄。
+      """
     out = {
-        "mfe_trail_pnl_pct": None,   # ① MFE可変トレール適用後 PnL%（★ v3.9.116 復活）
+        "mfe_trail_pnl_pct": None,
         "mfe_trail_min":     None,   # ① 決済までの保有分（トレール未発火なら窓末=60分）
     }
-    # ★ v3.9.152: 仮想損切り 狭/広 を復活（サンプリング付き・認定サポーターNの提案）。
-    #   狭 = 現行のモメンタム実発注と同じ幅（MOMENTUM_STOP_LOSS_PCT・全銘柄共通）
-    #   広 = 同じ基準値に銘柄別倍率を掛けた幅（Wizard [5b] が意図していた幅）
-    #   これで「SMH の損切りを広げていたらどうなっていたか」を実データで比較できる。
-    #   v3.9.110 が撤去した際の根拠（v3.9.32 で実装済＝検証完了）は、モメンタム
-    #   実発注については成立していなかった（P1-1）。判断根拠を作り直す。
     _vexit_sampled = False
     try:
         import random as _rnd_vx   # ファイル全体の流儀に合わせて関数内 import
@@ -1375,26 +1373,16 @@ def _compute_virtual_exits(entry_price: float, side_sign: int,
         if not fwd:
             return out
 
-        # ── ★ v3.9.152: 仮想損切り 狭/広（60分窓・発火しなければ窓末決済）──────
         bars60 = [b for b in fwd if (b["ts"] - decision_time_et).total_seconds() <= 60 * 60]
         if _vexit_sampled and bars60:
             _stop_narrow = float(MOMENTUM_STOP_LOSS_PCT)                       # 例 0.50
-            # ★ v3.9.152b: 広は「標準プロファイルの倍率」に固定する（Codexレビュー指摘）。
-            #   _symbol_loss_mult() は利用者が選んだプロファイルに依存するため、
-            #   narrow を選んだ人の「広」列が狭めの倍率になり、フリート横断の
-            #   比較（46-47列の集計）が壊れる。全員同じ定義で測る。
             _stop_wide = float(MOMENTUM_STOP_LOSS_PCT) * float(
                 _MOMENTUM_STOP_MULT.get("standard", {}).get(symbol, 1.0))  # 例 SMH 1.50
-            # ★ v3.9.152b: 窓末の採用は「60分近くまでデータがある」ときだけ
-            #   （Codexレビュー指摘）。足が途中で切れているのに最後の足を
-            #   「60分保有の結果」として記録すると、実質数分の値が混ざる。
             _window_ok = (bars60[-1]["ts"] - decision_time_et).total_seconds() >= 55 * 60
             for _key, _stop in (("stop_narrow_pnl_pct", _stop_narrow),
                                 ("stop_wide_pnl_pct", _stop_wide)):
                 _res = None
                 for b in bars60:
-                    # ★ v3.9.152b: 到達判定は足の中の最悪値で見る（Codexレビュー指摘）。
-                    #   LONG は安値・SHORT は高値。終値だけだと足中の到達を見逃す。
                     _worst = b["low"] if side_sign > 0 else b["high"]
                     if ret_pct(_worst) <= -_stop:
                         _res = round(-_stop, 4)   # 約定はしきい値で近似（実運用の指値相当）
@@ -1405,7 +1393,6 @@ def _compute_virtual_exits(entry_price: float, side_sign: int,
                     # 窓が不完全なら None のまま（発火も窓末も確定できない）
                 out[_key] = _res
 
-        # ── ① MFE可変トレール（含み益ピークから段階幅で追従・60分窓）★ v3.9.116 復活 ──
         if bars60:
             _peak = -999.0
             for b in bars60:
@@ -1420,9 +1407,6 @@ def _compute_virtual_exits(entry_price: float, side_sign: int,
                     break
             else:
                 # トレール未発火（未起動含む）→ 窓末で決済（≒60分保有）
-                # ★ v3.9.152b: 窓が55分に届いていない（データが途中で切れている）
-                #   ときは記録しない（Codexレビュー指摘）。数分ぶんの値を
-                #   「60分保有の結果」として混ぜない。狭/広の窓ガードと同じ扱い。
                 if (bars60[-1]["ts"] - decision_time_et).total_seconds() >= 55 * 60:
                     out["mfe_trail_pnl_pct"] = round(ret_pct(bars60[-1]["close"]), 4)
                     out["mfe_trail_min"] = round(
@@ -1445,8 +1429,6 @@ def _compute_and_send_observation_pnl(obs_id: str, info: dict) -> None:
         decision_time_et  = info["decision_time_et"]
 
         # ── 取得範囲: decision -120min 〜 decision +65min ──
-        #   ★ v3.9.74: 仮想exitの RSI(5分) 算出に過去ウォームアップが必要なため、
-        #     開始を -5min → -120min に拡張（+5/15/60min の最寄り抽出には影響なし）。
         start_et = (decision_time_et - datetime.timedelta(minutes=120)).strftime("%Y-%m-%d %H:%M:%S")
         end_et   = (decision_time_et + datetime.timedelta(minutes=65)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1477,7 +1459,7 @@ def _compute_and_send_observation_pnl(obs_id: str, info: dict) -> None:
             60: decision_time_et + datetime.timedelta(minutes=60),
         }
         nearest: Dict[int, Optional[Dict[str, Any]]] = {5: None, 15: None, 60: None}
-        _bars: list = []   # ★ v3.9.74: 仮想exit算出用に全バーを収集
+        _bars: list = []
         for _, row in klines.iterrows():
             try:
                 ts_et = datetime.datetime.strptime(str(row["time_key"]), "%Y-%m-%d %H:%M:%S")
@@ -1485,10 +1467,7 @@ def _compute_and_send_observation_pnl(obs_id: str, info: dict) -> None:
             except (KeyError, ValueError, TypeError):
                 continue
             if price <= 0 or not math.isfinite(price):
-                # ★ v3.9.152b: NaN は `<= 0` をすり抜ける（比較が常に偽・Codexレビュー指摘）
                 continue
-            # ★ v3.9.152b: 仮想損切りの判定用に高値/安値も持つ（Codexレビュー指摘）。
-            #   終値だけだと足の中での到達を見逃す。取れない足は close で代用（従来同等）。
             try:
                 _hi = float(row.get("high", price) or price)
                 _lo = float(row.get("low", price) or price)
@@ -1508,11 +1487,6 @@ def _compute_and_send_observation_pnl(obs_id: str, info: dict) -> None:
                     nearest[m] = {"ts": ts_et, "price": price}
 
         # ── PnL/share 計算 (側に応じて符号調整) ──
-        # ★ v3.9.130: 最寄りバーに許容誤差(±3分)を導入。argmin は上限が無く、候補に
-        #   -120分側のウォームアップバーも含むため、データが +Nmin に届かない場合(セッション跨ぎ・
-        #   薄商い・休場境界)に「判定時刻より前のバー」が pnl として無警告で記録される恐れがあった。
-        #   これは make_weekly_report.py の hold60 経由で select_v1 の検証データに直結するため、
-        #   target から離れすぎた最寄りバーは欠測(None)として記録し、静かなデータ歪みを防ぐ。
         _NEAREST_TOL_SEC = 180  # ±3分
         pnl_results: Dict[str, Optional[float]] = {}
         for m in (5, 15, 60):
@@ -1532,13 +1506,9 @@ def _compute_and_send_observation_pnl(obs_id: str, info: dict) -> None:
                     (snap["price"] - price_at_decision) * side_sign, 4
                 )
 
-        # ── ★ v3.9.74/110: Step0 仮想exit算出（実決済は不変・観測ログ専用）──
-        #   v3.9.110で下流未使用の反実仮想列を撤去し、継続計測の「15分撤退」のみ算出。
         _vexit = _compute_virtual_exits(
             float(price_at_decision), int(side_sign), decision_time_et, _bars,
             symbol=symbol,
-            # ★ v3.9.152b: 狭/広の計測はモメンタム観察に限定（Codexレビュー指摘）。
-            #   ニュース観察に混ぜると 46-47 列の分析が汚れる。
             # block_stage は pending の top-level ではなく entry の中に入っている
             # （:951 で payload に積まれ、それが entry として保持される）。
             is_momentum=(str(((info.get("entry") or {}).get("block_stage", ""))
@@ -1546,21 +1516,12 @@ def _compute_and_send_observation_pnl(obs_id: str, info: dict) -> None:
         )
 
         # ── GAS 送信 ──
-        # ★ v3.9.98: エントリ(保持済み)があれば「エントリ＋PnL」を1回の追記(observation_batch)で
-        #   まとめて送る＝POST半減＋GAS更新スキャン不要。エントリが無い旧pending(再起動前の
-        #   古い永続記録)のみ、従来の observation_pnl 更新にフォールバックする。
         _entry = info.get("entry")
         if _entry:
             _merged = dict(_entry)
-            # ★ v3.9.110: 5分/15分PnLは下流未使用のため送信停止（60分のみ保持）
             _merged["pnl_60min"] = pnl_results.get("pnl_60min")
-            _merged.update(_vexit)   # mfe_trail_*（★ v3.9.116: exit15_* は計測終了）
+            _merged.update(_vexit)
             _buffer_obs_entry(_merged)   # 統合：エントリ＋PnLを1行追記
-            # ★ v3.9.181: 基準価格も出す（認定サポーターの要望）。
-            #   v3.9.178 ② の受入確認「60分評価が体感と合う向きか」は、
-            #   基準がログに出ないため4晩ぶん確認できないままだった。
-            #   ここが実勢価格（発注指値ではない）であることを、利用者が
-            #   自分のログで確かめられるようにする。
             log.debug(
                 f"[観察統合] {obs_id} バッファ追加(エントリ+PnL) {symbol} "
                 f"判定時価格={_entry.get('price_at_decision')} "
@@ -1569,14 +1530,8 @@ def _compute_and_send_observation_pnl(obs_id: str, info: dict) -> None:
         else:
             _pnl_data = {
                 "observation_id": obs_id,
-                # ★ v3.9.110: 5分/15分PnLは下流未使用のため送信停止（60分のみ）
                 "pnl_60min":      pnl_results.get("pnl_60min"),
             }
-            # ★ v3.9.152b: 旧式更新経路には仮想exit（mfe_trail_* / 狭・広）を載せない。
-            #   GAS の更新経路（_applyObsPnlToRow_）はゲートを開くと 31-39 列を
-            #   まとめて書き直し、欠けている項目を空文字で「消して」しまうため
-            #   （Codexレビュー指摘）。旧pending（再起動前の残り）はごく少数なので、
-            #   狭/広の計測は統合経路（エントリあり）だけで行う。
             for _k_vx in ("stop_narrow_pnl_pct", "stop_wide_pnl_pct"):
                 _vexit.pop(_k_vx, None)
             _pnl_data.update(_vexit)
@@ -1596,7 +1551,6 @@ async def observation_pnl_check_loop() -> None:
         log.debug("[観察PnL] DATA_COLLECT 無効 → ループ非起動")
         return
 
-    # ★ v3.9.81 (P1-1): 起動時に前回までの pending観察を復元（停止/再起動でも回収）
     try:
         _load_pending_observations()
     except Exception as _e_lp:
@@ -1615,7 +1569,7 @@ async def observation_pnl_check_loop() -> None:
 
             for obs_id in ready_ids:
                 info = _PENDING_OBSERVATIONS.pop(obs_id, None)
-                _unpersist_pending_obs(obs_id)   # ★ v3.9.81: 処理に回したら永続ファイルから除去
+                _unpersist_pending_obs(obs_id)
                 if info is None:
                     continue
                 try:
@@ -1631,7 +1585,6 @@ async def observation_pnl_check_loop() -> None:
             await asyncio.sleep(60)
 
 
-# ── ★ v3.9.28: シャドー SHORT ライフサイクル シミュレーション ────────────────
 # moomoo デモ口座は API 経由の空売り非対応のため、これまでは place_short() で
 # 即スキップしていた。その結果、デモ環境では LONG のみが集計対象となり SHORT
 # 戦略の検証ができなかった。
@@ -1651,21 +1604,16 @@ SHADOW_SHORT_ENABLED: bool = (
     os.environ.get("SHADOW_SHORT_ENABLED", "true").strip().lower() == "true"
 )
 
-# ── ★ v3.9.65: デモ口座のネッティング空売り対応 ────────────────────────────────
 # moomoo デモは信用区分 (SELL_SHORT / BUY_BACK) を受け付けないが、ネッティング口座
 # としては「プレーン SELL で保有を超えて売る = ショート新規」「プレーン BUY で決済」が
 # できる (5/27 受講生ログで実証)。これを正式対応し、デモ生も勝ち筋のショート側を
 # 実発注検証できるようにする (信用口座に近い成績検証)。
 #   - DEMO_SHORT_ENABLED=true  : デモで SELL_SHORT シグナル時にプレーン SELL で建てる (既定)
 #   - DEMO_SHORT_ENABLED=false : スキップ → シャドー SHORT 記録のみ (従来動作に戻す場合)
-# ★ v3.9.68: 既定を false→true に変更。.env に記載が無ければデモでもショート実発注化。
-#   安全前提が出揃ったため既定 ON: デモ決済=BUY(v3.9.63)/二重決済防止(v3.9.64)/
-#   flat時のみ新規ショート(v3.9.65)/サーキットブレーカー配線(v3.9.67)。Wizard でも選択可。
 DEMO_SHORT_ENABLED: bool = (
     os.environ.get("DEMO_SHORT_ENABLED", "true").strip().lower() == "true"
 )
 
-# ── ★ v3.9.69: 実口座のショート(空売り) ON/OFF ─────────────────────────────────
 # 受講生要望: 実口座では空売り規制がなく PnL 低下が懸念されるため、買い専用運用を
 # 選べるようにする。REAL_SHORT_ENABLED=false で実口座のショートを一括停止
 # (ニュース駆動・モメンタム両方。place_short の共通ゲートで遮断)。
@@ -1682,10 +1630,8 @@ _SHADOW_SHORT_LOCK = threading.Lock()
 
 
 def _shadow_short_order_usd(symbol: str, confidence: float) -> Tuple[float, str]:
-    """★ v3.9.193: シャドー SHORT の仮想発注額。place_short と同じ
-    「山型配分 → 高ボラ銘柄の ÷倍率（下限あり）→ 個別株の1銘柄上限」を通す。
-    残余力キャップだけは口座の状態が要るので掛けない（記録側では再現できない）。
-    戻り値は (金額, 何を掛けたかの短い注記)。"""
+    """
+    """
     usd = calc_order_size(confidence)
     notes = []
     try:
@@ -1719,7 +1665,7 @@ def _shadow_short_open(
     headlines: Optional[List[str]] = None,
     beneficiaries: Optional[List[str]] = None,
     victims: Optional[List[str]] = None,
-    qty: Optional[int] = None,       # ★ v3.9.193: 数量明示の経路（モメンタム等）は実発注と同じ qty
+    qty: Optional[int] = None,
 ) -> None:
     """シャドー SHORT のエントリー記録。
     place_short() の TrdEnv.SIMULATE 分岐から呼び出される。
@@ -1739,10 +1685,6 @@ def _shadow_short_open(
             return
 
         # ── 仮想株数 ──
-        # ★ v3.9.193: 実発注（place_short）と同じ縮小を掛ける（認定サポーターの指摘）。
-        #   従来は山型配分だけで、高ボラ銘柄の ÷倍率 と個別株の1銘柄上限を通っておらず、
-        #   仮想発注額が実発注より大きく出ていた（観察ログの SMH 中央値 $6,000 に対し、
-        #   実発注なら ÷3.0 と下限 30% で $3,000）。
         if qty is not None and qty > 0:
             # 配布前レビュー（Claude 別人格 2周目）: 数量明示の実発注は「予算×比率」で決めた qty を
             # そのまま送る（÷倍率なし）。仮想側も同じ qty × 気配を金額にする。
@@ -1793,14 +1735,12 @@ def _shadow_short_open(
             "type":         "observation",
             "data": {
                 "observation_id":    obs_id,
-                "bot_version":       BOT_VERSION_TAGGED,   # ★ v3.9.116: select_v1有効時は "+select_v1" 付き
+                "bot_version":       BOT_VERSION_TAGGED,
                 "decision_time":     now_et.strftime("%Y-%m-%d %H:%M:%S"),
                 "symbol":            symbol,
                 "side":              "SELL_SHORT",
                 "session":           session,
                 "ai_score":          -1,
-                # ★ v3.9.190b: 第2位に丸めると、しきい値ぎわの実値（0.779 と 0.78）を
-                #   観察シートから復元できない。判定は実値で行うので記録も実値に寄せる。
                 "ai_confidence":     round(confidence, 4),
                 "ai_category":       category,
                 "news_source":       news_source,
@@ -1813,12 +1753,11 @@ def _shadow_short_open(
                 "price_at_decision": round(entry_price, 2),
                 "shadow_short_qty":  qty,
                 "shadow_short_usd":  round(order_usd, 2),
-                "trade_env":         _RUN_TRADE_ENV,   # ★ v3.9.193: 口座区分（直送経路にも）
+                "trade_env":         _RUN_TRADE_ENV,
             }
         }, ensure_ascii=False)
 
         def _send_thread():
-            # ★ v3.9.75: 再送/退避つき送信（entry は append・retry時 observation_id で dedup）
             _gas_send_with_retry(_gas_webhook_url(), payload,
                                  kind="observation", key=obs_id, timeout=15)
         threading.Thread(target=_send_thread, daemon=True).start()
@@ -1854,7 +1793,6 @@ def _shadow_short_check_exit(pos: Dict[str, Any]) -> Optional[Tuple[str, float]]
             pos["peak_price"] = cur
 
         # ── ① 損切り: 価格上昇で SHORT 損 ──
-        # ★ v3.9.32: 高ボラ銘柄 (SMH 等) は損切り幅を拡大
         _eff_loss = _effective_max_loss_pct(symbol, MAX_LOSS_PCT)
         if cur >= entry * (1 + _eff_loss):
             return ("強制損切り", cur)
@@ -1911,7 +1849,7 @@ def _shadow_short_close(obs_id: str, pos: Dict[str, Any], exit_reason: str, exit
             "type":         "shadow_short_exit",
             "data": {
                 "observation_id":    obs_id,
-                "bot_version":       BOT_VERSION_TAGGED,   # ★ v3.9.116: select_v1有効時は "+select_v1" 付き
+                "bot_version":       BOT_VERSION_TAGGED,
                 "symbol":            symbol,
                 "entry_price":       round(entry, 2),
                 "exit_price":        round(exit_price, 2),
@@ -1925,12 +1863,10 @@ def _shadow_short_close(obs_id: str, pos: Dict[str, Any], exit_reason: str, exit
         }, ensure_ascii=False)
 
         def _send_thread():
-            # ★ v3.9.75: 再送/退避つき送信（exit は observation_id 照合の更新＝冪等）
             _gas_send_with_retry(_gas_webhook_url(), payload,
                                  kind="observation", key=obs_id, timeout=15)
         threading.Thread(target=_send_thread, daemon=True).start()
 
-        # ★ v3.9.30: 当日サマリ用バッファに追記 (Discord/端末表示用)
         try:
             _record_today_shadow_short({
                 "symbol":      symbol,
@@ -1987,10 +1923,8 @@ async def shadow_short_exit_loop() -> None:
             await asyncio.sleep(60)
 
 
-# ── ★ v3.9.12: モメンタムシャドー観察ループ (Phase 0) ──────────────────────────
 def _smh_buy_unreachable_note() -> str:
-    """★ v3.9.192: 標準プロファイルで SMH の買いを実発注対象にしていても、モメンタム経由
-    では実発注に届かないことを起動時に言う（認定サポーターの指摘⑥）。
+    """
 
     モメンタム経由の買いは confidence を 0.70 固定で渡すが、SMH の買いには 0.78 の関門
     （730件の分析で SMH の買いが最大の損失源だったための固定値）がある。設定画面では
@@ -1998,7 +1932,7 @@ def _smh_buy_unreachable_note() -> str:
     関門を通す変更は発注対象が変わるので、この版ではしない（PAN 判断・2026-09-04）。"""
     try:
         if not MOMENTUM_LIVE_TRADING:
-            return ""            # ★ v3.9.193: Phase 0 は何も実発注しないので、この注記も出さない
+            return ""
         if MOMENTUM_PROFILE_SELECT or MOMENTUM_PROFILE_SELECT_V2:
             return ""            # 選抜v1 は買い自体を実発注しない・v2 は SMH の買いを対象から外している
         if "SMH:BUY" not in {sd.upper() for sd in MOMENTUM_ENABLED_SIDES}:
@@ -2013,9 +1947,8 @@ def _smh_buy_unreachable_note() -> str:
 def _select_profile_block_reason(symbol: str, side: str, now_et_hour: int,
                                  pct_5: Optional[float] = None, pct_15: Optional[float] = None,
                                  qqq_60m: Optional[float] = None) -> Optional[str]:
-    """★ v3.9.194: 戦略プロファイル（v1 / v2）が実発注を止める理由。止めなければ None。
-    v1 の条件は v3.9.116 のまま（方向・銘柄・時間帯）。v2 は方向ごとの時間帯・強度・相場との整合を足す。
-    シャドー観察はどちらでも全件続く（呼び出し側は実発注の可否だけを変える）。"""
+    """
+    """
     if MOMENTUM_PROFILE_SELECT:
         if side == "BUY":
             return "LONGは実発注対象外（SHORTのみ）"
@@ -2058,12 +1991,6 @@ def _select_profile_block_reason(symbol: str, side: str, now_et_hour: int,
 def _momentum_effective_live_sides(trd_env: TrdEnv) -> list:
     """口座別ゲートまで適用した「実際に実発注され得るサイド」の一覧（表示用の正）。
 
-    ★ v3.9.156: プロファイル絞り込みの式が2箇所に複製され版ずれ事故が続いたため一本化。
-    ★ v3.9.157 (A-2): さらに口座別ゲートを適用する（認定サポーターの指摘）。
-      v3.9.156 のヘルパーは REAL_SHORT_ENABLED を見ておらず、実口座＋買い専用設定で
-      「SHORT も実発注対象です」という偽の注記と、ゲート適用前のサイド一覧を出していた。
-      実発注を実際に止めるゲート（:13327 実口座買い専用 / :13145 デモSHORT不可）と
-      同じ条件から作る。
     """
     sides = sorted(MOMENTUM_ENABLED_SIDES)
     if MOMENTUM_PROFILE_SELECT:
@@ -2071,7 +1998,6 @@ def _momentum_effective_live_sides(trd_env: TrdEnv) -> list:
                  if sd.endswith(":SELL_SHORT")
                  and sd.split(":", 1)[0] not in _SELECT_V1_EXCLUDED_SYMBOLS]
     elif MOMENTUM_PROFILE_SELECT_V2:
-        # ★ v3.9.194: v2 は買いも対象。SPY と SMH の買いだけ外す
         sides = [sd for sd in sides
                  if sd.split(":", 1)[0] not in _SELECT_V2_EXCLUDED_SYMBOLS
                  and sd not in _SELECT_V2_EXCLUDED_SIDES]
@@ -2107,16 +2033,11 @@ def _momentum_sides_setting_disp(trd_env: TrdEnv) -> str:
 def _momentum_demo_short_note(trd_env: TrdEnv) -> str:
     """SHORT の実発注可否についての起動時注記（環境で内容が変わる）。
 
-    ★ v3.9.156: 環境で分岐する1関数に集約（v3.9.155 の偽表示の再発防止）。
-    ★ v3.9.157 (A-2): REAL_SHORT_ENABLED を反映。実口座＋買い専用設定で
-      「SHORT も実発注対象」と出す矛盾を解消し、実発注ゼロになる組み合わせは
-      口座種別を問わず明記する。
     """
     if trd_env != TrdEnv.SIMULATE:
         if not REAL_SHORT_ENABLED:
             base = "実口座は買い専用 (REAL_SHORT_ENABLED=false)。SHORT はシャドー記録のみ"
             if not _momentum_effective_live_sides(trd_env):
-                # ★ v3.9.157b: select_v1 が無効の構成では理由に挙げない（レビュー指摘）
                 _why = ("select_v1 は SHORT のみ実発注のため" if MOMENTUM_PROFILE_SELECT
                         else "有効な BUY サイドが無いため")
                 base += f"。{_why}、この組み合わせでは実発注は発生しません"
@@ -2135,9 +2056,6 @@ def _momentum_demo_short_note(trd_env: TrdEnv) -> str:
 async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
     """強トレンド検知でモメンタムシグナルを観察 / 実発注する。
 
-    ★ v3.9.35: Phase 1 実発注に対応。
-      - MOMENTUM_LIVE_TRADING=false → シャドー観察のみ (実発注なし)
-      - MOMENTUM_LIVE_TRADING=true  → 観察 + live-eligible シグナルを実発注
 
     起動条件:
       - 実発注モード (MOMENTUM_LIVE_TRADING=true) なら DATA_COLLECT 不問で起動
@@ -2162,7 +2080,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
         log.debug("[モメンタム] MOMENTUM_ORDER_SIZE_PCT=0 → 機能無効")
         return
 
-    # ★ v3.9.16/v3.9.25: Level + 銘柄別閾値 + リスク管理設定を表示
     _level_name = _MOMENTUM_LEVEL_NAMES.get(MOMENTUM_LEVEL, "?")
     _risk_name = _MOMENTUM_RISK_LEVEL_NAMES.get(MOMENTUM_RISK_LEVEL, "?")
     _thresh_summary = ", ".join(
@@ -2171,12 +2088,7 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
         for (_t5, _t15) in [_get_momentum_thresholds(_s)]
     )
     _mom_mode_label = "実発注モード (Phase 1)" if MOMENTUM_LIVE_TRADING else "シャドー観察モード (Phase 0)"
-    # ★ v3.9.116: 戦略プロファイルの適用状態を起動時に明示
     if MOMENTUM_PROFILE_SELECT:
-        # ★ v3.9.192: Phase 0（シャドー観察）で起動したときは、その旨を先に言う
-        #   （認定サポーターの指摘——同じミリ秒に「実発注は SHORT のみ」と
-        #   「シャドー観察モード ループ開始」が並び、逆のことを言っていた）。
-        # ★ v3.9.193: 括弧の閉じが案内した中身の前に来ていた（認定サポーターの指摘）。
         _sel_head = ("" if MOMENTUM_LIVE_TRADING
                      else "いまはシャドー観察モード (Phase 0) なので実発注はありません。実発注にした場合は、")
         log.warning(
@@ -2197,8 +2109,8 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
             f" Level {_SELECT_V2_MIN_LEVEL} 以上の強さ / 直近60分で QQQ が +{_SELECT_V2_SHORT_QQQ_60M_MAX:.2f}% より上げているときは売り見送り に絞り、"
             "建玉トレールは無効（固定損切り）になります。"
             "シャドー観察は全銘柄・全サイド・全時間帯で継続します。"
-            " ※ Wizard v1.46 は v2 を知らないため、Wizard を再実行して Enter で進めると select_v1 に戻ります。"
-            "v2 を試す間は Wizard を再実行しないでください（v1.47 で選べるようにします）。"
+            " ※ 設定ウィザードは v1.50 から v2 を選べます。v1.49 以前のウィザードで Enter を押して進めると"
+            " select_v1 に戻るため、ウィザードを使うときは v1.50 以降にしてください。"
         )
     elif _PROFILE_TAG == "+flatstop":
         log.warning(
@@ -2209,7 +2121,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
         )
     else:
         log.info("[モメンタム] 🎛 戦略プロファイル: 標準（従来どおり・プロファイルによる絞り込みなし）")
-    # ★ v3.9.116: シャドー観察の当番制（重複送信削減）の状態を明示
     if MOMENTUM_SHADOW_REPORTER_PCT < 100:
         log.info(
             f"[モメンタム] 📡 シャドー観察の送信当番: 本日は"
@@ -2223,11 +2134,7 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
         f"最大発注額={MOMENTUM_ORDER_SIZE_PCT}% of BUDGET)"
     )
     if MOMENTUM_LIVE_TRADING:
-        # ★ v3.9.156: 注記は環境（実口座/デモ）で分岐する共通ヘルパーへ集約。
-        #   v3.9.155 はここに SIMULATE ガード無しの文言を置き、実口座で
-        #   「実発注は発生しません」と偽の表示を出していた（5日分レビュー）。
         _demo_short_note = _momentum_demo_short_note(trd_env)
-        # ★ v3.9.154: ここも絞り込み後の実効サイドを出す（認定サポーターの指摘§4）。
         _live_sides_disp = _momentum_effective_live_sides(trd_env)
         _live_sides_note = ("（select_v1 絞り込み後・口座別ゲート適用後）" if MOMENTUM_PROFILE_SELECT
                             else "（select_v2 絞り込み後・口座別ゲート適用後）" if MOMENTUM_PROFILE_SELECT_V2
@@ -2237,7 +2144,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
             f"{_live_sides_note} "
             f"を実発注します (上記以外のサイド・銘柄はシャドー記録のみ。{_demo_short_note})"
         )
-        # ★ v3.9.67: 実発注対象 vs リスク監視対象を起動時に明示 (認定サポーター指摘対応)
         log.warning(
             f"[モメンタム監視整合] 実発注対象銘柄={sorted(_momentum_live_symbols())} "
             f"→ これらは risk_monitor/週末決済/パニック/sync の監視対象に取込済 (v3.9.61)。"
@@ -2249,7 +2155,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
         f"1日損失 ≤ {MOMENTUM_DAILY_LOSS_PCT:.2f}% / "
         f"急変動ガード ±{MOMENTUM_VOLATILITY_GUARD_PCT:.2f}%"
     )
-    # ★ v3.9.67: サーキットブレーカー (日次/週次損失上限) の設定値と現在状態を明示。
     _cb_daily_preset = _BUDGET_USD * (MOMENTUM_DAILY_LOSS_PCT / 100.0)
     _cb_daily_budget = (_BUDGET_USD * (MOMENTUM_DAILY_LOSS_BUDGET_PCT / 100.0)
                         if MOMENTUM_DAILY_LOSS_BUDGET_PCT > 0 else 0.0)
@@ -2271,18 +2176,15 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
         f"損切り -{MOMENTUM_STOP_LOSS_PCT:.2f}% / "
         f"強シグナル上限 ±{MOMENTUM_MAX_SIGNAL_PCT:.2f}%"
         + ("（無効）" if MOMENTUM_MAX_SIGNAL_PCT <= 0 else "")
-        + (f" (DRAM ±{MOMENTUM_DRAM_MAX_SIGNAL_PCT:.2f}%)" if "DRAM" in MOMENTUM_SYMBOLS else "")  # ★ v3.9.62
-        + (f" (SMH ±{MOMENTUM_SMH_MAX_SIGNAL_PCT:.2f}%)" if "SMH" in MOMENTUM_SYMBOLS else "")  # ★ v3.9.72
+        + (f" (DRAM ±{MOMENTUM_DRAM_MAX_SIGNAL_PCT:.2f}%)" if "DRAM" in MOMENTUM_SYMBOLS else "")
+        + (f" (SMH ±{MOMENTUM_SMH_MAX_SIGNAL_PCT:.2f}%)" if "SMH" in MOMENTUM_SYMBOLS else "")
         + f" / タイムアウト "
         + ("無効（トレール/損切りで管理）" if MOMENTUM_TIMEOUT_MIN <= 0 else f"{MOMENTUM_TIMEOUT_MIN}分")
         + f" / セッション切替CD "
         + ("無効" if MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC <= 0 else f"{MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC}秒")
         + f" / L/S転換 "
         + ("ON(従来=反対シグナルで強制転換)" if MOMENTUM_REVERSE_EXIT
-           else "OFF(転換抑制=反対シグナルは見送り・既定 v3.9.89)")  # ★ v3.9.89
-        # ★ v3.9.184: 上限も出す（配布前調査で発覚）。下限しか印字しておらず、
-        #   実発注を左右する MOMENTUM_LONG_MAX_SIGNAL_PCT が**どのログにも残らない**
-        #   ため、報告を読んでも設定を確かめられなかった（.env を直接見るしかない）。
+           else "OFF(転換抑制=反対シグナルは見送り・既定 v3.9.89)")
         + f" / LONG発注レンジ 5m "
         + ("下限なし" if MOMENTUM_LONG_MIN_SIGNAL_PCT <= 0
            else f"{MOMENTUM_LONG_MIN_SIGNAL_PCT:.2f}%")
@@ -2301,17 +2203,10 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
             now = datetime.datetime.now()
             cooldown_sec = MOMENTUM_COOLDOWN_MIN * 60
 
-            # ★ v3.9.41: 時間帯フィルタは廃案 (3 日中 2 日で逆効果が実証された
-            #   ため撤去)。寄り付き 9-10 時台が黄金時間帯になる日が多く、
-            #   固定時間帯フィルタは害となるケースが大半 (5/22 検証で
-            #   フィルタ後 WR 0.0% に壊滅)。代わりに既存の急変動ガード
-            #   (SPY 5m |Δ| ≥ MOMENTUM_VOLATILITY_GUARD_PCT) で制御する。
 
-            # ★ v3.9.25: デイストップロス済みなら新規発注しない (シャドーでも記録停止)
             if _momentum_is_daily_stopped():
                 continue
 
-            # ★ v3.9.58: セッション切替直後のクールダウン
             # OVN/WEEKEND/休日から稼働セッションへ遷移した直後は値動きが
             # 急変動しがちだが、その方向性は持続しないケースが多い (寄り高 V 字等)。
             # MOMENTUM_SESSION_CHANGE_COOLDOWN_SEC 秒間 (デフォルト 300 = 5 分) は
@@ -2334,7 +2229,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                         setattr(momentum_shadow_loop, "_cooldown_logged_at", now)
                     continue
 
-            # ★ v3.9.25: 急変動ガード (SPY 5m チェック)
             if _momentum_check_volatility_guard("SPY"):
                 continue
 
@@ -2346,7 +2240,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                 if pct_5 is None or pct_15 is None:
                     continue
 
-                # ★ v3.9.16: 銘柄別の閾値を取得 (MOMENTUM_LEVEL プリセット or 個別 override)
                 thresh_5m, thresh_15m = _get_momentum_thresholds(symbol)
 
                 # 強上昇 / 強下落の判定 (両方の閾値を同時に満たす)
@@ -2357,7 +2250,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                 else:
                     continue
 
-                # ★ v3.9.25/v3.9.32: 銘柄サイドが Phase 1 実発注の対象かを判定。
                 # v3.9.25 は非対象サイドを continue でスキップしていたが、
                 # v3.9.32 で「シャドー観察は全銘柄・全サイド記録、実発注対象は
                 # MOMENTUM_ENABLED_SIDES のみ」に変更。SMH は ENABLED_SIDES に
@@ -2379,30 +2271,11 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                 except Exception:
                     pass
 
-                # ★ v3.9.25: 銘柄別サイズ係数 + 連敗縮小を適用
-                # ★ v3.9.31: シグナル強度別サイズ配分 (山型) を追加
-                #   弱 50% / 中 75% / 中強 100% / 強 0%(発注なし)
-                #   0.8%+ の強シグナルは累計マイナスのため発注対象外。ただし
-                #   シャドーではデータ収集のため引き続き観察ログに記録する。
                 size_multiplier = MOMENTUM_SIZE_MULTIPLIER.get(symbol, 1.0)
                 consec_multiplier = _momentum_get_size_multiplier()
                 strength_multiplier, strength_label = _momentum_strength_multiplier(pct_15, symbol)
-                # ★ v3.9.66 (施策C): サイド別係数で勝ち筋(SHORT)に資金を寄せる。
                 _side_multiplier = MOMENTUM_SHORT_SIZE_MULT if side == "SELL_SHORT" else MOMENTUM_BUY_SIZE_MULT
 
-                # ★ v3.9.94/114: LONG は 5分モメンタムが選択レンジ [下限, 上限) の内側のみ実発注。
-                #   弱LONG(下限未満)は損失の主因、強すぎるLONG(上限以上)は反転しやすく低調のため除外。
-                #   SHORTは対象外＝従来どおり。シャドー観察は下で全件記録（見送り分もデータに残る）。
-                # ★ v3.9.184: **係数の確定を、そこから導く値より前に済ませる**（配布前調査で発覚）。
-                #   v3.9.114 はレンジ判定と強帯の解除を、発注額を算出した**後**に置いていた。
-                #   解除で effective_size_pct だけを直し、hypothetical_order_usd（＝実発注の
-                #   株数の元）を直し忘れていたため、「強帯も許可」の LONG は
-                #   `max(1, int(0 / price))` で **必ず1株**しか発注していなかった
-                #   （ログにも `想定発注=$0` と出たまま実発注が通る）。
-                #   順番を入れ替え、係数 → 発注額 → ログ文言を1回だけ通す形にする。
-                # ★ v3.9.194: 選抜 v2 はプロファイルが強度（Level 2 以上）を決めるので、[2-d] のロング
-                #   レンジ（既定 0.70〜0.80%）は掛けない（配布前レビュー: 掛けたままだと v2 の買いは
-                #   一度も実発注に届かず、Wizard の「プロファイルが [2-d] より優先」とも食い違う）。
                 _long_range_ok = MOMENTUM_PROFILE_SELECT_V2 or (
                     side != "BUY"
                     or (
@@ -2410,9 +2283,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                         and (MOMENTUM_LONG_MAX_SIGNAL_PCT <= 0 or pct_5 < MOMENTUM_LONG_MAX_SIGNAL_PCT)
                     )
                 )
-                # ★ v3.9.114: LONGが選択レンジ内なら、山型(15分基準)の「強(発注なし)=0」を解除して
-                #   強帯も実発注する（Wizardの上限緩和選択の意図を反映）。弱/中の縮小配分は維持。
-                #   ショート・レンジ外は従来の山型のまま。
                 if side == "BUY" and _long_range_ok and strength_multiplier <= 0:
                     strength_multiplier, strength_label = 1.00, "強(LONG許可)"
 
@@ -2420,30 +2290,17 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     MOMENTUM_ORDER_SIZE_PCT * size_multiplier
                     * consec_multiplier * strength_multiplier * _side_multiplier
                 )
-                # ★ v3.9.123 (PAN方針決定 7/21): モメンタムは損切り幅のみボラ別に拡大し、
-                #   発注サイズは縮小しない（÷倍率は適用しない）。
-                #   理由: ボラティリティが高い銘柄ほど手数料（アドバンス往復最低約$4.4）に
-                #   勝ちやすく、SMH SHORT は全期間で最主力のエッジ。サイズを1/3にすると
-                #   手数料ハードルが 0.073%→0.218% に跳ね上がり、利確0.22%の設計と両立しない。
-                #   1トレードの想定損失は銘柄で異なるが、日次/週次サーキットブレーカー
-                #   （MOMENTUM_DAILY/WEEKLY_LOSS_BUDGET_PCT）で総量を管理する。
-                #   （v3.9.122 で一時導入したサイズ÷倍率は同方針により撤回。
-                #    ニュース系・qty自動計算経路の÷は従来どおり place 側で維持。）
 
                 # 想定発注額 + 想定株数 (集計時の総 PnL 換算用)
                 hypothetical_order_usd = _BUDGET_USD * (effective_size_pct / 100.0)
                 hypothetical_qty = round(hypothetical_order_usd / price, 2) if price > 0 else 0
 
-                # ★ v3.9.32: Phase 1 実発注の対象判定タグ
                 _elig_tag = "live可" if _live_eligible else "シャドー専用"
                 reason = (
                     f"{symbol} 5m {pct_5:+.2f}% / 15m {pct_15:+.2f}%  "
                     f"強度={strength_label}  "
                     f"[{_elig_tag}]  "
                     f"budget_pct={effective_size_pct:.1f}%  "
-                    # ★ v3.9.184: side= が抜けており、掛け合わせても budget_pct に
-                    #   ならなかった（既定は SHORT=1.00 / LONG=0.60 なので、LONG は
-                    #   必ず食い違う）。読み手が仕組みを誤読する原因になっていた。
                     f"(base={MOMENTUM_ORDER_SIZE_PCT}% × sym={size_multiplier:.2f} "
                     f"× consec={consec_multiplier:.2f} × 強度={strength_multiplier:.2f} "
                     f"× side={_side_multiplier:.2f})  "
@@ -2451,17 +2308,12 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     f"想定株数={hypothetical_qty}株"
                 )
 
-                # ★ v3.9.35: Phase 1 実発注を行うかの判定
                 _will_live_order = (
                     MOMENTUM_LIVE_TRADING and _live_eligible
                     and strength_multiplier > 0
                     and effective_size_pct > 0 and price > 0
                     and _long_range_ok
                 )
-                # ★ v3.9.103: 当日トレンド・フィルター（逆張り抑制）。
-                #   上昇日(SPY+)のショート / 下落日(SPY-)のロング を against-trend と判定。
-                #   既定は計測のみ（売買不変・観察ログに trend_filter_ab を残す）。
-                #   MOMENTUM_TREND_FILTER_ENABLED=true で against-trend の実発注を実ブロック。
                 _trend_pct = _market_trend_pct()
                 _against_trend = False
                 if _trend_pct is not None and MOMENTUM_TREND_FILTER_PCT > 0:
@@ -2474,18 +2326,12 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     _will_live_order = False
                     _trend_blocked = True
 
-                # ★ v3.9.104: プレマーケット新規エントリー抑制（既定は計測のみ）。
-                #   premarket が恒常的な出血源のため、premarket 中の新規実発注を対象にする。
-                #   既定 MOMENTUM_PREMARKET_FILTER_ENABLED=false ＝売買不変（計測のみ）。
                 _is_premarket = (get_session_info()[0] == SESSION_PREMARKET)
                 _premarket_blocked = False
                 if _is_premarket and _will_live_order and MOMENTUM_PREMARKET_FILTER_ENABLED:
                     _will_live_order = False
                     _premarket_blocked = True
 
-                # ★ v3.9.121: MOMENTUM_MAX_OPEN_POSITIONS（既定1）を実装。
-                #   従来は定義のみで未参照の死に設定だった（利用者H指摘②の調査で発覚）。
-                #   モメンタム由来の建玉数が上限以上なら新規実発注を見送る（シャドー記録は全件継続）。
                 _max_open_blocked = False
                 if _will_live_order and MOMENTUM_MAX_OPEN_POSITIONS > 0:
                     try:
@@ -2500,11 +2346,8 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     except Exception:
                         pass
 
-                # ★ v3.9.116: 戦略プロファイル select_v1（Wizard STEP 1・既定OFF）。
-                #   実発注だけを絞り、シャドー観察は全件継続（trend/premarketフィルタと同型）。
                 _profile_block_reason = None
                 if _will_live_order and (MOMENTUM_PROFILE_SELECT or MOMENTUM_PROFILE_SELECT_V2):
-                    # ★ v3.9.194: v1/v2 の絞り込みは _select_profile_block_reason に一本化
                     _now_et_hour = datetime.datetime.now(_ET).hour
                     _qqq_60m = get_index_pct_change("QQQ", 60) if MOMENTUM_PROFILE_SELECT_V2 else None
                     _profile_block_reason = _select_profile_block_reason(
@@ -2532,9 +2375,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                 elif not _live_eligible:
                     _order_note = "実発注なし・シャドー専用銘柄 (Phase 1 でも発注対象外)"
                 elif not _long_range_ok:
-                    # ★ v3.9.121: v3.9.114 の改名(_long_min_ok→_long_range_ok)取りこぼしを修正。
-                    #   旧名参照で NameError → ループ全体 except に捕捉され、その周回の後続銘柄の
-                    #   走査・シャドー記録・実発注が丸ごとスキップされていた（実ログで20回確認・利用者H指摘①）。
                     _order_note = (
                         f"実発注なし・LONGレンジ外 "
                         f"(5m {pct_5:+.2f}% / レンジ {MOMENTUM_LONG_MIN_SIGNAL_PCT:.2f}〜"
@@ -2564,7 +2404,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     block_stage="momentum_shadow",
                     block_reason=reason[:300],
                     price_at_decision=price,
-                    # ★ v3.9.83: 発注判断の文脈（運営が「なぜ発注/見送りか」を後から検証）
                     live_allowed=_live_eligible,
                     size_pct=effective_size_pct,
                     eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
@@ -2572,9 +2411,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     pct_15m=pct_15,
                 )
 
-                # ★ v3.9.103: 当日トレンド逆行（against-trend）の計測ログ。
-                #   既存の +5/+15/+60分 仮想exitパイプラインに相乗りし、「上昇日ショート/
-                #   下落日ロングを抑制したら成績がどう変わるか」を後追い計測する（売買は不変）。
                 if _against_trend:
                     try:
                         _log_observation(
@@ -2605,10 +2441,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     except Exception:
                         pass
 
-                # ★ v3.9.104: プレマーケット新規エントリー抑制の計測ログ。
-                #   「premarket の実発注を抑制したら成績がどう変わるか」を、既存の
-                #   +5/+15/+60分 仮想exitパイプラインで後追い計測する（既定は売買不変）。
-                #   実発注対象（would-be-live）だった premarket 建てのみ記録。
                 if _is_premarket and (_will_live_order or _premarket_blocked):
                     try:
                         _log_observation(
@@ -2638,8 +2470,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     except Exception:
                         pass
 
-                # ★ v3.9.30: 当日サマリ用バッファに追記 (Discord/端末表示用)
-                # ★ v3.9.31: シグナル強度ラベルと係数も記録
                 try:
                     _record_today_shadow_momentum({
                         "symbol":         symbol,
@@ -2651,21 +2481,16 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                         "size_pct":       effective_size_pct,
                         "strength_label": strength_label,
                         "strength_mult":  strength_multiplier,
-                        "live_eligible":  _live_eligible,    # ★ v3.9.32
+                        "live_eligible":  _live_eligible,
                     })
                 except Exception:
                     pass
 
-                # ── ★ v3.9.35: Phase 1 実発注 ────────────────────────────────
                 # MOMENTUM_LIVE_TRADING=true かつ live-eligible サイドのみ。
                 # place_buy / place_short を再利用するため、発注後のポジションは
                 # risk_monitor_loop が損切り/トレール/時間切れで自動管理する。
                 # qty を明示指定して calc_order_size を回避し、モメンタム算出の
                 # サイズ (BUDGET × MAX_PCT × 強度係数) で発注する。
-                # ★ v3.9.65: デモ口座での SHORT は place_short 内で分岐:
-                #   DEMO_SHORT_ENABLED=true  → プレーン SELL で実発注ショート (ネッティング)
-                #   DEMO_SHORT_ENABLED=false → シャドー SHORT に自動転送 (記録のみ)。
-                # ★ v3.9.63: 寄り高値掴みガード — 直近高値圏での BUY 追随は実発注見送り
                 # (シャドー観察ログは上で記録済み)。
                 if _will_live_order and _momentum_high_chase_block(symbol, side, price):
                     log.info(
@@ -2682,10 +2507,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     )
                     try:
                         _place_fn = place_buy if side == "BUY" else place_short
-                        # ★ v3.9.121: ニュース系(process_headlines/process_stock_news)と同じ
-                        #   銘柄単位ロックで発注を直列化（利用者H指摘②-1）。同一銘柄への
-                        #   ニュース発注とモメンタム発注が同時に走る race を防ぐ。
-                        #   place_buy/place_short/place_close_all は sync のためデッドロックは増えない。
                         async with _get_sym_lock(symbol):
                             _mom_ok = await asyncio.to_thread(
                                 _place_fn, symbol, trd_env,
@@ -2696,10 +2517,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                                 category="MOMENTUM",
                                 news_source="MOMENTUM",
                                 headlines=[f"[MOMENTUM] {reason}"],
-                                # ★ v3.9.111: エントリー時モメンタム5分/15分%を建玉状態に記録
-                                #   （決済時に _send_trade_result がトレード行へ相乗り記録・解析用）
-                                # ★ v3.9.149: 発注後に書くと、先に走り出した約定記録が
-                                #   前回の建玉の値を読むことがあるため、引数で渡す。
                                 entry_pct_5m=pct_5,
                                 entry_pct_15m=pct_15,
                             )
@@ -2724,10 +2541,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
             await asyncio.sleep(60)
 
 
-# ── ★ v3.9.91: 決済理由 → 構造化コード(exit_code) ───────────────────────────────
-#   自由文字列の決済理由は表記揺れでレポート分類が取りこぼし「その他」に落ちる
-#   （6/22: 報告書「その他」-$3,062 の実体は建玉トレールだった）。決済時に一意な
-#   コードを付与し、レポート/集計を常に正確にする。人間用の文章は exit_reason に残す。
 def _exit_code_from_reason(reason: str) -> str:
     """決済理由(自由文字列) を構造化コードへ正規化する。判定は決定論的・順序依存。"""
     s = str(reason or "")
@@ -2753,17 +2566,6 @@ def _exit_code_from_reason(reason: str) -> str:
     #   5類型を分類器本体でも構造化する（GAS へ送る exit_code も揃える）。
     #   既存の判定を「すべて通過した」文字列だけが到達する末尾に置くことで、
     #   既存コードの割り当ては1件も変わらない（B-1 の懸念への設計上の回答）。
-    #   ★ v3.9.179: この「1件も変わらない」は**末尾に足した2規則**
-    #   （夜間持ち越し→OVN / 早期クローズ・連休前→SESSION_CLOSE）に係る。
-    #   **先頭へ移したシグナル判定には当てはまらない。**固定語彙の組み合わせ
-    #   2,625通りで294件の割り当てが変わる（認定サポーターの検証・v3.9.180 で
-    #   291/239 から訂正。取り直すと 294/238 で、291 になるのは語とその上位語が
-    #   同じ組に入る3件を採点から外した場合だけ）。うち238件は
-    #   既存種別→LS_REVERSE で、いずれも「ネガティブシグナル」または
-    #   「シグナルのため＋決済」を含むシグナル決済の生成箇所からしか到達しない
-    #   ため動作上は正しいが、注記だけを読むと【B】の変更全体が無害に読める。
-    #   GAS は exit_code を素通しで記録するのみ（値で分岐しない）ため変更不要。
-    #   集計側は未知コードをテキスト判定へ落とす設計なので、OVN 新設でも壊れない。
     if "夜間持ち越し" in s:                                    return "OVN"
     if "早期クローズ" in s or "連休前" in s:                   return "SESSION_CLOSE"
     if s.strip() == "":                                        return "UNKNOWN"
@@ -2775,28 +2577,18 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
                        qty: int, realized_pnl: float, hold_min: float,
                        session: str, ai_score: int, ai_conf: float,
                        ai_category: str, news_source: str, exit_reason: str,
-                       # ── ★ v2.95: GAS連携用の追加フィールド（kwargs） ──────
                        headlines: Optional[List[str]] = None,
                        beneficiaries: Optional[List[str]] = None,
                        victims: Optional[List[str]] = None,
                        price_trend: float = 0.0,
                        peak_pnl: float = 0.0,
-                       # ── ★ v3.1.0: ショート取引識別フィールド ───────────
                        # 後方互換のためデフォルトは "LONG"。引数を渡さない既存
                        # コードからの呼出は従来通りロング扱いになる。
                        trade_type: str = "LONG",
-                       # ── ★ v3.9.133: 決済時点でスナップショットした「実際に適用された
-                       #   損切り%」（%単位）。本関数は別スレッドで走るため、ここで受け取らずに
-                       #   state から読むと、同一銘柄の次の建玉や sync のクリアで値が
-                       #   入れ替わりうる（Codexレビュー指摘）。None のときのみ state を参照する。
                        enforced_stop_pct: Optional[float] = None,
-                       # ★ v3.9.175: 監視ループが適用した出口条件を1組で受け取る。
-                       #   enforced_stop_pct と同じ理由（別スレッドで走るため、
-                       #   ここで state から読むと次の建玉の値に入れ替わりうる）。
                        enforced_exit: Optional[dict] = None) -> None:
     """1トレード完結時にGAS Webhookへ即時送信する。 / DATA_COLLECT=true かつ STUDENT_NAME 設定済みの場合のみ動作。 / センシティブ情報（APIキー・口座番号）は一切送信しない。"""
     import json as _json, datetime as _dt
-    # ★ v3.8.6: 当日トレード集計バッファに追記 (DATA_COLLECT 設定や送信成否に依存せず、
     # ローカルでサマリを表示するため必ず記録)。
     try:
         _record_today_trade({
@@ -2814,7 +2606,6 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
     except Exception:
         pass  # サマリ記録の失敗は GAS 送信を阻害しない
 
-    # ── ★ v3.9.67: モメンタム・サーキットブレーカーへ確定損益を反映 ──────────
     # 認定サポーター指摘 (6/3): momentum_record_trade_result() が定義のみで未配線
     # だったため、日次/週次の損失上限が機能していなかった。決済確定の共通経路である
     # 本関数 (LONG/SHORT・即時/リトライの全 4 経路から呼ばれる) で、ai_category が
@@ -2837,17 +2628,14 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
         "/exec"
     )
     cfg_url = os.environ.get("WEBHOOK_URL", "").strip() or DEFAULT_URL
-    # ★ v2.86: 固定オフセット(-4h)は EDT 専用。EST 期間（11月〜3月）は -5h で
     # 1時間ズレるため、DST を自動考慮する ZoneInfo に変更。
     now_et = _dt.datetime.now(ZoneInfo("America/New_York"))
     _exit_ts = now_et.strftime("%Y-%m-%d %H:%M:%S")
-    # ★ v3.9.75: 決定論的 trade_id（再送時の GAS 側重複排除キー）。
     import hashlib as _hl
     _tid_src = (f"{cfg_name}|{symbol}|{_exit_ts}|{qty}|"
                 f"{round(entry_price, 2)}|{round(exit_price, 2)}|{trade_type}")
     trade_id = _hl.md5(_tid_src.encode("utf-8")).hexdigest()[:16]
 
-    # ── ★ v3.9.111: 出口チューニング解析用の派生列（利用者B要望B案・すべて決済時に計算＝GAS負荷増なし）──
     _abs_qty = abs(qty) if qty else 0
     _entry_notional = entry_price * _abs_qty
     def _pct_of_notional(v):
@@ -2862,33 +2650,17 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
     _exit_code_val   = _exit_code_from_reason(exit_reason)
     _trail_triggered = 1 if _exit_code_val in ("TRAIL", "ENTRY_TRAIL") else 0
     _is_mom = (ai_category == "MOMENTUM")
-    # ★ v3.9.175: 戦略の正準表現は1度だけ作って使い回す（v3.9.173 は settings 側に
-    #   別の語彙で2つ目の strategy を作り、同じ payload 内で NEWS と TECH のように
-    #   食い違っていた）。GAS はこの値を「戦略」列へ書く。
     _strategy_label = ("OVN" if ai_category == "OVN"
                        else ("MOMENTUM" if _is_mom else "NEWS"))
 
     def _eff_exit_get(key: str):
         """監視ループが適用した出口条件を1項目取り出す。
 
-        ★ v3.9.175: state へのフォールバックは置かない。本関数は別スレッドで
-          走るため、ここで state を読むと、同一銘柄の次の建玉が監視ループに
-          評価された後だった場合に「次の建玉の値」を前の建玉の記録へ載せる。
-          渡されなかった＝監視ループが評価する前に決済された建玉なので、
-          誤った値を書くより空にする（GAS 側は空欄として保存する）。
-          夜間持ち越しの「掛からない」(None) も空欄になるが、両者は
-          exit_basis 列で区別できる（overnight か、空か）。"""
+          """
         if not isinstance(enforced_exit, dict):
             return ""
         v = enforced_exit.get(key)
         return "" if v is None else v
-    # ★ v3.9.133: 損切り%は「設定の素の値」と「実際に適用された値」を分けて記録する。
-    #   旧実装は常に高ボラ倍率を掛けて出力していたが、モメンタム建玉は監視ループ側で
-    #   倍率をスキップする仕様（v3.9.93）のため、記録=1.50% / 実際=0.50%（SMH）のように
-    #   系統的にズレていた。この列を根拠にした損切り幅のチューニングは無効になるため、
-    #   実際に適用された値（監視ループが建玉に保存）を優先して出力する。
-    #   _base_stop_pct     … 設定の素の値（倍率なし）
-    #   _eff_stop          … 実際に適用された値。監視ループ未評価時のみ設計値で補完する。
     try:
         _base_stop = MOMENTUM_STOP_LOSS_PCT if _is_mom else (MAX_LOSS_PCT * 100.0)
         _base_stop_pct = round(_base_stop, 4)
@@ -2896,12 +2668,6 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
         _base_stop = 0.0; _base_stop_pct = ""
     _eff_stop = ""
     try:
-        # ★ v3.9.175b: 出口条件を1組で受け取っているなら、そちらを最優先する
-        #   （外部レビュー指摘）。同じ行に並ぶ列54-58 と食い違わせないため。
-        #   とくに夜間持ち越しは損切りが掛からない（stop_pct=None）のに、
-        #   下の③が共通設定 0.30% を推測で埋めるため、この列だけが
-        #   「実効損切り 0.30%」と読めていた。監視ループ由来の値なので、
-        #   通常の建玉では下の①と同じ値になる。
         _has_exit = isinstance(enforced_exit, dict) and "stop_pct" in enforced_exit
         # ①決済時に渡されたスナップショットを最優先（本関数は別スレッドで走るため、
         #   state から読むと同一銘柄の次の建玉や sync のクリアで値が入れ替わりうる）
@@ -2966,32 +2732,18 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
             "ai_category":  ai_category,
             "news_source":  news_source,
             "exit_reason":  exit_reason,
-            "exit_code":    _exit_code_val,  # ★ v3.9.91 構造化決済コード（:2366 で算出済みを再利用）
-            "trade_env":    _RUN_TRADE_ENV,                       # ★ v3.9.99: REAL / DEMO（実取引/デモ判別）
-            # ★ v3.9.140: 戦略の識別。NEWS（日中のニュース売買）/ MOMENTUM / OVN（夜間持ち越し）。
-            #   OVN は建て方も決済条件もまったく別なので、勝率・損益を混ぜて集計しない。
+            "exit_code":    _exit_code_val,
+            "trade_env":    _RUN_TRADE_ENV,
             "strategy":     _strategy_label,
-            "momentum_level": MOMENTUM_LEVEL,                     # ★ v3.9.109: L1-5（設定別レポート用）
-            # ── ★ v3.9.111: 出口チューニング解析用（利用者B要望B案・決済時計算・GAS負荷増なし）──
+            "momentum_level": MOMENTUM_LEVEL,
             "realized_pnl_pct":        _realized_pct,      # 確定損益%（建玉額比・予算非依存）
             "peak_pnl_pct":            _peak_pct,          # 最大含み益%
             "drawdown_from_peak_pct":  _dd_from_peak,      # ピークからの戻り幅%
             "trail_triggered":         _trail_triggered,   # トレール決済=1（TRAIL/ENTRY_TRAIL）
             "trail_width_pct":         _trail_width,       # トレール幅%（設定値・参考）
-            # ★ v3.9.133: 実際に適用された損切り%（監視ループが確定した値）。
-            #   TRAIL(利確トレール)決済は損切り閾値を使わないため参考値。
             "stop_loss_pct_effective": _eff_stop,
-            "base_stop_pct":           _base_stop_pct,     # ★ v3.9.133: 設定の素の値（倍率なし）
-            # ★ v3.9.133: 上の損切り%がこの決済で実際に発動したか（1=発動 / 0=非発動）。
-            #   FORCED_STOP と ENTRY_TRAIL は損切り閾値で決済、TRAIL は利確トレールで決済。
+            "base_stop_pct":           _base_stop_pct,
             "stop_pct_applied":        1 if _exit_code_val in ("FORCED_STOP", "ENTRY_TRAIL") else 0,
-            # ★ v3.9.175: 出口条件の実効値を最上位フィールドで送る。
-            #   GAS は settings の JSON を丸ごと保存せず、既知のキーだけを列へ写すため、
-            #   settings に入れただけではシートに載らない（外部レビュー指摘）。
-            #   列22-24（timeout_min / trail_trigger / trail_drop）と列46（トレール幅%）は
-            #   グローバル値・環境変数の直読みで、モメンタム・決算・夜間持ち越しでは
-            #   実挙動とずれる。既存列の意味は変えず、実効値は別列（54-58）に足す。
-            #   監視ループが評価する前に決済された建玉は空（誤った値を書かない）。
             "timeout_min_effective":       _eff_exit_get("timeout_min"),
             "trail_trigger_pct_effective": _eff_exit_get("trail_trigger_pct"),
             "trail_drop_pct_effective":    _eff_exit_get("trail_drop_pct"),
@@ -3000,38 +2752,26 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
             "fee_estimate":            _fee_est,           # 往復手数料 概算$
             "momentum_5m_pct":         _e5m,               # エントリー時モメンタム5分%
             "momentum_15m_pct":        _e15m,              # エントリー時モメンタム15分%
-            # ── ★ v2.95: GAS連携用の追加フィールド ──────────────────────
             "headlines":    (headlines or [])[:3],
             "beneficiaries": beneficiaries or [],
             "victims":      victims or [],
             "price_trend":  round(price_trend, 3),
             "peak_pnl":     round(peak_pnl, 2),
-            # ── ★ v3.1.0: ショート取引識別フィールド ─────────────────
             # "LONG" または "SHORT"。GAS 側はこの値を「取引方向」列に記録する。
             "trade_type":   trade_type,
-            # ★ v3.9.175: 監視ループが適用した出口条件をそのまま記録へ。
-            #   state へのフォールバックは置かない。本関数は別スレッドで走るため、
-            #   ここで state を読むと、同一銘柄の次の建玉が監視ループに評価された
-            #   後だった場合に「次の建玉の出口条件」を前の建玉の記録に載せてしまう
-            #   （外部レビュー指摘）。渡されなかった＝監視ループが評価する前に
-            #   決済された建玉なので、誤った値を書くより空にする。
             "settings":     _get_settings_snapshot(
                 enforced_exit=enforced_exit,
                 strategy=_strategy_label),
         }
     }, ensure_ascii=False)
-    # ★ v3.9.75: インライン再送→失敗時はローカルキューへ退避（記録欠落を防止）。
-    # ★ v3.9.126: デモ日次/週末前/移行前の一斉決済は全台が同一秒に送信するため、
-    #   ジッターを広げて GAS の書き込みロック逼迫（＝再送・退避の多発）を避ける。
     _is_bulk = any(h in str(exit_reason or "") for h in _BULK_CLOSE_REASON_HINTS)
     _jit = _GAS_SEND_JITTER_SEC_BULK if _is_bulk else None
     if _gas_send_with_retry(cfg_url, payload, kind="trade", key=trade_id,
                             timeout=60, jitter_max=_jit):
         log.info(f"[データ収集] ✅ トレード送信完了  {symbol}  pnl={realized_pnl:+.2f}"
                  + ("  [選抜プロファイルv1]" if MOMENTUM_PROFILE_SELECT
-                    else "  [選抜プロファイルv2]" if MOMENTUM_PROFILE_SELECT_V2 else ""))   # ★ v3.9.116
+                    else "  [選抜プロファイルv2]" if MOMENTUM_PROFILE_SELECT_V2 else ""))
 
-    # ── ★ v3.9.116: 決済時シミュレーション2種を計測終了・撤去 ─────────────────
     # ①peakリトレース微利確sim(v3.9.17/peak_retrace_sim・週470行) は「含み益をどう守るか」
     #   の問いごと仮想MFEトレール(mfe_trail_pnl_pct・v3.9.116復活)が上位互換で計測するため統合。
     # ②TIMEOUT延長sim(v3.9.16/timeout_extension・週372行) は「延長したらどうなったか」が
@@ -3078,7 +2818,6 @@ def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
                            strategy: str = "") -> str:
     """ルール改善分析用に設定値を文字列化（センシティブ情報は含まない）
 
-    ★ v3.9.175: 「実際に適用された値」は**受け取るだけ**にした。
 
     v3.9.173 では戦略と銘柄を受け取って記録側で再計算していたが、配布前レビューで
     次が判明したため差し戻し、設計を変えた。
@@ -3101,22 +2840,11 @@ def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
     """
     import json as _json
     snap = {
-        # ★ v3.9.116: select_v1 有効時は "+select_v1" 付き。GAS はこの値をシートの
-        #   「botバージョン」列へ書くため、決済記録からプロファイル選択が判別できる。
         "bot_version":   BOT_VERSION_TAGGED,
-        "strategy_profile": MOMENTUM_STRATEGY_PROFILE,   # ★ v3.9.116（将来のGAS列追加用）
-        # ★ v3.9.191: デモか実口座かを記録に残す。シートにはこれまで区別が無く、
-        #   「Bot のこれまでの損益」を出そうとすると、デモの成績が混ざったまま
-        #   足し合わせてしまう（実際に切り分けできず、証券会社側から取り直した）。
-        #   後から復元できない情報なので、送る側で持たせる。
+        "strategy_profile": MOMENTUM_STRATEGY_PROFILE,
         "trade_env":     _RUN_TRADE_ENV,
-        # ★ v3.9.192: 「何で判定したか」を記録に残す（認定サポーターの提案②）。
-        #   モデルやプロンプトを変えた前後を、記録から分けて比べられるようにする。
         "model":         CLAUDE_MODEL,
         "prompt_ver":    _PROMPTS_VERSION,
-        # ★ v3.9.193: 判定に効くのに指紋に入っていなかった設定（認定サポーターの指摘）。
-        #   セッション別しきい値・決算しきい値・モメンタムの実発注有無と対象サイド・
-        #   実口座の空売り可否・夜間持ち越し。これらを変えても config_id が同じだった。
         "confidence_rth":         _CONF_RTH,
         "confidence_premarket":   _CONF_PREMARKET,
         "confidence_afterhours":  _CONF_AFTERHOURS,
@@ -3129,7 +2857,6 @@ def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
         "ovn_mode":               OVN_MODE,
         "ovn_vix_level":          OVN_VIX_LEVEL,
     }
-    # ★ v3.9.175: 監視ループが実際に適用した出口条件（あるときだけ載せる）
     if isinstance(enforced_exit, dict):
         snap["effective_stop_loss_pct"]     = enforced_exit.get("stop_pct")
         snap["effective_timeout_min"]       = enforced_exit.get("timeout_min")
@@ -3144,10 +2871,6 @@ def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
     snap.update({
         # 以下は共通設定（default_*）。env の直読みをやめ、起動時に解決済みの
         # 定数を使う（既定値の取り残しを防ぐ）。キー名は互換のため据え置き。
-        # ★ v3.9.192: env の直読みをやめ、起動時に解決済みの定数を使う（認定サポーターの指摘）。
-        #   この1行だけが直読みで、BUDGET_USD=10000.0 や 1e4 と書くと int() が ValueError になり、
-        #   決済の記録が再送キューに入る前に**静かに消えていた**（この関数は payload を組む途中で
-        #   呼ばれ、例外は別スレッドの外側で吸われる）。_BUDGET_USD は起動時に検証済み。
         "budget_usd":    int(_BUDGET_USD),
         "max_loss_pct":  round(MAX_LOSS_PCT * 100.0, 4),
         "trail_trigger": round(TRAIL_TRIGGER_PCT * 100.0, 4),
@@ -3157,8 +2880,6 @@ def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
         "timeout_min":   TIMEOUT_EXIT_MINUTES,
         "tickers":       os.environ.get("TRIGGER_TICKERS", "SPY,QQQ"),
         # v3.9.20: pyramid_* キーは撤去 (山型サイズ配分に置き換え)
-        # ★ v3.9.173: 銘柄タイプで使い分ける現行仕様を反映（従来は使われていない
-        #   グローバル値をそのまま記録しており、実際の発注価格と無関係だった）
         "limit_buf":       round(LIMIT_BUFFER_PCT * 100.0, 4),
         "limit_buf_etf":   round(LIMIT_BUFFER_PCT_ETF * 100.0, 4),
         "limit_buf_stock": round(LIMIT_BUFFER_PCT_STOCK * 100.0, 4),
@@ -3171,9 +2892,6 @@ def _get_settings_snapshot(enforced_exit: Optional[dict] = None,
             ] if k
         ),
     })
-    # ★ v3.9.192: 設定の指紋（認定サポーターの提案②）。判定に効く設定だけを並べて sha256 の
-    #   先頭12桁にする。版・口座区分・その場の適用値・モデル/プロンプト版は含めない
-    #   （それらは別の列で持つ）。同じ設定なら再起動しても同じ ID、1つ変えれば変わる。
     snap["config_id"] = _config_fingerprint(snap)
     return _json.dumps(snap, ensure_ascii=False, separators=(",", ":"))
 
@@ -3199,11 +2917,6 @@ if _WIZARD_COMPLETED != "true":
 MOOMOO_HOST    = os.environ.get("MOOMOO_HOST", "127.0.0.1")
 MOOMOO_PORT    = int(os.environ.get("MOOMOO_PORT", "11111"))
 MOOMOO_RSA_KEY = os.environ.get("MOOMOO_RSA_KEY", "")   # RSA秘密鍵ファイルパス（任意）
-# ★ v3.9.129: OpenD 無応答対策。moomoo SDK の同期照会は「接続READY待ち」を
-#   _sync_query_connect_timeout=None（＝無限）で待つため、OpenD がクラッシュせず
-#   固まると position_list_query 等が永久に返らない（利用者Aの実口座で120分沈黙）。
-#   ctx 生成直後に set_sync_query_connect_timeout() でこの待ちを有限化する。
-#   応答自体は SDK 内部の 12 秒 query_timeout / 33 秒 conn_alive で頭打ちされる。
 MOOMOO_CONNECT_TIMEOUT_SEC = int(os.environ.get("MOOMOO_CONNECT_TIMEOUT_SEC", "20"))
 # MOOMOO_TRADE_PASSWORD: moomoo GUI版ではAPIからのロック解除が無効化されたため未使用
 # 取引ロックが発生した場合は moomoo アプリで手動アンロックが必要です
@@ -3239,7 +2952,6 @@ _semi_sym  = "SMH" if "SMH" in TRIGGER_TICKERS else _tech_sym
 LEVERAGED_MAP: Dict[str, Dict[str, str]] = {
     "MACRO":       {"bull": _macro_sym, "bear": _macro_sym},
     "TECH":        {"bull": _tech_sym,  "bear": _tech_sym},
-    # ★ v2.94: SEMI_STRONG (強い半導体ニュース) のみ SMH 発注対象。
     # 旧 "SEMI" エントリーは process_signal 側で発注前に return するため
     # 実質使われないが、AI 旧モデル等が "SEMI" を返した場合のフォールバック用
     # に残しておく（process_signal の SEMI スキップが先に発動する）。
@@ -3247,7 +2959,6 @@ LEVERAGED_MAP: Dict[str, Dict[str, str]] = {
     "SEMI":        {"bull": _semi_sym,  "bear": _semi_sym},
 }
 
-# ── ★ v3.9.169: ニュース選抜プロファイル v1（既定オフ・opt-in）────────────────
 # 6週間（7/13〜8/21・設定資金$100k未満）の実データで、ニュースのカテゴリ別成績は
 #   MACRO       平均 -0.015% (t=-5.8・1,633件)  ← 唯一の有意な損失源
 #   TECH        平均 +0.019% (t=+2.5・  740件)
@@ -3310,10 +3021,6 @@ def _news_select_v1_flush_skips(skipped: list, *, category: str, score: int,
     )
     _side = "BUY" if score == 1 else "SELL_SHORT"
     for _sym in skipped:
-        # ★ v3.9.169b（レビュー指摘）: price_at_decision を渡さないと
-        #   _log_observation が同期の get_quote を引き、非同期ループを塞ぐ
-        #   （v3.9.157 が根治した凍結経路と同型）。リスク監視が約60秒ごとに
-        #   補充している値動き履歴から渡し、無ければ 0 のまま（記録は残る）。
         _px = 0.0
         try:
             _hist = _INDEX_PRICE_HISTORY.get(_sym) or []
@@ -3351,7 +3058,7 @@ EARNINGS_AFTER_TICKERS: List[str] = [t.strip().upper() for t in _earn_after_raw.
 EARNINGS_POLL_SEC:   int   = int(os.environ.get("EARNINGS_POLL_SEC",   "2"))
 EARNINGS_CONFIDENCE: float = float(os.environ.get("EARNINGS_CONFIDENCE", "0.80"))
 _all_earnings = list(dict.fromkeys(EARNINGS_PRE_TICKERS + EARNINGS_AFTER_TICKERS))
-_all_earnings_set = frozenset(_all_earnings)   # ★ v3.9.156: 高頻度の membership 判定用
+_all_earnings_set = frozenset(_all_earnings)
 
 # ── 決算後モメンタム戦略パラメータ (v2.50 / アイデアB) ──────────────────────
 # WAIT_SEC: 検知後の方向確認待機秒数 (0=待機なし旧動作) / MIN_PCT: 最小変動率 %
@@ -3363,7 +3070,6 @@ try:
 except ValueError:
     EARNINGS_MOMENTUM_MIN_PCT = 2.0
 
-# ── ★ v3.9.73: PCT 入力単位の統一「1 = 1%」(後方互換あり) ───────────────────
 # 旧来、%系 env に2系統が混在していた:
 #   A群「1=1%」 : MAX_LOSS_PCT=0.30(=0.30%) / STOCK_MAX_PCT=10 / MOMENTUM_* など
 #   B群「0.01=1%」: TRAIL_*/LIMIT_BUFFER_*/EARNINGS_MAX_LOSS_PCT/EARNINGS_TRAIL_*
@@ -3396,7 +3102,7 @@ def _pct_frac(key: str, default_frac: float, lo_frac: float = 0.0, hi_frac: floa
 
 
 def _emit_pct_unit_warnings() -> None:
-    """★ v3.9.73: 旧小数表記を検出した PCT 項目を起動時に1回まとめて警告。"""
+    """"""
     if not _pct_unit_legacy_warnings:
         return
     log.warning(
@@ -3410,7 +3116,6 @@ def _emit_pct_unit_warnings() -> None:
 # ── 決算銘柄専用トレール・タイムアウト (v2.50 / アイデアC) ─────────────────
 # 決算後は値動きが大きいためトレール幅広・タイムアウト無効が標準。
 # TRAIL_TRIGGER_PCT 3% (通常1%) / TRAIL_DROP_PCT 1.5% (通常0.5%) / TIMEOUT 0=無効
-# ★ v3.9.73: 入力は「1=1%」に統一 (旧小数も後方互換で受ける・_pct_frac)。
 EARNINGS_TRAIL_TRIGGER_PCT: float = _pct_frac("EARNINGS_TRAIL_TRIGGER_PCT", 0.03, 0.0, 0.5)
 EARNINGS_TRAIL_DROP_PCT: float = _pct_frac("EARNINGS_TRAIL_DROP_PCT", 0.015, 0.0, 0.5)
 _etout_raw = os.environ.get("EARNINGS_TIMEOUT_EXIT_MINUTES", "").strip()
@@ -3422,11 +3127,9 @@ except ValueError:
     EARNINGS_TIMEOUT_EXIT_MINUTES = 0
 
 # EARNINGS_MAX_LOSS_PCT: 決算銘柄専用の強制損切りライン（未設定/0 時はMAX_LOSS_PCTを流用）
-# ★ v3.9.73: 入力は「1=1%」に統一 (例 EARNINGS_MAX_LOSS_PCT=3 → -3%。旧 0.03 も後方互換)。
 EARNINGS_MAX_LOSS_PCT: float = _pct_frac("EARNINGS_MAX_LOSS_PCT", 0.0, 0.0, 0.5)
 # 0または未設定 = 通常のMAX_LOSS_PCTを流用
 
-# ── ★ v3.9.12: モメンタムシャドー観察モード (Phase 0) ──────────────────────
 # ニュースに頼らず「強いトレンド検出だけで発注する」戦略の Phase 0 評価機能。
 # 実発注は行わず、観察ログに「もし発注していたらどうなったか」を記録するだけ。
 # 5/12 PAN ログ分析で、preEntry +0.1〜+0.3% トレンド帯のエントリーが勝率 93%
@@ -3446,8 +3149,6 @@ EARNINGS_MAX_LOSS_PCT: float = _pct_frac("EARNINGS_MAX_LOSS_PCT", 0.0, 0.0, 0.5)
 MOMENTUM_SHADOW_ENABLED: bool = (
     os.environ.get("MOMENTUM_SHADOW_ENABLED", "true").strip().lower() == "true"
 )
-# ★ v3.9.68: 既定を false→true に変更。.env に記載が無ければモメンタム実発注 ON。
-#   (Wizard [2] 動作モードでも選択可。シャドー観察のみに戻す場合は false を明示)
 MOMENTUM_LIVE_TRADING: bool = (
     os.environ.get("MOMENTUM_LIVE_TRADING", "true").strip().lower() == "true"
 )
@@ -3479,15 +3180,6 @@ MOMENTUM_COOLDOWN_MIN:        int   = _parse_momentum_int("MOMENTUM_COOLDOWN_MIN
 MOMENTUM_ORDER_SIZE_PCT:      float = _parse_momentum_float("MOMENTUM_ORDER_SIZE_PCT", 70.0, 0.0, 100.0)
 MOMENTUM_MAX_OPEN_POSITIONS:  int   = _parse_momentum_int("MOMENTUM_MAX_OPEN_POSITIONS", 1, 0, 10)
 
-# ── ★ v3.9.16: 銘柄別キャリブレーション (5 段階レベル) ───────────────────────
-# ★ v3.9.26: プリセット値を上方スライド (案B: 旧Lv1 → 新Lv3 にピン留め)
-#   5/15-5/19 シャドー観察データで「旧 Lv1 が累計最良 (+1.19% / 勝率61.5%) /
-#   旧 Lv5 のみ累計マイナス (-0.36% / 勝率41.2%)」と判明。旧プリセットでは
-#   推奨値の Lv3 が中庸過ぎ、Lv5 はノイズ過多だった。
-#   ユーザ .env の MOMENTUM_LEVEL 値は変更せず、プリセットの中身だけスライド:
-#     新 Lv3 = 旧 Lv1 (実績最良)  / 新 Lv4 = 旧 Lv2  / 新 Lv5 = 旧 Lv3
-#     新 Lv1 = 旧 Lv1 ×1.5 (より保守)  / 新 Lv2 = 旧 Lv1 ×1.25
-#   既存ユーザの .env は無変更でOK、推奨 Lv3 がデータ最良値に一致する。
 #
 # MOMENTUM_LEVEL: 1 (超厳格) 〜 5 (最緩和) の 5 段階。閾値の 6 値のみ制御。
 # 想定発火頻度: L1 ≈ 0-1件/日 〜 L5 ≈ 5-8件/日 (3 銘柄合算)
@@ -3500,14 +3192,6 @@ MOMENTUM_MAX_OPEN_POSITIONS:  int   = _parse_momentum_int("MOMENTUM_MAX_OPEN_POS
 MOMENTUM_LEVEL: int = _parse_momentum_int("MOMENTUM_LEVEL", 3, 1, 5)
 
 # Level → 銘柄別 (5min, 15min) 閾値プリセット (絶対値)
-# ★ v3.9.26: 上方スライド (新Lv3 = 旧Lv1 ピン留め)
-# ★ v3.9.33: IWM (Russell 2000 小型株 ETF) を追加。シャドー専用 (MOMENTUM_ENABLED_SIDES
-#   には含めない) のため実発注対象外。閾値は QQQ をやや上回る推定値で開始し、
-#   1-2 週間のシャドー観察データで再キャリブレーション予定。
-# ★ v3.9.62: DRAM (Roundhill Memory ETF・2026-04-02 上場) を追加。シャドー専用。
-#   DRAM はボラが非常に大きい (≈ SPY の約3倍) ため、閾値は SPY プリセット × 3.0 で
-#   開始する (Lv3 標準 = SPY 0.10/0.22 → DRAM 0.30/0.66)。新規上場で実績が浅いため、
-#   IWM 同様 1-2 週間のシャドー観察データで再キャリブレーション予定。
 _MOMENTUM_LEVEL_PRESETS: Dict[int, Dict[str, tuple]] = {
     1: {"QQQ": (0.22, 0.45), "SPY": (0.15, 0.33), "SMH": (0.33, 0.67), "IWM": (0.24, 0.48), "DRAM": (0.45, 0.99)},  # 超厳格
     2: {"QQQ": (0.18, 0.36), "SPY": (0.13, 0.28), "SMH": (0.27, 0.55), "IWM": (0.20, 0.40), "DRAM": (0.39, 0.84)},  # 厳格
@@ -3519,7 +3203,6 @@ _MOMENTUM_LEVEL_NAMES: Dict[int, str] = {
     1: "超厳格", 2: "厳格", 3: "標準", 4: "緩和", 5: "最緩和",
 }
 
-# ★ v3.9.26: プリセット履歴 (レポート集計のバージョン跨ぎ一貫性のため)
 # 観察ログには bot_version と LEVEL の実効値 (signal_threshold) が記録されるので、
 # レポート側は「実効プロファイル」基準で連結集計できる。
 # 例: v3.9.25 Lv1 と v3.9.26 Lv3 はどちらも QQQ=(0.15, 0.30) → 同じプロファイル。
@@ -3536,10 +3219,6 @@ _MOMENTUM_LEVEL_PRESETS_HISTORY: Dict[str, Dict[int, Dict[str, tuple]]] = {
     #     ため、上記スナップショットに含まれていても集計上の問題はない。
 }
 
-# ── ★ v3.9.25: MOMENTUM_RISK_LEVEL (1-5) リスク管理一括設定 ─────────────────
-# ★ v3.9.26: RISK_LEVEL も同方針で上方スライド (新Lv3 = 旧Lv1 ピン留め)
-#   理由: LEVEL のスライドと整合させ「LEVEL=3,3 推奨」を v3.9.25 と一致させる。
-#   ユーザ .env の MOMENTUM_RISK_LEVEL 値は変更せず、プリセットの中身だけ更新。
 #
 # Level → (1回損失%, 1日損失%, 投入額%, 急変動ガード%)
 _MOMENTUM_RISK_LEVEL_PRESETS: Dict[int, Dict[str, float]] = {
@@ -3553,7 +3232,6 @@ _MOMENTUM_RISK_LEVEL_NAMES: Dict[int, str] = {
     1: "超慎重", 2: "慎重", 3: "標準", 4: "積極", 5: "高リスク",
 }
 
-# ★ v3.9.26: RISK_LEVEL プリセット履歴 (レポート集計のバージョン跨ぎ一貫性)
 _MOMENTUM_RISK_LEVEL_PRESETS_HISTORY: Dict[str, Dict[int, Dict[str, float]]] = {
     "v3.9.25": {
         1: {"per_trade_pct": 0.20, "daily_pct": 0.50, "order_pct": 10.0, "vola_pct": 0.70},
@@ -3573,7 +3251,6 @@ MOMENTUM_DAILY_LOSS_PCT:      float = _risk_preset["daily_pct"]       # 1 日累
 MOMENTUM_RISK_ORDER_SIZE_PCT: float = _risk_preset["order_pct"]       # 投入額 (RISK_LEVEL から)
 MOMENTUM_VOLATILITY_GUARD_PCT: float = _risk_preset["vola_pct"]       # 急変動ガード 閾値
 
-# ── ★ v3.9.34: MOMENTUM_MAX_PCT (Wizard v1.8 で設定する 1 回の最大発注比率) ──
 # 発注額の決定方法を「最大発注比率 (MAX_PCT) を山型配分」に変更。
 #   最終発注額 = BUDGET × MOMENTUM_MAX_PCT × シグナル強度係数 (50/75/100/0%)
 # 優先順位:
@@ -3598,46 +3275,9 @@ else:
     # ③ フォールバック: RISK_LEVEL プリセットの order_pct
     MOMENTUM_ORDER_SIZE_PCT = MOMENTUM_RISK_ORDER_SIZE_PCT
 
-# ── ★ v3.9.25: 個別 .env 設定 (上級者向け・5 項目) ────────────────────────
 # Wizard では聞かない。デフォルト動作で大半の受講生は問題なし。
 
 # 1) 銘柄サイド有効化 (デフォルト: 7 日間シャドーで累計プラスの組合せのみ)
-# ★ v3.9.61: IWM:SELL_SHORT を実発注対象から除外しシャドー専用に戻す。
-#   v3.9.54 で IWM:SELL_SHORT を実発注対象に追加していたが、IWM は TRIGGER_TICKERS
-#   にも EXECUTION_MAP にも含まれないため、risk_monitor_loop / 週末決済 /
-#   パニックセル / sync_positions のいずれの監視系統からも漏れていた
-#   (5/29 23:25 IWM SHORT 27株が約定後・週末決済でも検出されず放置された実例)。
-#   実発注は「TRIGGER_TICKERS に含まれ監視対象である」SPY/QQQ のみに限定する。
-#   IWM は MOMENTUM_SYMBOLS でシャドー観察を継続。
-#   (※ v3.9.61 では併せて「実発注銘柄は必ず監視対象に含める」システム的修正と
-#      起動時のズレ検証警告を追加。万一 env で監視外銘柄を実発注対象にしても
-#      自動的に監視対象へ取り込まれる。)
-# ★ v3.9.63: SMH:BUY を実発注対象に追加 (構造問題の是正)。
-#   背景: 全受講生がデモ口座で、デモは API 空売り不可 (place_short が shadow 転送)。
-#   そのため SPY/QQQ:SELL_SHORT を有効化しても実際に約定する実発注は QQQ:BUY のみに
-#   なり、QQQ:BUY は観察で最悪サイド (6/1: WR22.8%/-1.72%, Phase 1 実発注 WR14.3%)。
-#   一方デモで約定可能かつ観察で好調な SMH-BUY (6/1: +3.30%/WR80.2%) はシャドー止まり
-#   だった。★ v3.9.150 訂正: ここに「SMH は TRIGGER_TICKERS(標準 SPY,QQQ,SMH)
-#   に含まれるので orphan の懸念なし」と書いていたが、Wizard の標準設定は
-#   SPY,QQQ であり誤りだった（認定サポーターの指摘）。SMH は
-#   _momentum_live_symbols() 経由で監視対象に入る。起動時復元も v3.9.149 で
-#   同じ和集合に揃えた。
-#   QQQ:BUY は実発注継続だが要観察 (上昇トレンド日は機能・往来/下落日は不振)。
-#   env MOMENTUM_ENABLED_SIDES で上書き可 (QQQ:BUY を外す等は受講生/講師判断)。
-# ★ v3.9.66: 勝ち筋の SHORT 側を実発注対象に追加 (ブレークスルー施策A)。
-#   観察データで SHORT が一貫して BUY を圧倒 (6/2: SHORT +2.25%/WR87% vs BUY +0.55%/WR50%)。
-#   SMH-SHORT +3.34%, QQQ-SHORT +2.97%(WR100%), IWM-SHORT +1.56%(WR100%),
-#   DRAM-SHORT +0.73%(WR98%)。v3.9.65 のデモ・ネッティング空売り (DEMO_SHORT_ENABLED=true)
-#   と組み合わせることで、デモ生も勝ち筋ショートを実発注化できる。
-#   監視整合性: SMH・IWM とも _momentum_live_symbols() 経由で
-#   risk_monitor/週末決済/パニック/sync に自動取込済 (v3.9.61 原則)。
-#   ★ v3.9.150 訂正: 旧記述の「SMH は TRIGGER_TICKERS」は誤り（標準は SPY,QQQ）。
-# ★ v3.9.70: DRAM:SELL_SHORT を既定から除外 (実績浅く、自動実発注化が想定外だったため)。
-#   DRAM は MOMENTUM_SYMBOLS でシャドー観察を継続 (実発注はしない)。
-#   実発注対象サイドは Wizard で明示選択し MOMENTUM_ENABLED_SIDES に書き出す方針へ。
-#   .env に MOMENTUM_ENABLED_SIDES があればそれが最優先 (= Wizard 設定が取引対象)。
-# ★ v3.9.79: 既定の実発注サイドから IWM を除外（IWM/DRAM はシャドー観察のみ・実発注成績不振のため）。
-#   IWM/DRAM を実発注にしたい場合のみ env MOMENTUM_ENABLED_SIDES で明示指定する。
 _DEFAULT_ENABLED_SIDES = (
     "SPY:SELL_SHORT,QQQ:SELL_SHORT,QQQ:BUY,SMH:BUY,SMH:SELL_SHORT"
 )
@@ -3650,7 +3290,7 @@ for _pair in _enabled_sides_raw.split(","):
 
 
 def _momentum_live_symbols() -> set:
-    """★ v3.9.61: MOMENTUM_LIVE_TRADING=true 時に実発注されうる銘柄の集合を返す。
+    """
 
     MOMENTUM_ENABLED_SIDES (例: {'QQQ:BUY', 'SPY:SELL_SHORT'}) から銘柄部分のみを
     抽出する。risk_monitor_loop / 週末決済 / パニックセル / sync_positions の
@@ -3666,7 +3306,6 @@ def _momentum_live_symbols() -> set:
         if ":" in _s
     }
 
-# 2) ★ v3.9.45: 銘柄別サイズ係数は廃止 (全銘柄 1.0 に統一)
 # 旧 v3.9.32-v3.9.44: SPY=1.0 / QQQ=0.5 / SMH=0.0 / IWM=0.85
 # 旧設計の理由:
 #   - QQQ=0.5 は変動が大きいためサイズ縮小 (リスク調整)
@@ -3688,10 +3327,9 @@ MOMENTUM_SIZE_MULTIPLIER: Dict[str, float] = {
     "QQQ":  _parse_momentum_float("MOMENTUM_SIZE_MULTIPLIER_QQQ", 1.00, 0.0, 2.0),
     "SMH":  _parse_momentum_float("MOMENTUM_SIZE_MULTIPLIER_SMH", 1.00, 0.0, 2.0),
     "IWM":  _parse_momentum_float("MOMENTUM_SIZE_MULTIPLIER_IWM", 1.00, 0.0, 2.0),
-    "DRAM": _parse_momentum_float("MOMENTUM_SIZE_MULTIPLIER_DRAM", 1.00, 0.0, 2.0),  # ★ v3.9.62
+    "DRAM": _parse_momentum_float("MOMENTUM_SIZE_MULTIPLIER_DRAM", 1.00, 0.0, 2.0),
 }
 
-# 3-4) ★ v3.9.41: 発注時間帯フィルタは廃案
 # v3.9.25 で「RTH 11:00-15:30 ET 限定発火」フィルタを導入したが、
 # 8 日間のシャドー検証 (5/15-22) で 3 日中 2 日で逆効果が実証された:
 #   - 5/20 大幅劣化: フィルタ前 +1.55% / WR 78.6% → フィルタ後 -0.17% / WR 60%
@@ -3704,34 +3342,17 @@ MOMENTUM_SIZE_MULTIPLIER: Dict[str, float] = {
 # 5) 個別損切りライン (デフォルト 0.50%)
 MOMENTUM_STOP_LOSS_PCT: float = _parse_momentum_float("MOMENTUM_STOP_LOSS_PCT", 0.50, 0.10, 5.0)
 
-# ★ v3.9.94: LONG(BUY) の最小シグナル閾値 (5分騰落率の下限・デフォルト 0.15%)。
-#   実データ分析(LONG 1,699件): エントリー前変動 <0.10% の弱シグナルLONGが損失の
-#   ほぼ全て(その帯だけ約 -$5,275)。0.10%以上に絞るとLONGは -$4,599 → +$676 と
-#   プラス転換し、勝率も 0.52→0.58→0.64 と単調改善。安全マージンを取り 0.15% を
-#   LONG専用の下限に設定(371件・WR53%・+$627)。SHORTは現状維持(SHORTが利益源のため)。
-#   ※ LONG の実発注のみ抑制し、シャドー観察(momentum_shadow)は全件継続記録する。
-#   0 で無効(従来どおり)。
 MOMENTUM_LONG_MIN_SIGNAL_PCT: float = _parse_momentum_float(
-    "MOMENTUM_LONG_MIN_SIGNAL_PCT", 0.70, 0.0, 5.0)   # ★ v3.9.114: 0.15→0.70（弱LONG除外）
-# ★ v3.9.114: ロング実発注の5分モメンタム上限（0=無制限）。過去観察で1.5%超は反転しやすく
-#   低調だったため、Wizardの「強帯も許可」選択でここを1.50へ緩和して強帯を捕捉する。
-#   0.80(既定・現行上限相当) / 1.00(中程度以上) / 1.50(強帯も許可)。ショートは対象外。
+    "MOMENTUM_LONG_MIN_SIGNAL_PCT", 0.70, 0.0, 5.0)
 MOMENTUM_LONG_MAX_SIGNAL_PCT: float = _parse_momentum_float(
     "MOMENTUM_LONG_MAX_SIGNAL_PCT", 0.80, 0.0, 5.0)
 
-# ★ v3.9.93 (案a): 高ボラ銘柄の損切り幅拡大は「実取引では変えず、全員のシャドーで検証」
-#   する方針。現状の不整合（高ボラ銘柄は発注時に size÷倍率済みなのに、モメンタム損切りは
-#   0.50%固定で倍率未適用＝SMHは小サイズ+狭損切りで自分のノイズ0.52%に負けwhipsaw）を、
-#   観察ログの仮想列「狭い損切り(現行) vs 広い損切り(×倍率)」(_compute_virtual_exits)で
-#   計測する。実発注のロジックは一切変更しない。
 
-# 6) ★ v3.9.26: 強シグナル上限ガード
 # 5/19 シャドーで「強シグナル 0.8%+ が 2 日連続マイナス」と判明 (ノイズ域)。
 # |5min 騰落率| ≥ MOMENTUM_MAX_SIGNAL_PCT のシグナルはノイズ扱いでスキップ。
 # 0 設定で無効化 (上限なし)。
 MOMENTUM_MAX_SIGNAL_PCT: float = _parse_momentum_float("MOMENTUM_MAX_SIGNAL_PCT", 0.80, 0.0, 5.0)
 
-# ★ v3.9.62: 銘柄別の強シグナル上限オーバーライド。
 # 既定の 0.80% は SPY/QQQ スケールの観察データ由来。DRAM はボラが約3倍のため、
 # 同じ 0.80% だと通常のトレンドが頻繁に「ノイズ(発注なし)」扱いで弾かれる。
 # DRAM 専用に ≈3倍 (= 既定 0.80% × 3 = 2.40%) を適用する。env で上書き可能。
@@ -3739,7 +3360,6 @@ MOMENTUM_MAX_SIGNAL_PCT: float = _parse_momentum_float("MOMENTUM_MAX_SIGNAL_PCT"
 MOMENTUM_DRAM_MAX_SIGNAL_PCT: float = _parse_momentum_float(
     "MOMENTUM_DRAM_MAX_SIGNAL_PCT", round(MOMENTUM_MAX_SIGNAL_PCT * 3.0, 2), 0.0, 10.0
 )
-# ★ v3.9.72: SMH の強シグナル上限を 0.80%→1.20% に引き上げ (env 上書き可)。
 # SMH は 15分変動率の中央値 0.52% と高ボラで、共通 0.80% 上限だと信号の約17%が
 # 「強(発注なし)」に弾かれ発注機会を不必要に削っていた。検証 (観察60分) では新たに
 # 解禁される 0.80-1.20% 帯が SHORT +0.36%/WR75%・LONG +0.13%/WR70% と明確にプラス。
@@ -3752,7 +3372,6 @@ _MOMENTUM_MAX_SIGNAL_OVERRIDE: Dict[str, float] = {
     "SMH":  MOMENTUM_SMH_MAX_SIGNAL_PCT,
 }
 
-# 7) ★ v3.9.63: 寄り高値掴みガード (BUY 実発注のみ)。
 # 6/1 実発注は全件 QQQ-BUY で WR14.3%、エントリー $744-745 の高値掴みほどマイナス大
 # (QQQ が寄り $737→$745 へ上昇後に伸び悩み、時間切れ決済が小幅マイナス連発)。
 # 直近 MOMENTUM_HIGH_CHASE_LOOKBACK_MIN 分の高値に対し現値が GUARD_PCT% 以内なら
@@ -3765,7 +3384,6 @@ MOMENTUM_HIGH_CHASE_GUARD_PCT: float = _parse_momentum_float(
 MOMENTUM_HIGH_CHASE_LOOKBACK_MIN: int = _parse_momentum_int(
     "MOMENTUM_HIGH_CHASE_LOOKBACK_MIN", 30, 5, 240)
 
-# 8) ★ v3.9.66 (施策C): サイド別サイズ配分 — 勝ち筋に資金を寄せる。
 # 観察データで SHORT が BUY を一貫して圧倒 (6/2: SHORT WR87% vs BUY WR50%)。
 # BUY のサイズに係数を掛けて縮小し、相対的に SHORT へ資金を集中させる。
 # 1.0 で無効 (BUY も SHORT と同サイズ)。既定 0.6 (BUY を 60% に圧縮)。
@@ -3774,7 +3392,7 @@ MOMENTUM_SHORT_SIZE_MULT: float = _parse_momentum_float("MOMENTUM_SHORT_SIZE_MUL
 
 
 def _momentum_high_chase_block(symbol: str, side: str, price: float) -> bool:
-    """★ v3.9.63: BUY 実発注が「直近高値の追随買い (高値掴み)」かを判定。
+    """
 
     True を返すと実発注を見送る (シャドー観察は別途継続)。
     - SHORT / ガード無効 (PCT<=0) / 価格不正 のときは常に False。
@@ -3797,7 +3415,7 @@ def _momentum_high_chase_block(symbol: str, side: str, price: float) -> bool:
 
 
 def _momentum_max_signal_for(symbol: str) -> float:
-    """★ v3.9.62: 銘柄別の強シグナル上限 (絶対値%) を返す。未登録銘柄は共通値。"""
+    """"""
     return _MOMENTUM_MAX_SIGNAL_OVERRIDE.get(symbol, MOMENTUM_MAX_SIGNAL_PCT)
 
 # ── コード固定値 (env なし・全員共通) ──────────────────────────────────────
@@ -3809,12 +3427,10 @@ _MOMENTUM_TRAIL_MIN_PEAK_USD     = 1.50   # peak トレール 発動最低 PnL
 _MOMENTUM_TRAIL_RETRACE_PCT      = 0.35   # peak から 35% 戻し
 _MOMENTUM_DAILY_RESET_HOUR_ET    = 4      # デイストップ リセット 04:00 ET
 
-# ── ★ v3.9.25: モメンタム実行時の状態管理 ────────────────────────────────
 # デイストップロス: 1 日累計 PnL を追跡 → -X% で当日停止
 _momentum_daily_pnl: float = 0.0
 _momentum_daily_reset_date: Optional["datetime.date"] = None
 _momentum_daily_stopped: bool = False
-# ★ v3.9.67: momentum_record_trade_result は決済確定スレッド (_send_trade_result) から
 # 呼ばれるため、日次/週次 PnL 累計の競合を防ぐロック。
 _momentum_pnl_lock = threading.Lock()
 
@@ -3825,7 +3441,6 @@ _momentum_volatility_guard_until: Optional["datetime.datetime"] = None
 _momentum_consecutive_losses: int = 0
 _momentum_last_win_time: Optional["datetime.datetime"] = None
 
-# ★ v3.9.55: BUDGET 比 % ベースのサーキットブレーカー (5/27 Phase 1 初日 -$504 への対応)
 # 既存の MOMENTUM_DAILY_LOSS_PCT は RISK_LEVEL プリセット由来 (L3=0.50%) で
 # 絶対額があまりに小さく、Phase 1 の壊滅損失を防げなかった。
 # 受講生の BUDGET (例 $10,000) に対する % で「日 3% (= $300) / 週 5% (= $500)」を
@@ -3835,7 +3450,6 @@ _momentum_weekly_pnl: float = 0.0
 _momentum_weekly_reset_date: Optional["datetime.date"] = None   # 週の月曜日
 _momentum_weekly_stopped: bool = False
 
-# ── ★ v3.9.58: セッション切替後のモメンタムクールダウン ──────────────────
 # OVN/WEEKEND/休日 → PREMARKET 等の切替直後は急変動しがちだが持続しない
 # (寄り高 V 字等) ケースが多いため、モメンタムシグナル発火を一定時間見送る。
 # 0 設定で無効化。デフォルト 300 秒 = 5 分。
@@ -3867,7 +3481,6 @@ except ValueError:
 
 def _momentum_reset_daily_if_needed() -> None:
     """ET 基準で日付が変わったらデイストップ状態をリセット。
-    ★ v3.9.54: 週次サーキットブレーカー (月曜 04:00 ET リセット) も同時に処理。
     """
     global _momentum_daily_pnl, _momentum_daily_reset_date, _momentum_daily_stopped
     global _momentum_weekly_pnl, _momentum_weekly_reset_date, _momentum_weekly_stopped
@@ -3927,7 +3540,7 @@ def _momentum_get_size_multiplier() -> float:
 
 
 def _momentum_strength_multiplier(pct_15: float, symbol: Optional[str] = None) -> tuple:
-    """★ v3.9.31: シグナル強度 (15m 騰落率の絶対値) でサイズ係数を山型に算出。
+    """
 
     5/15-5/21 シャドー観察 5,358 件の強度別 5 日累計成績:
       <0.3% (弱)        累計 +0.04%  → 投入 50%
@@ -3938,8 +3551,6 @@ def _momentum_strength_multiplier(pct_15: float, symbol: Optional[str] = None) -
     「最も強い」ではなく「最も効率的な 0.5〜0.8% 帯」に集中投下する山型設計。
     0.8%+ 強シグナルは累計マイナスのため発注対象外 (MOMENTUM_MAX_SIGNAL_PCT で制御)。
 
-    ★ v3.9.62: 強シグナル上限は銘柄別 (_momentum_max_signal_for)。DRAM はボラ約3倍の
-       ため上限も ≈3倍 (既定 2.40%) を適用し、通常のトレンドが過剰に弾かれるのを防ぐ。
 
     戻り値: (係数, ラベル) のタプル。
     """
@@ -3996,7 +3607,6 @@ def momentum_record_trade_result(pnl: float, budget: float) -> None:
                 f"({MOMENTUM_DAILY_LOSS_BUDGET_PCT:.1f}% of BUDGET ${budget:,.0f}) "
                 f"→ 当日の新規発注を停止 (04:00 ET 翌朝リセット)"
             )
-    # ★ v3.9.55: 1 週間損失上限チェック (BUDGET 比 %)
     if not _momentum_weekly_stopped and MOMENTUM_WEEKLY_LOSS_BUDGET_PCT > 0:
         weekly_limit = -budget * (MOMENTUM_WEEKLY_LOSS_BUDGET_PCT / 100.0)
         if _momentum_weekly_pnl <= weekly_limit:
@@ -4026,8 +3636,6 @@ def momentum_record_trade_result(pnl: float, budget: float) -> None:
 
 def _momentum_is_daily_stopped() -> bool:
     """1 日損失上限到達済みか判定。
-    ★ v3.9.54: 週次サーキットブレーカー (USD) も同時にチェック。
-    どちらかが発火していれば停止状態 (True) を返す。
     """
     _momentum_reset_daily_if_needed()
     return _momentum_daily_stopped or _momentum_weekly_stopped
@@ -4048,7 +3656,7 @@ _MOMENTUM_SMH_15M_OVERRIDE = os.environ.get("MOMENTUM_SMH_15M_PCT", "").strip()
 
 
 def _get_momentum_thresholds(symbol: str) -> tuple:
-    """★ v3.9.16: 銘柄別モメンタム閾値 (5min, 15min) を返す (絶対値%)。
+    """
 
     優先順位:
       ① MOMENTUM_{symbol}_5M_PCT / 15M_PCT が個別に設定されていれば使用
@@ -4075,68 +3683,36 @@ def _get_momentum_thresholds(symbol: str) -> tuple:
         except ValueError:
             pass
     return base_5m, base_15m
-# ★ v3.9.47: MOMENTUM_TIMEOUT_MIN を Phase 1 実発注で実際に使用するよう配線
 # (risk_monitor_loop で entry_ai_category == "MOMENTUM" のポジションに適用)。
 # 旧設計の TIMEOUT_EXIT_MINUTES (デフォルト 10 分) は「ニュースの鮮度」を前提とした
 # 値で、モメンタムには短すぎる。モメンタムはトレンド継続を狙う戦略のため、シャドー
 # 観察データの 60 分 PnL ベンチマークに合わせて 60 分をデフォルトに設定。
 # 0 を設定するとモメンタムのタイムアウト決済を無効化 (トレール / 損切り / 反転に委ねる)。
 MOMENTUM_TIMEOUT_MIN:         int   = _parse_momentum_int("MOMENTUM_TIMEOUT_MIN", 60, 0, 240)
-# ★ v3.9.63: MOMENTUM_STOP_LOSS_PCT は risk_monitor_loop の強制損切りで実際に
-#   適用されるようになった (entry_ai_category=="MOMENTUM" 時、MAX_LOSS_PCT の代わりに
-#   MOMENTUM_STOP_LOSS_PCT/100 を損切りラインに使用)。Wizard で選択可能。
 # 以下 MOMENTUM_STOP_PCT / MOMENTUM_TRAIL_* は将来のモメンタム専用トレール/反転決済用
 # (現状トレールは通常の TRAIL_TRIGGER_PCT / TRAIL_DROP_PCT を流用するため未参照)。
 MOMENTUM_STOP_PCT:            float = _parse_momentum_float("MOMENTUM_STOP_PCT", -0.30, -5.0, 0.0)
 MOMENTUM_TRAIL_TRIGGER_PCT:   float = _parse_momentum_float("MOMENTUM_TRAIL_TRIGGER_PCT", 0.30, 0.05, 2.0)
 MOMENTUM_TRAIL_DROP_PCT:      float = _parse_momentum_float("MOMENTUM_TRAIL_DROP_PCT", 0.20, 0.05, 1.0)
-# ★ v3.9.89: 既定を false（転換抑制）に変更。反対シグナルでの強制転換決済は実データで
-#   WR0%・純出血（6/17 -$749）。既定で「転換せず新規エントリーを見送り」、既存ポジは
-#   損切り/トレール/時間切れ/建玉トレールに委ねる。従来挙動に戻すなら MOMENTUM_REVERSE_EXIT=true。
 MOMENTUM_REVERSE_EXIT: bool = (
     os.environ.get("MOMENTUM_REVERSE_EXIT", "false").strip().lower() == "true"
 )
-# ★ v3.9.85: PAN案（任意・既定OFF）。モメンタム建玉の損失保護を「固定の強制損切り
-#   (建値基準)」から「建玉時からのトレールストップ(幅=損切り幅)」に切り替える。
-#   peak が有利側へ動けば損切り線も切り上がるため、一度含み益が出てから反転した
-#   建玉の損失を縮小できる(下方向は固定損切りに劣らない=弱意味で優位)。trail_active
-#   到達後は既存の狭いトレール(TRAIL_DROP_PCT)が先に発火し、自然に2段階トレールになる。
-#   検証者のみ true 推奨。未設定(false)なら全受講生は従来どおりの固定損切り。
-# ★ v3.9.90: 既定を true（建玉トレール標準）に変更。実データで固定の強制損切りより1件あたりの
-#   損失がほぼ半分（建玉トレール −$34 vs 固定 −$67・131件）。v3.9.86でpeakを建値でfloor/cap済み＝
-#   下方向は固定損切りに劣らない（弱意味で優位）。従来の固定損切りに戻すなら MOMENTUM_TRAIL_FROM_ENTRY=false。
 MOMENTUM_TRAIL_FROM_ENTRY: bool = (
     os.environ.get("MOMENTUM_TRAIL_FROM_ENTRY", "true").strip().lower() == "true"
 )
-# ★ v3.9.101: 約定直後の損失保護（建玉トレール/強制損切り）抑止の猶予秒数。
-#   発注時 avg_cost は指値の仮設定で、実約定単価が反映されるまでの過渡期に
-#   指値基準で誤発火するのを防ぐ保険（根本対策は sync_positions の確定判定）。0 で無効。
 MOMENTUM_ENTRY_GRACE_SEC: int = _parse_momentum_int("MOMENTUM_ENTRY_GRACE_SEC", 15, 0, 120)
-# ★ v3.9.103: 当日トレンド・フィルター（逆張り抑制）。上昇日のショート / 下落日のロングを
-#   抑制する。SPY（無ければQQQ）の LOOKBACK 分騰落が ±FILTER_PCT を超えたら「トレンド日」。
-#   既定は計測のみ（ENABLED=false＝売買は不変・観察ログに trend_filter_ab を残すだけ）。
-#   効果が確認できたら MOMENTUM_TREND_FILTER_ENABLED=true で against-trend の実発注を実ブロック。
 MOMENTUM_TREND_FILTER_PCT: float = _parse_momentum_float("MOMENTUM_TREND_FILTER_PCT", 0.5, 0.0, 10.0)
 MOMENTUM_TREND_LOOKBACK_MIN: int = _parse_momentum_int("MOMENTUM_TREND_LOOKBACK_MIN", 60, 5, 390)
 MOMENTUM_TREND_FILTER_ENABLED: bool = (
     os.environ.get("MOMENTUM_TREND_FILTER_ENABLED", "false").strip().lower() == "true"
 )
-# ★ v3.9.104: プレマーケット新規エントリー抑制フィルター。premarket が恒常的な出血源のため、
-#   premarket 中の新規モメンタム実発注を抑制する。既定は計測のみ（ENABLED=false＝売買不変・
-#   観察ログに premarket_filter_ab を残すだけ）。効果が確認できたら
-#   MOMENTUM_PREMARKET_FILTER_ENABLED=true で premarket の実発注を実ブロック。
 MOMENTUM_PREMARKET_FILTER_ENABLED: bool = (
     os.environ.get("MOMENTUM_PREMARKET_FILTER_ENABLED", "false").strip().lower() == "true"
 )
 # 対象銘柄 (env で絞り込み可、デフォルトは QQQ/SPY/SMH/IWM/DRAM)
-# ★ v3.9.33: IWM (Russell 2000 小型株 ETF) を追加。シャドー観察専用
-#   (MOMENTUM_ENABLED_SIDES に含めないため実発注対象外)。
-# ★ v3.9.62: DRAM (Roundhill Memory ETF) を追加。シャドー観察専用 (実発注対象外)。
-#   閾値は SPY×3 (_MOMENTUM_LEVEL_PRESETS)、強シグナル上限は DRAM 別枠 (≈2.4%)。
 _mom_syms_raw = os.environ.get("MOMENTUM_SYMBOLS", "QQQ,SPY,SMH,IWM,DRAM").strip()
 MOMENTUM_SYMBOLS: tuple = tuple(s.strip().upper() for s in _mom_syms_raw.split(",") if s.strip())
 
-# ── ★ v3.9.116: 戦略プロファイル（Wizard STEP 1 で選択・既定 standard=従来どおり）──
 # select_v1（選抜プロファイル）: 実発注5週間+シャドー観察（2026/6/9〜7/10・ユニーク
 #   シグナル4,952件）の集計で、全期間・前半/後半スプリット・週別のいずれでも
 #   期待値がプラスだった条件の組み合わせ（過去観察に基づく設定であり将来を保証しない）:
@@ -4165,19 +3741,6 @@ MOMENTUM_STRATEGY_PROFILE: str = (
 if MOMENTUM_STRATEGY_PROFILE not in ("standard", "select_v1", "select_v2"):
     MOMENTUM_STRATEGY_PROFILE = "standard"   # 不正値は従来どおり（他configと同じ静かなfallback）
 MOMENTUM_PROFILE_SELECT: bool = (MOMENTUM_STRATEGY_PROFILE == "select_v1")
-# ★ v3.9.194: 選抜プロファイル v2（既定オフ・opt-in・.env に MOMENTUM_STRATEGY_PROFILE=select_v2）。
-#   v1 の中身は変えない（版管理の規約）。v2 は 8/1〜9/3 の観察ログ（重複除去 1,512 シグナル）と
-#   7〜9 月の実取引（選抜 v1 2,355 件）の再集計から作った。v1 との違い:
-#     ・方向を固定しない（買いも対象）。8〜9 月は QQQ/SMH の買いが +0.06〜+0.08%、ショートが −0.06〜−0.10%
-#     ・時間帯（ET）: ショートは 9・12 時台、買いは 9〜11 時台。13 時台は実取引の勝率 17%（n=58）で外す。
-#       10 時台のショートは 8〜9 月に −0.10%（n=433）で最大の損失源だったため外す
-#     ・弱いシグナルを捨てる: 5 分・15 分の変化率が Level 2 の閾値以上のときだけ実発注
-#       （5 分 0.3% 未満のショートが −0.18%・勝率 31%）
-#     ・相場との整合: 直近 60 分で QQQ が +0.15% より上げているときはショートを見送る（−0.21%・勝率 22%・n=27）
-#     ・SPY は v1 と同じく対象外。SMH の買いは関門 0.78 に届かないため対象外
-#     ・固定損切り・日次損失予算 1.5% は v1 と同じ。時間切れは利用者の設定のまま
-#   これは 5 週間の相場から作った仮説で、v1 と同じ「その期間に合わせただけ」の危険がある。
-#   まずシャドーで v1 と並走させ（tools/eval_select_v2.py で観察ログから評価）、実発注は PAN の判断で。
 MOMENTUM_PROFILE_SELECT_V2: bool = (MOMENTUM_STRATEGY_PROFILE == "select_v2")
 MOMENTUM_PROFILE_ANY: bool = MOMENTUM_PROFILE_SELECT or MOMENTUM_PROFILE_SELECT_V2
 _SELECT_V1_ENTRY_HOURS_ET: frozenset = frozenset({9, 10, 12, 13})
@@ -4194,15 +3757,6 @@ if MOMENTUM_PROFILE_ANY:
     # ⑤ 日次損失予算: env 未指定なら 1.5% に強化（明示指定はそのまま尊重）
     if not _mom_daily_budget_pct_raw:
         MOMENTUM_DAILY_LOSS_BUDGET_PCT = 1.5
-# ★ v3.9.116: プロファイル選択をデータ・ログの両方で判別できるようにするタグ。
-#   GAS 送信ペイロードの bot_version（settings 経由でシート「botバージョン」列に載る）
-#   に "+select_v1" を付けることで、GAS/シート側の変更なしに、決済記録・観察ログの
-#   どの行がプロファイル有効時のものかを後から集計・監査できる。standard は無印＝従来どおり。
-# ★ v3.9.128: 標準プロファイルで建玉トレールを固定損切り(0.5%)へ置換したテスト群を
-#   分離集計できるよう "+flatstop" タグを付ける（段階導入・Codex/週次レビュー優先度1）。
-#   建玉トレールは全期間 -$25,724/勝率6.5% と最大の出血源で、固定0.5%への置換は反実仮想で
-#   プラス。実運用でも効くかを、シートの botバージョン列で「標準(+無印)」対「標準+flatstop」
-#   として2週以上比較して検証する。select_v1 は別タグ優先（内部で建玉トレールOFFのため）。
 if MOMENTUM_PROFILE_SELECT:
     _PROFILE_TAG = "+select_v1"
 elif MOMENTUM_PROFILE_SELECT_V2:
@@ -4211,13 +3765,6 @@ elif not MOMENTUM_TRAIL_FROM_ENTRY:
     _PROFILE_TAG = "+flatstop"     # 標準プロファイル × 建玉トレールOFF（固定損切り）
 else:
     _PROFILE_TAG = ""
-# ★ v3.9.169: ニュース選抜も同じ規約でタグ付けする。見送り行は観察ログの
-#   block_stage で分かるが、それだけでは「通った側（TECH/SEMI_STRONG の実発注）」を
-#   標準運転と区別できず、絞り込みの効果を比較できない。
-#   ★ _PROFILE_TAG 自体には足さない。この変数は他所で
-#   `_PROFILE_TAG == "+flatstop"` と**完全一致**で比較されており（:1743 と下の
-#   _PROFILE_DISPLAY）、連結すると「標準＋固定損切り」の表示が消える（Codex指摘）。
-#   版の文字列にだけ足す。
 _NEWS_PROFILE_TAG: str = "+news_v1" if NEWS_PROFILE_SELECT else ""
 BOT_VERSION_TAGGED: str = BOT_VERSION + _PROFILE_TAG + _NEWS_PROFILE_TAG
 _PROFILE_DISPLAY: str = (
@@ -4226,9 +3773,6 @@ _PROFILE_DISPLAY: str = (
           else ("標準＋固定損切り（建玉トレールOFF・検証中）" if _PROFILE_TAG == "+flatstop"
                 else "カスタマイズ設定（今まで通り）"))
 ) + (
-    # ★ v3.9.169: 日次サマリ（端末・Discord）はこの文字列だけを見せているため、
-    #   ニュース選抜が効いているのに「標準（今まで通り）」と出ていた。
-    #   MACRO の発注が消えた理由を、毎日見る表示から辿れるようにする。
     "＋ニュース選抜v1" if NEWS_PROFILE_SELECT else ""
 )
 
@@ -4252,17 +3796,12 @@ except ValueError:
 # ── 個別株・決算銘柄の1銘柄あたり予算上限 (v2.40) ────────────────────────────
 # STOCK_MAX_PCT: BUDGET_USD に対する 1 銘柄最大割合 (%) / 0 = 上限なし
 # 対象: STOCK_TICKERS / EARNINGS_PRE / EARNINGS_AFTER (実計算は _BUDGET_USD 後段)
-# ★ v3.9.66 (施策B'): 既定を 10% に変更 (旧 0=上限なし)。個別株のテール損失
-#   (5/27 BAC -$549・5/29 DELL -$153・6/2 NVDA -$240) は「上限なし」で建玉が
-#   過大化したことが一因。1 銘柄を BUDGET の 10% に制限し、悪材料の単独大損を抑える。
-#   env で明示すればその値が優先。0 を明示すると従来どおり上限なし。
 _stock_max_raw = os.environ.get("STOCK_MAX_PCT", "").strip()
 try:
     _STOCK_MAX_PCT: float = float(_stock_max_raw) / 100.0 if _stock_max_raw else 0.10
 except ValueError:
     _STOCK_MAX_PCT = 0.10
 
-# ★ v3.9.66 (施策B'): 個別株の 1 トレード絶対損失上限 (USD)。0 = 無効。
 # 含み損が -STOCK_MAX_LOSS_USD を下回ったら % 損切りラインに関係なく即決済する
 # (ギャップ・スリッページで % 損切りが間に合わず大損するのを防ぐ安全網)。
 # 既定 0 (無効)。受講生の BUDGET に依存するため、講師判断で .env 設定を推奨。
@@ -4309,7 +3848,6 @@ _SP500_TICKERS: set = {
 _DYNAMIC_EXCLUDE: set = set()  # 起動時に ALL_TICKERS から構築する（後述）
 
 # 全ユニーク銘柄（価格取得・リスク監視対象）
-# ★ v3.9.61: モメンタム実発注銘柄 (_momentum_live_symbols) を必ず含める。
 # これにより sync_positions / _tracked_position_cost / risk_monitor_loop の
 # 全監視系統がモメンタム実発注ポジションを確実に追跡する (IWM orphan 再発防止)。
 # MOMENTUM_LIVE_TRADING=false (シャドーのみ) なら _momentum_live_symbols() は
@@ -4387,7 +3925,6 @@ _CONF_PREMARKET  = _parse_conf("CONFIDENCE_PREMARKET")  # 例: 0.85
 _CONF_AFTERHOURS = _parse_conf("CONFIDENCE_AFTERHOURS") # 例: 0.85
 _CONF_OVERNIGHT  = _parse_conf("CONFIDENCE_OVERNIGHT")  # 例: 0.90
 
-# ── ★ v3.9.6: 「発注しない」sentinel 検出 (Anthropic API コスト削減) ──────────
 # setup_wizard が「発注しない」選択時に CONFIDENCE_PREMARKET=2.00 等の sentinel
 # 値を .env に書き込む (AI confidence は 0.0〜1.0 の範囲なので 2.0 は絶対超えない)。
 # _parse_conf は [0.5, 1.0] に clamp するため、clamp 前の生値を別途保持し、
@@ -4412,7 +3949,7 @@ _DISABLED_OVERNIGHT  = _raw_conf_disabled("CONFIDENCE_OVERNIGHT")
 
 
 def _is_session_disabled_by_name(session_name: str) -> bool:
-    """★ v3.9.6: 指定セッションが「発注しない」設定か (raw env ≥ 2.0 sentinel)。
+    """
 
     session_name には get_session_info() の戻り値 ('premarket'/'rth'/...) を渡す。
     None や未知の値は False (= 停止しない) として扱う (防御的)。
@@ -4429,7 +3966,7 @@ def _is_session_disabled_by_name(session_name: str) -> bool:
 
 
 def is_current_session_disabled() -> tuple[bool, str]:
-    """★ v3.9.6: 現在のセッションが「発注しない」設定か判定。
+    """
 
     setup_wizard で CONFIDENCE_* >= 2.0 sentinel を書き込んだセッションは、
     AI が何を返しても発注に至らない (confidence は max 1.0)。それを analyze_news()
@@ -4479,14 +4016,11 @@ def _parse_int_env(key: str, default: int, min_val: int = 0, max_val: int = 1440
         return default
 
 COOLDOWN_STOCK_MIN: int       = _parse_int_env("COOLDOWN_STOCK_MIN", 60, 0, 1440)
-# ★ v2.99.4: 15分→30分に延長 (受講生フィードバック: 同テーマで何度も入り直す問題)
 ETF_REENTRY_LOCKOUT_MIN: int  = _parse_int_env("ETF_REENTRY_LOCKOUT_MIN", 30, 0, 1440)
 
-# ★ v3.9.31: 決済発注の連続失敗 N 回で sync_positions 強制 → 実態確認 (無限リトライ防止)
 # 5/21 利用者T事例: ショートカバーが 11 分間無限ループした構造バグへの対策。
 _CLOSE_FAIL_GIVEUP_LIMIT: int = 3
 
-# ★ v3.9.63: 決済時 moomoo が「Not enough positions」を返した = 建玉は既に決済済み
 # (二重決済レース / 既決済 pid)。失敗ではなく「解決済み」を表す内部 ret コード。
 # 5/25-6/1 ログで QQQ 20 件・SPY 12 件の「Not enough positions」ERROR を確認。
 _RET_ALREADY_CLOSED: int = -2
@@ -4538,7 +4072,6 @@ def _mark_etf_close(symbol: str) -> None:
         _etf_close_history[symbol] = datetime.datetime.now()
 
 
-# ── ★ v2.99.4: 決済 FAILED 時の新規エントリー一時停止 ─────────────────────────
 # place_close_all が False (全 position_id 失敗) を返した銘柄を _failed_close_lockout
 # に登録 → place_buy 冒頭でチェック → 新規 BUY スキップ (既存解消優先)。
 # 解除: ①place_close_all=True ②sync_positions で qty=0 確認 ③タイムアウト経過
@@ -4577,18 +4110,11 @@ def _is_failed_close_locked(symbol: str) -> tuple[bool, float]:
 # 見出しに含まれているか照合して妥当性検証 (Azenta 小型株の決算ミスを QQQ 影響
 # と誤判定するケース等への二重防御)。SPY のみマクロキーワード (Fed/CPI/金利等)
 # の例外処理あり。
-# ★ v3.9.193: ティッカーと社名を分けて持つ（配布前レビュー・認定サポーターの提案）。
-#   ティッカーは**原文で大文字の独立トークン**（`MU` `(MU)` `$MU`）にだけ当てる。小文字化した
-#   本文に単語境界で当てるだけでは、SMH の `on`（ON Semiconductor）が前置詞の on に、QQQ の
-#   `cost`（Costco）が「cost of living」に当たり、SMH の関門は依然ほぼ素通しだった。
-#   社名は小文字化した本文に単語境界つきで当てる。`meta`（Meta's earnings）と `arm`
-#   （Arm reports）は社名としても持つ。`kla corporation` `vertex pharmaceuticals`
-#   `nxp semiconductors` は、境界を入れると `kla corp` 等の前方一致が効かなくなるため足した。
 QQQ_MAJOR_TICKERS: set = {
     "aapl", "msft", "googl", "goog", "amzn", "meta", "nvda", "tsla", "avgo", "amd", "intc",
     "csco", "qcom", "amat", "lrcx", "klac", "mu", "mchp", "snps", "cdns", "intu", "adbe",
     "nflx", "cmcsa", "pep", "cost", "tmus", "sbux", "txn", "isrg", "regn", "vrtx", "gild",
-    "panw", "crwd", "abnb",
+    "panw", "crwd", "abnb", "asml", "adi", "mrvl",
 }
 QQQ_MAJOR_NAMES: set = {
     "apple", "microsoft", "google", "alphabet", "amazon", "meta platforms", "facebook",
@@ -4598,11 +4124,17 @@ QQQ_MAJOR_NAMES: set = {
     "t-mobile", "tmobile", "starbucks", "texas instruments", "intuitive surgical",
     "regeneron", "vertex pharma", "gilead", "palo alto networks", "crowdstrike", "airbnb",
     "kla corporation", "vertex pharmaceuticals",
+    # 配布前レビュー（Codex）: "on semiconductor" は "pressure on semiconductor manufacturing" のような
+    #   前置詞句にも当たる。QQQ は semiconductor をセクター語に持たないので、これを入れると誤通過になる。
+    #   社名は "onsemi" だけにする（SMH 側は semiconductor がセクター語なので従来どおりで影響なし）。
+    # 配布前レビュー（Gemini）: ティッカーは原文大文字・社名は小文字、という既存の分担に合わせ、
+    #   "asml" は ticker 側だけに置く（SMH 表も同じ形）。
+    "asml holding", "marvell", "onsemi",
 }
 # 配布前レビュー（Gemini/Codex 2周目）: 一般語と同じ綴りの社名は、原文で先頭が大文字のときだけ当てる
 #   （"Meta's earnings" "Arm reports" "Booking shares" は通り、"meta-analysis" "investment arm"
 #   "record bookings" は通らない）。ハイフン続き（meta-）は除外。
-QQQ_MAJOR_PROPER: set = {"Meta", "Booking"}
+QQQ_MAJOR_PROPER: set = {"Meta", "Booking", "Analog Devices", "ON Semiconductor", "On Semiconductor"}
 QQQ_MAJOR_COMPANIES: set = QQQ_MAJOR_TICKERS | QQQ_MAJOR_NAMES | {n.lower() for n in QQQ_MAJOR_PROPER}   # 互換
 
 SMH_MAJOR_TICKERS: set = {
@@ -4640,21 +4172,16 @@ SPY_MAJOR_COMPANIES: set = SPY_MAJOR_TICKERS | SPY_MAJOR_NAMES | {n.lower() for 
 
 # SPY 通過用マクロキーワード (これらが含まれれば SPY の影響を許可)
 _MACRO_KEYWORDS: set = {
-    # ★ v3.9.192: ISM の非製造業（サービス業）指数。認定サポーターの実測で、MACRO
-    #   ネガティブ5件が「ISM Non-Manufacturing Prices…」等で SPY 厳格モードに落ち、
-    #   victims が空になって既存ロングの決済にも届いていなかった（PAN 判断で追加・様子見）。
     "ism non-manufacturing",
     # ── FED / 金融政策 ──
     "fed", "fomc", "federal reserve", "interest rate", "rate cut", "rate hike",
     "powell", "yield curve",
-    # ★ v3.9.11 追加: FOMC 関連シノニム + dot plot
     "dot plot", "fomc minutes", "fed minutes", "rate decision",
     "basis points", "bps cut", "bps hike", "fed funds",
     "hawkish", "dovish", "tightening", "easing cycle",
 
     # ── インフレ指標 (CPI/PPI 系) ──
     "inflation", "cpi", "ppi",
-    # ★ v3.9.11 追加: CPI/PPI のシノニム (5/12 「Consumer prices surged 3.8%」
     # が _MACRO_KEYWORDS に該当せず SPY 発注を取り逃がした事例への対策)
     "consumer prices", "consumer price index", "core prices", "core inflation",
     "core cpi", "headline inflation", "headline cpi",
@@ -4663,7 +4190,6 @@ _MACRO_KEYWORDS: set = {
 
     # ── 雇用統計 ──
     "jobs report", "unemployment", "payroll",
-    # ★ v3.9.11 追加: 雇用統計シノニム
     "nonfarm payrolls", "nfp", "unemployment rate", "jobless claims",
     "initial claims", "weekly claims", "continuing claims",
     "labor market", "wage growth", "average hourly earnings",
@@ -4671,7 +4197,6 @@ _MACRO_KEYWORDS: set = {
 
     # ── 経済成長指標 ──
     "gdp",
-    # ★ v3.9.11 追加: 主要マクロ指標
     "retail sales", "ism manufacturing", "ism services", "ism index",
     "pmi", "manufacturing pmi", "services pmi",
     "consumer confidence", "consumer sentiment", "michigan sentiment",
@@ -4683,7 +4208,6 @@ _MACRO_KEYWORDS: set = {
     # ── 通商・地政学・財政 ──
     "tariff", "trade war", "treasury yield", "treasury yields",
     "recession", "stagflation",
-    # ★ v3.9.11 追加
     "soft landing", "hard landing", "debt ceiling", "fiscal cliff",
     "government shutdown", "credit rating",
 }
@@ -4696,17 +4220,6 @@ _ETF_MAJOR_MAP: Dict[str, set] = {
 }
 
 
-# ★ v3.9.193: 構成銘柄名の照合を単語境界つきにする。
-#   v3.9.192 まで `name in combined` の部分一致だったため、短いティッカーが英単語の
-#   中に当たっていた（`autoimmune` の mu / `marathons` の on / `faster` の ter /
-#   `Trading` の adi / `investment` の stm / `Artificial intelligence` の intel）。
-#   認定サポーターの観察ログ集計では、QQQ/SMH/SPY がガードを通過した 10,480 行の
-#   うち 1,276 行（12.2%・SMH は 43.8%）がこの誤一致だけで通っていた。
-#   ETF ごとに正規表現を1回だけ組み、以後は使い回す（毎回の組み立てを避ける）。
-#   マクロ語（_MACRO_KEYWORDS）も語頭境界つきにし、複数形・形容詞形の接尾辞
-#   （s / es / ary）だけを許す（`tariffs` `interest rates` `inflationary` を落とさず、
-#   `federal` の中の `fed` は拾わない）。従来 `"fed "`（末尾空白）だったため `Fed's` を
-#   取り逃していた。セクター語（_ETF_SECTOR_WORDS）は部分一致のまま。
 def _build_major_name_pattern(names: set) -> "re.Pattern":
     """構成銘柄名の集合から、単語境界つきの照合パターンを1つ組む。
 
@@ -4774,6 +4287,25 @@ def _build_macro_keyword_pattern(keywords: set) -> "re.Pattern":
 
 _MACRO_KEYWORD_PATTERN: "re.Pattern" = _build_macro_keyword_pattern(_MACRO_KEYWORDS)
 
+_ETF_MACRO_OBS_GROUPS: Dict[str, "re.Pattern"] = {
+    # 配布前レビュー（Gemini）: 不規則な複数形（currencies / gases / indexes / indices）は s? では拾えない。
+    "oil": re.compile(r"\b(oils?|crude|opec|brent|wti|gasoline|natural\s+gas(?:es)?"
+                      r"|energy\s+prices?|oil\s+prices?)\b", re.I),
+    "geo": re.compile(r"\b(geopolitical|geopolitics|middle\s+east|sanctions?|hormuz|straits?"
+                      r"|airstrikes?|missiles?)\b", re.I),
+    "fx":  re.compile(r"\b(currency|currencies|exchange\s+rates?|forex|yen"
+                      r"|dollar\s+(?:index|indexes|indices)|greenbacks?)\b", re.I),
+}
+
+
+def _etf_macro_obs_groups(texts: List[str]) -> str:
+    """観察用: 見出しに当たった「広げる候補」の語群名を返す（例 "oil|geo"）。判定には使わない。"""
+    try:
+        blob = " ".join(texts or [])
+        return "|".join(name for name, pat in _ETF_MACRO_OBS_GROUPS.items() if pat.search(blob))
+    except Exception:
+        return ""
+
 # ETF セクター語 (構成銘柄に加えて通過させるブロード語)
 _ETF_SECTOR_WORDS: Dict[str, set] = {
     "QQQ": {"qqq", "nasdaq", "nasdaq 100", "nasdaq composite",
@@ -4796,28 +4328,20 @@ def _validate_etf_impact(
 
     Azenta 等の小型株の決算ミスを QQQ への victims と誤判定するケースを防ぐ。
 
-    ★ v3.1.2 (方針C 二重防御): SPY のみ厳格化。SPY 通過には以下のいずれかが必須:
-      (1) マクロキーワード (Fed/CPI/金利/関税 等)
-      (2) SPY セクター語 (s&p 500/spy/broader market/stocks slide 等)
-    SPY_MAJOR_COMPANIES (構成銘柄名) の登場では通過させない。理由:
-      ・SPY構成銘柄は500社で広く、大型株名が1つ混入するだけで誤通過しやすい
-      ・大型株個別材料は QQQ 経路で十分カバーされる (SPY二重発注は不要)
-      ・小型株単独材料 (Herbalife 等) で SPY ショートが暴発する事故を防ぐ
     """
     if not etf_list:
         return etf_list
 
-    combined_raw = " ".join(headlines)      # ★ v3.9.193: ティッカーは原文の大文字トークンに当てる
+    combined_raw = " ".join(headlines)
     combined = combined_raw.lower()
     # 配布前レビュー（Gemini 2周目）: 全部大文字の見出しでは "ON" "MA" が前置詞・移動平均と
     # 区別できない。そういう見出しはティッカー/固有名の照合から外す（社名・セクター語は残す）。
     combined_cased = " ".join(h for h in headlines if not _is_all_caps_headline(h))
-    # ★ v3.9.193: マクロ語も語頭境界つき（接尾辞 s/es/ary のみ許容）
     has_macro = _MACRO_KEYWORD_PATTERN.search(combined) is not None
 
     validated: List[str] = []
     rejected: List[str] = []
-    rejected_reasons: Dict[str, str] = {}  # ★ v3.1.2: 除外理由の可視化
+    rejected_reasons: Dict[str, str] = {}
 
     for sym in etf_list:
         # ETF でない (個別株が直接指定されている) 場合はそのまま通す
@@ -4825,7 +4349,6 @@ def _validate_etf_impact(
             validated.append(sym)
             continue
 
-        # ★ v3.1.2: SPY は厳格化 — マクロキーワード or SPYセクター語のみ通過
         if sym == "SPY":
             spy_sectors = _ETF_SECTOR_WORDS.get("SPY", set())
             has_spy_kw  = any(w in combined for w in spy_sectors)
@@ -4841,7 +4364,6 @@ def _validate_etf_impact(
             continue
 
         # SPY 以外 (QQQ / SMH) は従来通り: 主要構成銘柄 / セクター語のいずれか
-        # ★ v3.9.193: 構成銘柄名だけ単語境界つきの照合にする（セクター語は部分一致のまま）
         _pats = _ETF_MAJOR_PATTERNS.get(sym)
         sectors = _ETF_SECTOR_WORDS.get(sym, set())
         _major_hit = None
@@ -4851,7 +4373,6 @@ def _validate_etf_impact(
         _sector_hit = next((w for w in sectors if w in combined), None)
         if _major_hit is not None or _sector_hit is not None:
             validated.append(sym)
-            # ★ v3.9.193: 何で通ったかを debug に残す（除外側は従来どおり info）
             log.debug(
                 f"[ETF影響ガード] {list_label} の {sym} を通過: "
                 + (f"構成銘柄名 {_major_hit.group(0)!r}" if _major_hit is not None
@@ -4862,8 +4383,6 @@ def _validate_etf_impact(
             rejected_reasons[sym] = "主要構成銘柄/セクター語が記事に登場しないため"
 
     if rejected:
-        # ★ v3.1.2: 除外理由を ETF 別にロギング (Herbalife系の再発時に即特定可能)
-        # ★ v3.8.5: 正常な filter 動作のため WARNING → INFO に降格 (受講生混乱を回避)
         for _sym in rejected:
             log.info(
                 f"[ETF影響ガード] {list_label} から {_sym} を除外: "
@@ -4881,9 +4400,8 @@ _LAST_PRICE_MAX_AGE_SEC = 300   # 記録価格を「判定時価格」に使っ�
 
 
 def _last_recorded_price(symbol: str) -> float:
-    """★ v3.9.193: 監視ループが約60秒ごとに記録している価格の最新値（無ければ 0.0）。
-    観察ログの「判定時価格」に使い、記録のためだけに同期の気配取得をしない。
-    配布前レビュー: 5分より古い値（監視が止まっていた・起動時の埋め戻し）は使わない。"""
+    """
+    """
     try:
         _h = _INDEX_PRICE_HISTORY.get(symbol) or []
         if not _h:
@@ -4896,9 +4414,19 @@ def _last_recorded_price(symbol: str) -> float:
         return 0.0
 
 
+def _clip_block_reason(base: str, suffix: str = "", limit: int = _BLOCK_REASON_MAX) -> str:
+    """
+    """
+    suffix = suffix or ""
+    if len(suffix) >= limit:
+        return suffix[:limit]
+    return base[:limit - len(suffix)] + suffix
+
+
 def _log_etf_guard_empty(*, category: str, score: int, confidence: float,
-                         texts: List[str], orig_etfs: List[str], reason: str) -> None:
-    """★ v3.9.193: ETF影響ガードで発注先が空になった回を観察ログに1行残す（結果は変えない）。
+                         texts: List[str], orig_etfs: List[str], reason: str,
+                         guard_texts: Optional[List[str]] = None) -> None:
+    """
 
     SPY 厳格モードで victims が空になった回は、`_log_observation` より手前で return して
     いたため 22,235 行のどこにも無く、「語を1つ足すと何件回復するか」を実データで
@@ -4908,17 +4436,21 @@ def _log_etf_guard_empty(*, category: str, score: int, confidence: float,
         _sym = _CATEGORY_SYM_MAP.get(category, _macro_sym)
         _why = (f"ETF影響ガードで除外 (元AI指定 {','.join(orig_etfs)})" if orig_etfs
                 else "AI の指定が元から空")
+        _groups = (_etf_macro_obs_groups(guard_texts if guard_texts is not None else texts)
+                   if any(str(e).upper() == "SPY" for e in (orig_etfs or [])) else "")
         _log_observation(
             symbol=_sym, side=("BUY" if score == 1 else "SELL_SHORT"),
             confidence=confidence, score=score, category=category, headlines=texts,
             beneficiaries=(list(orig_etfs) if score == 1 else []),
             victims=(list(orig_etfs) if score == -1 else []),
             outcome="blocked", block_stage="etf_guard_empty",
-            block_reason=f"{_why}  reason={reason}"[:300],
+            block_reason=_clip_block_reason(f"{_why}  reason={reason}",
+                                            (f"  macro_obs={_groups}" if _groups else "")),
             price_at_decision=_last_recorded_price(_sym), skip_quote=True,
         )
-    except Exception:
-        pass
+    except Exception as _e:
+        # 配布前レビュー（Gemini）: 無音で観察が欠けると「語を広げたら何件戻るか」が数えられない。
+        log.debug(f"[観察ログ] etf_guard_empty の記録に失敗: {_e}")
 
 
 # ── ニュースソース表示ヘルパー（v2.99）────────────────────────────────────────
@@ -4937,13 +4469,9 @@ def _format_news_source(article) -> str:
 # 内部比率 (変更不要): MAX=100%、MIN=40% [v2.71]、下限 MIN=$500/MAX=$1,000。
 _BUDGET_USD_RAW  = os.environ.get("BUDGET_USD", "")
 _BUDGET_USD: float
-# ★ v3.9.105 (H5): 値が「書いてあるのに不正」な場合は起動拒否に変更。
-#   従来は $50,000 フォールバックだったため、BUDGET_USD=5,000（カンマ入り）等の
-#   記載ミスで意図の数倍の予算で発注され得た。資金額は黙って既定値に倒さない。
-#   未設定（空欄）のみ従来どおり既定 $50,000。
 try:
     _BUDGET_USD = float(_BUDGET_USD_RAW) if _BUDGET_USD_RAW.strip() else 50_000.0
-    if not math.isfinite(_BUDGET_USD) or _BUDGET_USD <= 0:   # ★ v3.9.193: inf/nan も止める
+    if not math.isfinite(_BUDGET_USD) or _BUDGET_USD <= 0:
         raise ValueError("BUDGET_USD は正の数を指定してください")
 except ValueError:
     print(f"[ERROR] BUDGET_USD の値が無効です（{_BUDGET_USD_RAW!r}）。")
@@ -4963,13 +4491,8 @@ STOCK_MAX_USD: float = _BUDGET_USD * _STOCK_MAX_PCT if _STOCK_MAX_PCT > 0 else 0
 # ── 損切りライン（MAX_LOSS_PCT）─────────────────────────────────────────────
 # setup_wizard.py の STEP3 で設定した「ポジションの何%損したら撤退するか」。
 # .env の MAX_LOSS_PCT を読み込む（例: 0.3 → 0.3%）。未設定時はデフォルト 0.3%。
-# ★ v3.9.46: デフォルトを 0.50% → 0.30% に引き下げ (TRAIL とセットで損益非対称性
 # を 5:1 → 2:1 に改善・損益分岐 WR 67% を目標)。
 _MAX_LOSS_PCT_RAW = os.environ.get("MAX_LOSS_PCT", "").strip()
-# ★ v3.9.105 (H5): 損切り幅も「書いてあるのに不正」なら起動拒否。
-#   併せて旧小数表記（例: 0.003 = 0.3% のつもり）を検出する。表記は「1=1%」なので
-#   0.003 と書くと 0.003% と解釈され即損切り連発になる。0 < 値 < 0.05 は旧表記の
-#   可能性が極めて高い（_pct_frac の新旧判別境界と同じ 0.05）ため推測変換せず停止する。
 try:
     if _MAX_LOSS_PCT_RAW:
         _mlp_val = float(_MAX_LOSS_PCT_RAW)
@@ -4980,7 +4503,7 @@ try:
             sys.exit(1)
         MAX_LOSS_PCT = _mlp_val / 100
     else:
-        MAX_LOSS_PCT = 0.003  # ★ v3.9.46: 未設定時デフォルト 0.3% (旧 0.5%)
+        MAX_LOSS_PCT = 0.003
     if not (0 < MAX_LOSS_PCT <= 1.0):
         raise ValueError
 except ValueError:
@@ -4989,7 +4512,6 @@ except ValueError:
     print("        安全のため起動を中止します。.env を修正して再起動してください。")
     sys.exit(1)
 
-# ── ★ v3.9.32: 高ボラ銘柄の損切り幅拡大 + ポジションサイズ縮小 ────────────────
 # 5/21 NVDA 利用者I -$41.80 事例: NVDA $223 の 0.5% = $1.12 は日中ノイズ範囲で、
 # 損切りが誤発動していた。高ボラ銘柄は損切り幅を拡げる必要があるが、幅を拡げる
 # だけだと 1 トレードあたりの損失額が増える。そこで「損切り幅 × N 倍」と同時に
@@ -5003,7 +4525,6 @@ except ValueError:
 _HIGHVOL_SYMBOLS: set = {
     "NVDA", "TSLA", "AMD", "MU", "AVGO", "SMH", "MRVL", "ARM",
     "SMCI", "COIN", "MSTR", "PLTR", "SOXX",
-    # ★ v3.9.53: SOXL (Direxion Daily Semiconductor Bull 3X) は moomoo JP の
     # 信用取引（特定口座）で取り扱い対象外のため削除。受講生から指摘。
     # SOXS (3x bear) は元々リスト未掲載。SOXX (1x iShares Semi) は通常 ETF
     # として継続。3x レバETF は基本的に信用取引対象外。
@@ -5016,18 +4537,8 @@ try:
 except ValueError:
     STOCK_HIGHVOL_LOSS_MULT = 2.5
 
-# ── ★ v3.9.114: モメンタムETFのボラ別 損切り幅倍率（プロファイル×銘柄）──────────
 # 20日シャドーの変動幅（SMHは60分変動が最大・DRAMは5分バーストが最大）に基づく。
 # 損切り幅 = 基準(MOMENTUM_STOP_LOSS_PCT 等) × 倍率。
-# ★ v3.9.123 (PAN方針 7/21): モメンタム実発注は「幅のみ拡大・サイズは縮小しない」。
-#   高ボラ銘柄ほど手数料に勝ちやすくエッジの主力（SMH SHORT）のため、サイズを削らない。
-#   1トレード損失の総量は日次/週次サーキットブレーカーで管理する。
-#   ※ ニュース系（qty自動計算）の place_buy/short 内 ÷_symbol_loss_mult は従来どおり維持。
-#   ★ v3.9.152 訂正: この倍率がモメンタム実発注の損切りに効くという記述が方針文書・
-#     Wizard に残っていたが、実装ではモメンタム実発注は MOMENTUM_STOP_LOSS_PCT
-#     （全銘柄共通）のみで動作しており、倍率はシャドー計測・ニュース系にしか
-#     効いていない（認定サポーターNの指摘・シートの実発火分布でも確認済み）。
-#     実発注への適用可否は 46-47 列（仮想損切り 狭/広）の計測結果で判断する。
 _MOMENTUM_STOP_MULT = {
     "narrow":   {"SMH": 2.0, "QQQ": 1.4, "SPY": 1.0, "DRAM": 1.4, "IWM": 0.7},
     "standard": {"SMH": 3.0, "QQQ": 2.0, "SPY": 1.3, "DRAM": 2.0, "IWM": 1.0},
@@ -5039,9 +4550,8 @@ if _STOP_PROFILE not in ("narrow", "standard", "wide", "flat"):
 
 
 def _symbol_loss_mult(symbol: str) -> float:
-    """★ v3.9.32/114: 銘柄の損切り幅倍率を返す。
-    優先順位: ①.env個別上書き MOMENTUM_STOP_MULT_<SYM> → ②profile=flatなら全銘柄1.0 →
-    ③ボラ別プロファイル表（SMH/QQQ/SPY/DRAM/IWM）→ ④その他の高ボラ株は STOCK_HIGHVOL_LOSS_MULT → ⑤1.0。"""
+    """
+    """
     sym = (symbol or "").upper()
     _ov = os.environ.get(f"MOMENTUM_STOP_MULT_{sym}", "").strip()
     if _ov:
@@ -5062,17 +4572,12 @@ def _symbol_loss_mult(symbol: str) -> float:
 
 
 def _effective_max_loss_pct(symbol: str, base_pct: float) -> float:
-    """★ v3.9.32: 銘柄別の実効損切り% を返す (高ボラ銘柄は base × 倍率)。"""
+    """"""
     return base_pct * _symbol_loss_mult(symbol)
 
-# ── ★ v3.9.35/v3.9.36: 取引不可セッション移行「前」の全決済 (CLOSE_BEFORE_INACTIVE) ──
 # 「発注しない設定」セッションや OVERNIGHT へ切り替わる CLOSE_BEFORE_INACTIVE_MIN 分前に
 # 保有ポジションを全決済する。true なら境界の N 分前に決済、false なら保持のまま。
 #
-# ★ v3.9.36: v3.9.35 の「移行を検知した時点」(=移行後) 決済を「移行 N 分前」決済へ変更。
-#   理由: 移行後に決済すると (1) 低流動性で不利な価格になる
-#         (2) OVERNIGHT 移行後はデモ口座が取引非対応で決済不能になる
-#   → まだ取引可能な現セッション内 (境界 N 分前) で決済する設計に修正。
 CLOSE_BEFORE_INACTIVE: bool = (
     os.environ.get("CLOSE_BEFORE_INACTIVE", "false").strip().lower() == "true"
 )
@@ -5085,7 +4590,6 @@ try:
 except ValueError:
     CLOSE_BEFORE_INACTIVE_MIN = 5
 
-# ── ★ v3.9.136: 夜間持ち越し（OVN）─ 隠し機能 ────────────────────────────────
 # 引け際に QQQ を買い、翌営業日の寄り付きで売る。日中のニュース売買とは別物で、
 # 昼のBotが動いていない時間だけを使う。
 #
@@ -5097,9 +4601,6 @@ except ValueError:
 #   OVN_VIX_LEVEL      loose / normal / strict（買う日の厳しさ）
 #   OVN_BUDGET_USD     1回に使う金額（必須）。Bot 本体の BUDGET_USD とは独立。
 #                      未設定・0 以下なら「金額未設定」として買わない。
-#                      ★ v3.9.138: 旧仕様「0 なら1株」は直感に反するため廃止。
-#                      1株だけ試したい場合は 1株ぶんより少し多い金額を書く（例 800）。
-#   OVN_SKIP_LONG_HOLIDAY  連休の前は持ち越さない（既定 true）
 OVN_ENABLED: bool = (os.environ.get("OVN_ENABLED", "false").strip().lower() == "true")
 OVN_MODE: str = os.environ.get("OVN_MODE", "live").strip().lower()
 OVN_VIX_LEVEL: str = os.environ.get("OVN_VIX_LEVEL", "normal").strip().lower()
@@ -5109,23 +4610,12 @@ try:
 except ValueError:
     OVN_BUDGET_USD = 0.0
 OVN_SKIP_LONG_HOLIDAY: bool = (os.environ.get("OVN_SKIP_LONG_HOLIDAY", "true").strip().lower() == "true")
-# ★ v3.9.144: 週末（土日2日）の持ち越しを見送る任意設定（認定サポーターの提案）。
-#   既定 false ＝ 従来どおり週末も持ち越す（バックテスト・実口座検証済みの挙動）。
-#   Bot 本体の金曜15:45の週末前全決済とは独立した、OVN 側だけの設定。
 OVN_SKIP_WEEKEND: bool = (os.environ.get("OVN_SKIP_WEEKEND", "false").strip().lower() == "true")
 OVN_SYMBOL: str = "QQQ"
 OVN_SMA_DAYS: int = 200
 OVN_ENTRY_ET = (15, 55)   # 引け際に判定して買う（まだ立会中なので普通に約定する）
 OVN_RESERVE_ET = (16, 5)  # 引け後に「翌寄りで売る」注文を置く（実口座のみ有効）
 OVN_EXIT_ET  = (9, 31)    # 翌寄り。予約が無い/効かなかった場合はここで売る
-# ★ v3.9.160: 状態の保存先を「本体スクリプトと同じフォルダ」から独立させる。
-#   認定サポーターの実機事故（OVN保有中の再起動で建玉が日中ロジックに吸収され、
-#   トレールで約5時間半早く決済）を再現テストで追い込んだ結果、症状が出る条件の
-#   最有力が「状態ファイルが読めない／見つからない」だった。本体の置き場所が
-#   変わる運用（版の更新でフォルダごと差し替える等）では、状態だけが旧フォルダに
-#   取り残されて建玉との紐づけが切れる。ホーム直下の固定フォルダへ移し、旧パスに
-#   ファイルがあれば自動で引き継ぐ（下の _ovn_migrate_legacy_dir）。
-#   環境変数 BOT_STATE_DIR で明示指定も可能。
 def _bot_state_dir() -> str:
     _d = (os.environ.get("BOT_STATE_DIR", "") or "").strip()
     if not _d:
@@ -5133,12 +4623,6 @@ def _bot_state_dir() -> str:
     try:
         os.makedirs(_d, exist_ok=True)
         # 書けるかを実地で確かめる（書けなければ従来どおり本体と同じ場所を使う）
-        # ★ v3.9.160b: 固定名だと REAL/DEMO 同時起動で互いの残骸を消し合い、
-        #   片方が誤って旧保存先へフォールバックする（Codex指摘）。PID固有名にする。
-        # ★ v3.9.163b: 検証すべきは「作れるか」ではなく、本番で使う
-        #   「一時ファイル作成 → os.replace で置換 → 後始末」が通るか
-        #   （Codexレビュー指摘——作成だけ通る保存先を採用すると、状態の保存が
-        #   毎回失敗して「記録が読めない」状態に落ちる）。
         _probe = os.path.join(_d, f".write_test.{os.getpid()}")
         _probe2 = _probe + ".tmp"
         try:
@@ -5146,8 +4630,6 @@ def _bot_state_dir() -> str:
                 _f.write("ok")
             os.replace(_probe2, _probe)   # 置換できなければ例外→フォールバック
         finally:
-            # ★ v3.9.163c: 成功・失敗どちらでも両方の候補を掃除する
-            #   （Codexレビュー指摘——残骸が毎起動たまり続ける）
             for _leftover in (_probe2, _probe):
                 try:
                     os.remove(_leftover)
@@ -5155,8 +4637,6 @@ def _bot_state_dir() -> str:
                     pass
         return _d
     except Exception as _e_dir:
-        # ★ v3.9.160c: 無言でフォールバックすると、古いスナップショットを正として
-        #   読む状態に気づけない（新規Claudeレビュアーの指摘）。必ず記録する。
         _fb = os.path.dirname(os.path.abspath(__file__))
         try:
             print(f"[起動] 状態の保存先 {_d} に書けないため {_fb} を使います: {_e_dir}", flush=True)
@@ -5166,20 +4646,15 @@ def _bot_state_dir() -> str:
 
 
 _OVN_LEGACY_DIR: str = os.path.dirname(os.path.abspath(__file__))
-_mig_attempted_this_process: bool = False   # ★ v3.9.162c: 引き継ぎは1プロセス1回
-# ★ v3.9.163: 旧フォルダに台帳が実在したのにコピーできなかった（新規Claudeレビュアーの
-#   指摘——この状態で「台帳が無い＝初回起動」と判定すると、口座の全建玉を Bot の建玉と
-#   して取り込む）。読み手（_ledger_load）が安全側へ倒すための印。
+_mig_attempted_this_process: bool = False
 _mig_ledger_failed: bool = False
 OVN_STATE_DIR: str = _bot_state_dir()
 OVN_STATE_FILE: str = os.path.join(OVN_STATE_DIR, "ovn_state.json")
 
 
 def _ovn_migrate_legacy_dir() -> None:
-    """★ v3.9.160: 旧パス（本体と同じフォルダ）の状態・台帳を新パスへ引き継ぐ。
+    """
 
-    ★ v3.9.161: 呼び出しは _ledger_load() の冒頭と main() の2箇所（冪等）。
-    どちらか片方が先に走っても、読み手より前に引き継ぎが完了することを保証する。
 
     新パスに既にファイルがあるときは触らない（新しい方が正）。移行は起動時に1回。
     失敗しても起動は止めない（旧パスの読み取りにフォールバックする経路は持たない
@@ -5187,29 +4662,18 @@ def _ovn_migrate_legacy_dir() -> None:
     """
     if os.path.abspath(OVN_STATE_DIR) == os.path.abspath(_OVN_LEGACY_DIR):
         return
-    # ★ v3.9.162/162b: 二度目以降の走査を省くための完了マーカー。
-    #   ★ 作業「前」に立てると、途中で落ちた場合にフラグだけ残って引き継ぎが
-    #   二度と走らず、新フォルダが空のまま「初回起動」判定になる（＝口座の全建玉を
-    #   取り込む事故の再現・新規Claudeレビュアーの指摘）。**完了後**に立てる。
-    #   並行起動の競合は、下の「移行先に既にあれば触らない」＋原子的置換で受ける。
     global _mig_attempted_this_process
     if _mig_attempted_this_process:
-        return   # ★ v3.9.162c: 1プロセス1回（警告と旧フォルダ走査の二重化を防ぐ）
+        return
     _mig_attempted_this_process = True
     _mig_flag = os.path.join(OVN_STATE_DIR, ".migrated_from_legacy")
     if os.path.exists(_mig_flag):
         return
     _mig_ok = True
-    _mig_saw_ledger = False   # ★ v3.9.163: 旧フォルダに台帳が実在したか
+    _mig_saw_ledger = False
     try:
         _names = sorted(os.listdir(_OVN_LEGACY_DIR))
     except Exception as _e_ls:
-        # ★ v3.9.163b: 列挙できないだけで「引き継ぐものが無い」と判断すると、
-        #   旧フォルダに台帳があっても新側が空のまま「初回起動」＝全建玉取り込みに
-        #   なる（Codexレビュー指摘）。既知のパスを直接確認して安全側へ倒す。
-        # ★ v3.9.163c: os.path.isfile は権限エラーでも False を返すため、
-        #   「本当に無い」と「確認できない」を区別できない（Codexレビュー指摘）。
-        #   os.stat を直接呼び、FileNotFoundError のときだけ「なし」と判断する。
         try:
             os.stat(os.path.join(_OVN_LEGACY_DIR, "bot_position_ledger.json"))
             globals()["_mig_ledger_failed"] = True    # 台帳が実在するのに運べない
@@ -5220,25 +4684,16 @@ def _ovn_migrate_legacy_dir() -> None:
         log.warning(f"[夜間持ち越し] 旧フォルダを読めません（続行）: {_mask_secrets(_e_ls)}")
         return
     for _name in _names:
-        # ★ v3.9.160b: 対象は状態本体だけ（.tmp / .migrated / 派生は運ばない）。
-        #   ファイル単位の try にして、1件の失敗で後続（REAL/DEMO の片方）が
-        #   移行されないのを防ぐ（Codex指摘）。
         if not (_name == "ovn_state.json"
                 or _name in ("ovn_state.REAL.json", "ovn_state.DEMO.json",
                              "bot_position_ledger.json")
                 or _name.startswith("bot_position_ledger.json.initialized")):
             continue
-        # ★ v3.9.165b: 印を付けた元ファイル自体を再び対象にしない（新規Claudeレビュアーの
-        #   指摘——起動のたびに .migrated_away が積み重なる）。
         if _name.endswith(".migrated_away"):
             continue
         _src = os.path.join(_OVN_LEGACY_DIR, _name)
         _dst = os.path.join(OVN_STATE_DIR, _name)
         _tmp = None
-        # ★ v3.9.165: os.path.isfile は「壊れた symlink」「stat できない ACL」でも
-        #   False を返し、引き継ぎ対象が無いものとして飛ばされる（認定サポーターの
-        #   指摘——continue は例外ではないので完了マーカーが立ち、原因を解消しても
-        #   二度と引き継がれない）。stat で「無い」と「読めない」を区別する。
         try:
             os.stat(_src)
             _src_exists, _src_unknown = True, False
@@ -5255,22 +4710,9 @@ def _ovn_migrate_legacy_dir() -> None:
         try:
             if not _src_exists or os.path.exists(_dst):
                 continue
-            # ★ v3.9.160b: 直接コピーだと、書いている途中を他プロセスが読んで
-            #   壊れたJSONを掴む（＝状態不明＝まさに事故の入口）。一時ファイルへ
-            #   コピーしてから原子的に置換する。
             _tmp = _dst + f".mig.{os.getpid()}"
             shutil.copy2(_src, _tmp)
             os.replace(_tmp, _dst)
-            # ★ v3.9.165: 移行元に印を付ける（認定サポーターの指摘——保存先が
-            #   書けなくなる／BOT_STATE_DIR を変える等で本体フォルダへ戻ったとき、
-            #   移行時点の古いスナップショットが「現在の状態」として復元され、
-            #   口座の建玉数がそのまま売却対象になる）。印のある元ファイルは
-            #   読み込み対象から外す。
-            # ★ v3.9.165b: ただし「台帳を作った目印」は **絶対に動かさない**
-            #   （新規Claudeレビュアーの指摘）。目印まで消すと、保存先が本体フォルダへ
-            #   戻ったとき「台帳も目印も無い＝初回起動」と判定され、口座の全建玉を
-            #   Bot の建玉として取り込む——何度も潰してきた事故そのものになる。
-            #   目印だけ残っていれば「初回ではない」と分かり、取り込みを避けられる。
             if not _name.startswith("bot_position_ledger.json.initialized"):
                 try:
                     os.replace(_src, _src + ".migrated_away")
@@ -5280,7 +4722,7 @@ def _ovn_migrate_legacy_dir() -> None:
                         f"（保存先が戻ると古い状態を読む恐れ）: {_mask_secrets(_e_mk2)}")
             log.info(f"[夜間持ち越し] 旧フォルダの状態ファイルを引き継ぎました: {_name}")
         except Exception as _e_mig:
-            _mig_ok = False   # ★ v3.9.162b: 1件でも失敗したら完了マーカーを立てない
+            _mig_ok = False
             log.warning(f"[夜間持ち越し] {_name} の引き継ぎに失敗（続行）: {_mask_secrets(_e_mig)}")
             try:
                 if _tmp and os.path.exists(_tmp):   # ★ 未束縛参照の防止
@@ -5293,7 +4735,6 @@ def _ovn_migrate_legacy_dir() -> None:
             with open(_mig_flag, "w", encoding="utf-8") as _f_flag:
                 _f_flag.write(datetime.datetime.now().isoformat(timespec="seconds"))
         except Exception as _e_flag:
-            # ★ v3.9.162b: 無音だと「毎起動で引き継ぎを試している」ことに気づけない
             log.warning(
                 f"[夜間持ち越し] 引き継ぎ完了の記録を残せません（毎起動で再確認します）:"
                 f" {_mask_secrets(_e_flag)}"
@@ -5304,24 +4745,15 @@ def _ovn_migrate_legacy_dir() -> None:
 #   「プロセス起動からの経過秒」になり、0.0 との差分だと起動直後の約30秒間
 #   （まさに吸収事故が起きる窓）はキャッシュが更新されない。None=未取得で管理する。
 _ovn_file_owns_cache = {"t": None, "v": False}
-_ovn_owns_lock = threading.Lock()   # ★ v3.9.159b: 破れ読み（tだけ新しくvが古い）防止
+_ovn_owns_lock = threading.Lock()
 
 
 def _ovn_owns_now() -> bool:
-    """★ v3.9.159: OVN の所有権を「メモリのフラグ」と「永続状態ファイル」の
-    二重ソースで判定し、ファイル側が所有しているのにフラグが落ちていれば
-    自己修復する（認定サポーターの実機報告——再起動後に何らかの理由で
-    フラグが復元されず、OVN 建玉が台帳へ吸収されて日中ロジックのトレールで
-    早期決済された。フラグ1本に依存しない防御に変える）。
-    ファイル読取は30秒キャッシュ（リスク監視の周期から呼ばれるため）。
+    """
     """
     ts = state.get(OVN_SYMBOL)
     if getattr(ts, "ovn_held", False):
         return True
-    # ★ v3.9.159c: ファイル読取はロックの外で行う（Codex指摘——旧形式からの移行では
-    #   _ovn_load → _ovn_save → キャッシュ無効化 が同じロックを再取得してデッドロック
-    #   していた）。ロックはキャッシュの t/v を対で読む・書くときだけ持つ。
-    #   競合時に読取が重複しても、小さなJSONの再読で害はない。
     with _ovn_owns_lock:
         _nowm = time.monotonic()
         _need_refresh = (_ovn_file_owns_cache["t"] is None
@@ -5335,9 +4767,6 @@ def _ovn_owns_now() -> bool:
                 _ovn_file_owns_cache["t"] = time.monotonic()
             _v_cached = _v_new
         except Exception as _e_own:
-            # ★ v3.9.159b: 読取失敗を「非保有」として30秒キャッシュすると、
-            #   まさに事故の起きる起動直後の窓で誤答を固定する（レビュー指摘）。
-            #   今回は False を返すが、次の呼び出しで必ず再試行する。無音にしない。
             log.warning(f"[夜間持ち越し] 所有権の永続状態を読めません（再試行します）: {_mask_secrets(_e_own)}")
             with _ovn_owns_lock:
                 _ovn_file_owns_cache["v"] = False
@@ -5356,7 +4785,7 @@ _ovn_unknown_guard = {"active": False, "noted": False, "since": None}
 
 
 def _ovn_state_readable() -> bool:
-    """★ v3.9.160: OVN の状態ファイルが「この環境の状態として読める」か。
+    """
 
     ファイル不在・破損・環境タグ違いはすべて False（＝状態不明）。
     所有権の判定（保有フェーズか）とは別の問い——「そもそも判断材料があるか」。
@@ -5374,7 +4803,7 @@ def _ovn_state_readable() -> bool:
 
 
 def _ovn_unknown_state_guard(symbol: str) -> bool:
-    """★ v3.9.160: 状態が読めないときに OVN 建玉を日中ロジックから守る安全網。
+    """
 
     認定サポーターの事故（OVN保有中の再起動で建玉が吸収され、トレールで
     約5時間半早く決済）を再現テストで追い込んだところ、「状態ファイルが
@@ -5397,8 +4826,6 @@ def _ovn_unknown_state_guard(symbol: str) -> bool:
         if state.get(symbol).position_qty == 0:
             return False   # 建玉が無ければ守る対象がない
         if _ovn_state_readable():
-            # ★ v3.9.160b: 復旧したら保護を解除し、通知も再武装する（Codex指摘——
-            #   noted が立ちっぱなしだと2度目の障害が無通知になる）。
             if _ovn_unknown_guard.get("active") or _ovn_unknown_guard.get("noted"):
                 log.info("[夜間持ち越し] 記録が読めるようになったため、建玉の保護を解除しました")
             _ovn_unknown_guard.update({"active": False, "noted": False, "since": None})
@@ -5428,23 +4855,17 @@ def _ovn_unknown_state_guard(symbol: str) -> bool:
 def _is_other_owner(symbol: str) -> bool:
     """日中のニュース売買が手を出してはいけない銘柄か。
 
-    ★ v3.9.136: 「Bot が建てていない建玉（externally_held）」に加えて、
-    「OVN が建てた建玉（ovn_held）」も日中ロジックから切り離す。同じ QQQ を
-    両方が扱うため、これが無いと日中の時間切れ決済が OVN の建玉を売ってしまう。
-    ★ v3.9.159: OVN はフラグ単独でなく永続状態との二重ソースで判定（自己修復つき）。
     """
     ts = state.get(symbol)
     if getattr(ts, "externally_held", False) or getattr(ts, "ovn_held", False):
         return True
     if symbol == OVN_SYMBOL:
-        # ★ v3.9.160: 二重ソース（フラグ＋状態ファイル）で判断できないときは、
-        #   口座の建玉と台帳から「触らない」側に倒す最後の砦を通す。
         return _ovn_owns_now() or _ovn_unknown_state_guard(symbol)
     return False
 
 
 def _ovn_acc_matches(st: dict) -> bool:
-    """★ v3.9.145: 状態に記録された口座IDが現在の口座と一致するか（A-10）。
+    """
 
     記録が無い旧状態は通す（引き継ぎ扱い）。有って食い違うときだけ拒否する。
     無条件必須にすると、この版に上げた時点で保有中の建玉が管理を失うため。
@@ -5456,16 +4877,13 @@ def _ovn_acc_matches(st: dict) -> bool:
     try:
         return int(saved) == int(REAL_ACC_ID)
     except (TypeError, ValueError):
-        # ★ v3.9.145: 記録が「有るのに判定できない」は拒否（Codexレビュー指摘）。
-        #   True に倒すと不正値が「記録なし」と同等に通ってしまう。
         return False
 
 
 def _ovn_state_owns_position(st: dict = None) -> bool:
     """永続状態上、OVN が QQQ 建玉を所有しているか。
 
-    ★ v3.9.159b: 読み込み済みの dict を渡せる（起動診断との二重読み・
-    表示と判定のスナップショット不一致を避ける）。"""
+    """
     if st is None:
         st = _ovn_load()
     if st.get("phase") not in ("BUY_INTENT", "BUY_PENDING", "HELD", "RESERVED", "HELD_NO_RESERVE"):
@@ -5473,14 +4891,9 @@ def _ovn_state_owns_position(st: dict = None) -> bool:
     # 保有後に機能を無効化／shadow化しても、決済完了までは所有権を放棄しない。
     # 環境タグの無い旧状態は REAL/DEMO を判別できないため所有権を復元しない。
     # 誤った口座の建玉を Bot 所有として売るより、安全側で管理対象外にする。
-    # ★ v3.9.145: 口座IDが記録されていて現在の口座と食い違う場合も復元しない（A-10）。
     return st.get("trade_env") == _RUN_TRADE_ENV and _ovn_acc_matches(st)
 
 
-# ── ★ v3.9.131: ハートビート監視（型B＝イベントループ凍結の検知） ───────────────
-#   独立OSスレッドで「最後の鼓動から N 分無音」を検知し、Discord＋端末に大声警告する。
-#   凍結中は asyncio が止まっても OS スレッドは動くため、「通知ゼロ(型B)」を破れる。
-#   安全のため通知のみ（自動再起動はしない＝実口座での再起動後ロック等の危険を避ける）。
 HEARTBEAT_WATCHDOG_ENABLED: bool = (
     os.environ.get("HEARTBEAT_WATCHDOG_ENABLED", "true").strip().lower() == "true"
 )
@@ -5502,12 +4915,10 @@ RISK_CHECK_SEC = 15
 
 # ── トレイリングストップ ──────────────────────────────────────────────────────
 # setup_wizard.py STEP4 で設定。
-# ★ v3.9.46: デフォルトを TRIGGER 1.0% → 0.30% / DROP 0.5% → 0.15% に引き下げ。
 # MAX_LOSS_PCT (0.30%) とセットで損益非対称性を改善:
 #   旧: 損 -0.50% / 利 最小 +0.50% (1.0 - 0.5) → 1:1 だが TRIGGER に到達せず timeout が大半
 #   新: 損 -0.30% / 利 最小 +0.15% (0.30 - 0.15) → 2:1 / 損益分岐 WR 67%
 # 「稀な大勝でカバー」型から「頻繁な小勝でコツコツ積上げ」型へシフト。
-# ★ v3.9.73: 入力は「1=1%」に統一 (例 TRAIL_TRIGGER_PCT=0.30 → 0.30%。旧 0.003 も後方互換)。
 TRAIL_TRIGGER_PCT = _pct_frac("TRAIL_TRIGGER_PCT", 0.003, 0.001, 0.5)
 TRAIL_DROP_PCT    = _pct_frac("TRAIL_DROP_PCT", 0.0015, 0.001, 0.5)
 
@@ -5527,8 +4938,6 @@ EXTERNAL_NEWS_POLL_SEC = 10    # Finnhub 取得間隔（秒）
 RSS_POLL_SEC           = 5     # RSS 並列取得間隔（秒）
 
 # ── 指値バッファ ──────────────────────────────────────────────────────────────
-# ★ v2.99.4: ETF/個別株でバッファ分離。LIMIT_BUFFER_PCT は全体デフォルト (後方互換)。
-# ★ v3.9.73: 入力は「1=1%」に統一 (例 0.30 → 0.30%。旧 0.003 も後方互換・_pct_frac)。
 # 未設定時: ETF=0.30%, STOCK=0.50% / 旧 LIMIT_BUFFER_PCT 単独指定環境は両者に継承。
 LIMIT_BUFFER_PCT = _pct_frac("LIMIT_BUFFER_PCT", 0.010, 0.001, 0.05)
 # 旧 LIMIT_BUFFER_PCT 単独設定があれば ETF/STOCK の既定として継承、無ければ各既定。
@@ -5539,7 +4948,7 @@ LIMIT_BUFFER_PCT_STOCK = _pct_frac(
     "LIMIT_BUFFER_PCT_STOCK", LIMIT_BUFFER_PCT if _buf_single_set else 0.005, 0.001, 0.05)
 
 def get_limit_buffer_pct(symbol: str) -> float:
-    """★ v2.99.4: シンボル種別に応じた指値バッファを返すヘルパー。
+    """
 
     TRIGGER_TICKERS (ETF) なら LIMIT_BUFFER_PCT_ETF、それ以外は LIMIT_BUFFER_PCT_STOCK。
     後方互換性: LIMIT_BUFFER_PCT 単独設定の旧環境では両方とも同じ値になる。
@@ -5557,17 +4966,11 @@ SESSION_RTH        = "rth"
 SESSION_AFTERHOURS = "afterhours"
 SESSION_OVERNIGHT  = "overnight"
 SESSION_WEEKEND    = "weekend"
-SESSION_HOLIDAY    = "holiday"      # ★ v2.87 追加: NYSE 完全休場日
-# ★ v3.9.149: 「週末決済を実行し、停止に入った」状態。実セッション名ではなく
-#   prev_session にだけ入る内部の値（"demo_closed" と同じ位置づけ）。
+SESSION_HOLIDAY    = "holiday"
 SESSION_WEEKEND_CLOSED = "weekend_closed"
 
 # ── Ctrl+C 停止メッセージ ────────────────────────────────────────────────────
 # asyncio.run() がCtrl+Cを処理する前にSIGINTをキャッチして確実に表示する。
-# ★ v3.9.38: 旧実装は停止メッセージ表示後に SIG_DFL へ戻して os.kill しており、
-#   プロセスが即座に kill されて main() の finally (トレード集計の端末表示 +
-#   Discord 送信) が一切実行されなかった。KeyboardInterrupt を送出する方式に
-#   変更し、asyncio のタスクキャンセル経由で finally を確実に走らせる。
 _stop_message_shown = False
 
 def _sigint_handler(sig, frame):
@@ -5599,7 +5002,6 @@ def _sigint_handler(sig, frame):
 signal.signal(signal.SIGINT, _sigint_handler)
 
 _ET           = ZoneInfo("America/New_York")
-# ★ v3.9.7 hotfix: クレジット切れ警告で参照されていた JST が module-level に
 # 未定義だったため、Ank 環境の RSS 高速ニュースループ等で NameError を発生
 # させていた。Asia/Tokyo の ZoneInfo を一度だけ作成して共有する。
 JST           = ZoneInfo("Asia/Tokyo")
@@ -5612,10 +5014,8 @@ _OVERNIGHT_START = datetime.time(20, 0)
 # 金曜 15:45 ET（通常市場クローズ15分前）に全ポジションを強制決済する。
 # この時刻以降は新規発注も停止し、月曜プリマーケット開始まで待機する
 # （プリマーケットが「発注しない」設定なら月曜 09:30 ET まで）。
-# ★ v3.9.149: 従来はこの停止が約60秒で解除され、15:47 以降に発注が再開していた。
 _FRIDAY_CLOSE_TIME = datetime.time(15, 45)
 
-# ── ★ v3.9.10: 終盤エントリーブロック設定 ────────────────────────────────────
 # 5/12 ログ分析で、デモ日次決済 (15:45 ET) の直前 1 分間に 22 件の新規 BUY が
 # 集中し、買った数秒〜数分後に強制決済で全件損切り (-$74.27 / 勝率 4.5%) という
 # 構造的バグを検出。close_trigger_time の N 分前以降は新規エントリーを禁止する。
@@ -5624,7 +5024,7 @@ ENTRY_BLOCK_BEFORE_CLOSE_MIN: int = 15   # 強制決済の何分前から新規�
 
 
 def _is_late_session_entry_blocked() -> tuple[bool, float]:
-    """★ v3.9.10: 強制決済発火時刻 (close_trigger_time) の N 分前以内なら True を返す。
+    """
 
     戻り値: (block_flag, mins_to_close)
       - block_flag: True なら新規エントリー禁止
@@ -5657,7 +5057,6 @@ def _is_late_session_entry_blocked() -> tuple[bool, float]:
 market_open_event: asyncio.Event = None  # type: ignore  → main() で初期化
 _main_loop: asyncio.AbstractEventLoop = None  # type: ignore  → main() で初期化
 
-# ── ★ v3.9.13: Anthropic API 並列呼出シリアライズ ────────────────────────────
 # 5/13 04:44 認定サポーター環境で観測: 異なるニュースループ (Alpaca + Yahoo) から
 # 並列に AI 呼出が同時発火 → サーバー側で 529 (Overloaded) を 2 連発した事例への対策。
 # semaphore で同時 1 接続のみ許可 + 最小間隔ガードで「サーバー側同時着弾」を排除。
@@ -5677,7 +5076,6 @@ def _parse_anthropic_min_interval() -> float:
         return 0.5
 ANTHROPIC_MIN_INTERVAL_SEC: float = _parse_anthropic_min_interval()
 
-# ── ★ v3.9.60: Anthropic API リトライ ─────────────────────────────────────────
 # 5/27 21:57 のログで「Error code: 529 - Overloaded」を受けて即「中立扱い」と
 # なり、発注機会を逃した事象を確認。一時的なサーバー過負荷 (529/503/
 # overloaded) は数秒待てば復旧することが多いため、指数バックオフで 3 回まで
@@ -5695,9 +5093,6 @@ def _anthropic_create_with_retry(client, max_retries: int = 3, **kwargs):
             return client.messages.create(**kwargs)
         except Exception as e:
             err_str = str(e).lower()
-            # ★ v3.9.77 (B-2): stop_sequences が Anthropic 400 で拒否された場合は、
-            #   stop_sequences を外して即リトライ（出力削減用の最適化なので無くても安全）。
-            #   Anthropic 側の stop_sequence 仕様変更に対して頑健にする。
             if (("stop_sequence" in err_str or "stop sequences" in err_str)
                     and kwargs.get("stop_sequences")):
                 log.warning(
@@ -5740,20 +5135,15 @@ def _threadsafe_discord(text: str) -> None:
         else:
             send_discord_message(text)
     except Exception as _e:
-        # ★ v3.9.63: 通知失敗が呼び出し元 (発注経路等) に伝播しないよう必ず握りつぶす
         log.debug(f"[スレッド] Discord 送信スキップ (例外): {_e}")
 
 def _threadsafe_future(coro):
     """スレッド安全なコルーチン実行。 同期関数からasyncio.ensure_futureの代わりに使用する。
 
-    ★ v3.9.63: ループ未起動/終了間際でも例外を発注経路へ伝播させない。
-    過去ログの「[ORDER] BUY 例外: There is no current event loop」「[セッション監視]
-    予期しないエラー: no current event loop」(旧版・worker thread からの asyncio 直叩き) の
-    再発防止。run_coroutine_threadsafe が万一 raise しても握りつぶし、coro は確実に close する。
     """
     try:
         if _main_loop and _main_loop.is_running():
-            return asyncio.run_coroutine_threadsafe(coro, _main_loop)   # ★ v3.9.159b: 成否を返す
+            return asyncio.run_coroutine_threadsafe(coro, _main_loop)
         log.warning("[スレッド] イベントループ未起動のためコルーチンをスキップ")
     except Exception as _e:
         log.warning(f"[スレッド] コルーチン投入に失敗 (スキップ): {_e}")
@@ -5765,7 +5155,6 @@ def _threadsafe_future(coro):
     return None
 
 
-# ── ★ v3.9.42: API キー / Webhook URL の非ASCII文字サニタイザ ────────────────
 # 5/18-22 のログで「AI 呼出が 3,924 件全失敗 / UnicodeEncodeError "ascii" codec
 # can't encode characters in position 108-125」を確認。原因は受講生の .env で
 # ANTHROPIC_API_KEY の末尾にスマートクォート ("" U+201C/201D) や全角スペース、
@@ -5816,47 +5205,17 @@ FINNHUB_API_KEY        = _sanitize_api_key(os.environ.get("FINNHUB_API_KEY", "")
 ALPACA_API_KEY_ID      = _sanitize_api_key(os.environ.get("ALPACA_API_KEY_ID", ""), "ALPACA_API_KEY_ID")        # Alpaca News WebSocket（任意）
 ALPACA_API_SECRET_KEY  = _sanitize_api_key(os.environ.get("ALPACA_API_SECRET_KEY", ""), "ALPACA_API_SECRET_KEY")  # Alpaca News WebSocket（任意）
 
-# ★ v3.9.31: Alpaca News の健全性追跡 (health_warning_loop が 5 分おきに参照)
 # 5/21 集計で Alpaca 認証/接続エラー 54 件。初回 ERROR 表示後は WARNING に埋もれ、
 # 受講生が「ニュースの半分が来ていない」状態に気づけなかった。
 _alpaca_news_health: Dict[str, Any] = {
     "last_success_at": None,   # 最後に正常認証/受信した時刻 (datetime)
     "auth_fail_count": 0,      # 連続認証失敗回数
     "last_error":      "",     # 直近エラーの概要
-    # ★ v3.9.189: セッション別に警告を間引くための last_warning_at を外した。
-    #   書き込むだけで**どこからも読んでいなかった**（認定サポーターの指摘）。
-    #   v3.9.51 当時は 20 分の無受信でも 🚨 が出ていたので間引く意味があったが、
-    #   v3.9.184〜186 で誤検知の側（接続の生死・60分のしきい値）を塞いだため、
-    #   いま 🚨 が出るのは本物の障害だけになった。本物を 5 分ごとに出し続けるのは
-    #   sync_positions・クレジット切れと同じ意図した動作なので、間引きは入れない。
-    #   認定サポーターの実測（プレ帯の最大空白 13〜22分・5日間で60分超ゼロ・
-    #   受信 300〜390件/日）が、間引きの実害が無いことの裏づけ。
-    # ★ v3.9.184: 接続が生きているか（認定サポーター2名の指摘）。
-    #   受信間隔だけで「接続不全」と断じていたため、**ニュースが静かなだけの
-    #   時間帯**を障害と誤判定していた（同じ夜に2環境で発生し、52秒/8秒で復帰。
-    #   3人目の環境では受信が続いており ERROR は出ていない＝受信状況の差）。
-    #   購読完了で立て、接続が切れたら倒す。切断・認証失敗が無いのに受信だけが
-    #   途切れている状態を、本物の障害と区別するために使う。
     "connected_at": None,
-    # ★ v3.9.184: 「受信なし・要確認」の間引き用（30分に1回）
     "last_quiet_warn_at": None,
-    # ★ v3.9.185: 再接続の回数（配布前レビュー指摘）。10秒周期で切断・再接続を
-    #   繰り返す本物のフラッピングでも、5分おきの見回りでは**たいてい接続済みに
-    #   見える**ため、「接続は継続中」と事実と違う文面が出続けていた。
     "reconnects": 0,
-    # ★ v3.9.186b: この接続の試行を始めた時刻（配布前レビュー指摘）。
-    #   接続そのものに失敗し続ける環境（ファイアウォール・DNS・TLS）は
-    #   認証にも到達しないので auth_fail_count が increment されず、
-    #   last_success_at も None のままになる。時刻の基準が無いと
-    #   「まだ1件も受信していない」と「1件も受信できない」を区別できず、
-    #   **配信が一度も来ない環境で 🚨 が永久に出なかった**。
     "started_at": None,
 }
-# ★ v3.9.185: 接続が生きていても、この分数を越えて1件も来なければ障害として扱う
-#   （配布前レビュー指摘）。購読権限が切れて配信が止まった場合、ソケットは開いた
-#   ままなので「接続は生きている」だけを根拠にすると 🚨 が二度と出ない。
-#   認定サポーター2名が誤検知を踏んだのは 20〜21分・復帰は8〜52秒だったので、
-#   60分なら誤検知を戻さずに番兵を復活できる。
 _ALPACA_STALE_ERROR_MIN = 60
 # 直近1時間にこの回数を越えて再接続していたらフラッピングとみなす
 _ALPACA_FLAP_RECONNECTS = 3
@@ -5869,11 +5228,6 @@ def _alpaca_health_verdict(health: dict, now=None) -> tuple:
 
     判定は "bad"（🚨 接続不全）/ "quiet"（受信なし・要確認）/ ""（正常）。
 
-    ★ v3.9.186: **見回りループの中に埋め込んでいた条件を、そのまま外に出した**
-      （動きは変えていない）。埋め込んだままだと時間の経過を作れないので、
-      検査がソースの文字列を見るだけになり、**判定そのものを一度も動かせて
-      いなかった**。v3.9.184 で番兵を弱めすぎた欠陥は、その形の検査を
-      すり抜けている（配布前レビューが指摘）。
 
     判定の考え方:
       ・認証が3回以上連続で失敗 → 本物の障害
@@ -5889,9 +5243,6 @@ def _alpaca_health_verdict(health: dict, now=None) -> tuple:
         復帰は8〜52秒。3人目の環境では同時刻に受信が続いていた）
     """
     _now = now or datetime.datetime.now()
-    # ★ v3.9.186b: 一度も受信していないときは「この接続を試み始めてから」を
-    #   基準にする（配布前レビュー指摘）。基準が無いと、接続に失敗し続ける
-    #   環境が永久に「正常」と判定される。
     _last_ok = health.get("last_success_at") or health.get("started_at")
     _stale_min = None
     if _last_ok is not None:
@@ -5980,9 +5331,6 @@ else:
 
 
 # ── ターミナルカラー出力ユーティリティ ───────────────────────────────────────────────────────
-# ★ v3.9.107: pythonw.exe / タスクスケジューラ等のコンソールなし実行では
-#   sys.stdout が None になり、import 時に AttributeError で即クラッシュしていた
-#   （受講生報告・無人運転環境）。None-safe にし、非TTY扱い（色なし）で継続する。
 try:
     _IS_TTY = bool(sys.stdout is not None and sys.stdout.isatty())
 except Exception:
@@ -6101,7 +5449,6 @@ def discord_pnl(pnl: float, pct: float = None, qty: int = None) -> str:
     qty_str = f"  {qty}株"    if qty is not None else ""
     return f"{icon} {label} {amt}{pct_str}{qty_str}"
 
-# ── ★ v3.9.19: 重大エラー時のアラート音 ─────────────────────────────────────
 # 6 つの致命的イベント発生時に OS 組み込み音源を再生して即座に気づけるようにする。
 # 対象イベント:
 #   ① Anthropic クレジット切れ検知   ② moomoo SDK 古すぎる (起動拒否)
@@ -6144,7 +5491,6 @@ def _is_alert_quiet_hours() -> bool:
         return False
 
 
-# ★ v3.9.119: 重大アラート6条件の日本語ラベル（Discord通知用）
 _ALERT_EVENT_LABELS = {
     "credit_exhausted":        "Anthropic API クレジット切れ検知（AI判定が全件失敗）",
     "moomoo_sdk_outdated":     "moomoo SDK が古すぎます（起動拒否）",
@@ -6155,20 +5501,14 @@ _ALERT_EVENT_LABELS = {
 }
 _alert_discord_last_sent: dict = {}   # {event_key: datetime} — Discord用クールダウン
 _ALERT_DISCORD_COOLDOWN_SEC = 600     # 同一イベントのDiscord再通知は10分に1回まで
-_ALERT_DISCORD_LOCK = threading.Lock()  # ★ v3.9.120: クールダウンの check-then-set を排他
+_ALERT_DISCORD_LOCK = threading.Lock()
 
 
 def _notify_alert_discord(event_key: str) -> None:
-    """★ v3.9.119: 重大アラートを Discord にも通知する。
-    アラート音の有効/無効・夜間ミュートとは独立（Webhook 設定時のみ・静かな通知）。
-    連発防止のため同一イベントは _ALERT_DISCORD_COOLDOWN_SEC に1回まで。
-    ★ v3.9.120: 送信は常に daemon スレッドで実行（メインループ不在時に同期送信へ
-    フォールバックして呼び出し元＝エラー処理経路をブロックする穴を塞ぐ）。
-    クールダウン判定もロックで排他（同時発火時の二重送信防止）。外部AIレビュー指摘。"""
+    """
+    """
     if not DISCORD_WEBHOOK_URL:
         return
-    # ★ v3.9.151: 表示に「JST」と付けるので、実体も JST にする（認定サポーターの指摘）。
-    #   従来はマシンのローカル時刻で、日本以外の環境では表示がずれていた。
     now = datetime.datetime.now(JST)
     with _ALERT_DISCORD_LOCK:
         last = _alert_discord_last_sent.get(event_key)
@@ -6194,12 +5534,9 @@ def _notify_alert_discord(event_key: str) -> None:
 
 def _play_alert_sound(event_key: str, notify_discord: bool = True) -> None:
     """重大イベント時にアラート音を再生する。 デフォルト無効 / クールダウン / 夜間ミュート対応。
-    ★ v3.9.119: 同じ条件で Discord 通知も送る（音設定と独立・上の _notify_alert_discord）。
-    ★ v3.9.151: notify_discord=False で音だけにできる（認定サポーターの指摘）。
-    401 認証エラーは専用の正しい文面を別途送っているのに、ここが event_key の
-    「クレジット切れ検知」ラベルでもう1通送り、実態と食い違う通知が届いていた。"""
+    """
     if notify_discord:
-        _notify_alert_discord(event_key)   # ★ v3.9.119: 音が無効でも Discord には通知
+        _notify_alert_discord(event_key)
     if not ENABLE_ALERT_SOUND:
         return
     if _is_alert_quiet_hours():
@@ -6245,8 +5582,6 @@ def _play_alert_sound(event_key: str, notify_discord: bool = True) -> None:
 _trade_locked: bool = False
 _trade_lock_at: Optional[datetime.datetime] = None    # ロックで発注が失敗した時刻
 _trade_lock_last_warned: Optional[datetime.datetime] = None
-# ★ v3.9.135: フル警告を出す最短間隔。定期的な鳴らし直しは廃止したので、
-#   これは「発注が連続してブロックされたときに鳴らしすぎない」ためだけに使う。
 _TRADE_LOCK_WARN_INTERVAL_SEC = 1800   # 30分
 # ロック中と記録している間、解除されたかを確かめる間隔（注文は出さない）。
 # moomoo の上限は 10回/30秒。10分おきなら十分に余裕がある。
@@ -6258,8 +5593,6 @@ _trade_lock_last_probe: Optional[datetime.datetime] = None
 def _clear_trade_lock(where: str = "") -> None:
     """発注が通った＝ロックは解けている。フラグを下ろす。
 
-    ★ v3.9.135: 従来は新規ロングの成功時にしか下ろしておらず、ショートや決済が
-    通っても警告が消えなかった。発注が成功する経路すべてから呼ぶ。
     """
     global _trade_locked, _trade_lock_at, _trade_lock_last_warned, _trade_lock_last_probe
     if _trade_locked:
@@ -6275,10 +5608,6 @@ def _probe_trade_unlocked(trd_env) -> Optional[bool]:
 
     戻り値: True=解除済み / False=ロック中 / None=判定できず
 
-    ★ v3.9.135: moomoo にはロック状態を照会する API が無い（公式ドキュメント
-    "No query API exists." / SDK の Trd_UnlockTrade 応答は空）。
-    ロック解除が要るのは「発注」と「注文の変更・取消」だけで、建玉照会などは
-    ロック中でも通るため、照会系では判定できない。
 
     そこで **存在しない注文IDの取消** を投げる。注文は一切出さない。
       ・ロック中        → unlock を促すエラーが返る（取消の手前で弾かれる）
@@ -6322,7 +5651,6 @@ def _probe_trade_unlocked(trd_env) -> Optional[bool]:
 def _lock_status_suffix() -> str:
     """[状況] 行に足す取引ロックの状態。ロックで失敗していなければ空文字。
 
-    ★ v3.9.135: 鳴らし続ける代わりに、ここで静かに状態を出す。
     """
     if not _trade_locked or _trade_lock_at is None:
         return ""
@@ -6332,11 +5660,6 @@ def _lock_status_suffix() -> str:
 def _warn_trade_locked(repeat: bool = False) -> None:
     """取引ロックで発注が失敗したことを知らせる。
 
-    ★ v3.9.135: 文面を実態に合わせた。
-      ・この Bot は OpenD とだけ通信する。moomoo アプリ側の操作では解除されない
-        ため、アプリの案内は誤解のもとだった（利用者指摘）。
-      ・Bot はロック状態を直接問い合わせられないため、安全な取消プローブまたは
-        次の発注成功で解除を確認する。
     """
     _at = _trade_lock_at.strftime("%H:%M") if _trade_lock_at else "直近"
     if repeat:
@@ -6346,7 +5669,6 @@ def _warn_trade_locked(repeat: bool = False) -> None:
             f"（Bot からは解除できたかを確認できません）"
         )
         return
-    # ★ v3.9.135: 同じロックで発注が連続ブロックされたときに鳴らし続けない
     global _trade_lock_last_warned
     _now_w = datetime.datetime.now()
     if (_trade_lock_last_warned is not None and
@@ -6354,7 +5676,7 @@ def _warn_trade_locked(repeat: bool = False) -> None:
         log.warning(f"  ⛔ [取引ロック] 発注がブロックされました（{_now_w:%H:%M}）")
         return
     _trade_lock_last_warned = _now_w
-    _play_alert_sound("trade_locked")  # ★ v3.9.19: アラート音
+    _play_alert_sound("trade_locked")
     lines = [
         "╔══════════════════════════════════════════════════════════╗",
         "║  ⛔  取引ロックのため発注できませんでした                 ║",
@@ -6389,7 +5711,6 @@ class _PlainFormatter(logging.Formatter):
         msg = super().format(record)
         return self._ANSI.sub("", msg)
 
-# ── ★ v3.8.7: 週次ログアーカイブ・ハンドラ (logbackup/ + 8週保持) ─────────
 # 毎週月曜 00:00 (システムローカル時刻、JST 想定) にログを logbackup/ へ
 # 以下のファイル名で移動し、新しい moomoo_trade_v1.log を開始する。
 #   moomoo_trade_v1.YYYY-MM-DD_to_YYYY-MM-DD.log
@@ -6400,12 +5721,9 @@ class _PlainFormatter(logging.Formatter):
 class WeeklyLogbackupHandler(TimedRotatingFileHandler):
     """毎週月曜 00:00 にログを logbackup/ へアーカイブする週次ローテーション。
 
-    ★ v3.9.43: アーカイブ形式を ZIP に変更 (圧縮率 約 90%・容量 1/10)。
-                .log → .zip の移行は起動時に 1 回だけ自動で実施する。
     """
 
     _LOG_HEADER_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
-    # ★ v3.9.43: 旧形式 .log と新形式 .zip の両方にマッチ (移行期間中・cleanup 用)
     _ARCHIVE_NAME_RE = re.compile(
         r"^(?P<stem>.+)\.(?P<start>\d{4}-\d{2}-\d{2})_to_(?P<end>\d{4}-\d{2}-\d{2})"
         r"(?P<sfx>_\d+)?(?P<ext>\.log|\.zip)$"
@@ -6427,18 +5745,16 @@ class WeeklyLogbackupHandler(TimedRotatingFileHandler):
             os.makedirs(self.archive_dir, exist_ok=True)
         except OSError:
             pass  # 作成失敗してもログ書き込みは継続
-        # ★ v3.9.43: 既存の旧形式 .log アーカイブを起動時 1 回だけ .zip に圧縮変換。
         # 失敗時は元 .log を残してログ書き込みは継続。log オブジェクト未初期化のため
         # 通知は print(stderr) を使う。
         self._migrate_existing_logs_to_zip()
         self._current_week_start = self._initial_week_start()
-        # ★ v3.8.8: 起動時 catch-up ローテーション (月曜 00:00 を跨いで停止していた
         # 場合に備えて起動時にも実行)。Bot が月曜 00:00 ちょうどに稼働している
         # 必要がなくなるため、v3.8.0 以降の WEEKEND 停止と共存できる。
         self._maybe_catch_up_rollover()
 
     def _migrate_existing_logs_to_zip(self) -> None:
-        """★ v3.9.43: 旧形式 .log アーカイブを .zip に一括変換 (起動時 1 回のみ)。
+        """
 
         logbackup/ 内に残る v3.9.42 以前の非圧縮 .log を見つけて、それぞれ
         個別の .zip に圧縮する。圧縮失敗時は元 .log を残し、ログ書き込みは継続。
@@ -6561,11 +5877,6 @@ class WeeklyLogbackupHandler(TimedRotatingFileHandler):
     def doRollover(self) -> None:
         """月曜 00:00 のローテーション: 現在ログを logbackup/ へ ZIP 圧縮して移動 + 古い分削除。
 
-        ★ v3.9.43: アーカイブ形式を .log → .zip に変更 (圧縮率 約 90%)。
-                     圧縮は ZIP_DEFLATED + 最大圧縮レベル 9。
-                     一時ファイル .zip.tmp に書き出してから rename することで
-                     クラッシュ耐性を確保。
-                     圧縮失敗時は非圧縮 .log への移動にフォールバック。
         """
         if self.stream:
             self.stream.close()
@@ -6577,7 +5888,6 @@ class WeeklyLogbackupHandler(TimedRotatingFileHandler):
         week_start = self._current_week_start
 
         stem, ext = os.path.splitext(os.path.basename(self.baseFilename))
-        # ★ v3.9.43: アーカイブ拡張子は .zip 固定 (元 ext は ZIP 内部のファイル名に使用)
         base_archive = f"{stem}.{week_start.isoformat()}_to_{week_end.isoformat()}"
         archive_name = f"{base_archive}.zip"
         archive_path = os.path.join(self.archive_dir, archive_name)
@@ -6675,7 +5985,6 @@ class WeeklyLogbackupHandler(TimedRotatingFileHandler):
                     pass
 
 
-# ── ★ v3.9.44: 機密情報マスキング・フィルタ ──────────────────────────────────
 # 5/18-22 の受講生環境ログで Alpaca API キー (PKAPZ...) と Secret (DDSnr3...) が
 # 平文記録されているのを確認した。原因は websockets ライブラリ (Alpaca News で
 # 使用) の DEBUG ログが root logger に流れていたこと。本フィルタは万一機密文字列が
@@ -6730,8 +6039,7 @@ class _SecretMaskingFilter(logging.Filter):
         return "***"
 
     def mask_text(self, text: str) -> str:
-        """★ v3.9.141: 任意の文字列にマスクを適用する（認定サポーターからの指摘）。
-        トレースバックや Discord 本文など、record.msg 以外にも掛けるために切り出した。
+        """
         """
         try:
             for secret in self._known_secrets:
@@ -6777,10 +6085,6 @@ class _SecretMaskingFilter(logging.Filter):
             if modified:
                 record.msg = msg
                 record.args = ()  # フォーマット済みなので args はクリア
-            # ★ v3.9.141: トレースバックにもマスクを掛ける（認定サポーターからの指摘）。
-            #   Formatter は record.msg の後ろに exc_info を連結するため、
-            #   従来は例外の中身（口座ID・パス・資格情報）が素通りしていた。
-            #   ここで exc_text を確定させて差し替え、Formatter に再生成させない。
             if record.exc_info:
                 import traceback as _tb
                 if not record.exc_text:
@@ -6796,17 +6100,12 @@ class _SecretMaskingFilter(logging.Filter):
 
 # ── ログ設定 ────────────────────────────────────────────────────────────────────
 _log_fmt = "%(asctime)s [%(levelname)s] %(message)s"
-_secret_filter = _SecretMaskingFilter()  # ★ v3.9.44: 両ハンドラで共有
+_secret_filter = _SecretMaskingFilter()
 _stream_handler = logging.StreamHandler(sys.stdout)
 _stream_handler.setFormatter(logging.Formatter(_log_fmt))
 _stream_handler.setLevel(logging.INFO)   # コンソール: INFO以上のみ（RAWログ・パターン詳細は非表示）
-_stream_handler.addFilter(_secret_filter)  # ★ v3.9.44: 機密マスキング
+_stream_handler.addFilter(_secret_filter)
 
-# ★ v3.9.191: コンソールへの書き込みを**別スレッドのキュー経由**にする
-#   （認定サポーターの実測: Windows コンソールの QuickEdit で標準出力が塞がれ、
-#   Bot が 8時間25分 無言で凍結した。py-spy で全スレッドが emit() の stdout 書き込み
-#   待ちだった）。logging のハンドラは順に呼ばれるので、コンソールが詰まると
-#   後ろのファイルにも届かず、ログが途中でぷつりと切れる形になっていた。
 #
 #   キューに積むだけなら logging 側は一切待たない。コンソールが詰まっても
 #   詰まるのは書き出しスレッドだけで、売買・監視・ファイルログは動き続ける。
@@ -6886,22 +6185,9 @@ def _console_listener_stop_at_exit() -> None:
 
 import atexit as _atexit
 _atexit.register(_console_listener_stop_at_exit)
-# ★ v3.8.7: 週次ログアーカイブ (logbackup/ + 8 週保持) に対応した FileHandler。
 # 旧版 (v3.8.6 以前) の logging.FileHandler はローテーションなしでログが
 # 無限肥大化していたため、WeeklyLogbackupHandler に置き換え。
-# ★ v3.9.178: テスト実行時はログの出力先も使い捨てへ（外部レビュー指摘）。
-#   本体ログは run_daily_data_collect が行単位で解析し、当日サマリと
-#   「エラーログ詳細」シートを作る。テストは意図的に異常系を通すので、
-#   本番ログに書くと**実在しない障害が当日のシートに載る**（1回の実行で
-#   30KB・ERROR 26行・WARNING 83行を追記していた）。除外タグにも入っていない。
-#   BOT_STATE_DIR は既にテスト隔離で使い捨てフォルダを指しているので、それに乗る。
 _LOG_DIR = os.environ.get("BOT_STATE_DIR", "").strip()
-# ★ v3.9.181: 書き手と読み手を1つの値から作る（認定サポーターの指摘）。
-#   v3.9.178 で書き手だけを BOT_STATE_DIR 配下へ移し、読み手5箇所を相対パスの
-#   ままにしていた。run_daily_data_collect は約定・確定損益・セッション別成績を
-#   すべてログ行から組み立てるため、この環境では「取引はしているのに日次サマリが
-#   空」「未送信日が検出されない」が**無症状で**起きる。
-#   既定（BOT_STATE_DIR 未設定）では従来と同じ相対パスになる。
 _LOG_PATH        = os.path.join(_LOG_DIR, "moomoo_trade_v1.log") if _LOG_DIR else "moomoo_trade_v1.log"
 _LOG_BACKUP_DIR  = os.path.join(_LOG_DIR, "logbackup") if _LOG_DIR else "logbackup"
 _file_handler = WeeklyLogbackupHandler(
@@ -6912,9 +6198,7 @@ _file_handler = WeeklyLogbackupHandler(
 )
 _file_handler.setFormatter(_PlainFormatter(_log_fmt))  # ファイルはANSIなし
 _file_handler.setLevel(logging.DEBUG)    # ファイル: DEBUG以上をすべて記録（RAWログ含む）
-_file_handler.addFilter(_secret_filter)   # ★ v3.9.44: 機密マスキング
-# ★ v3.9.191: **ファイルを先に**。コンソール側はキューなので詰まらないが、
-#   万一に備えて「記録が残る側」を先頭にする（読み手は run_daily_data_collect ほか）。
+_file_handler.addFilter(_secret_filter)
 logging.basicConfig(level=logging.DEBUG, handlers=[_file_handler, _console_qh])
 log = logging.getLogger(__name__)
 
@@ -6925,7 +6209,6 @@ log = logging.getLogger(__name__)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
 logging.getLogger("websocket").setLevel(logging.WARNING)        # websocket-client (旧)
-# ★ v3.9.44: websockets ライブラリ (Alpaca News で使用・モダンな async 版) は
 # DEBUG レベルで "> APCA-API-KEY-ID: ..." 等の送受信ペイロードを全件出力するため、
 # 受講生環境のログに Alpaca キー / Secret が平文で記録されていた。サブロガーも含めて
 # 一括で WARNING 以上に制限する。anthropic / httpx / httpcore も同様に抑制。
@@ -7010,8 +6293,6 @@ def _get_ai_error_fix(msg: str) -> str:
     """未知エラーに対してAnthropicのAIで対処法を生成する。 キャッシュヒット時はAPIを呼び出さない。 失敗した場合は空文字を返す（エラーは握りつぶす）。"""
     import datetime as _dt, json as _json, urllib.request as _ureq
 
-    # ★ v3.9.42: x-api-key ヘッダに非 ASCII 文字が混入すると urllib が
-    #   UnicodeEncodeError を出すため、サニタイズしてから使う。
     api_key = _sanitize_api_key(os.environ.get("ANTHROPIC_API_KEY", ""), "ANTHROPIC_API_KEY")
     if not api_key or "placeholder" in api_key.lower():
         return ""
@@ -7103,11 +6384,6 @@ _error_fix_handler = _ErrorFixHandler()
 _error_fix_handler.setLevel(logging.WARNING)
 logging.getLogger().addHandler(_error_fix_handler)
 
-# ★ v3.9.87 (B-1): エラーログ(GAS「エラーログ詳細」)に送らない"情報バナー/状態通知"の
-#   識別タグ。これらは端末では WARNING で表示するが、エラーではない（起動バナー・
-#   設定通知・定常的な移行決済・送信バックオフ等）。エラーシートに混入すると
-#   "エラー"件数を水増しし、本当のエラーが埋もれるため、日次サマリのエラー収集時に除外する。
-#   ※ 売買やデータ送信には一切影響しない（ログの選別のみ）。
 _ERROR_LOG_EXCLUDE_TAGS = (
     "[PCT単位]",            # 旧表記検出の起動時通知
     "[デモ空売り]",         # 起動バナー
@@ -7117,13 +6393,9 @@ _ERROR_LOG_EXCLUDE_TAGS = (
     "[移行前全決済]",       # セッション移行時の定常決済通知
     "[モメンタム監視整合]", # 実発注対象の定常リコンサイル通知
     "実発注モード有効",     # [モメンタム] ⚡ 実発注モード有効: ... の起動バナー
-    # ★ v3.9.174: 実際のログは大文字 [GAS_COOLDOWN]（:388）で、小文字の
-    #   タグは一度も一致していなかった（レビュー指摘・比較は大小文字を区別する）。
     "[GAS_COOLDOWN]",       # 送信側オートバックオフ(設計どおりの一時休止)
-    # ── ★ v3.9.92 (A-2): GAS送信失敗・再送退避（売買影響なし）はエラーではない ──
     "記録送信のみ失敗",     # OBSERVATION_TIMEOUT/ERR/EMPTYRESP・DATA_COLLECT_* 共通の語
     "[データ収集] 通信エラー",  # 送信タイムアウト（再送キューが処理・売買影響なし）
-    # ── ★ v3.9.92 (A-2): 正常なトレードイベント（決済・発注・CB）はエラーではない ──
     "強制損切り",           # 【X】⚠ 強制損切り！ … 通常の損切り発動
     "トレイリングストップ", # 【X】★ トレイリングストップ！ … 通常のトレール決済
     "建玉トレールストップ", # 建玉トレールによる通常決済
@@ -7134,17 +6406,8 @@ _ERROR_LOG_EXCLUDE_TAGS = (
     "1日損失上限",          # RiskLevel 到達の通知（設計どおりの停止）
     "デモ日次決済",         # デモ口座の引け決済（定常）
     "週末前強制決済",       # 金曜引けの定常決済
-    # ── ★ v3.9.104: 起動時のJP口座API不安定による良性の空応答（ブロックなし）──
-    #   「position_list_queryは空だが accinfo=$… → JP口座APIの既知の不安定さ」は
-    #   多数の受講生で毎起動発生し、エラーシートを水増ししていた（売買影響なし）。
-    #   ※ 他の[起動時復元]警告（accinfoエラー/position_id取得不能）は除外しない。
     "position_list_queryは空だが",
-    # ── ★ v3.9.132: 今週(8/3-8/7)の実データで漏れが判明した情報バナー ──────────
-    #   1,548件のエラーのうち 226件(15%)がこの2種で、本物のエラーが埋もれていた。
     "戦略プロファイル:",     # [モメンタム] 🎛 戦略プロファイル: 選抜プロファイル v1 …（起動バナー・165件）
-    # ★ v3.9.169: ニュース選抜の起動バナーも log.warning なので同様に除外する。
-    #   入れ忘れると毎起動「エラーログ詳細」に偽の1件が積まれ、さらに未知エラー
-    #   扱いで AI に対処法を問い合わせてコンソールに表示する（v3.9.132 の退行）。
     "ニュース選抜プロファイル",
     "実口座モードが有効",     # 実口座モードが有効です。5秒後に開始します…（起動バナー・61件）
     "3連敗到達",             # [モメンタム] ⚠ 3連敗到達 → サイズ縮小（設計どおりの自動調整）
@@ -7152,10 +6415,6 @@ _ERROR_LOG_EXCLUDE_TAGS = (
     "Bot 以外の建玉のため自動売買は停止中",  # 管理対象外建玉の定常ステータス表示
 )
 
-# ★ v3.9.132: 「再試行で回復した一時的エラー」は、最終的に失敗した時だけ記録する。
-#   Alpaca/Anthropic の再接続・再試行は設計どおりの動作で、途中経過を毎回エラー扱いすると
-#   件数が水増しされる（今週: Alpaca再接続395件・Anthropic再試行262件）。
-#   ※ 「再試行 N/M」の途中経過のみ除外し、最終失敗（再試行後も回復せず）は残す。
 _ERROR_LOG_TRANSIENT_TAGS = (
     "接続エラー・再接続待機",   # [Alpaca News] 接続エラー・再接続待機 (10秒): no close frame …
     "OverloadedError (再試行",  # [Anthropic API] OverloadedError (再試行 1/3) …
@@ -7165,15 +6424,8 @@ _ERROR_LOG_TRANSIENT_TAGS = (
 )
 
 
-# ── ★ v3.9.111: エラーの「売買影響」区分（利用者B要望B案・解析で真の要因を切り分ける）──
-#   execution_risk = 実売買に影響し得る（OpenD/建玉同期/購買力/貸株/発注・決済系）
-#   data_send_only = 記録・送信のみ（GAS/Sheets/観察送信・売買影響なし）
-#   warning_only   = それ以外の警告
 def _classify_error_impact(msg: str) -> str:
     m = str(msg or "")
-    # ★ v3.9.132: 設定内容の説明文（「実発注は SHORTのみ」等）が「発注」に反応して
-    #   execution_risk に誤分類されていた（今週の実データで178件）。売買に影響しない
-    #   起動バナー/設定通知は、キーワード判定より先に warning_only へ確定させる。
     _info = ("戦略プロファイル", "実口座モードが有効", "3連敗到達", "サイズを 50% に縮小",
              "実発注モード有効", "[モメンタム監視整合]", "[起動時検証]")
     if any(k in m for k in _info):
@@ -7248,7 +6500,7 @@ sys.stderr = _FilteredStream(sys.stderr)
 
 
 def _disable_console_quickedit() -> str:
-    """★ v3.9.191: 自分のコンソールの簡易編集モード（QuickEdit）を切る。
+    """
 
     Windows のコンソールは QuickEdit が有効だと、画面をクリック／ドラッグしただけで
     「選択」状態になり、**そのプロセスの標準出力への書き込みが止まる**。認定サポーターの
@@ -7294,7 +6546,7 @@ _mlf = _MoomooLogFilter()
 #    StreamHandler の stream を filtered 版に差し替える
 def _suppress_sdk_logs():
     """全ロガー・全ハンドラーを走査して moomoo SDK ログを完全抑制する。"""
-    _our = {_stream_handler, _file_handler, _console_qh}   # ★ v3.9.191: キュー側も自分のもの
+    _our = {_stream_handler, _file_handler, _console_qh}
     _orig_err = sys.__stderr__
     _orig_out = sys.__stdout__
 
@@ -7352,53 +6604,22 @@ class TickerState:
     entry_ai_category:  str    = ""              # AI判定カテゴリ（SEMI/TECH/MACRO）
     entry_news_source:  str    = ""              # ニュースソース（Alpaca/Finnhub/RSS等）
     entry_reason:       str    = ""              # AI判定理由（日本語）
-    # ★ v3.9.111: エントリー時モメンタム5分/15分%（モメンタム実発注時に記録・決済ログへ相乗り）
     entry_pct_5m:       object = field(default=None)
     entry_pct_15m:      object = field(default=None)
-    # ★ v3.9.133: risk_monitor_loop が実際に適用した損切り%（%単位・例 0.50）。
-    #   記録用に「後からグローバル値で再計算」すると実挙動とズレるため（モメンタムは
-    #   高ボラ倍率をスキップする＝v3.9.93 の仕様）、監視ループ側で確定した値をここへ保存し、
-    #   決済記録はこれをそのまま出す。None = 監視ループが一度も評価していない。
     enforced_stop_pct:  object = field(default=None)
-    # ★ v3.9.175: 出口条件を1組で保存する（認定サポーターの報告 → 設計見直し）。
-    #   v3.9.133 で損切りだけ「監視ループが決めた値を建玉に置き、決済記録はそれを
-    #   そのまま出す」形にしたが、タイムアウトとトレールには同じ器が無く、記録は
-    #   共通設定のままだった（実効60分に対し記録10分など）。
-    #   分岐（決算 > モメンタム > 通常／高ボラ倍率／夜間持ち越し）は「横の軸」、
-    #   項目（損切り・タイムアウト・トレール）は「縦の軸」で、v3.9.173 は横しか
-    #   見ていなかったため決算・夜間持ち越しで record と実挙動が10倍ずれた。
-    #   監視ループは3つを同じ場所で同時に決めているので、決めた時点で1組にする。
-    #   キー: stop_pct / stop_mode / timeout_min / trail_trigger_pct / trail_drop_pct / basis
-    #   None = 監視ループが一度も評価していない（＝記録側は「不明」を出す）。
     enforced_exit:      object = field(default=None)
-    # ★ v3.9.179: 直近に決済し終えた建玉の entry_time。時間切れ監視が「建玉が無い」と
-    #   気づいたときに、正常に決済できたのか注文が通らなかったのかを区別する。
-    #   **時刻の前後では判定できない**——決済→1秒→反転エントリーの経路では、
-    #   旧決済の約定確認（8〜17秒後）が新しい建玉より必ず後になるため、
-    #   新しい建玉を「決済済み」と誤判定してしまう（外部レビュー指摘）。
-    #   どの建玉を決済したかで照合する。
     last_closed_entry_time: object = field(default=None)
-    # ★ v3.9.134: Bot が建てた建玉ではない（＝台帳にこの銘柄が無い）ことを示すフラグ。
-    #   True の間はこの銘柄を「見るだけ・触らない」に切り替える:
-    #     ・自動決済を一切しない（時間切れ/損切り/トレール/パニック等すべて）
-    #     ・新規エントリーもしない（決済は銘柄単位の全決済なので混ぜられない）
-    #   建玉が口座から消えたら False に戻り、通常運転を再開する。
     externally_held:      bool   = False
-    # ★ v3.9.136: 夜間持ち越し(OVN)が建てた建玉。日中のニュース売買から切り離す。
-    #   同じ QQQ をニュース側も扱うため、これが無いと日中の時間切れ・損切りが
-    #   OVN の建玉を決済してしまう（建玉台帳だけでは両者を区別できない）。
     ovn_held:             bool   = False
     pending_close_reason: str  = ""              # 決済理由（place_close_allから保存）
     pending_entry_time:   object = field(default=None)  # 決済発注時にentry_timeを保存（TRADE_RESULTのhold_min用）
     pending_avg_cost:     float  = 0.0           # 決済発注時にavg_costを保存（sync_positionsによる上書き防止用）
     is_short:             bool   = False         # 意図的なショートポジション中フラグ（緊急買い戻し誤発動防止）
-    # ── ★ v2.98: position_id 対応 (JP 信用口座建玉ごとの個別決済用) ────────
     # moomoo SDK 10.4+ の place_order が受け付ける隠しパラメータ。
     # JP 信用は同銘柄 LONG/SHORT 共存可で決済時に position_id 指定必須。
     # sync_positions で取得した pid を方向別リストで保持。部分約定で複数pid可。
     # 構造: {"LONG": [{pid, qty, cost}, ..], "SHORT": [..]}  ※ qty は絶対値
     position_ids: dict = field(default_factory=lambda: {"LONG": [], "SHORT": []})
-    # ── ★ v2.95: GAS連携用の追加フィールド (Google Sheets への詳細送信) ─────
     entry_headlines:      list   = field(default_factory=list)  # ヘッドライン上位3件
     entry_beneficiaries:  list   = field(default_factory=list)  # AI beneficiaries
     entry_victims:        list   = field(default_factory=list)  # AI victims
@@ -7411,13 +6632,11 @@ class TickerState:
     # 5/13 22:49 SPY 事例: SHORT 発注後 2.7 秒で limit=$732.32 vs 現値$736.05 から
     # 誤った PnL=-$26 (-0.51%) を算出し強制損切り誤発動 → BUY_BACK で自己決済。
     entry_pending_fill:   bool   = False
-    # ── ★ v3.9.101: avg_cost が実約定単価で確定済みか（指値の仮設定でないか）─────
     # 発注直後は avg_cost = 指値(仮設定)。_check_order_filled で実約定単価に上書きした
     # 時点で True。sync_positions はこれが True の時のみ entry_pending_fill を解除する。
     # 未確定のまま解除すると建玉トレール/強制損切りが指値基準で誤発火する
     # （5/13 SPY・6/29 SMH 事例）。
     avg_cost_confirmed:   bool   = False
-    # ── ★ v3.9.31: 決済発注の連続失敗カウント (無限リトライ防止) ──────────
     # 5/21 利用者T事例: QQQ ショートカバーが moomoo に拒否され続け、
     # 時間切れ決済が 11 分間 60 秒ごとに無限リトライした。
     # N 回連続失敗で sync_positions を強制実行し、実態 qty=0 なら諦める。
@@ -7428,13 +6647,6 @@ class TickerState:
         self.trail_active = False
 
 
-# ★ v3.9.157b: 既読を二層に分ける（4レーンレビューの裁定）。
-#   ・正規化一致（数値を # に置換したキー）……従来どおり 60 分。ここを 180 分に
-#     すると「25bp→50bp」「$1B→$4B」のような数値だけ違う続報まで3時間落ちる
-#     （Codex指摘——数値正規化と長TTLの組み合わせが判断材料を潰す）。
-#   ・完全一致（同一文字列）……180 分・スライディング更新。5分おきに再配信され
-#     続ける同一見出しが「ちょうど60分」で再判定に到達する機序（実測で二重発注）
-#     は、初見時刻固定では延命にしかならないため、見るたびに時刻を更新する。
 try:
     _HEADLINE_DEDUP_TTL_SEC_DEFAULT: int = max(1, int(
         os.environ.get("HEADLINE_DEDUP_TTL_MIN", "60") or "60")) * 60
@@ -7463,7 +6675,6 @@ class GlobalState:
     AI_CACHE_SEC: int = field(default=900, init=False, repr=False)
 
     # キャッシュをバイパスして必ず AI を呼ぶ強制キーワード（相場に大きく影響するイベント語）
-    # ★ v2.88: 単語境界マッチ (\\b{kw}\\b) に変更。複数形・活用形を明示登録する必要あり。
     # 例: tariff/tariffs, merger/mergers, recall/recalls, beat/beats, miss/misses
     # 不可算名詞や不変化語 (inflation, fed, war, recession 等) は単数形のみ。
     AI_FORCE_KEYWORDS: frozenset = field(
@@ -7520,16 +6731,8 @@ class GlobalState:
         同じトリガー＋同一ニュース内容に対して AI_CACHE_SEC 以内に判定済みの結果があればキャッシュを返す。
         ★ キャッシュキーにニュース内容のハッシュを含める（異なるニュースへの誤流用を防止）
 
-        ★ v2.88 修正: AI_FORCE_KEYWORDS の判定を単純な部分一致から単語境界マッチに変更。
-        旧コード `kw in combined_lower` では `miss` が `missile`/`mission`/`dismiss` に、
-        `rate` が `corporate`/`separate`/`accelerate` に、
-        `war` が `award`/`warn`/`warner` に誤マッチしていた。
-        英文ニュースタイトルにこれらの単語が含まれない記事はほぼ無いため、
-        AI判定キャッシュが事実上機能せず、Anthropic API への呼び出し回数が
-        想定の数倍に膨らんでいた可能性があった。
         """
         combined_lower = " ".join(headlines).lower()
-        # ★ v2.88: 単語境界マッチで完全単語のみヒットさせる
         if any(re.search(rf"\b{re.escape(kw)}\b", combined_lower) for kw in self.AI_FORCE_KEYWORDS):
             return None
         import hashlib
@@ -7551,10 +6754,8 @@ class GlobalState:
 
     # ── ③ トピック重複防止 (同一トピック60分以内は再判定しない) ──────────────
     # 地政学/金利/関税など既報トピックの過剰反応を防ぐ。
-    # ★ v2.92: 価格乖離による動的解除追加。前回から QQQ が±0.3%以上動けば
     # 「市場が織り込み中=情報は新鮮」とみなして重複扱い解除。
     # 5/4 NY11時のイラン情勢20件全スキップ事案 (価格下落中に反応できず) への対策。
-    # ★ v3.8.4: 30分→60分に延長。価格乖離による動的解除があるため重要トピック
     # (急激な相場変動を伴うニュース) はそのまま再判定可能。重複削減によるコスト
     # 削減効果は月 $15-20 程度を想定。
     TOPIC_COOLDOWN_SEC: int = field(default=3600, init=False, repr=False)  # 60分
@@ -7601,16 +6802,11 @@ class GlobalState:
         戻り値: (is_blocked: bool, matched_topic: str)
         is_blocked=True の場合、そのトピックは30分以内に既出なのでスキップ推奨。
 
-        ★ v2.92: 価格乖離による動的解除
-        前回判定時の QQQ 価格と現在の QQQ 価格を比較し、±0.3% 以上動いていれば
-        「市場が織り込み中＝情報は新鮮」とみなして重複扱いを解除する。
-        QQQ 価格が取得できないケース（ネットワーク不安定等）は従来通り重複スキップ。
         """
         combined = " ".join(headlines).lower()
         now = datetime.datetime.now()
         # 期限切れトピックを削除
         cutoff = now - datetime.timedelta(seconds=self.TOPIC_COOLDOWN_SEC)
-        # ★ v2.92: 値が dict 形式 {time, qqq_price} に変更されたが、
         # 後方互換のため datetime のままのエントリーも有効として扱う。
         def _entry_time(v):
             return v["time"] if isinstance(v, dict) else v
@@ -7625,7 +6821,6 @@ class GlobalState:
                     last_time = _entry_time(entry)
                     elapsed = (now - last_time).total_seconds()
 
-                    # ★ v2.92: 価格乖離による動的解除をチェック
                     # entry が dict 形式で qqq_price が記録されていて、かつ
                     # 現在の QQQ 価格が取得できる場合のみ判定。
                     if isinstance(entry, dict) and entry.get("qqq_price", 0) > 0:
@@ -7652,13 +6847,9 @@ class GlobalState:
     def mark_topic_seen(self, headlines: list) -> None:
         """判定を行ったヘッドラインのトピックを記録する。
 
-        ★ v2.92: 判定時の QQQ 価格も併せて記録し、次回の重複チェック時に
-        価格乖離が ±0.3% を超えていれば重複扱いを解除する判断材料とする。
-        QQQ 価格が取得できない場合は従来通り time のみ記録（後方互換）。
         """
         combined = " ".join(headlines).lower()
         now = datetime.datetime.now()
-        # ★ v2.92: 判定時の QQQ 価格を取得（取得失敗時は 0.0 で記録 → 重複解除は機能しない）
         _qqq_price = 0.0
         try:
             _qq = get_quote("QQQ")
@@ -7669,7 +6860,6 @@ class GlobalState:
             if kw in combined:
                 self.seen_topics[topic_key] = {"time": now, "qqq_price": _qqq_price}
 
-    # ── ★ v3.9.8: 正規化ヘッドライン dedup (任意の繰り返し記事を 60 分間吸収) ───
     # TOPIC_KEYWORDS dedup (iran/fed/tariff等の固定キーワード) では拾えない
     # 「同一ヘッドラインの繰り返し配信」を補完するための層。
     # 5/11 PAN ログで観測された無駄判定:
@@ -7680,8 +6870,6 @@ class GlobalState:
     # Yahoo Finance の GUID 更新で URL dedup を素通りする問題への対策。
     seen_normalized_headlines: dict = field(default_factory=dict, init=False, repr=False)
     # {正規化キー (sha1[:16]): {time: datetime, original: str (最初に見た原文)}}
-    # ★ v3.9.157/157b: 正規化一致の TTL（既定60分・HEADLINE_DEDUP_TTL_MIN で変更可）。
-    #   同一文字列の二重発注対策は HEADLINE_EXACT_TTL_SEC（180分・スライディング）が担う。
     HEADLINE_DEDUP_TTL_SEC: int = field(
         default=_HEADLINE_DEDUP_TTL_SEC_DEFAULT, init=False, repr=False)
     HEADLINE_EXACT_TTL_SEC: int = field(
@@ -7720,7 +6908,7 @@ class GlobalState:
         return hashlib.sha1(h.encode('utf-8')).hexdigest()[:16]
 
     def _exact_headline_key(self, headline: str, scope: str) -> str:
-        """★ v3.9.157b: 数値を残した同一文字列キー（小文字化＋空白圧縮のみ）。"""
+        """"""
         import hashlib, html as _html, re as _re
         h = _html.unescape(headline or "")
         h = _re.sub(r"\s+", " ", h.lower().strip())
@@ -7734,11 +6922,6 @@ class GlobalState:
           - elapsed_seconds: 前回判定からの経過秒数 (新規時は 0)
           - total_seen_count: このキーで今まで何回 dedup されたか (新規時は 0)
 
-        ★ v3.9.153 (B-1): scope でルート別に既読を分ける（認定サポーターNの指摘）。
-        通常News（SPY/QQQ/SMH に効くか）と個別株（この銘柄に直接関係するか）は
-        AI への問いが違うのに既読を共有していたため、先着する通常News側の印で
-        個別株側が全滅していた（受講生実測: 新着8件→AI判定0件）。
-        既定 "SHARED" なので既存の呼び出しはそのまま動く。
         """
         if not headline:
             return False, 0, 0
@@ -7750,8 +6933,6 @@ class GlobalState:
             k: v for k, v in self.seen_normalized_headlines.items()
             if v.get("time", now) > cutoff
         }
-        # ★ v3.9.157b: 完全一致層（180分・スライディング）。同一文字列の再配信は
-        #   mark のたびに時刻が更新されるため、配信が続くかぎり再判定されない。
         _xkey = self._exact_headline_key(headline, scope)
         _xcut = now - datetime.timedelta(seconds=self.HEADLINE_EXACT_TTL_SEC)
         self.seen_exact_headlines = {
@@ -7769,7 +6950,7 @@ class GlobalState:
         return False, 0, 0
 
     def unmark_headline_seen(self, headline: str, scope: str = "SHARED") -> None:
-        """★ v3.9.153: 付けた既読の印を取り消す（AI 呼出が例外で落ちた時の巻き戻し用）。"""
+        """"""
         if not headline:
             return
         key = scope + ":" + self._normalize_headline_key(headline)
@@ -7792,7 +6973,6 @@ class GlobalState:
         else:
             entry["hit_count"] = entry.get("hit_count", 0) + 1
             # time は最初に見た時刻を保持 (= 経過時間が正しく計算される)
-        # ★ v3.9.157b: 完全一致層はスライディング（見るたびに time を更新）。
         _xkey = self._exact_headline_key(headline, scope)
         _xentry = self.seen_exact_headlines.get(_xkey)
         if _xentry is None:
@@ -7808,9 +6988,6 @@ class GlobalState:
         lines = []
         for sym, ts in self.tickers.items():
             if ts.total_orders > 0:
-                # ★ v3.9.153: forced_exits は強制損切りと時間切れの合算カウンタで、
-                #   total_orders は新規と決済の両方を数える。旧ラベル（発注=・損切=）は
-                #   実際より悪い決済ミックスに見えた（認定サポーターの指摘）。
                 lines.append(
                     f"  {sym}: 注文数(新規+決済)={ts.total_orders} "
                     f"強制決済(損切+時間切れ)={ts.forced_exits} "
@@ -7842,9 +7019,6 @@ def _get_sym_lock(sym: str) -> asyncio.Lock:
 def send_discord_message(text: str) -> None:
     if not DISCORD_WEBHOOK_URL:
         return
-    # ★ v3.9.141: 送信直前にもマスクを通す（認定サポーターからの指摘）。
-    #   本文は無加工で外へ出ていたため、例外文字列を組み立てて渡している箇所
-    #   （_loop_guard など）から資格情報・口座ID・パスが漏れうる。
     try:
         text = _secret_filter.mask_text(text)
     except Exception:
@@ -7941,9 +7115,6 @@ def get_session_info() -> Tuple[str, str]:
     現在のトレーディングセッションと注文 TIF 文字列を返す。
     TIF 文字列は moomoo API の TimeInForce に対応させる際に参照する。
 
-    ★ v2.87: NYSE 休日・早期クローズ日に対応
-      - 完全休場日 → SESSION_HOLIDAY を返す（最優先）
-      - 早期クローズ日 → RTH 終了時刻を 13:00 ET に短縮（AFTERHOURS への遷移を早める）
 
     戻り値タプル長（str, str）は変更なし。互換性維持。
     """
@@ -7952,7 +7123,6 @@ def get_session_info() -> Tuple[str, str]:
     dow    = now_et.weekday()
     t      = now_et.time()
 
-    # ★ v2.87: 休日判定（最優先 — 週末判定より前）
     # 平日でも休場日なら SESSION_HOLIDAY。週末 + 休日の場合も
     # SESSION_HOLIDAY を返す（次の取引日まで停止する点では同じ扱い）。
     if is_nyse_holiday(today):
@@ -7968,7 +7138,6 @@ def get_session_info() -> Tuple[str, str]:
     if _PREMARKET_START <= t < _MARKET_OPEN:
         return SESSION_PREMARKET, "DAY"
 
-    # ★ v2.87: 早期クローズ日は RTH 終了時刻を 13:00 ET に短縮
     early_close = get_early_close_time(today)
     rth_end = early_close if early_close else _MARKET_CLOSE
 
@@ -7980,7 +7149,7 @@ def get_session_info() -> Tuple[str, str]:
 
 
 def seconds_until_premarket() -> float:
-    """★ v2.87: 休日も非取引日として扱い、最大 14 日先まで探索。 連休（例: Thanksgiving 木 + Black Friday 早期クローズ）にも対応。"""
+    """"""
     now_et = datetime.datetime.now(_ET)
     for days_ahead in range(15):  # 8 → 15 に拡張（連休対応）
         candidate = (now_et + datetime.timedelta(days=days_ahead)).replace(
@@ -7988,14 +7157,12 @@ def seconds_until_premarket() -> float:
         )
         if candidate <= now_et:
             continue
-        # ★ v2.87: 週末 + 休日も除外（is_trading_day で一括判定）
         if not is_trading_day(candidate.date()):
             continue
         return (candidate - now_et).total_seconds()
     return 3 * 24 * 3600
 
 
-# ── ★ v3.9.36: 次セッション境界の判定 (CLOSE_BEFORE_INACTIVE 用) ────────────────
 def _next_session_boundary() -> Tuple[datetime.time, str]:
     """現在の ET 時刻から見た「次のセッション境界時刻」と「その後のセッション名」を返す。
     早期クローズ日は RTH 終了を短縮時刻に合わせる。
@@ -8021,8 +7188,7 @@ def _next_session_boundary() -> Tuple[datetime.time, str]:
 
 
 def _should_preclose_before_inactive() -> Tuple[bool, str]:
-    """★ v3.9.36: CLOSE_BEFORE_INACTIVE — 次セッションが取引不可で、境界まで
-    CLOSE_BEFORE_INACTIVE_MIN 分以内なら (True, 理由) を返す。
+    """
 
     「取引不可セッション」= OVERNIGHT または「発注しない設定」(CONFIDENCE_*=2.00)
     のセッション。これらへ移行する N 分前に、まだ取引可能な現セッション内で
@@ -8051,7 +7217,6 @@ def _should_preclose_before_inactive() -> Tuple[bool, str]:
 # {symbol: datetime} 形式でロング決済完了時刻を記録し、60秒間は緊急買い戻しをスキップ
 _long_close_grace: dict = {}
 
-# ★ v2.99.2: 決済発注全失敗後の再試行クールダウン
 # place_close_all=False の直後 N 秒間は同銘柄への再発注を見送る (失敗連射防止)。
 _close_retry_cooldown: dict = {}
 _CLOSE_RETRY_COOLDOWN_SEC = 60  # 60秒間は再発注をスキップ
@@ -8077,14 +7242,10 @@ def _clear_close_retry_cooldown(symbol: str) -> None:
     """決済発注成功時にクールダウンをクリア。"""
     _close_retry_cooldown.pop(symbol, None)
 
-# ★ v3.9.145: 直近の一斉決済で「対象外」にした銘柄（通知文の正確化に使う）
 _last_sweep_skipped_owned: list = []
 
 
 _SWEEP_VERIFY_WAIT_SEC: int = 10    # 成行の約定反映を待つ秒数（テストで0に差し替え可）
-# ★ v3.9.157 (A-1): スイープ（週末/デモ日次決済）中に出した決済注文の記録。
-#   建玉照会の空応答（moomoo JP で実在が確認されている現象）だけを根拠に
-#   「建玉ゼロ確認」と確定しないため、注文の側（終端＋約定数）でも裏を取る。
 _sweep_oid_ctx = threading.local()
 _last_sweep_close_orders: list = []
 
@@ -8115,17 +7276,12 @@ def _sweep_session_begin() -> None:
     _today = _sweep_today_et()
     globals()["_last_sweep_close_orders"] = [
         e for e in _last_sweep_close_orders if e.get("day") == _today]
-_SWEEP_VERIFY_ATTEMPTS: int = 3     # ★ v3.9.156b: 裏取りの試行回数
-# ★ v3.9.156c: 20秒×2回（初回10秒と合わせ最大50秒）。60秒間隔だと、注文拒否等で
-#   本当に決済できていない場合の再決済が1巡あたり最大130秒遅れ、15:45 ET 起点の
-#   週末決済で最終再試行が閉場にかかり得る（Codexレビュー指摘）。「約定済みだが
-#   建玉表示だけ古い」窓の実測は概ね数十秒〜2分弱のため、50秒＋再試行側の60秒
-#   （合計110秒超の経過観察）で二重決済の窓は実用上塞がる。
+_SWEEP_VERIFY_ATTEMPTS: int = 3
 _SWEEP_VERIFY_RETRY_SEC: int = 20
 
 
 def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> bool:
-    """全決済のあと、停止に入る前の最終裏取り（★ v3.9.156・5日分レビュー）。
+    """
 
     place_close_all の "full" は「全量を発注できた」であって「約定した」ではない。
     従来はそのまま監視を止めて「全決済しました」と通知しており、発注後に失効・
@@ -8133,11 +7289,6 @@ def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> 
     ここで実口座を再同期し、Bot 所有の建玉が残っていないことを確認する。
     確認できないときは False（＝呼び出し側の再試行・監視継続に戻す）。
     """
-    # ★ v3.9.156b: 裏取りは複数回行う（新規Claudeレビュアーの指摘）。1回目の照会が
-    #   「約定済みなのに建玉がまだ見える」反映遅延だった場合、即 False で戻すと
-    #   呼び出し側が close_all_for_weekend を再実行し、決済済み建玉への二重決済
-    #   （デモのネッティングでは反対建玉化・v3.9.64 の事故型）の窓ができる。
-    #   間隔を置いて再確認し、それでも残っているときだけ再決済に回す。
     for _v_try in range(_SWEEP_VERIFY_ATTEMPTS):
         time.sleep(_SWEEP_VERIFY_WAIT_SEC if _v_try == 0 else _SWEEP_VERIFY_RETRY_SEC)
         _seq_before = _account_scan_seq
@@ -8146,11 +7297,6 @@ def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> 
         except Exception as _e_v:
             log.warning(f"[{log_prefix}] 決済後の再同期に失敗（{_v_try + 1}回目）: {_mask_secrets(_e_v)}")
             continue
-        # ★ v3.9.156b: _account_scan_valid は累積フラグ（一度 True なら True のまま）で、
-        #   「いまの同期」が照会失敗で早期 return しても True に見える。sync_positions は
-        #   冒頭で一部建玉をゼロクリアするため、失敗＋ゼロクリアの組で「建玉ゼロ」に
-        #   見える偽成功が成立していた（Codexレビュー指摘）。世代番号が進んだこと＝
-        #   いまの同期が完走したことを確認する。
         if _account_scan_seq <= _seq_before:
             log.warning(f"[{log_prefix}] 決済後の建玉照会が完走しませんでした（{_v_try + 1}回目）")
             continue
@@ -8159,16 +7305,6 @@ def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> 
             if state.get(sym).position_qty != 0 and not _is_other_owner(sym)
         )
         if not _left:
-            # ★ v3.9.157 (A-1): 建玉の不在だけでは確定しない（認定サポーターの指摘）。
-            #   moomoo JP の position_list_query は建玉があっても空を返すことがあり、
-            #   決済注文の直後は追跡コストのゼロクリアと重なって「1回の空応答＝
-            #   建玉ゼロ確認」に化けていた。このスイープで出した決済注文の側でも
-            #   裏を取り、全注文が FILLED_ALL（または約定数が目標到達）のときだけ
-            #   確定する。UNKNOWN・生存中は未確定として次の試行へ回す。
-            # ★ v3.9.157c: 審査は銘柄ごとに集約する（Codex指摘）。再発注で同一銘柄に
-            #   新旧の注文が並ぶとき、「どれか1本が全量約定」していればその銘柄は充足。
-            #   充足が無く UNKNOWN/生存中が残るなら未解決（再確認）。全て終端かつ
-            #   未約定なら不成立（再決済へ）。
             # ★ 認定サポーターの受入確認（v3.9.167）: 照合対象は経過時間で絞らない。
             #   台帳はセッション単位（_sweep_session_begin でクリア）なので、
             #   ここにある記録は全て「今回のシーケンスで出した注文」。時間で絞ると
@@ -8192,10 +7328,6 @@ def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> 
                 _by_sym.setdefault(_co["symbol"], []).append((_co, _st_o, _dealt_o))
             _unfilled, _unresolved = [], []
             for _sym_o, _entries in _by_sym.items():
-                # ★ v3.9.157c2: 充足は「最新の注文」を基準に判定する（Codex指摘——
-                #   旧注文 qty=5 の約定だけで、数量が増えた新注文 qty=10 の取消を
-                #   見逃してはならない）。最新注文が約定しているか、全注文の約定数
-                #   合計が最新注文の数量に達していれば充足。
                 _latest = max(_entries, key=lambda x: float(x[0].get("ts", 0) or 0))
                 _lc, _lst, _ld = _latest
                 _dealt_sum = sum(_d for _c, _st, _d in _entries)
@@ -8243,8 +7375,6 @@ def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> 
             f"[{log_prefix}] 発注後も建玉が見えます（{_v_try + 1}/{_SWEEP_VERIFY_ATTEMPTS}回目・"
             f"{', '.join(_left)}）→ 反映遅延の可能性があるため間隔を置いて再確認します"
         )
-    # ★ v3.9.157b: 「建玉が残っている」とは限らない（注文照会だけが不能のケースも
-    #   ここへ来る）。切り分けを誤らせない文言にする（レビュー指摘）。
     log.error(
         f"[{log_prefix}] 🔴 決済完了を確認できませんでした（建玉の残存または注文照会の不能）"
         f" → 完了扱いにせず再試行します"
@@ -8264,7 +7394,6 @@ def close_all_for_weekend(trd_env: TrdEnv,
         trd_env: 取引環境（REAL / SIMULATE）
         reason:  place_close_all に渡す決済理由ラベル。
         log_prefix: ログプレフィックス。None の場合は reason から自動判定。
-                    ★ v3.9.35: 移行前全決済から呼ぶ際に "移行前全決済" を渡す。
     """
     # ログプレフィックスを呼び出し元によって出し分け
     # ★ レビュー後の追修正（既存バグ）: 完全一致だと再試行（「…（再試行N）」）と
@@ -8274,14 +7403,10 @@ def close_all_for_weekend(trd_env: TrdEnv,
         ("週末前強制決済", "早期クローズ前強制決済", "連休前強制決済"))
     if log_prefix is None:
         log_prefix = "週末決済" if is_weekly else "デモ日次決済"
-    # ★ v3.9.113: スイープ前に実口座と同期し、内部状態のズレ（orphan建玉）を再捕捉する。
-    #   内部stateだけを信じると、同期漏れで position_qty=0 扱いの実建玉が決済されず放置される
-    #   （7/6: QQQ/SPY SHORT が22時間放置→翌日時間切れで大損）。実口座の建玉を基準に全決済する。
     try:
         sync_positions(trd_env)
     except Exception as _e_sync_sweep:
         log.warning(f"[{log_prefix}] 事前同期に失敗（内部state基準で続行）: {_mask_secrets(_e_sync_sweep)}")
-    # ★ v3.9.61: モメンタム実発注銘柄も週末/日次決済の対象に含める (IWM orphan 防止)
     exec_syms = (
         {sym for syms in EXECUTION_MAP.values() for sym in syms}
         | set(STOCK_TICKERS)
@@ -8289,20 +7414,12 @@ def close_all_for_weekend(trd_env: TrdEnv,
         | set(EARNINGS_AFTER_TICKERS)
         | _momentum_live_symbols()
     )
-    # ★ v3.9.113: 設定universe外の建玉も取りこぼさないよう、同期後に qty!=0 の全銘柄を対象化。
     _cand = sorted({
         sym for sym in (exec_syms | set(state.tickers.keys()))
         if state.get(sym).position_qty != 0
     })
-    # ★ v3.9.144: 夜間持ち越し（OVN）・Bot 以外の建玉は最初から対象にしない
-    #   （認定サポーターの指摘 A-5）。従来は place_close_all の所有権ガードが
-    #   守って False を返し、それが「決済失敗」として集約されて、正常なのに
-    #   🔴通知が再試行のたびに出ていた（本物の失敗が埋もれる）。
     _skipped_owned = [sym for sym in _cand if _is_other_owner(sym)]
     targets = [sym for sym in _cand if not _is_other_owner(sym)]
-    # ★ v3.9.145: 呼び出し側の「全決済しました」通知が正確になるよう、対象外を公開する
-    #   （認定サポーターの指摘 A-5 訂正版）。対象外があるのに「全決済」と言うと、
-    #   口座に株が残っているのを見た利用者が矛盾を感じる。
     global _last_sweep_skipped_owned
     _last_sweep_skipped_owned = list(_skipped_owned)
     if _skipped_owned:
@@ -8318,18 +7435,7 @@ def close_all_for_weekend(trd_env: TrdEnv,
         #   失って「決済完了」に反転する。前日の記録の掃除（v3.9.157b の目的）は
         #   _sweep_session_begin（シーケンス開始時のクリア）が担う。
         log.info(f"[{log_prefix}] 決済対象ポジションなし → スキップ")
-        # ★ v3.9.184: 週末はここでも 🏁 を出す（認定サポーターの指摘）。
-        #   従来はこの分岐が 🏁 の出力より手前で return しており、
-        #   **金曜 15:45 ET に建玉が無い回は週末通知が一切出なかった**。
-        #   受講生は「週末モードに入ったか」を通知で確認しているので、
-        #   決済対象の有無にかかわらず区切りは知らせる。
-        #   再試行の回は送らない（同文が何度も飛ぶのを防ぐ・下の分岐と同じ扱い）。
         if is_weekly:
-            # ★ v3.9.185: 「建玉ゼロ」と断定しない（配布前レビュー指摘）。
-            #   この分岐は「夜間持ち越し・Bot 以外の建玉を除いた結果 targets が空」
-            #   でも通る。金曜 15:45 ET に OVN が QQQ を持ち越していれば口座には
-            #   建玉が残っており、断定すると v3.9.145 が移行前全決済の経路で
-            #   解消した矛盾（口座に株があるのに「全決済」）がここで再発する。
             _kept = ("、".join(_skipped_owned) if _skipped_owned else "")
             log.warning(
                 f"[{log_prefix}] 🏁 週末・休場前の停止（決済対象なし"
@@ -8344,8 +7450,6 @@ def close_all_for_weekend(trd_env: TrdEnv,
                     + "ニュース取得・発注を停止し、次のプリマーケットまで待機します\n"
                     "（プリマーケットを「発注しない」設定にしている場合は次の 09:30 ET まで）"
                 )
-        # ★ v3.9.141: 決済すべきものが無い＝成功。裸の return（None=偽）のままだと、
-        #   建玉ゼロの正常な状態を呼び出し側が「失敗」と誤判定し、毎分再試行し続ける。
         return True
 
     targets_str = ", ".join(targets)
@@ -8362,30 +7466,13 @@ def close_all_for_weekend(trd_env: TrdEnv,
             )
     else:
         log.warning(f"[{log_prefix}] 🌙 デモ日次全決済開始  対象: {targets_str}")
-    # ★ v3.9.141: 各決済の成否を集約して返す（認定サポーターからの指摘）。
-    #   従来は戻り値を捨てて None を返しており、呼び出し側は「例外が出なかった＝成功」
-    #   として完了マーカーを立て、全決済が失敗していても
-    #   「保有ポジションを全決済しました」と通知していた。境界での再試行も無効化される。
-    # ★ v3.9.148: 「Bot 以外の建玉になったので見送った」は決済失敗ではない
-    #   （Codexレビュー指摘）。失敗に数えると「決済しきれませんでした」の重大通知が
-    #   実害のない回にも出る。見送りは _skipped_owned と同じく対象外として扱う。
-    # ★ v3.9.148: 見送りの理由で扱いを分ける（Codexレビュー指摘）。
-    #   "owned"   = Bot 以外の建玉 → 決済対象外。完了を妨げない
-    #   "pending" = 既存の決済注文の処理待ち → まだ終わっていない。完了扱いにすると
-    #               その注文が結局通らなかったとき建玉が残ったまま再試行されない
-    # ★ v3.9.149: 戻り値（1本でも発注できたか）ではなく結果の内訳で分ける。
-    #   "partial"（一部しか決済できていない）を完了扱いにすると、再試行が回らず
-    #   建玉が残ったまま週末停止に入る（認定サポーターの指摘）。
     _failed, _deferred, _pending, _partial = [], [], [], []
-    _sweep_oid_ctx.oids = []   # ★ v3.9.157 (A-1): このスイープで出す注文の収集を開始
+    _sweep_oid_ctx.oids = []
     try:
         for sym in targets:
             try:
                 place_close_all(sym, trd_env, reason)
             except Exception as _e_pc:
-                # ★ v3.9.157 (C-2): 1銘柄の例外で後続銘柄が未処理のままループごと
-                #   落ちていた（認定サポーターの実験で確認・_loop_guard 再起動で
-                #   同じ地点を繰り返す）。失敗に数えて次の銘柄へ進む。
                 log.error(
                     f"[{log_prefix}] 🔴 {sym} の決済処理で例外: "
                     f"{type(_e_pc).__name__}: {_mask_secrets(_e_pc)} → 失敗に数えて次の銘柄へ進みます"
@@ -8396,8 +7483,6 @@ def close_all_for_weekend(trd_env: TrdEnv,
             if _why == "full":
                 continue
             elif _why in ("partial", "unknown"):
-                # ★ v3.9.150: "unknown"（内部数量ゼロ・照会の応答が欠けている疑い）も
-                #   完了扱いにしない。残玉ごと週末停止に入る経路を塞ぐ。
                 _partial.append(sym)
             elif _why == "owned":
                 _deferred.append(sym)
@@ -8410,9 +7495,6 @@ def close_all_for_weekend(trd_env: TrdEnv,
                 f"[{log_prefix}] 決済の対象外: {', '.join(_deferred)}"
                 f"（Bot 以外の建玉／失敗には数えません）"
             )
-            # ★ v3.9.148: 完了通知の注記にはループ内で見送った分も載せる（Codexレビュー指摘）。
-            #   従来は「はじめから対象外にした分」(_skipped_owned) しか載らず、
-            #   全件が途中で見送りになった回に「全決済しました」とだけ届いていた。
             _last_sweep_skipped_owned = list(_skipped_owned) + [
                 s for s in _deferred if s not in _skipped_owned
             ]
@@ -8423,8 +7505,6 @@ def close_all_for_weekend(trd_env: TrdEnv,
                 f"（一部のみ発注／建玉照会の応答が不完全）→ 完了扱いにせず、再試行します"
             )
         if _pending:
-            # ★ v3.9.148: 処理待ちは「まだ終わっていない」。重大通知は出さず（実際に
-            #   失敗したわけではない）、完了扱いにもしないで境界の再試行に委ねる。
             log.warning(
                 f"[{log_prefix}] 既存の決済注文の処理待ちで見送った銘柄: {', '.join(_pending)}"
                 f" → 完了扱いにせず、次の巡回で再試行します"
@@ -8441,16 +7521,7 @@ def close_all_for_weekend(trd_env: TrdEnv,
                 f"moomoo アプリで建玉をご確認のうえ、必要なら手動で決済してください。"
             ))
     finally:
-        # ★ v3.9.157 (A-1/157b): 出した注文のスナップショットを裏取りへ渡す。
-        #   例外時も finally で必ず公開・収集器を畳む（プールスレッドの再利用で
-        #   無関係な決済呼び出しに記録が漏れる穴を塞ぐ）。前回分の未解決の証拠
-        #   （鮮度内・今回の再発注で置き換わっていない注文）はマージして残す
-        #   ——再試行で対象銘柄が照会の空応答に隠れたとき、取消済み注文の証拠を
-        #   上書きで失う穴（レビュー指摘）を塞ぐ。
         _cur = list(getattr(_sweep_oid_ctx, "oids", []) or [])
-        # ★ v3.9.157c: 同一銘柄でも旧注文の証拠は落とさない（Codex指摘——
-        #   旧注文が遅れて約定した二重決済や、取消の失敗証拠を検知できなくなる）。
-        #   重複排除は oid 単位のみ。新旧の裁定は裏取り側が銘柄ごとに行う。
         _cur_oids = {e["oid"] for e in _cur}
         # ★ 認定サポーターの受入確認（v3.9.167）: 持ち越しは経過時間で絞らない。
         #   台帳はセッション単位で管理する（_sweep_session_begin 参照）。
@@ -8462,7 +7533,6 @@ def close_all_for_weekend(trd_env: TrdEnv,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ★ v3.8.6: 当日トレード集計 (Discord 自動送信 + Ctrl+C 終了時の端末表示で共通化)
 # ─────────────────────────────────────────────────────────────────────────────
 # 受講生から「moomoo 証券アプリで取引履歴を見るのが手間」という意見を受けて
 # 追加。同じ整形関数を Discord メッセージ (毎日 ET 15:50) と Ctrl+C 終了時の
@@ -8470,12 +7540,6 @@ def close_all_for_weekend(trd_env: TrdEnv,
 _today_trades: list[dict] = []
 _today_trades_date: Optional["datetime.date"] = None
 _daily_summary_sent_date: Optional["datetime.date"] = None
-# ★ v3.9.126: 日次サマリの送信時刻を「一日の取引終了後」に動的化。
-#   - デモ口座: RTH 後は価格更新されず close_trigger_time(15:45 等)で日次決済・停止するため、
-#     実質 RTH 終了が一日の終わり → RTH 終了時刻に送る。
-#   - 実口座 × アフター非対象(CONFIDENCE_AFTERHOURS≧2.0): RTH 終了後に送る。
-#   - 実口座 × アフター対象: アフターアワーズ終了(=オーバーナイト開始 20:00 ET)後に送る。
-#   早期クローズ日は get_early_close_time() の時刻を RTH 終了として用いる。
 def _daily_summary_send_time(trd_env: "TrdEnv", today_et_date: "datetime.date") -> datetime.time:
     early   = get_early_close_time(today_et_date)
     rth_end = early if early else _MARKET_CLOSE          # 16:00 ET（早期クローズ日はその時刻）
@@ -8484,14 +7548,12 @@ def _daily_summary_send_time(trd_env: "TrdEnv", today_et_date: "datetime.date") 
         return rth_end
     return _OVERNIGHT_START                              # 20:00 ET＝アフター終了
 
-# ── ★ v3.9.30: シャドー取引集計バッファ (受講生が自分の成績を確認できるように) ──
 # 日次サマリ (Discord + 端末) に「もし発注していたら」の集計を表示する。
 # シャドー SHORT エグジット時と、シャドーモメンタムシグナル検知時に追記する。
 _today_shadow_short: list[dict] = []      # 決済確定したシャドー SHORT のみ集計
 _today_shadow_momentum: list[dict] = []   # シャドーモメンタム シグナル検知ログ
-_today_shadow_ovn: list[dict] = []        # ★ v3.9.137: 夜間持ち越し「記録のみ」の結果
+_today_shadow_ovn: list[dict] = []
 
-# ── ★ v3.9.115: 当日サマリ集計のディスク永続化 ─────────────────────────────
 # 認定サポーター指摘 (7/10): 上記バッファはメモリのみで、Bot 再起動でクリアされる
 # ため、再起動前に決済したトレードが日次サマリ(端末/Discord)から抜け、過小表示に
 # なっていた (全件は Google シートに記録済みで、あくまで表示側の欠落)。当日分を
@@ -8501,22 +7563,13 @@ _TODAY_STATE_LOCK = threading.Lock()
 
 
 def _today_state_path() -> str:
-    """★ v3.9.157 (案B): 当日サマリの保存先を口座別に分ける（認定サポーターの提案）。
+    """
 
     同一 ET 日付内で実口座⇄デモを切り替えると、前の口座の当日トレードが
     復元で合算され、Discord の日次集計に両口座の損益が混ざっていた。
     OVN 状態ファイル（v3.9.145）と同じ REAL/DEMO 分割方式。旧単一ファイルは
     読み戻さない（表示専用のため、更新初日の同日復元だけが対象外になる）。
 
-    ★ v3.9.183: 置き場所を本体スクリプトの隣から `OVN_STATE_DIR` へ移した
-      （配布前レビューの一致指摘・状態の置き場所を1本化）。
-    ★ v3.9.189: 旧い場所から引き継ぐようにした（認定サポーターの指摘）。
-      v3.9.183 では「表示専用の短命なファイルなので引き継がない」としたが、
-      その根拠は「版の差し替えはセッション外に行う」という前提だった。
-      **取引セッションの最中に差し替えた日は、差し替え前に約定していた分が
-      その日の Discord 日次集計から丸ごと落ちる。** 手順で守る設計は手順を
-      守らない場合に破れるので、仕組みの側で引き継ぐ。
-      シートの数字には影響しない（GAS へ送る集計はログ行から組み立てるため）。
     """
     return _state_path("today_summary_state.json")
 
@@ -8524,9 +7577,6 @@ def _today_state_path() -> str:
 def _today_state_ready() -> bool:
     """当日サマリを旧い置き場所から1度だけ引き継ぐ（best-effort）。
 
-    ★ v3.9.189d: **引き継ぎに失敗しても保存は止めない**（配布前レビュー10レーンの
-      一致指摘を受けた再設計）。GAS 再送キュー（_gas_queue_migrate）と同じ選択で、
-      理由も同じ形です。
 
       止めた場合に失うもの: そのプロセスの間、当日サマリを一切保存しない。
       途中で再起動すると、その日の約定が Discord 日次集計から**丸ごと**落ちる
@@ -8557,17 +7607,7 @@ def _save_today_state() -> None:
             "shadow_short":    _today_shadow_short,
             "shadow_momentum": _today_shadow_momentum,
         }
-        # ★ v3.9.189b: **保存の側では引き継がない**（配布前レビュー指摘）。
-        #   引き継ぎは「読み戻して復元する」ために行うもので、保存の直前に走らせると
-        #   引き継いだ内容をその場の書き込みが上書きして消す。
-        #   実際に起きうる筋: 起動時の引き継ぎが失敗 → _load_today_state は 0 件 →
-        #   メモリは空 → 次の決済で保存が走り、そこで引き継ぎが成功して当日の
-        #   約定を書き戻した直後に、空のメモリで上書き。元ファイルには「引き継ぎ済み」の
-        #   印が残るので二度と復元できない。引き継がないより悪い。
-        #   引き継ぎは _load_today_state（起動時に1回・main が必ず呼ぶ）だけで行う。
         with _TODAY_STATE_LOCK:
-            # ★ v3.9.183: flush も fsync もせずに置換していた（配布前レビュー指摘）。
-            #   電源断で当日サマリが空か途中で切れた状態になる。共通の書き手へ。
             _atomic_write_text(_today_state_path(),
                                json.dumps(state, ensure_ascii=False))
     except Exception as _e:
@@ -8579,7 +7619,7 @@ def _load_today_state() -> int:
     global _today_trades, _today_trades_date
     global _today_shadow_short, _today_shadow_momentum
     try:
-        _today_state_ready()   # ★ v3.9.189: 読む前に引き継ぐ（差し替え当日の復元）
+        _today_state_ready()
         _path_ts = _today_state_path()
         if not os.path.exists(_path_ts):
             return 0
@@ -8600,7 +7640,6 @@ def _load_today_state() -> int:
         return 0
 
 
-# ── ★ v3.9.134: 建玉台帳（Bot が建玉を持っている銘柄を記録するだけ）────────────
 # 従来、Bot は「口座にある建玉はすべて自分のもの」として起動時に取り込み、
 # 時間切れ・損切り・トレールの管理下に置いていた。このため、利用者が同じ口座で
 # SPY/QQQ/SMH を手で保有していると Bot がそれを決済してしまう（2026-08-11 に
@@ -8616,9 +7655,6 @@ def _load_today_state() -> int:
 #
 # 残る限界: Bot がすでにその銘柄を持っている最中に手で買い増された分は
 # 巻き込まれる。ただしこれは v3.9.133 以前と同じ挙動で、悪化はしない。
-# ★ v3.9.160c: 台帳も状態ファイルと同じ固定フォルダへ（新規Claudeレビュアーの指摘——
-#   本体フォルダ差し替えでは台帳も同時に消え、初回移行が全建玉を Bot 建玉として
-#   取り込む。これが OVN 事故の増幅要因だった）。旧フォルダにあれば起動時に引き継ぐ。
 _LEDGER_PATH = os.path.join(OVN_STATE_DIR, "bot_position_ledger.json")
 # 「台帳をこの環境で一度でも作ったか」の目印。台帳ファイルが消えたときに
 # 「アップグレード直後の初回」と区別するために使う（初回だけ既存建玉を取り込む）。
@@ -8632,7 +7668,6 @@ _ledger_broken: bool = False       # 台帳が読めなかった（＝建玉を�
 def _ledger_env_key(trd_env=None) -> str:
     """台帳のキー（REAL / DEMO）。実口座とデモで分けて持つ。
 
-    ★ v3.9.183: 判定そのものは _env_tag に1本化した（同じ式が6箇所にあった）。
     """
     return _env_tag(trd_env)
 
@@ -8649,18 +7684,7 @@ def _ledger_save() -> bool:
     """
     try:
         with _LEDGER_LOCK:
-            # ★ v3.9.141: REAL と DEMO を同時に動かすと、先に読んだ側の記録が
-            #   消えていた（認定サポーターからの指摘）。各プロセスは台帳全体の
-            #   スナップショットを丸ごと書き戻すため、後から保存した側が勝つ。
-            #   消えた側は再起動時に「Bot 以外の建玉」に分類され、損切り・
-            #   時間切れ決済の対象から外れる。
-            #   対策: 保存の直前にファイルを読み直し、自分の環境の部分だけを
-            #   差し替えてから書く。他環境の記録には触れない。
             _mine = _ledger_env_key()
-            # ★ v3.9.141b: プロセス間ロック（Codexレビュー指摘）。
-            #   _LEDGER_LOCK はプロセス内の RLock でしかないため、REAL と DEMO の
-            #   2プロセスが同時に read-modify-write すると、後から replace した側が
-            #   先行の更新を消す。OS のファイルロックで read〜replace 全体を守る。
             _lockf = None
             _lock_kind = None   # "fcntl" / "msvcrt" / None
             try:
@@ -8669,10 +7693,6 @@ def _ledger_save() -> bool:
                 fcntl.flock(_lockf.fileno(), fcntl.LOCK_EX)
                 _lock_kind = "fcntl"
             except ImportError:
-                # ★ v3.9.142: Windows には fcntl が無い（Codexレビュー指摘）。
-                #   Win365 が本番環境なので msvcrt.locking で同等の排他を張る。
-                #   LK_LOCK は約10秒粘ってから諦める。取れなければ無ロックで続行
-                #   （従来と同じ状態に戻るだけで、悪化はしない）。
                 try:
                     import msvcrt
                     _lockf = open(_LEDGER_PATH + ".lock", "w")
@@ -8706,16 +7726,12 @@ def _ledger_save() -> bool:
                     _read_ok = False
                     log.error(f"[建玉台帳] 既存の台帳を読めません: {_mask_secrets(_e_read)}")
                 if not _read_ok and os.path.isfile(_LEDGER_PATH):
-                    # ★ v3.9.141b: 壊れた台帳を自分の環境だけで上書きすると、
-                    #   もう一方の環境の記録を巻き込んで消す（Codexレビュー指摘）。
-                    #   読めないときは書かずに失敗を返し、利用者に知らせる。
                     log.error(
                         "[建玉台帳] 🔴 台帳が壊れているため保存しません"
                         "（他の口座の記録を消さないため）"
                     )
                     return False
                 _merged[_mine] = _position_ledger.get(_mine, {})
-                # ★ v3.9.183: 共通の書き手へ（v3.9.141 の fsync はそちらが持つ）。
                 _atomic_write_text(_LEDGER_PATH,
                                    json.dumps(_merged, ensure_ascii=False))
                 # 次回の読み込みと食い違わないよう、メモリ側も揃えておく
@@ -8756,12 +7772,6 @@ def _ledger_load() -> int:
     global _position_ledger, _ledger_first_run, _ledger_broken
     _ledger_first_run = False
     _ledger_broken    = False
-    # ★ v3.9.161: 読み込みの「前」に旧フォルダからの引き継ぎを必ず終わらせる。
-    #   v3.9.160 は main() の後段で引き継いでいたため、台帳の読み込みに間に合わず
-    #   「台帳が無い＝初回移行」と判定され、口座の建玉をすべて Bot の建玉として
-    #   取り込んでいた（実機の反映で発覚）。OVN 建玉を持ったまま更新した利用者では
-    #   これがそのまま今回の事故（早期決済）の再現になる。呼び出し順に依存しない
-    #   よう、読み手の側で引き継ぎを保証する（冪等なので複数回呼んでも安全）。
     try:
         _ovn_migrate_legacy_dir()
     except Exception as _e_mig0:
@@ -8772,8 +7782,6 @@ def _ledger_load() -> int:
         # 台帳消失時に既存建玉を再取り込みする危険を避けるための互換措置。
         _initialized = os.path.exists(_init_mark) or os.path.exists(_LEDGER_INIT_MARK)
         if _mig_ledger_failed and not os.path.exists(_LEDGER_PATH):
-            # ★ v3.9.163: 旧フォルダに台帳があったのに運べなかった＝「初回起動」では
-            #   ない。取り込まず、破損として安全側（全建玉を管理対象外＋通知）に倒す。
             _ledger_broken = True
             log.error(
                 "[建玉台帳] 🔴 旧フォルダの台帳を引き継げませんでした"
@@ -8796,10 +7804,6 @@ def _ledger_load() -> int:
         with _LEDGER_LOCK:
             with open(_LEDGER_PATH, "r", encoding="utf-8") as f:
                 _position_ledger = json.load(f) or {}
-        # ★ v3.9.162c: 現在環境のセクションが dict でない（null / 配列 / 文字列）ときは
-        #   破損として扱う（Codexレビュー指摘——キー存在だけを見ると、破損した台帳でも
-        #   初回扱いにならず、既存の Bot 建玉が静かに管理対象外へ落ちて損切りが止まる。
-        #   しかも「台帳を読めませんでした」の通知も出ない）。
         _sec_key_now = _ledger_env_key()
         if (_sec_key_now in _position_ledger
                 and not isinstance(_position_ledger[_sec_key_now], dict)):
@@ -8814,18 +7818,6 @@ def _ledger_load() -> int:
             return 0
         # 台帳ファイルは共有だが、初回移行は環境ごとに一度ずつ必要。
         _ledger_first_run = not _initialized
-        # ★ v3.9.162: 台帳が実在して読めたのに「マーカーが無い」だけで初回扱いに
-        #   すると、口座の建玉をすべて Bot の建玉として取り込む（＝夜間持ち越しの
-        #   建玉が日中ロジックに吸収され早期決済される事故の再発経路・Codexレビュー
-        #   指摘）。マーカーの欠落は移行の部分失敗などで起こり得るため、台帳がある
-        #   ならマーカー側を補完して初回扱いを取り消す。
-        # ★ v3.9.162b: 台帳は REAL/DEMO 共有なので、全体で判定すると
-        #   「DEMO の記録しかない台帳で REAL を初めて起動」したときに正当な初回移行が
-        #   取り消され、REAL の建玉が一斉に管理対象外になる（＝損切り・時間切れが
-        #   全部止まる・新規Claudeレビュアーの指摘）。現在環境のセクションで判定する。
-        # ★ v3.9.162b: 判定は「非空か」ではなく「このキーがあるか」（Codexレビュー指摘——
-        #   建玉ゼロで初回移行を終えた環境は "REAL": {} が正常状態。非空判定だと
-        #   マーカー消失時に初回扱いが続き、既存建玉を取り込む）。
         if _ledger_first_run and _ledger_env_key() in _position_ledger:
             log.warning(
                 "[建玉台帳] 台帳はありますが初回移行の目印が見つかりません。"
@@ -8858,10 +7850,6 @@ def _ledger_touch_mark(trd_env=None) -> None:
 def _ledger_mark(symbol: str, trd_env=None, entry_time=None, category=None) -> None:
     """この銘柄で Bot が建玉を持ったことを記録する。
 
-    ★ v3.9.149: どの戦略で建てたか（entry_ai_category）も残す。従来は entry_time
-    だけだったため、再起動するとモメンタム建玉が通常建玉として扱われ、時間切れが
-    60分→10分に、損切りが銘柄倍率つきの緩い値に変わっていた（認定サポーターの指摘）。
-    category を省略した呼び出しでは、既存レコードの値をそのまま残す（消さない）。
     """
     try:
         with _LEDGER_LOCK:
@@ -8883,7 +7871,7 @@ def _ledger_mark(symbol: str, trd_env=None, entry_time=None, category=None) -> N
 
 
 def _ledger_repair_ovn_absorption() -> bool:
-    """★ v3.9.162: 過去の版で誤って台帳に取り込まれた OVN 建玉を外す。
+    """
 
     Codexレビューの指摘——一度取り込まれると「台帳にある＝Bot の建玉」として
     日中ロジックの決済対象になり続け、事故条件（夜間持ち越しの建玉が早期決済
@@ -8891,17 +7879,11 @@ def _ledger_repair_ovn_absorption() -> bool:
     所有を主張しているなら台帳から外すのが正しい。戻り値=外したか。
     """
     try:
-        # ★ v3.9.162b: 古い phase=HELD が残っているだけの状態で、日中ロジックが
-        #   建てた QQQ を台帳から外すと、その建玉の損切り・時間切れが効かなくなる
-        #   （新規Claudeレビュアーの指摘）。記録が「直近のもの」のときだけ修復する。
         _st_rep = _ovn_load()
         _ed_rep = str(_st_rep.get("entry_date", "") or "")
         _fresh_rep = False
         try:
             if _ed_rep:
-                # ★ v3.9.162b: 上限だけだと未来日（時計ずれ・不正データ）で常に真になり、
-                #   日中ロジックの QQQ 建玉が台帳から消えて損切りが効かなくなる
-                #   （Codexレビュー指摘）。0日以上4日以内に限定する。
                 _age_rep = (datetime.datetime.now(_ET).date()
                             - datetime.date.fromisoformat(_ed_rep)).days
                 if _age_rep < 0:
@@ -8956,7 +7938,7 @@ def _ledger_entry_time(symbol: str, trd_env=None):
 
 
 def _ledger_category(symbol: str, trd_env=None):
-    """★ v3.9.149: 台帳に記録した建玉の戦略種別（無ければ None）。
+    """
 
     旧版が書いたレコードには入っていないので、必ず None を許容すること。
     """
@@ -8969,7 +7951,6 @@ def _ledger_category(symbol: str, trd_env=None):
         return None
 
 
-# ── ★ v3.9.134: 管理対象外の銘柄を「気づける」ようにする ──────────────────────
 # 自動売買が止まっていることに利用者が気づけないと、「なぜ発注されないのか
 # 分からない」状態になる。次の4箇所で繰り返し知らせる:
 #   ① 検出した瞬間に Discord
@@ -8980,12 +7961,6 @@ _EXT_REMIND_HOURS: float = float(os.environ.get("EXT_HOLD_REMIND_HOURS", "6") or
 _ext_last_remind: dict = {}
 
 
-# ★ v3.9.190c: いま口座にあって、監視対象に入っていない建玉（配布前レビューの指摘）。
-#   起動時の整合性警告と、発注ブロック解除の回の2箇所でしか名前が出ず、以後は
-#   どの定期通知にも現れなかった。損切りも時間切れも週末決済も効かない建玉が、
-#   危険が続いているあいだ黙っているのは表示の欠落として重い。
-#   sync_positions が毎回の照会で**丸ごと差し替える**（部分更新はしない。
-#   途中の状態を読み手に見せないため）。
 #
 #   ★ 照会が失敗した回は更新しない＝古い一覧が残る。これは意図した選択で、
 #     「分からない」ときに警告を消すより、直近に分かっていたことを言い続ける
@@ -9004,7 +7979,6 @@ def _unmonitored_holding_symbols() -> list:
 def _ext_blocked_symbols() -> list:
     """いま管理対象外になっている銘柄の一覧（画面表示・日次サマリ用）。"""
     try:
-        # ★ v3.9.165: OVN 銘柄が ALL_TICKERS に入らない構成でも6時間ごとの再送に載せる
         return [s for s in dict.fromkeys(list(ALL_TICKERS) + [OVN_SYMBOL])
                 if getattr(state.get(s), "externally_held", False)]
     except Exception:
@@ -9015,7 +7989,6 @@ def _ext_status_suffix() -> str:
     """[状況] 行に足す注意書き。管理対象外が無ければ空文字。"""
     _b = _ext_blocked_symbols()
     _s = f"  ⚠️ 自動売買停止中: {'/'.join(_b)}（Bot以外の建玉あり）" if _b else ""
-    # ★ v3.9.190c: 監視対象外の建玉も毎回ここに出す（配布前レビューの指摘）。
     _u = _unmonitored_holding_symbols()
     if _u:
         _s += (f"  ⚠️ 監視対象外の建玉: {'/'.join(_u)}"
@@ -9027,21 +8000,9 @@ def _ext_remind_if_due() -> None:
     """管理対象外が続いている銘柄を、一定時間ごとに Discord で再通知する。"""
     if _EXT_REMIND_HOURS <= 0:
         return
-    # ★ v3.9.190c: 監視対象外の建玉も同じ間隔で再通知する（配布前レビューの指摘）。
-    #   文面は分けて出す（止まっている理由が違う）。
-    # ★ v3.9.190d: 理由ごとに分けて数える（配布前レビュー2者の指摘）。
-    #   ・キーを (銘柄, 理由) にする。銘柄名だけだと、同じ銘柄が「Bot以外の建玉で
-    #     停止」から「監視対象外」へ変わったとき、**理由の違う初回の警告が最大6時間
-    #     出ない**。
-    #   ・両方に該当する銘柄は「停止中」側に入れる。そちらには「決済すれば再開する」
-    #     という行動が書いてあり、落とすと何をすればよいか分からなくなる。
     _blocked = _ext_blocked_symbols()
     _unmon = [s for s in _unmonitored_holding_symbols() if s not in _blocked]
     _b = [(s, "blocked") for s in _blocked] + [(s, "unmonitored") for s in _unmon]
-    # ★ v3.9.193: いま該当しない鍵は理由を問わず落とす（認定サポーターの指摘）。
-    #   192 は解除時に (銘柄, "blocked") だけを pop していたため、監視対象外
-    #   （"unmonitored"）側の刻印が残り、6時間以内に再該当しても通知が出なかった。
-    #   理由が増えても同じ抜けが起きないよう、ここで毎回そろえる。
     for _k in [k for k in _ext_last_remind if isinstance(k, tuple) and k not in _b]:
         _ext_last_remind.pop(_k, None)
     if not _b:
@@ -9067,8 +8028,6 @@ def _ext_remind_if_due() -> None:
             f"（そのまま保有される場合は、この銘柄だけ Bot が動きません）"
         ))
     if _outside:
-        # ★ v3.9.190c: 監視対象外は「止まっている」のではなく「見ていない」。
-        #   損切りも時間切れも週末決済も効かないので、危険が続くあいだ言い続ける。
         _threadsafe_future(asyncio.to_thread(
             send_discord_message,
             f"⚠️ 【{'/'.join(_outside)}】 は監視対象外のまま口座に残っています\n"
@@ -9086,10 +8045,6 @@ def _ext_set_held(symbol: str, held: bool, reason: str = "",
         return
     ts.externally_held = held
     if held:
-        # ★ v3.9.192: 鍵を (銘柄, 理由) に揃える（認定サポーターの指摘・v3.9.190d の欠陥）。
-        #   190d で _ext_remind_if_due の鍵だけを (銘柄, 理由) に変え、同じ辞書を読み書きする
-        #   ここを素の銘柄名のまま残した。停止直後の刻印が読まれず、「🛡️ 見つけました」の
-        #   直後の同期で「⏸️ 停止したままです」が数十秒差で並び、解除後も古い鍵が残っていた。
         _ext_last_remind[(symbol, "blocked")] = datetime.datetime.now()
         log.warning(f"[建玉台帳] 🛡️ 【{symbol}】 {reason} → 自動売買を停止します（決済も新規発注もしません）")
         _threadsafe_future(asyncio.to_thread(
@@ -9155,7 +8110,7 @@ def _maybe_reset_today_trades() -> None:
         _today_shadow_momentum = []
         _today_shadow_ovn = []
         _today_trades_date = today_et
-        _save_today_state()   # ★ v3.9.115: 日付跨ぎで永続ファイルも当日(空)へ更新
+        _save_today_state()
 
 
 def _record_today_trade(rec: dict) -> None:
@@ -9166,9 +8121,7 @@ def _record_today_trade(rec: dict) -> None:
 
 
 def _format_shadow_summary_block() -> Optional[str]:
-    """★ v3.9.30: シャドー SHORT + シャドーモメンタム のサマリブロックを整形して返す。
-    Discord・端末両方で使うので、_format_daily_summary 末尾に追記する形で使う。
-    シャドーデータがゼロなら None を返す。
+    """
     """
     if not _today_shadow_short and not _today_shadow_momentum and not _today_shadow_ovn:
         return None
@@ -9224,7 +8177,6 @@ def _format_shadow_summary_block() -> Optional[str]:
         lines.append("")
         lines.append("▼ シャドーモメンタム  本日のシグナルなし")
 
-    # ── ★ v3.9.137: 夜間持ち越し（記録のみ）サマリ ─────────────────
     if _today_shadow_ovn:
         n_total = len(_today_shadow_ovn)
         n_w = len([o for o in _today_shadow_ovn if o.get('pnl', 0) > 0])
@@ -9258,7 +8210,7 @@ def _format_daily_summary() -> Optional[str]:
         header = []
         header.append(f"📊 本日のトレード集計 {'🔴 実口座' if _RUN_TRADE_ENV == 'REAL' else '🟡 デモ口座'}  {today_et.strftime('%Y-%m-%d (%a) %H:%M ET')}")
         header.append('=' * 56)
-        header.append(f"🎛 戦略プロファイル: {_PROFILE_DISPLAY}")   # ★ v3.9.116
+        header.append(f"🎛 戦略プロファイル: {_PROFILE_DISPLAY}")
         header.append("本日の実トレードはありません")
         shadow = _format_shadow_summary_block()
         if shadow:
@@ -9273,7 +8225,6 @@ def _format_daily_summary() -> Optional[str]:
     total_pnl = sum(t['pnl'] for t in _today_trades)
     avg_w = sum(t['pnl'] for t in wins)   / n_w if n_w else 0.0
     avg_l = sum(t['pnl'] for t in losses) / n_l if n_l else 0.0
-    # ★ v3.9.23: best/worst は wins/losses から抽出 (全件マイナス時の誤表示防止)
     # 旧版は max(_today_trades, ...) のため全件マイナス日に「最もマシな負け」を
     # 「最高勝ち」と誤表示していた (受講生報告 5/15 SPY 1件 -$3.28 の事例)。
     best  = max(wins,   key=lambda t: t['pnl']) if wins   else None
@@ -9291,12 +8242,6 @@ def _format_daily_summary() -> Optional[str]:
             s['w'] += 1
         # 決済理由は短縮ラベルに正規化
         reason = (t.get('exit_reason') or '')
-        # ★ v3.9.167: 自前のキーワード連鎖をやめ、正規の分類器に合わせる
-        #   （認定サポーター2名の指摘）。実際に記録される理由は
-        #   「トレイリングストップ（利益確保後の戻り）」で **「トレール」を含まない**ため、
-        #   利益トレールが丸ごと「その他」に落ちていた。同じ型の取りこぼしは
-        #   6/22 にも起きており（「その他」-$3,062 の実体が建玉トレールだった）、
-        #   そのとき作った _exit_code_from_reason() をこちら側でも使う。
         # ★ 受入確認（v3.9.167）【B】対応後: 5類型（夜間持ち越し・早期クローズ/
         #   連休前・ネガティブシグナル）は分類器本体が OVN/SESSION_CLOSE/LS_REVERSE
         #   を返すようになった（GAS へ送る exit_code も同じ）。下の先取りは
@@ -9311,10 +8256,6 @@ def _format_daily_summary() -> Optional[str]:
                 'FORCED_STOP':   '強制損切り',
                 'PANIC':         'パニックセル',
                 'LS_REVERSE':    'シグナル切替',
-                # ★ v3.9.179: SESSION_CLOSE と DEMO_DAILY を別の行に分ける
-                #   （認定サポーターの受入確認）。分類器は v3.9.168 から
-                #   両者を区別していたが、この表が同じ文言に写していたため
-                #   早期クローズ・連休前・週末が「日次/週末決済」に丸まっていた。
                 'SESSION_CLOSE': 'セッション終了決済',
                 'DEMO_DAILY':    'デモ日次決済',
                 'TAKE_PROFIT':   '利確',
@@ -9331,7 +8272,7 @@ def _format_daily_summary() -> Optional[str]:
     lines = []
     lines.append(f"📊 本日のトレード集計 {'🔴 実口座' if _RUN_TRADE_ENV == 'REAL' else '🟡 デモ口座'}  {today_et.strftime('%Y-%m-%d (%a) %H:%M ET')}")
     lines.append('=' * 56)
-    lines.append(f"🎛 戦略プロファイル: {_PROFILE_DISPLAY}")   # ★ v3.9.116
+    lines.append(f"🎛 戦略プロファイル: {_PROFILE_DISPLAY}")
     lines.append(f"合計 {n_total}件   勝率 {win_rate:.0f}% ({n_w}勝 {n_l}敗)")
     lines.append(f"損益  {total_pnl:+.2f}   平均勝ち {avg_w:+.2f} / 平均負け {avg_l:+.2f}")
     lines.append("")
@@ -9359,7 +8300,6 @@ def _format_daily_summary() -> Optional[str]:
     lines.append("▼ AI カテゴリ別")
     for c, s in sorted(by_cat.items(), key=lambda kv: -kv[1]['pnl']):
         lines.append(f"  {c:12s}  {s['n']:2d}件  {s['pnl']:+8.2f}")
-    # ★ v3.9.30: シャドー成績を末尾に追記 (Discord・端末両方で表示される)
     shadow = _format_shadow_summary_block()
     if shadow:
         lines.append(shadow)
@@ -9370,8 +8310,6 @@ async def _send_daily_summary_if_needed(trd_env: "TrdEnv") -> None:
     """一日の取引終了後に当日サマリを Discord 送信 (1 日 1 回・取引なしならスキップ)。
 
     送信時刻は _daily_summary_send_time() が口座種別とアフター設定から決める
-    （★ v3.9.126: 従来は固定 15:50 ET → RTH 終了後 / アフター終了後に変更）。
-    market_schedule_loop の毎分ポーリングから呼ばれる前提。
     """
     global _daily_summary_sent_date
     now_et = datetime.datetime.now(_ET)
@@ -9397,8 +8335,6 @@ async def _send_daily_summary_if_needed(trd_env: "TrdEnv") -> None:
 def _print_daily_summary_to_terminal() -> None:
     """Ctrl+C / 終了時に端末へ当日サマリを表示する (Discord と同じ整形)。
 
-    ★ v3.9.23: print() で枠付き出力に変更 (log.info だとログ行に埋もれるため)。
-    ANSI 色は使わず、stderr に出して flush で確実に表示。
     """
     summary = _format_daily_summary()
     if summary is None:
@@ -9420,9 +8356,6 @@ def _print_daily_summary_to_terminal() -> None:
         sys.stderr.flush()
     except Exception:
         pass
-    # ★ v3.9.112: ログファイルにのみ記録する（端末は上のstderrで表示済み）。
-    #   以前は log.info で出していたが、StreamHandler(stdout) 経由で画面にも出るため
-    #   「集計が2回表示される」不具合になっていた。ファイルハンドラへ直接記録して重複を解消。
     try:
         _rec = log.makeRecord(log.name, logging.INFO, __file__, 0,
                               f"[終了サマリ]\n{summary}", None, None)
@@ -9439,9 +8372,6 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
       1. 全ポジションを強制決済（close_all_for_weekend）
       2. market_open_event を clear してニュース取得・発注を停止
       3. 以降は週末判定ブロックで月曜プリマーケットまで待機
-         (★ v3.9.149: 週末決済の実行は prev_session = SESSION_WEEKEND_CLOSED で
-          表し、「本当に週末だった」と区別する。同じ値を使っていた頃は、
-          次の周回で復帰と誤判定されて発注が再開していた)
 
     追加機能②: デモ口座（SIMULATE）限定 — 毎日 15:45 ET に全決済・停止
       - デモ口座は RTH 終了後に株価が更新されないため、
@@ -9450,30 +8380,15 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
       - 実口座（REAL）では本ロジックは発火しない
         → 実口座は夜間取引セッションも株価取得・発注が可能
 
-    追加機能③ (★ v2.87): NYSE 休日対応
-      - 完全休場日 → market_open_event を clear して停止
-      - 早期クローズ日（13:00 ET）→ 決済発火を 12:45 ET に変更
-      - 連休前（翌取引日が翌日以降にある）→ 前日 15:45 ET に強制決済
-        例: Good Friday の前日（木）15:45 ET、Thanksgiving の前日（水）など
 
-    追加機能④ (★ v3.8.0): OVERNIGHT (20:00〜04:00 ET) を全モード停止対象に
-      - 旧仕様: LIVE は moomoo 24h 取引対応で OVERNIGHT も継続稼働
-      - 新仕様: LIVE/DEMO 共に OVERNIGHT はニュース取得・AI判定・発注を停止
-        理由: アフター終了後は新規ニュースの取引価値が低く、無駄な API コスト
-        (ニュース取得 + Anthropic 判定) が発生していたため
-      - 翌プリマーケット (04:00 ET) で自動再開
     """
     log.info("=== セッション監視ループ 開始 ===")
     prev_session        = None
     _weekend_close_done = False  # 金曜決済を1回だけ実行するフラグ
-    # ★ v3.9.149b: 「週末決済に成功して停止に入った」状態（Codexレビュー指摘）。
-    #   _weekend_close_done は「今日その処理を走らせたか」のラッチで、決済に
-    #   失敗した回も真になる。停止の判定にそれを使うと、決済しきれず
-    #   「監視は止めずに続行します」と言っている回まで監視を止めてしまう。
     _weekend_halt = False
     _demo_daily_close_done = False  # デモ口座：当日の日次決済実行フラグ
     _live_last_sent_date = None  # 実口座：日次データ送信済み日付（ET）
-    _holiday_close_done_date: Optional[datetime.date] = None  # ★ v2.87: 連休前決済を1日1回だけ実行
+    _holiday_close_done_date: Optional[datetime.date] = None
     is_demo = (trd_env == TrdEnv.SIMULATE)
 
     while True:
@@ -9483,7 +8398,6 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
         dow_et       = now_et.weekday()   # 月=0 … 金=4 / 土=5 / 日=6
         t_et         = now_et.time()
 
-        # ── ★ v2.87: 休日ブロック（最優先 — 既存ロジックの前に挿入）─────────
         # 完全休場日は決済も発注も不要。市場が動いていないので何もせず待機。
         # 注: 連休前決済（前日 15:45 ET）は通常曜日として下のブロックで実行済みのため、
         #     ここに到達した時点では既に決済済み or 当日休場で発注対象なし。
@@ -9509,7 +8423,6 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
             await asyncio.sleep(60)
             continue
 
-        # ── ★ v2.87: 早期クローズ日の決済発火時刻を 12:45 ET に変更 ──────────
         # 早期クローズ日（13:00 ET）はクローズ 15 分前（12:45 ET）に決済発火。
         # 通常日は _FRIDAY_CLOSE_TIME（15:45 ET）を使用。
         early_close_today = get_early_close_time(today_et)
@@ -9520,7 +8433,6 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
         else:
             close_trigger_time = _FRIDAY_CLOSE_TIME
 
-        # ── ★ v2.87: 連休前判定 ──────────────────────────────────────────────
         # 翌取引日が 2 日以上後 → 連休前夜とみなして強制決済 (通常金曜も対象)。
         # 休日/週末は上の SESSION_HOLIDAY 分岐で抜けているのでここでは取引可能日確定。
         next_td_for_close = next_trading_day(today_et)
@@ -9531,12 +8443,11 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
         # ── 週末/連休前 強制全決済 ────────────────────────────────────────────
         # 「金曜 15:45 ET」を連休前 close_trigger_time に拡張。
         # 例: 金→月(3日)/木→月(4日)/水→金(2日) すべて is_pre_holiday=True
-        # ★ v2.89: 平日 (dow_et<5) + RTH/AFTERHOURS ガード追加。
         # 旧版は土曜任意時刻起動で next_td=月曜→is_pre_holiday=True となり
         # SESSION_WEEKEND でも誤発火する重大バグ (全決済注文が出る) があった。
         if (is_pre_holiday
-            and dow_et < 5                                          # ★ v2.89: 平日のみ
-            and session in (SESSION_RTH, SESSION_AFTERHOURS)        # ★ v2.89: 市場開場中のみ
+            and dow_et < 5
+            and session in (SESSION_RTH, SESSION_AFTERHOURS)
             and t_et >= close_trigger_time
             and not_yet_done_today
             and not _weekend_close_done):
@@ -9562,15 +8473,10 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 f" → 全ポジション強制決済・ニュース停止 (理由: {close_reason})"
             )
             # 同期関数なので to_thread でブロッキングを回避
-            # ★ v3.9.141: 戻り値を見て、失敗時は60秒間隔で最大4回まで再試行する。
-            #   従来は戻り値を捨てており、決済に失敗しても監視を止めて
-            #   建玉を持ち越していた（認定サポーターからの指摘）。
             # ★ 受入確認（v3.9.167）: シーケンス開始で前回までの注文記録を捨てる。
             #   以後（初回＋再試行4回＋各裏取り）の記録は全てこのセッションのもの。
             _sweep_session_begin()
             _wk_ok = await asyncio.to_thread(close_all_for_weekend, trd_env, close_reason)
-            # ★ v3.9.156: 「発注できた」で終わらせず、口座の実態（建玉ゼロ）まで
-            #   裏を取ってから停止に入る（5日分レビュー・Codex指摘）。
             if _wk_ok:
                 _wk_ok = await asyncio.to_thread(_sweep_close_verified, trd_env, "週末決済")
             for _wk_retry in range(4):
@@ -9599,15 +8505,7 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
             wait_h, r = divmod(int(wait_sec), 3600)
             wait_m    = r // 60
             log.info(f"[週末決済] 次のプリマーケットまで {wait_h}h{wait_m}m 待機")
-            # ★ v3.9.149: ここで SESSION_WEEKEND を入れると、次の60秒周回で
-            #   「週末から復帰した」と誤判定され（_was_stopped が真になり）
-            #   market_open_event が set し直されて発注が再開していた
-            #   （認定サポーターの指摘・実口座のみ。金曜15:47〜の窓）。
-            #   「本当に週末だった」と「週末決済を実行した」を別の値に分ける。
             prev_session = SESSION_WEEKEND_CLOSED  # 重複通知の抑止のみに使う
-            # ★ v3.9.149b: 停止の維持はこのフラグで行う。prev_session は毎周回
-            #   末尾で session に上書きされるため、それだけに頼ると停止通知が
-            #   繰り返し出る（Codexレビュー指摘）。
             _weekend_halt = True
             await asyncio.sleep(60)
             continue
@@ -9615,13 +8513,12 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
         # ── デモ口座限定：通常営業日 15:45 ET に日次全決済・翌日プリマーケットまで停止 ──
         # 理由: デモは RTH 終了後に株価が更新されないため。実口座は夜間取引対応で不要。
         # is_pre_holiday=False の通常曜日のみ発火。早期クローズ日は 12:45 で発火。
-        # ★ v2.89: 平日 + RTH/AFTERHOURS ガード追加。
         # 旧版は曜日と時刻だけで判定 → 日曜夕方/月曜深夜 OVERNIGHT 起動で誤発火し、
         # 市場閉鎖中に決済注文を出す重大バグ (2026-05-03 LLY 15株 SELL 事案) があった。
         if (is_demo
             and not is_pre_holiday
-            and dow_et < 5                                          # ★ v2.89: 平日のみ
-            and session in (SESSION_RTH, SESSION_AFTERHOURS)        # ★ v2.89: 市場開場中のみ
+            and dow_et < 5
+            and session in (SESSION_RTH, SESSION_AFTERHOURS)
             and t_et >= close_trigger_time
             and not _demo_daily_close_done):
             _demo_daily_close_done = True
@@ -9629,13 +8526,12 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 f"[デモ日次決済] {close_trigger_time.strftime('%H:%M')} ET 到達 "
                 f"→ デモ口座のため全ポジション決済・翌プリマーケットまで停止"
             )
-            # ★ v3.9.141: 週末決済と同じく、失敗時は再試行し、駄目なら監視を止めない。
             # ★ 受入確認（v3.9.167）: 週末決済と同じくセッション開始で記録を捨てる。
             _sweep_session_begin()
             _dd_ok = await asyncio.to_thread(
                 close_all_for_weekend, trd_env,
                 f"デモ日次決済（{close_trigger_time.strftime('%H:%M')} ET）")
-            if _dd_ok:   # ★ v3.9.156: 週末決済と同じく実態まで裏を取る
+            if _dd_ok:
                 _dd_ok = await asyncio.to_thread(_sweep_close_verified, trd_env, "デモ日次決済")
             for _dd_retry in range(4):
                 if _dd_ok:
@@ -9669,7 +8565,6 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
             await asyncio.sleep(60)
             continue
 
-        # ── ★ v3.9.36: 取引不可セッション移行 N 分前の全決済 (CLOSE_BEFORE_INACTIVE) ──
         # 「発注しない設定」セッション / OVERNIGHT へ移行する N 分前に、まだ取引可能な
         # 現セッション内で全決済する。移行後の低流動性 / OVN 決済不能を回避する。
         # boundary をキーに 1 回だけ発火 (毎分ポーリングで重複しないよう dedup)。
@@ -9682,15 +8577,7 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                     f"[移行前全決済] {_pc_reason} → CLOSE_BEFORE_INACTIVE=true のため"
                     f"全ポジションを決済します (まだ取引可能な現セッション内で実行)"
                 )
-                # ★ v3.9.120: 完了マークは決済処理の「成功後」に付ける（外部AIレビュー指摘）。
-                #   旧実装は試行前にマークしていたため、OpenD瞬断などで例外になると
-                #   残りの猶予時間内に再試行されず、ポジションを持ったまま移行していた。
-                #   失敗時はマークせず、次の1分ポーリングで境界までの間リトライする。
                 try:
-                    # ★ v3.9.141: 戻り値を見て、全銘柄の決済に成功したときだけ
-                    #   完了マークと「全決済しました」の通知を出す（認定サポーターからの指摘）。
-                    #   旧実装は例外が出なければ成功扱いで、全決済が失敗していても
-                    #   同じ通知を送り、境界までの再試行も止めていた。
                     # ★ 受入確認（v3.9.167）フォロー（Codex所見・低）: この経路は裏取りを
                     #   呼ばないが close_all は台帳へ書くため、セッション開始を置かないと
                     #   週末/デモ日次スイープが走らない運用（長期連続稼働）で記録が
@@ -9707,7 +8594,6 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                         )
                         raise RuntimeError("移行前全決済が完了しませんでした")
                     setattr(market_schedule_loop, "_preclose_done_for", _pc_key)
-                    # ★ v3.9.145: 対象外（OVN等）が残っている回は「全決済」と言わない。
                     _pc_note = (
                         f"\n※ {', '.join(_last_sweep_skipped_owned)} は夜間持ち越し等の"
                         f"管理下のため対象外（保有継続・予定どおりの動きです）"
@@ -9729,11 +8615,10 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
         # ── 実口座限定: 通常営業日 close_trigger_time に当日分データ送信 ──────
         # is_demo=True / is_pre_holiday=True は上で発火済 → ここは実口座通常曜日のみ。
         # 取引は停止せずデータ送信のみ (実口座は夜間取引継続可)。
-        # ★ v2.89: 平日 + RTH/AFTERHOURS ガード (旧版は土日月深夜起動で誤発火)。
         if (not is_demo
             and not is_pre_holiday
-            and dow_et < 5                                          # ★ v2.89: 平日のみ
-            and session in (SESSION_RTH, SESSION_AFTERHOURS)        # ★ v2.89: 市場開場中のみ
+            and dow_et < 5
+            and session in (SESSION_RTH, SESSION_AFTERHOURS)
             and t_et >= close_trigger_time
             and _live_last_sent_date != today_et):
             _live_last_sent_date = today_et
@@ -9749,11 +8634,6 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 _demo_daily_close_done = False
                 log.info("[日次決済] フラグリセット → 本日の取引を開始します")
 
-        # ★ v3.9.149: 決済を実行した日より後の営業日に入ったら解除する。
-        #   旧実装は `dow_et < 4`（月〜木）だけを見ていたため、水曜の連休前決済
-        #   （感謝祭週など）のあと木曜=休場・金曜=dow_et 4 で解除されず、
-        #   金曜を丸1日止めてしまう（Codexレビュー指摘）。
-        #   停止の維持は「決済した当日のあいだ」だけでよい。
         if _weekend_close_done and _holiday_close_done_date and today_et > _holiday_close_done_date:
             _weekend_close_done = False
             _weekend_halt = False
@@ -9767,10 +8647,8 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
 
         # ── 通常のセッション管理 ─────────────────────────────────────────────
         # 停止条件：週末は全モード / オーバーナイトも全モード共通で停止 / デモ日次決済後は翌プリマーケットまで
-        # ★ v3.8.0: LIVE モードでも OVERNIGHT (20:00〜04:00 ET) はニュース取得を停止する。
         # アフター終了後は新規ニュースの取引価値が低い & API コスト削減のため。
         # 翌プリマーケット (04:00 ET) で自動再開する。
-        # ★ v3.9.6: setup_wizard で「発注しない」(CONFIDENCE_*=2.00 sentinel) に設定
         # されたセッションも停止対象に追加。ニュース取得・AI判定・発注すべて停止。
         # 旧設計では発注のみ止まり Anthropic API は消費されていた問題を解消する。
         _cur_disabled  = _is_session_disabled_by_name(session)
@@ -9778,31 +8656,21 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
         _should_stop = (
             (session == SESSION_WEEKEND) or
             (session == SESSION_OVERNIGHT) or
-            _cur_disabled or                                  # ★ v3.9.6
+            _cur_disabled or
             (is_demo and _demo_daily_close_done) or  # デモ日次決済後は再開まで停止を維持
-            # ★ v3.9.149: 週末決済で停止に入ったら、実セッションがまだ RTH でも
-            #   停止を維持する（デモ日次決済と同じ扱い）。この行が無いと
-            #   15:46 に「停止条件に当たらない」と判定され、発注が再開する。
             _weekend_halt
         )
         _was_stopped = (
             (prev_session == SESSION_WEEKEND) or
-            (prev_session == SESSION_HOLIDAY) or  # ★ v2.87: 休日明けの再開検出
+            (prev_session == SESSION_HOLIDAY) or
             (prev_session == SESSION_OVERNIGHT) or
-            _prev_disabled or                                 # ★ v3.9.6
+            _prev_disabled or
             (prev_session == "demo_closed") or  # デモ日次決済後の再開検出
-            (prev_session == SESSION_WEEKEND_CLOSED) or  # ★ v3.9.149: 週末決済後の再開検出
-            _weekend_halt or  # ★ v3.9.149b: 停止通知を毎分繰り返さない
+            (prev_session == SESSION_WEEKEND_CLOSED) or
+            _weekend_halt or
             (is_demo and _demo_daily_close_done)  # 修正(v2.63): 毎分Discord通知を防止
         )
 
-        # ★ v3.9.150 (認定サポーターの指摘 1-1): イベントの操作を毎周回の
-        #   「レベル駆動」にする。従来は clear()/set() を立ち上がり判定の中でしか
-        #   行っていなかったため、停止中にプロセスが一時停止（スリープ等）して
-        #   状態の遷移を跨いで再開すると、どちらの立ち上がりも起きず
-        #   market_open_event が clear のまま翌営業日いっぱい復帰しなかった。
-        #   v3.9.149 で停止を強めたことで、この経路が現実に踏めるようになっていた。
-        #   通知（ログ・Discord）は従来どおり立ち上がりのときだけ出す。
         if _should_stop:
             market_open_event.clear()
         else:
@@ -9819,15 +8687,12 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                                 f"{now_et.strftime('%Y-%m-%d %H:%M')} ET\n"
                                 f"次の開始まで約 {wait_h}時間{wait_m}分")
                 elif session == SESSION_OVERNIGHT:
-                    # ★ v3.8.0: LIVE/DEMO 共通でオーバーナイト停止
-                    # ★ v3.9.0: ログ/Discord 表示は「実口座」表記に統一（旧軍事的表現は v3.9.116 で全面禁止）
                     mode_label = "デモ" if is_demo else "実口座"
                     stop_reason = f"オーバーナイト（{mode_label}）: プリマーケット（04:00 ET）まで停止"
                     disc_msg = (f"🌙 [{mode_label}] オーバーナイト: ニュース取得・AI判定・発注を停止\n"
                                 f"{now_et.strftime('%Y-%m-%d %H:%M')} ET\n"
                                 f"プリマーケット開始（04:00 ET）まで待機")
                 elif _cur_disabled:
-                    # ★ v3.9.6: setup_wizard「発注しない」設定 (CONFIDENCE_*=2.00) の停止
                     _sess_jp = _session_label_jp(session)
                     mode_label = "デモ" if is_demo else "実口座"
                     stop_reason = (
@@ -9841,7 +8706,6 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                         f"ニュース取得・AI判定・発注を停止 → Anthropic API 課金ゼロ\n"
                         f"次セッションに切り替わると自動再開"
                     )
-                    # ★ v3.9.36: CLOSE_BEFORE_INACTIVE の決済は「移行時」ではなく
                     # 「移行 N 分前」(_preclose 処理・後述) で実施するため、ここでは何もしない。
                 else:
                     # デモ日次決済後の停止維持 (is_demo and _demo_daily_close_done)
@@ -9853,14 +8717,12 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 _threadsafe_future(asyncio.to_thread(send_discord_message, disc_msg))
         else:
             if _was_stopped or prev_session in ("demo_closed", None):
-                # ★ v3.9.56: セッション切替直後の古いニュース対策
                 # 停止状態 (OVN/WEEKEND/休日/disabled) から稼働へ復帰する瞬間に
                 # 蓄積ニュースが流れ込む。SESSION_CHANGE_QUIET_SEC 秒間は新規
                 # ニュース処理をスキップする (process_headlines 等が参照)。
                 global _last_session_change_at
                 _last_session_change_at = datetime.datetime.now()
                 market_open_event.set()
-                # ★ v3.9.57: セッション切替時にも _INDEX_PRICE_HISTORY を再 bootstrap
                 # OVN/WEEKEND 中は K 線データが取得できないが、PREMARKET 開始時には
                 # 前営業日の AFTERHOURS データが取得可能になる。これでセッション
                 # 開始直後でも 15分/60分 判定が「データ不足」にならず即座に有効化。
@@ -9868,7 +8730,7 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                     _threadsafe_future(asyncio.to_thread(_backfill_index_price_history))
                 except Exception as _e_bf2:
                     log.debug(f"[セッション切替バックフィル] スケジュール失敗: {_e_bf2}")
-                if prev_session == SESSION_HOLIDAY:    # ★ v2.87
+                if prev_session == SESSION_HOLIDAY:
                     resume_reason = "休日明け営業開始"
                 elif prev_session in (SESSION_WEEKEND, SESSION_WEEKEND_CLOSED):
                     resume_reason = "週次営業開始"
@@ -9877,7 +8739,6 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 elif prev_session == "demo_closed":
                     resume_reason = "プリマーケット開始（デモ日次再開）"
                 elif _prev_disabled:
-                    # ★ v3.9.6: 発注しない設定セッションから稼働セッションへの遷移
                     resume_reason = (
                         f"発注しない設定 ({_session_label_jp(prev_session)}) "
                         f"→ {_session_label_jp(session)} 開始 (Anthropic 課金再開)"
@@ -9904,7 +8765,6 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 ))
 
         prev_session = session
-        # ★ v3.8.6/v3.9.126: 一日の取引終了後(RTH終了後 / アフター終了後)に当日集計を Discord 送信 (1日1回)
         try:
             await _send_daily_summary_if_needed(trd_env)
         except Exception as _e_sum:
@@ -9913,9 +8773,6 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
 
 # ── Anthropic クライアント ────────────────────────────────────────────────────────
 def get_anthropic_client() -> anthropic.Anthropic:
-    # ★ v3.9.42: API キーから非 ASCII 文字 / 囲みクォート / 全角スペース等を除去。
-    #   除去しないと httpx が x-api-key ヘッダの ASCII エンコードで毎回失敗し、
-    #   AI 判定が 1 件も成功しない (5/18-22 ログで全 3,924 件失敗を確認)。
     api_key = _sanitize_api_key(os.environ.get("ANTHROPIC_API_KEY", ""), "ANTHROPIC_API_KEY")
     if not api_key:
         log.error("環境変数 ANTHROPIC_API_KEY が設定されていません")
@@ -9926,8 +8783,6 @@ def get_anthropic_client() -> anthropic.Anthropic:
             "  正しい API キー（sk-ant-... ）を設定してください。"
         )
         sys.exit(1)
-    # ★ v3.9.42: サニタイズ後も形式が正しくない場合はここで止めて、
-    #   API 呼出が全失敗する状態を防ぐ。
     if not api_key.startswith("sk-ant-"):
         log.error(
             "ANTHROPIC_API_KEY の形式が不正です。\n"
@@ -9938,14 +8793,11 @@ def get_anthropic_client() -> anthropic.Anthropic:
         sys.exit(1)
     return anthropic.Anthropic(api_key=api_key)
 
-# ── ★ v3.3.0: Anthropic API クレジット切れ検知 (2026-05-08 合意, メモリ#13) ──
 # 検知: BadRequestError/APIError 内に "credit balance is too low" 含む。
 # 初回: CRITICAL ブロック警告 + Discord 1 通 → 以降は全ログ沈黙、AI=None で中立。
 # 復旧: 2連続成功で確定 → INFO + Discord → 状態リセット。
 # 共通ヘルパー _call_anthropic_with_credit_guard で try/except 集約。
 _anthropic_credit_exhausted: bool = False
-# ★ v3.5.3 hotfix: Python 3.9 では `datetime` は標準 import が module 参照のため
-#   typing.Optional[datetime] は TypeError。datetime.datetime クラスを明示する。
 _anthropic_credit_exhausted_at: Optional["datetime.datetime"] = None
 _anthropic_skip_count: int = 0
 _anthropic_recovery_success_count: int = 0
@@ -9953,21 +8805,15 @@ _anthropic_last_request_id: Optional[str] = None
 _ANTHROPIC_CREDIT_KEYWORD = "credit balance is too low"
 _ANTHROPIC_RECOVERY_THRESHOLD = 2  # 2 回連続成功で復旧確定
 
-# ★ v3.9.113: Anthropic 認証エラー(401)の検知＋通知。クレジット切れ(400)とは別で、
-#   従来は log.error だけで Discord/端末バナーが出ず「AI判定が静かに全停止」していた
-#   （7/6ログ: Error code: 401 が4件・無通知）。APIキー誤り/失効/無効化が主因で自動復旧
-#   しないため、初回に必ず通知し、継続中は30分おきに再通知する。
 _anthropic_auth_failed: bool = False
 _anthropic_auth_last_discord_at: Optional["datetime.datetime"] = None
 
-# ★ v3.9.63: クレジット切れ中の API バックオフ。
 # 切れている間、毎ニュースで API を叩くと (1) 無駄な往復 (2) ERROR ログ量産
 # (旧版で 197 件確認) が起きる。検知後は API 呼出を一切止め、PROBE_INTERVAL ごとに
 # 1 回だけ「復旧プローブ」を許可する。プローブが成功したら即バックオフを解除し、
 # 通常運用へ素早く復帰する。
 _ANTHROPIC_CREDIT_PROBE_INTERVAL_SEC: int = 1800  # 30 分ごとに 1 回だけ復旧確認
 _anthropic_credit_last_probe_at: Optional["datetime.datetime"] = None
-# ★ v3.9.71: クレジット切れ継続中の Discord 再通知間隔 (30 分おき)。端末は 5 分おき赤字。
 _ANTHROPIC_CREDIT_DISCORD_INTERVAL_SEC: int = 1800
 _anthropic_credit_last_discord_at: Optional["datetime.datetime"] = None
 
@@ -9999,7 +8845,7 @@ def _is_credit_exhausted_error(exc: Exception) -> bool:
 
 
 def _is_auth_error(exc: Exception) -> bool:
-    """★ v3.9.113: Anthropic 認証エラー(401)判定。クレジット切れ(400)は除外。"""
+    """"""
     try:
         if _ANTHROPIC_CREDIT_KEYWORD in str(exc).lower():
             return False
@@ -10013,7 +8859,7 @@ def _is_auth_error(exc: Exception) -> bool:
 
 
 def _is_billing_error(exc: Exception) -> bool:
-    """★ v3.9.151: 支払い情報の問題（402 billing_error）判定（認定サポーターの指摘）。
+    """
 
     「前払いクレジットの残高切れ（400・文字列で検知済み）」とは別物で、
     自動チャージのカード失効・決済失敗などで起きる。SDK に専用の例外クラスが
@@ -10031,15 +8877,11 @@ _anthropic_billing_last_discord_at: Optional["datetime.datetime"] = None
 
 
 def _handle_anthropic_billing_error(exc: Exception) -> None:
-    """★ v3.9.151: 402（支払い情報の問題）の通知。初回は即時・以後30分おき。
+    """
 
     従来はどの分岐にも掛からず log.error のみで、AI 判定が止まっているのに
     利用者が気づけなかった（認定サポーターの指摘）。
     """
-    # ★ v3.9.151b: 「初回は即時」の判定をやめ、30分クールダウン一本にする
-    #   （Codexレビュー指摘）。成功と失敗が交互に起きる状態で「初回」が毎回
-    #   立て直され、クールダウンを素通しして通知が氾濫するため。
-    #   一度も通知していなければ即時に送られる（last が None のため）。
     global _anthropic_billing_last_discord_at
     now = datetime.datetime.now()
     log.error(f"[Anthropic] 支払い情報エラー(402)を検知: {_mask_secrets(exc)}")
@@ -10061,10 +8903,6 @@ def _handle_anthropic_billing_error(exc: Exception) -> None:
             log.debug(f"[支払いエラー] Discord 通知失敗: {_e}")
 
 
-# ★ v3.9.151: 分類できない AI 判定エラーの連続失敗カウンタ（認定サポーターの提案）。
-#   既知の形（残高・401・400・402）の列挙は、Anthropic 側が文言やステータスを
-#   変えると穴が開く。「知らないものが来たら鳴る」形を health_warning_loop に足す。
-#   429/5xx/接続エラー（SDK が自動再試行する一時的なもの）は数えない。
 _ai_unclassified_fail: dict = {
     "consecutive": 0,
     "last_error": "",
@@ -10092,7 +8930,7 @@ def _reset_ai_unclassified_failure() -> None:
 
 
 def _handle_anthropic_auth_error(exc: Exception) -> None:
-    """★ v3.9.113: 認証エラー(401)を検知→初回に端末バナー＋Discord、継続中は30分おきに再通知。"""
+    """"""
     global _anthropic_auth_failed, _anthropic_auth_last_discord_at
     now = datetime.datetime.now(JST)
     first = not _anthropic_auth_failed
@@ -10126,15 +8964,13 @@ def _handle_anthropic_auth_error(exc: Exception) -> None:
         except Exception as _e:
             log.debug(f"[認証エラー] Discord 通知失敗: {_e}")
         try:
-            # ★ v3.9.151: 音だけ鳴らす。Discord は上の 401 専用文面 1 通に集約
-            #   （credit_exhausted のラベルで送ると「クレジット切れ」と誤読される）。
             _play_alert_sound("credit_exhausted", notify_discord=False)
         except Exception:
             pass
 
 
 def _handle_anthropic_auth_recovery() -> None:
-    """★ v3.9.113: 認証エラー状態からの回復（成功時）に1回だけ通知してリセット。"""
+    """"""
     global _anthropic_auth_failed, _anthropic_auth_last_discord_at
     if not _anthropic_auth_failed:
         return
@@ -10168,7 +9004,7 @@ def _extract_request_id(exc: Exception) -> Optional[str]:
 
 def _check_recent_credit_exhaustion(log_path: str = _LOG_PATH,
                                      hours: int = 24) -> tuple[int, Optional["datetime.datetime"]]:
-    """★ v3.9.18: 過去 N 時間以内のクレジット切れエラー件数と最終発生時刻を返す。
+    """
 
     起動時バナー表示用。ログファイルを後ろから読んで効率化する。
     戻り値: (件数, 最終発生時刻) — ファイルが無い / エラー時は (0, None)。
@@ -10310,7 +9146,7 @@ def _handle_credit_exhausted(exc: Exception) -> None:
         _anthropic_recovery_success_count = 0
         _emit_credit_exhausted_warning(rid)
         _emit_credit_exhausted_discord()
-        _play_alert_sound("credit_exhausted")  # ★ v3.9.19: アラート音
+        _play_alert_sound("credit_exhausted")
     else:
         # ── 検知中 (沈黙) ──
         _anthropic_skip_count += 1
@@ -11024,7 +9860,6 @@ HEADLINE_HEDGE_PATTERNS: tuple = (
     r'\banalysts?\s+(?:predict|expect|see|wonder|debate|question)(?:s|ed|ing)?\b',
 )
 
-# ── ★ v3.9.7: ネガティブ語幹 × LONG 倒錯ガード (score=±1 を score=0 強制) ──
 # 5/11 サポーター環境で発覚: Keel Infrastructure "$145M net loss in Q1 as
 # legacy mining business shrinks" を AI が QQQ ロングで判定し 11 件 -$201 の損失。
 # AI が「mining」→「AI mining (TECH)」連想に引きずられ、明確なネガ語幹を見落とした。
@@ -11042,7 +9877,6 @@ HEADLINE_NEGATIVE_TONE_PATTERNS: tuple = (
     r'\bgoes?\s+bust\b',                              # goes bust (断定形)
     r'\bbankruptcy\s+filing\b',                       # bankruptcy filing
     r'\bchapter\s+11\b',                              # chapter 11
-    # ★ v3.9.22 追加: 損失系の拡張
     r'\bloss(?:es)?\s+(?:widen|deepen|mount|balloon)(?:ed|ing|s)?\b',  # losses widen
     r'\b(?:reports?|reported)\s+(?:a\s+)?(?:\$?[\d.]+[bmk]?\s+)?loss\b',  # reports loss
     r'\bswings?\s+to\s+(?:a\s+)?loss\b',              # swings to loss
@@ -11058,7 +9892,6 @@ HEADLINE_NEGATIVE_TONE_PATTERNS: tuple = (
     r'\bguides?\s+down\b',                            # guides down
     r'\bwithdraws?\s+(?:guidance|outlook|forecast)\b',
     r'\bslash(?:es|ed)?\s+(?:guidance|forecast|outlook|target|estimates?)\b',
-    # ★ v3.9.22 追加: ミス系の拡張
     r'\b(?:revenue|sales|earnings|eps)\s+miss(?:es|ed)?\b',  # revenue miss
     r'\bmiss(?:es|ed)?\s+(?:on\s+)?(?:revenue|sales|earnings|eps|top[- ]?line|bottom[- ]?line)\b',
     r'\bdisappoint(?:s|ed|ing)?\s+(?:investors|wall\s+street|market)\b',
@@ -11073,7 +9906,6 @@ HEADLINE_NEGATIVE_TONE_PATTERNS: tuple = (
     r'\bproduction\s+halt(?:ed|s)?\b',
     r'\brecall\s+announced\b',
     r'\bfda\s+rejection\b',
-    # ★ v3.9.22 追加: 退潮系の拡張
     r'\bheadwinds?\b',                                # headwinds (週次レポート提案)
     r'\b(?:revenue|sales|earnings)\s+(?:fell|declined|decreased|dropped)\b',
     r'\b(?:facing|faces)\s+(?:headwinds?|challenges?|pressure|slowdown)\b',
@@ -11084,7 +9916,6 @@ HEADLINE_NEGATIVE_TONE_PATTERNS: tuple = (
     # AI が断定 LONG を出す前提で、これらの動詞が見出しにある = 致命的誤判定
     r'\b(?:stock|shares?)\s+(?:plunges?|tumbles?|sinks?|crashes?|slumps?)\b',
     r'\b(?:plunge|tumble|sink|crash|slump)(?:s|d|ed)?\s+(?:on|after)\b',
-    # ★ v3.9.22 追加: 急落系の拡張
     r'\bfalls?\s+to\s+(?:multi[- ]?year|record|fresh|new)\s+low\b',
     r'\bsink(?:s|ing)?\s+to\s+(?:multi[- ]?year|record|fresh|new)\s+low\b',
 )
@@ -11109,18 +9940,15 @@ HEADLINE_QUESTION_PATTERNS: tuple = (
     # ── アナリスト疑問形 (典型: "Are Analysts Predicting X Will Climb or Sink?") ──
     r'\banalysts?\s+(?:predict|expect|see)\b[^?\n]{0,80}\?',
 
-    # ── ★ v3.9.10 追加: 反語 "Think X? Y" 形式 (悲観未来形を含むケースをカバー) ──
     # 例: "Think $6 Gas Is Bad? It's About to Get Even Worse in California"
     # 反語 (Think X?) + 後続節 (It's/That's/We're/You're 等) で方向性が逆転する
     # パターン。AI がポジ要素 ($6 = 具体的金額) に引きずられて誤判定する典型例。
     r'^\s*Think\s+[^?]{3,}\?\s+(?:It|That|This|We|You|Here|There)',
 
-    # ── ★ v3.9.10 追加: 悲観未来形 "about to get worse / harder" ──
     # 反語疑問とセット出現する悲観表現。単独でもネガ方向だが、AI が見出しの
     # 他の単語に引きずられてポジ判定するケースがあるため score=0 強制で確実化。
     r'\babout\s+to\s+get\s+(?:worse|harder|tougher|tighter|uglier|messier)\b',
 
-    # ── ★ v3.9.10 追加: "Bad? ... Worse" 形式の比較ヘッジ ──
     # 例: "Think $6 Gas Is Bad? ... Worse in California"
     # Bad + ? + Worse は「現状が悪い + 未来は更に悪い」の構造で方向性は弱気だが、
     # AI が「Bad ≠ 確定ネガ」と曖昧に解釈することがあるため score=0 強制。
@@ -11129,7 +9957,6 @@ HEADLINE_QUESTION_PATTERNS: tuple = (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ★ v3.8.3: 高信頼度ノイズパターン (AI 呼出前 pre-filter)
 # ─────────────────────────────────────────────────────────────────────────────
 # ログ分析 (4/30〜5/9, 28,000 件超の AI 判定) で「常に score=0 を返す」noise
 # パターンを抽出。対応するルールはすべて統合 SYSTEM_PROMPT に既存だが、
@@ -11427,13 +10254,11 @@ assert isinstance(NYSE_EARLY_CLOSE, dict) and len(NYSE_EARLY_CLOSE) >= 3, "NYSE_
 assert all(len(d) == 10 and d[4] == '-' for d in NYSE_HOLIDAYS), "NYSE_HOLIDAYS bad date format"
 assert isinstance(HEADLINE_HEDGE_PATTERNS, tuple) and len(HEADLINE_HEDGE_PATTERNS) >= 5, "HEDGE patterns too few"
 assert isinstance(HEADLINE_QUESTION_PATTERNS, tuple) and len(HEADLINE_QUESTION_PATTERNS) >= 3, "QUESTION patterns too few"
-# ★ v3.9.7: ネガ語幹パターンの検証 (Keel 倒錯ガード用)
 assert isinstance(HEADLINE_NEGATIVE_TONE_PATTERNS, tuple) and len(HEADLINE_NEGATIVE_TONE_PATTERNS) >= 10, "NEGATIVE_TONE patterns too few"
 for _p in HEADLINE_HEDGE_PATTERNS + HEADLINE_QUESTION_PATTERNS + HEADLINE_NEGATIVE_TONE_PATTERNS:
     re.compile(_p)  # 各パターンが有効な正規表現か検証
 del _p
 
-# ★ v3.8.3: ノイズパターンの正規表現コンパイル + assert
 assert isinstance(HEADLINE_NOISE_PATTERNS, tuple) and len(HEADLINE_NOISE_PATTERNS) >= 10, "NOISE patterns too few"
 for _np, _label in HEADLINE_NOISE_PATTERNS:
     re.compile(_np, re.IGNORECASE)
@@ -11466,7 +10291,6 @@ assert "{tech_sym}" not in SYSTEM_PROMPT, "統合プロンプトに {tech_sym} �
 assert "{macro_sym}" not in SYSTEM_PROMPT, "統合プロンプトに {macro_sym} の置換漏れあり"
 
 
-# ── ★ v3.5.0: プロンプトキャッシュ閾値の起動時実測 (オプション) ─────────────
 # Haiku 4.5 の Prompt Caching 最低 4,096 tok を確実に上回ることを保証する。
 # VERIFY_PROMPT_CACHE_SIZE=true で有効化 (default: false / API消費なし)。
 # 有効時は count_tokens で ETF/STOCK 実測 → 閾値割れなら CRITICAL ログ。
@@ -11517,7 +10341,6 @@ def _verify_prompt_cache_eligibility() -> None:
 _verify_prompt_cache_eligibility()
 
 
-# ── ★ v3.5.1: Prompt Cache 利用統計の時間帯別収集 (運用可視化) ──────────────
 # 各 AI 呼出の cache_creation/read_input_tokens を ET セッション別に集計し、
 # 1 時間ごとに INFO ログでサマリ (ヒット率/書込発生率/推定コスト) を出力。
 # 24 時間ローテーション。CACHE_STATS_ENABLED で無効化可能 (default: true)。
@@ -11705,7 +10528,6 @@ async def cache_stats_loop() -> None:
         await asyncio.sleep(CACHE_STATS_INTERVAL_SEC)
 
 
-# ── ★ v3.4.0: ヘッドライン メタフィルタ (ヘッジ語/疑問形 検出) ────────────────
 # 14:46 事象 (2026-05-07 / 10名同期 LOSS) 対策。プロンプト改修と独立した最後の砦。
 # ① ヘッジ/警告語 (warns/could等) → confidence ペナルティ
 # ② 疑問形/方向不明 ("X or Y?")  → score=0 強制
@@ -11715,7 +10537,7 @@ async def cache_stats_loop() -> None:
 # 統計カウンタ (運用監視用 - 既存 _anthropic_skip_count パターンに準拠)
 _meta_filter_hedge_count:    int = 0   # ヘッジ語検出により conf 減算した回数
 _meta_filter_question_count: int = 0   # 疑問形検出により score=0 強制した回数
-_meta_filter_negtone_count:  int = 0   # ★ v3.9.7: ネガ語幹×LONG倒錯で score=0 強制した回数
+_meta_filter_negtone_count:  int = 0
 _meta_filter_zeroed_count:   int = 0   # メタフィルタで実際に score を 0 に書き換えた回数
 
 # 環境変数からの設定読み込み (.env 未設定時は安全側 default で有効)
@@ -11727,7 +10549,6 @@ HEADLINE_QUESTION_FORCE_ZERO: bool = (
     os.getenv("HEADLINE_QUESTION_FORCE_ZERO", "true").lower() == "true"
 )
 
-# ── ★ v3.8.3: ノイズパターン pre-filter (AI 呼出前の早期 score=0 判定) ─────
 # 統合 SYSTEM_PROMPT が「常に score=0 を返す」パターンを正規表現で先回りブロック。
 # AI 呼出 1 回 = 約 $0.0018 (output 200tok + cache_read 7,500tok) を節約。
 # ログ分析 (4/30〜5/9) で全 AI 判定の 48% が score=0 と判明、削減余地が大きい。
@@ -11755,7 +10576,6 @@ def _check_noise_pattern(headline: str) -> Optional[str]:
     return None
 
 
-# ── ★ v3.9.153: ニュース除外キーワード（単語境界つき・認定サポーターNの指摘A）──
 # 旧実装は関数内 set の部分一致（kw in lower）だったため、
 #   i[nfl]ation / f[actor]y / up[dating] など13語で市場ニュースを誤って除外していた。
 # Win365 の実測（8/17-19・約40時間）では 'nfl' 165件のうち75%が
@@ -11810,20 +10630,9 @@ def _build_skip_regex(keywords, ignorecase: bool) -> "re.Pattern":
         if kw[:1].isalnum():
             pat = r"\b" + pat
         if kw[-1:].isalnum():
-            # ★ v3.9.154: 複数形も落とす（認定サポーターの指摘§2）。
-            #   キーワード表は olympic / esport / movie のように単数形で登録されており、
-            #   旧実装（部分一致）は複数形を自動的に拾えていた。\b を付けた時点で
-            #   その前提が外れ、Olympics / esports / movies が通るようになっていた。
-            #   同じ判断が AI_FORCE_KEYWORDS 側（:5857 の v2.88 コメント）にもある。
-            #   ★ 子音+y で終わる語は y→ies（celebrity→celebrities・Codexレビュー指摘）。
             if len(kw) >= 2 and kw[-1] == "y" and kw[-2] not in "aeiou":
-                # ★ v3.9.155: 固有名詞は -ys 複数（Grammys/Emmys）になるため両方許す
                 pat = pat[:-len(re.escape("y"))] + r"(?:y|ys|ies)\b"
             else:
-                # ★ v3.9.157 (B-1): -er(s)/-ing も落とす（golfers/footballers/filming/
-                #   touring・認定サポーターの辞書234,289語での巻き添え測定に基づく。
-                #   -ed は "concerted effort"/"old-fashioned" が金融文で頻出のため
-                #   足さない——同測定の結論を採用）。
                 pat = pat + r"(?:e?s|ers?|ing)?\b"
         else:
             pat = pat + ""
@@ -11835,17 +10644,6 @@ _SKIP_REGEX_CI = _build_skip_regex(_SKIP_KEYWORDS_CI, ignorecase=True)
 _SKIP_REGEX_CS = _build_skip_regex(_SKIP_ACRONYMS_CS, ignorecase=False)
 
 
-# ★ v3.9.157: 個人の資産運用Q&A見出しの上流パターン（認定サポーター2名の指摘）。
-#   "Can I Retire at 62 With $2.5M in a Roth IRA...?" のような個人向け相談記事が
-#   ノイズフィルタを通過して判定バッチに混ざり、META疑問形ガードが無関係の
-#   実シグナル（Samsung値上げ等）まで巻き込んで中立化していた。
-#   META ガード本体は現状維持（根拠見出しの特定は応答スキーマ変更が必要で、
-#   ガードが守った損失も実在する）が正しく、上流で落とすのが安全という裁定。
-#   誤爆を避けるため「疑問形の書き出し＋個人文脈」に限定した保守的なパターンにする。
-# ★ v3.9.157b: レビューで2点を絞り込み——(1) "we" を外す（"Should We Expect More
-#   Fed Rate Cuts?" のような市場エディトリアルまで落ちる）(2) 素の "roth ira" を
-#   外す（"Robinhood launches Roth IRA match" のような商品ニュースが実在する。
-#   個人相談の見出しは疑問形の書き出しパターンで既に拾える）。
 _SKIP_PERSONAL_QA_PATTERNS = [
     re.compile(r"^(can|should|how can|how should) i \b", re.I),
     re.compile(r"^how much (do|does|should|will) (i|you) need", re.I),
@@ -11869,15 +10667,6 @@ def _match_skip_keyword(headline: str) -> "Optional[str]":
     return None
 
 
-# ★ v3.9.153 (B-3): ティッカー直行ルート用の社名エイリアス（認定サポーターNの指摘）。
-#   見出しは "Nvidia" のような社名表記が大半で、"NVDA" では拾えなかった。
-#   ここに無い銘柄はティッカーそのもので照合する（従来どおり）。
-# ★ v3.9.153b: 一般名詞と衝突する社名は入れない（Codexレビュー指摘）。
-#   "ORACLE"（Oracle of Omaha＝バフェット記事で頻出）・"APPLE"（Big Apple）・
-#   "AMAZON"（熱帯雨林）・"ALPHABET"（alphabet soup）は誤ルーティングの温床。
-#   これらの銘柄はティッカーそのもの（従来どおり）でのみ照合する。
-#   誤ルーティングしても個別株AIが「直接関係するか」で弾くため実害は出ないが、
-#   AI 呼出の無駄と直行ログの汚れを避ける。
 _TICKER_ALIASES: dict = {
     "NVDA": ("NVDA", "NVIDIA"),
     "MSFT": ("MSFT", "MICROSOFT"),
@@ -11893,7 +10682,6 @@ _TICKER_ALIASES: dict = {
 }
 
 
-# ★ v3.9.153 (A-2): 除外語別のヒット数（修正前後の比較用・日次サマリで出力）
 _skip_keyword_hits: dict = {}
 
 
@@ -11933,8 +10721,6 @@ def _maybe_log_noise_filter_summary() -> None:
             f"{_noise_filter_total_count}件ブロック (推定削減 ${_saved_cost:.2f}) "
             f"内訳上位5: {_top_str}"
         )
-    # ★ v3.9.153 (A-2): 除外キーワード別のヒット数も同じ日次サイクルで出す。
-    #   単語境界化（v3.9.153）の前後で「AI 判定に回る件数」を比較するための計測。
     if _skip_keyword_hits:
         _kw_total = sum(_skip_keyword_hits.values())
         _kw_top = sorted(_skip_keyword_hits.items(), key=lambda kv: -kv[1])[:8]
@@ -11998,7 +10784,7 @@ def _detect_question_signals(headlines: list[str]) -> list[tuple[int, str, str]]
 
 
 def _detect_negative_tone_signals(headlines: list[str]) -> list[tuple[int, str, str]]:
-    """★ v3.9.7: ヘッドラインから断定的ネガティブ語幹を検出 (Keel 倒錯ガード用)。
+    """
 
     HEDGE_PATTERNS (warns / could+ネガ動詞 等の "弱い対策") とは別に、
     "net loss" / "misses estimates" / "business shrinks" 等の **断定形** を検出する。
@@ -12056,7 +10842,6 @@ def _apply_meta_filter_to_ai_result(
 
     hedge_hits    = _detect_hedge_signals(headlines)
     question_hits = _detect_question_signals(headlines)
-    # ★ v3.9.7: 断定的ネガ語幹検出 (Keel 倒錯ガード用)
     negtone_hits  = _detect_negative_tone_signals(headlines) if score == 1 else []
 
     # 検出なし → そのまま返す
@@ -12065,7 +10850,6 @@ def _apply_meta_filter_to_ai_result(
 
     note_parts: list[str] = []
 
-    # ── ★ v3.9.7 ⓪: ネガ語幹 × score=1 倒錯ガード (最強対策: score=0 強制) ──
     # 5/11 Keel Infrastructure "$145M net loss... business shrinks" を AI が
     # QQQ ロングで判定して -$201 損失を出した事案への根本対策。
     # AI が「mining」→「AI mining (TECH)」表層連想で誤判定したケースを構造的に防ぐ。
@@ -12133,7 +10917,6 @@ def _apply_meta_filter_to_ai_result(
                 f"pattern={hedge_hits[0][2]!r}"
             )
 
-    # ── ★ v3.9.10: ③ カテゴリ × キーワード整合性チェック ────────────────────
     # AI が SEMI_STRONG カテゴリを返したのに、ヘッドラインに半導体関連キーワードが
     # 全く含まれていない場合、それは構造的誤判定 (例: 5/12 "$6 Gas in California"
     # を SMH に振った事案) → score=0 強制で確実に発注ブロック。
@@ -12154,7 +10937,6 @@ def _apply_meta_filter_to_ai_result(
             result["score"] = 0
             _meta_filter_zeroed_count += 1
 
-    # ── ★ v3.9.17: ③.5 個別株サージ語彙 × ETF 強気判定 ガード (post-AI) ──────
     # 5/13 MPWR "Surged on Robust Quarterly Results" を AI が SEMI_STRONG QQQ BUY と
     # 判定 → 受講生 5 名同時被弾 (-$24.14 / -$21.87 / -$18.50)。
     # ETF モード (target_symbol が None → category != "") かつ score=1 で個別株サージ
@@ -12179,7 +10961,6 @@ def _apply_meta_filter_to_ai_result(
             result["score"] = 0
             _meta_filter_zeroed_count += 1
 
-    # ── ★ v3.9.10: ④ エネルギー価格 + ETF 整合性チェック (post-AI) ───────────
     # ガス/原油等のエネルギー価格関連ヘッドラインで AI が QQQ/SMH を beneficiaries に
     # 入れた場合、それは誤分類 (エネルギー価格 → MACRO → SPY のはず) → 該当銘柄を除外。
     if int(result.get("score", 0)) != 0:
@@ -12216,7 +10997,6 @@ def _apply_meta_filter_to_ai_result(
     return result
 
 
-# ── ★ v3.9.10: カテゴリ × キーワード整合性チェック用 regex ───────────────────
 # SEMI_STRONG カテゴリ判定時の妥当性検証 (post-AI 検証用)。
 # 半導体関連で頻出する銘柄名・専門用語を網羅。
 _SEMI_KEYWORD_REGEX = re.compile(
@@ -12239,7 +11019,6 @@ _ENERGY_PRICE_REGEX = re.compile(
     re.IGNORECASE
 )
 
-# ★ v3.9.18: 観測記事プレフィルタ (AI 呼出前にハードブロック)。
 # 5/8-5/14 の 4 連続日次レポートで指摘されていた継続課題:
 #   - 5/14 "Stock market today: Dow retakes 50,000 level" 11件 -$130.13
 #   - 5/13 "Barbarians meet their new gatekeepers" 2件 -$12.60
@@ -12266,19 +11045,15 @@ _OBSERVATION_HEADLINE_REGEX = re.compile(
     r'what\s+is\s+(?:a\s+)?(?:perpetual|defi|crypto|bitcoin|ethereum|nft|dao|dex)\b|'
     # 「Barbarians meet... / wealthtech middlemen」型の論評記事
     r'(?:barbarians|middlemen|gatekeepers|insiders)\s+(?:meet|face|battle|fight)|'
-    # ★ v3.9.24 追加: 「Tech stocks today: ...」プレフィックス
     # 5/18 で 3 件 -$31.20、5/8/5/13/5/14 でも累計 -$80+ の損失源
     r'tech\s+stocks?\s+today\b|'
-    # ★ v3.9.24 追加: 「Analyst Report: {企業名}」型 (アナリストレポート集約記事)
     # 5/18 で +$22.97 のラッキー勝ち。長期的には方向性なしで運に依存
     r'analyst\s+report\s*:\s*\w+|'
-    # ★ v3.9.24 追加: 訴訟・判決ニュース (株価への直接的影響は限定的)
     # 5/18 利用者C -$28.22 "U.S. Jury Finds OpenAI, Sam Altman Not Liable" 型
     r'(?:u\.?\s*s\.?\s+|federal\s+|state\s+|district\s+|supreme\s+)?(?:jury|court|judge)\s+'
     r'(?:finds?|rules?|orders?|sides?\s+with|dismisses?|throws?\s+out|tosses?)|'
     r'(?:found|ruled|deemed)\s+not\s+liable\b|'
     r'verdict\s+in\s+(?:lawsuit|case|trial)|'
-    # ★ v3.9.27 追加: 新興国の金融政策ニュース (米国 ETF への波及は限定的)
     # 5/20 利用者A 3 名 "Zambia and Angola announce rate cuts, boosting the construction industry"
     # 3 件 -$75.04 (当日損失の 79%)。中国/日本/EU/UK/米国は US 連動性が高いため除外。
     r'\b(?:zambia|angola|argentina|venezuela|nigeria|kenya|egypt|ghana|'
@@ -12289,7 +11064,6 @@ _OBSERVATION_HEADLINE_REGEX = re.compile(
     r'\s+(?:announces?|announced|cuts?|cutting|raises?|raising|'
     r'hikes?|hiking|lowers?|lowering|holds?)\s+'
     r'(?:interest\s+|policy\s+|key\s+)?(?:rates?|interest)|'
-    # ★ v3.9.27 追加: 自動車個別企業の生産地移管ニュース (TECH ETF への波及は限定的)
     # 5/20 3 名 "GM to shift some production from Asia to Mexico from 2027" -$8.42
     # 生産移管は単一企業の経営判断で、TECH/SEMI/MACRO のいずれにも該当しない。
     r'\b(?:gm|general\s+motors|ford|stellantis|toyota|honda|nissan|hyundai|kia|'
@@ -12304,7 +11078,6 @@ _OBSERVATION_HEADLINE_REGEX = re.compile(
     re.IGNORECASE
 )
 
-# ★ v3.9.31: 純粋な市場コメンタリー記事 (ETF・個別株 両モードでブロック)。
 # 5/21 "Sector Update: Tech Stocks Advance Thursday Afternoon" を Finnhub(NVDA)
 # 経由で AI が NVDA-STOCK 判定 (conf=0.66) → 強制損切り -$28.99。
 # これは「セクター全体の値動きを後追い解説する記事」で、特定銘柄の材料ではない。
@@ -12329,7 +11102,6 @@ _MARKET_COMMENTARY_REGEX = re.compile(
     re.IGNORECASE
 )
 
-# ★ v3.9.18: Bitcoin / Crypto 系ヘッドライン除外 (ETF モードでは無関係)。
 # 5/12 "Bitcoin and ethereum prices today" 13件 +$171 (ラッキー勝ち)
 # 5/14 "Explained: What is a perpetual DEX?" 13件 +$287.52 (大ラッキー勝ち)
 # 上昇相場では偶然勝てるが、下落相場では同じ仕組みで大損する → 長期勝率 50% 以下になる。
@@ -12356,7 +11128,6 @@ _CRYPTO_HEADLINE_REGEX = re.compile(
 )
 
 
-# ★ v3.9.17: 個別株サージ語彙ガード (ETF モード post-AI 検証)。
 # 5/13 MPWR (Monolithic Power Systems) "Surged on Robust Quarterly Results" を AI が
 # SEMI_STRONG/QQQ BUY と誤判定 → 受講生 5 名同時被弾 (-$24.14 / -$21.87 / -$18.50)。
 # 個別企業の単独サージ動詞 (Surged/Soared/Jumps/Spikes/Rallies) を含むヘッドラインは
@@ -12364,7 +11135,6 @@ _CRYPTO_HEADLINE_REGEX = re.compile(
 # キーワード (broader market / s&p 500 / nasdaq / market rally) が同居している場合は
 # 個別株ではなく市場全体の動きなので除外。
 #
-# ★ v3.9.21 拡張: 5/15-5/16 で「個別企業の決算電話/Transcript/IPO」型でも
 # 同様の被害が判明 (利用者Q SPY -$47.88 "Eos Energy Q1 2026 Earnings Call Summary",
 # 利用者F QQQ -$23.00 "Innovate (VATE) Q1 2026 Earnings Transcript",
 # Cerebras IPO で 3 名 -$37 等)。これらは「決算/IPO ニュース = 個別企業特有」で
@@ -12380,30 +11150,23 @@ _STOCK_SURGE_REGEX = re.compile(
     r'\bclimbs?\s+(?:on|after|to|amid|following)\b|'
     r'\brobust\s+quarterly\s+results?\b|'
     r'\bshares?\s+(?:are\s+)?trading\s+higher\s+after\b|'
-    # ★ v3.9.21 追加: 個別企業の決算電話/Transcript 型
     r'\bq[1-4]\s+\d{4}\s+earnings\s+(?:call\s+)?(?:summary|highlights|transcript|recap)\b|'
     r'\bearnings\s+call\s+(?:summary|highlights|transcript|recap)\b|'
     r'\bq[1-4]\s+earnings\s+call\b|'
-    # ★ v3.9.21 追加: 個別企業の IPO ニュース
     r'\b(?:stock\s+)?opens?\s+at\s+\$\d+(?:\.\d+)?\s+per\s+share\b|'
     r'\bbiggest\s+ipo\s+of\s+\d{4}\b|'
     r'\b(?:debuts?|launched?)\s+(?:at|with)\s+\$\d+(?:\.\d+)?\b|'
-    # ★ v3.9.21 追加: 提携・大型契約 (個別企業主導)
     r'\bcommits?\s+\$\d+(?:\.\d+)?\s*(?:b|billion)\b|'
     r'\binvests?\s+\$\d+(?:\.\d+)?\s*(?:b|billion)\s+in\b|'
-    # ★ v3.9.21 追加: 個別企業の決算 Beat 型
     r'\b(?:lights?\s+up|jumps?|leaps?)\s+on\s+(?:first|second|third|fourth|q[1-4])[\-\s]*quarter\s+beat\b|'
     r'\bon\s+(?:first|second|third|fourth)[\-\s]*quarter\s+beat\b|'
-    # ★ v3.9.24 追加: 個別企業の上場/IPO/ADS 計画ニュース
     # 5/18 利用者A -$71.00 "Kioxia plans U.S. ADS listing amid AI memory chip boom" 型
     r'\bplans?\s+(?:u\.?\s*s\.?\s+|american\s+|nasdaq\s+|nyse\s+)?(?:ads|adr|ipo|listing|dual\s+listing|public\s+offering)\b|'
     r'\b(?:ads|adr)\s+listing\b|'
     r'\bto\s+list\s+(?:on|via)\s+(?:nasdaq|nyse|otc)\b|'
-    # ★ v3.9.24 追加: 個別企業の値動き解説型 (中小型企業のスリップ/ドロップ)
     # 5/18 コバ -$1.14 "Mattel (MAT) Slipped Due to Unexpected Incremental Spending" 型
     r'\bslip(?:s|ped|ping)?\s+(?:due\s+to|on|after|amid|because\s+of)\b|'
     r'\b(?:dropped?|fell|tumbled|slid)\s+(?:due\s+to|on|after|amid|because\s+of)\s+(?:unexpected|disappointing|weak|lower)\b|'
-    # ★ v3.9.26 追加: JV (Joint Venture) / M&A 大型契約型 (市場全体キーワードなし)
     # 5/19 "Blackstone Commits $5B Equity To Launch Joint Venture With Google" 6件 -$23.93
     # → broader market / S&P 500 が同居していなければ単一企業の話で ETF 波及は限定的
     r'\b(?:commits?|invests?|pledges?)\s+\$?\d+(?:\.\d+)?\s*(?:b|billion|bn|m|million|mm)?\s+'
@@ -12432,9 +11195,8 @@ async def analyze_news(
     headlines: list[str],
     trigger_symbol: str,       # ログ用
     target_symbol: Optional[str] = None,  # v1.3.0: 個別株モード時の対象銘柄。None=ETFモード
-    market_context: str = "",  # ★ v2.92: マクロ環境（直近騰落率）の文脈を AI に追加
+    market_context: str = "",
 ) -> dict:
-    # ── ★ v3.9.6: 「発注しない」セッションは Anthropic API 呼出を完全スキップ ──
     # setup_wizard で CONFIDENCE_PREMARKET=2.00 等の sentinel を設定したセッションは、
     # AI が何を返しても発注に至らない (confidence の上限 1.0 < 閾値 2.0)。
     # 旧設計では AI を呼んでから confidence < threshold で発注ブロックしていたため、
@@ -12456,7 +11218,6 @@ async def analyze_news(
             "victims":       [],
         }
 
-    # ── ★ v3.9.63: クレジット切れ中は API バックオフ (無駄打ち + ERROR スパム防止) ──
     # 検知後は 30 分ごとの復旧プローブ枠以外は API を叩かず即中立スキップ。
     if _anthropic_credit_exhausted and not _anthropic_credit_probe_due():
         global _anthropic_skip_count
@@ -12471,7 +11232,6 @@ async def analyze_news(
             "category": "MACRO", "beneficiaries": [], "victims": [],
         }
 
-    # ── ★ v3.9.31: 市場コメンタリー記事のプレフィルタ (ETF・個別株 両モード) ──
     # 「Sector Update」「Tech Stocks Advance」型は、どの銘柄にとっても売買材料に
     # ならない純粋な市況サマリ。ETF モード専用の観測記事フィルタとは別に、
     # 個別株モードも含めて AI 呼出前にハードブロックする。
@@ -12486,7 +11246,7 @@ async def analyze_news(
         try:
             _log_observation(
                 symbol=(target_symbol or trigger_symbol),
-                side="-", confidence=0.0, score=0,   # ★ v3.9.193: 方向は未定（BUY 直書きをやめる）
+                side="-", confidence=0.0, score=0,
                 category="MACRO", headlines=headlines,
                 beneficiaries=[], victims=[],
                 outcome="blocked", block_stage="market_commentary",
@@ -12505,7 +11265,6 @@ async def analyze_news(
             "victims":       [],
         }
 
-    # ── ★ v3.9.18: 観測記事 / Crypto 系ヘッドラインのプレフィルタ ──────────────
     # AI 呼出前に regex でハードブロック。ETF モードのみ対象 (個別株モードは
     # Coinbase 等の個別判定に影響しないよう除外)。
     # 過去 4 連続日次レポートで指摘された累計 -$220+ の機会損失への対策。
@@ -12524,7 +11283,7 @@ async def analyze_news(
             # 観察ログ記録 (集計用)。pnl60 バックフィルでフィルタの妥当性を後で検証可能。
             try:
                 _log_observation(
-                    symbol=trigger_symbol, side="-", confidence=0.0, score=0,   # ★ v3.9.193: 方向は未定
+                    symbol=trigger_symbol, side="-", confidence=0.0, score=0,
                     category="MACRO", headlines=headlines,
                     beneficiaries=[], victims=[],
                     outcome="blocked", block_stage=_stage,
@@ -12543,11 +11302,8 @@ async def analyze_news(
                 "victims":       [],
             }
 
-    # ★ v3.9.193: 見出しに 1 始まりの番号を振る。AI が返す evidence（根拠にした
-    #   見出しの番号）を、こちらで同じ見出しに引き当てられるようにするため。
     _sent_headlines = headlines[:5]
     combined = "\n".join(f"{_i + 1}. {_h}" for _i, _h in enumerate(_sent_headlines))
-    # ★ v1.3.0 統合版: 判定モードを user メッセージ冒頭で指定する。
     # システムプロンプト側に {symbol} を埋めずに済むため、全リクエストが同一の
     # SYSTEM_PROMPT キャッシュをヒットする (ETF/個別株すべて共通キャッシュ)。
     if target_symbol:
@@ -12555,7 +11311,6 @@ async def analyze_news(
     else:
         mode_line = "判定モード: ETF（SEMI_STRONG / SEMI / TECH / MACRO のカテゴリ分類）"
     parts = [mode_line]
-    # ★ v2.92: market_context が指定されている場合は mode_line の直後に付加。
     # 5/4 NY11時の急落事案で、相場全体の流れを AI が考慮できなかった問題への対策。
     if market_context:
         parts.append(market_context)
@@ -12563,14 +11318,10 @@ async def analyze_news(
     user_msg = "\n\n".join(parts)
     raw = ""
     try:
-        # ★ v1.3.0: system は統合 SYSTEM_PROMPT のみ。cache_control で Prompt Caching 有効化。
         # ETF / 個別株モード両方が 4,096 tok 超の同一キャッシュをヒット → 高ヒット率。
         # user 側 (動的: モード行 + market_context + headlines) はキャッシュ対象外。
-        # ★ v3.8.4: max_tokens 1500→1000 に縮小 (ログ実測で max=1009 / avg=266、
         # 99.98% は 1000 以下なので通常運用への影響なし)。万一切断されても result
         # は中立判定にフォールバックするため安全。
-        # ★ v3.8.4 / v3.9.1: stop_sequences で JSON 後にコメント生成を停止 (output 削減)。
-        # ★ v3.9.1: Anthropic API 仕様変更により「空白のみの stop_sequence」が
         # 400 invalid_request_error になったため、"\n\n" を削除し非空白文字を含む
         # パターンに差し替え。エラー本文:
         #   "stop_sequences: each stop sequence must contain non-whitespace"
@@ -12580,7 +11331,6 @@ async def analyze_news(
         #   - "\n注:":  日本語の「注:」開始
         # 共通: JSON 本体は 1 行記述 (改行禁止) を厳守させているため、これらの
         # シーケンスが現れた = AI がコメント生成に入ったタイミング。
-        # ── ★ v3.9.13: 並列 API 呼出シリアライズ + 最小間隔ガード ──────────────
         # 全 async ループ (external/alpaca/global/stock/earnings) が共通の
         # _anthropic_api_lock (Semaphore(1)) を待つことで、サーバー側への
         # 同時着弾を排除。さらに最小 ANTHROPIC_MIN_INTERVAL_SEC 秒の間隔を空ける。
@@ -12599,7 +11349,6 @@ async def analyze_news(
                         )
                         await asyncio.sleep(_wait)
                 _last_anthropic_call_time = datetime.datetime.now()
-                # ★ v3.9.60: 529/503/overloaded で指数バックオフ再試行
                 response = await asyncio.to_thread(
                     _anthropic_create_with_retry,
                     client,
@@ -12617,7 +11366,6 @@ async def analyze_news(
                 )
         else:
             # フォールバック (semaphore 未初期化時): 従来通り直列化なし
-            # ★ v3.9.60: ここでもリトライ機能を適用
             response = await asyncio.to_thread(
                 _anthropic_create_with_retry,
                 client,
@@ -12633,7 +11381,6 @@ async def analyze_news(
                 ],
                 messages=[{"role": "user", "content": user_msg}],
             )
-        # ★ v3.0.0: Prompt Cache 統計を DEBUG ログ出力
         # cache_creation > 0 → 書込発生 / cache_read > 0 → ヒット (90% off)
         # 両方0 → キャッシュ未到達 (4,096 tok 未満の可能性) / getattr で安全取得
         _usage = getattr(response, "usage", None)
@@ -12646,13 +11393,11 @@ async def analyze_news(
                 f"[{trigger_symbol}] AI usage: "
                 f"in={_in} cache_write={_cw} cache_read={_cr} out={_ot}"
             )
-            # ★ v3.5.1: 時間帯別バケットに記録 (1時間ごとサマリ用)
             _record_cache_usage(_cw, _cr, _in, _ot)
         raw     = response.content[0].text.strip()
         # ── JSON パース戦略 (優先順位順) ──────────────────────────────────────
         # ① コードフェンス除去 + json.loads 直接 (最も確実)
         # ② regex で [...] 抽出 / ③ {...} 抽出 / ④ 複数JSONブロックを順次試行
-        # ★ v2.80: 旧版の "arr_match優先" は {"beneficiaries":["QQQ"]} のネスト配列を
         # 誤マッチして "Extra data" 多発 → 上記順序に変更で根本解決。
         cleaned = re.sub(r"```[a-zA-Z]*\s*", "", raw)  # 開始フェンス除去
         cleaned = re.sub(r"\s*```", "", cleaned)         # 終了フェンス除去
@@ -12721,7 +11466,6 @@ async def analyze_news(
                 except json.JSONDecodeError:
                     continue
 
-        # ── ⑤ ★ v3.9.60: AI 散文応答からの score 抽出 ────────────────────────────
         # AI が「以下の4件を評価:\n1. ...→ score = 0\n2. ...→ score = 0」のような
         # 散文形式で応答した場合、JSON ブロックが存在せず ①〜④ が全て失敗する。
         # 散文中の "score = N" / "score: N" / '"score": N' パターンを抽出する。
@@ -12776,7 +11520,6 @@ async def analyze_news(
         result.setdefault("beneficiaries", [])
         result.setdefault("victims", [])
         result.setdefault("category", "MACRO")   # SEMI / TECH / MACRO
-        # ── ★ v3.9.193: evidence（AI が根拠にした見出しの番号）を正規化 ──────────
         # 1〜送った見出し数 の整数に直せたときだけ採用し、それ以外は None にする。
         # None のときは呼び出し側が従来どおりバッチ全体で ETF 影響ガードを掛ける
         # （番号が無い/壊れているだけで判定が止まることはない）。
@@ -12799,46 +11542,36 @@ async def analyze_news(
         exec_syms = {sym for syms in EXECUTION_MAP.values() for sym in syms}
         result["beneficiaries"] = [s for s in result["beneficiaries"] if s in exec_syms]
         result["victims"]       = [s for s in result["victims"]       if s in exec_syms]
-        # ★ v3.4.0: ヘッドライン メタフィルタ適用
         # (ヘッジ/警告語: conf 減算 / 疑問形・二者択一: score=0 強制)
         # 14:46 事象 (2026-05-07) のような誤判定の最後の砦。
         # AI の判定材料は reason 欄に保持されるため、誤検知時もトレースバック可能。
         result = _apply_meta_filter_to_ai_result(result, headlines, trigger_symbol)
-        # ★ v3.3.0: AI 呼出成功 → クレジット切れ検知中なら復旧候補カウンタを進める
         # (2 連続成功で復旧確定し、状態リセット + 復旧通知が出る)
         _handle_anthropic_success()
-        # ★ v3.9.63: 復旧確定前のプローブ成功時は次回を即プローブ可能にして
         # 高速復帰させる (30 分待たずに 2 回目の成功 → 復旧確定)。
         if _anthropic_credit_exhausted:
             global _anthropic_credit_last_probe_at
             _anthropic_credit_last_probe_at = None
-        _handle_anthropic_auth_recovery()   # ★ v3.9.113: 認証エラーからの回復を通知
-        _reset_ai_unclassified_failure()    # ★ v3.9.151: 成功で連続失敗カウンタを戻す
+        _handle_anthropic_auth_recovery()
+        _reset_ai_unclassified_failure()
         return result
     except (json.JSONDecodeError, KeyError, AssertionError) as e:
-        # ★ v3.9.151: 解析エラーも「AI 判定が機能していない」状態なので数える
-        #   （Codexレビュー指摘）。応答形式の変更などで続けて失敗したら鳴る。
         _note_ai_unclassified_failure(e)
         log.warning(f"[{trigger_symbol}] AI レスポンス解析エラー: {e}  raw={raw!r}")
         return {"score": 0, "confidence": 0.0, "horizon": "unknown",
                 "reason": "解析エラー（中立扱い）", "beneficiaries": [], "victims": []}
     except anthropic.APIError as e:
-        # ★ v3.9.151: 402（支払い情報の問題）は最初に見る（Codexレビュー指摘）。
-        #   下の残高判定は文字列一致なので、402 の本文が同じ語を含むと誤routeされる。
-        #   status_code による判定を文字列判定より先に置く。
         if _is_billing_error(e):
             _handle_anthropic_billing_error(e)
             return {"score": 0, "confidence": 0.0, "horizon": "unknown",
                     "reason": "Anthropic API 支払いエラー402（中立スキップ）",
                     "beneficiaries": [], "victims": []}
-        # ★ v3.3.0: クレジット切れを文字列マッチで検知 (BadRequestError も APIError 配下)
         if _is_credit_exhausted_error(e):
             _handle_credit_exhausted(e)
             # 検知後は中立スキップ（ログは _handle_credit_exhausted 内で完結）
             return {"score": 0, "confidence": 0.0, "horizon": "unknown",
                     "reason": "Anthropic API クレジット切れ（中立スキップ）",
                     "beneficiaries": [], "victims": []}
-        # ── ★ v3.9.17: 400 invalid_request_error の詳細ロギング ───────────────
         # 5/13 認定サポーター環境で 49 件発生。原因特定のため status_code / body /
         # リクエスト要素 (model, max_tokens, stop_sequences, user_msg 先頭) を出力。
         _status = getattr(e, "status_code", None)
@@ -12863,15 +11596,12 @@ async def analyze_news(
             return {"score": 0, "confidence": 0.0, "horizon": "unknown",
                     "reason": f"400 invalid_request ({_err_type})",
                     "beneficiaries": [], "victims": []}
-        # ★ v3.9.113: 認証エラー(401)は専用通知（Discord＋端末バナー・従来は無通知だった）
         if _is_auth_error(e):
             _handle_anthropic_auth_error(e)
             return {"score": 0, "confidence": 0.0, "horizon": "unknown",
                     "reason": "Anthropic API 認証エラー401（中立スキップ）",
                     "beneficiaries": [], "victims": []}
         # クレジット切れ・認証エラー以外の API エラーは従来通り
-        # ★ v3.9.151: どの分岐にも当たらなかった＝分類できない失敗として数える。
-        #   連続すると health_warning_loop が原因を問わず警告する。
         _note_ai_unclassified_failure(e)
         log.error(f"[{trigger_symbol}] Anthropic API エラー: {e}")
         return {"score": 0, "confidence": 0.0, "horizon": "unknown",
@@ -12905,10 +11635,6 @@ except (TypeError, ValueError):
 # ★ 初回抑制バグ回避: 0.0 起点だと起動直後の約120秒（OpenD 起動順の問題が
 #   まさに起きる窓）は通知が間引かれてしまう。None=未送信で管理する。
 _opend_down_last_note_mono = None
-# ★ v3.9.157b: 半死状態（TCPは通るがSDK生成が返らない）でのスレッド堆積対策。
-#   生成スレッドの同時実行に上限を設け、タイムアウト直後は短時間ブレーカーで
-#   即例外にする（4レーンレビューの一致指摘——上限なしだと数時間で数百本の
-#   ハングスレッド＋SDKの非daemon再接続スレッドが積もる）。
 _ctx_build_lock = threading.Lock()
 _ctx_build_inflight: int = 0
 _CTX_BUILD_MAX_INFLIGHT: int = 3
@@ -12917,7 +11643,7 @@ _CTX_BUILD_BACKOFF_SEC: float = 20.0
 
 
 class OpenDUnavailableError(RuntimeError):
-    """★ v3.9.157: OpenD に接続できない／応答しないときに投げる。
+    """
 
     SDK のコンテキストコンストラクタは OpenD と繋がるまで例外もタイムアウトも
     無しに6秒間隔で無限に再試行する。これがイベントループ上で起きると、
@@ -12941,30 +11667,16 @@ def _opend_tcp_ok(timeout_sec: float = 3.0) -> bool:
 async def _wait_for_opend() -> bool:
     """OpenD が起動するまで待つ。戻り値: 最終的に到達できたか。
 
-    ★ v3.9.167: v3.9.157b でこの待機を入れたが、**起動時の到達性チェックが手前で
-    sys.exit(1) するため、OpenD 未起動のままでは一度も実行されなかった**
-    （認定サポーターの指摘）。共通の関数に切り出して到達性チェックから呼ぶ。
 
-    ★ v3.9.167b: レビューで3点直した。
-      - 待たなかったときに **一言も出さずに False を返す**経路があり、呼び出し側の
-        sys.exit(1) が完全な無言終了になっていた → 結果は必ずログに残す
-      - ループ条件で確認した直後にもう一度 TCP を張っており、その一瞬の揺れで
-        「待って到達したのに失敗」になり得た → 確認は1回だけにする
-      - `OPEND_STARTUP_WAIT_MIN=0` は従来「待たずに続行」だったのに「1回の失敗で終了」に
-        変わっていた → 0 は「この関門を使わない」に戻す
     """
     try:
         _min = float(os.environ.get("OPEND_STARTUP_WAIT_MIN", "10") or 10)
         if not math.isfinite(_min) or _min < 0:
-            _min = 10.0   # ★ v3.9.157c: nan/負値で待機が消えるのを防ぐ
-        _min = min(_min, 120.0)   # ★ v3.9.167b: 桁を打ち間違えても止まり続けない
+            _min = 10.0
+        _min = min(_min, 120.0)
     except (TypeError, ValueError):
         _min = 10.0
     if _min <= 0:
-        # ★ v3.9.167c: 「待たない」＝現状をそのまま答える（Codexレビュー指摘——
-        #   True 固定にすると、最初の到達性チェックが失敗を握り潰して続行し、
-        #   実口座検証の SDK 接続でハングする。従来の 0 は「後段の待機をスキップ」
-        #   であって「到達性チェックもスキップ」ではない）。
         return _opend_tcp_ok()
     if _opend_tcp_ok():
         return True
@@ -12992,7 +11704,7 @@ def _note_opend_down(what: str, detail: str) -> None:
     原因を名指しする通知を、ループの状態に関係なく出せる使い捨てスレッドで送る。
     """
     global _opend_down_last_note_mono
-    with _ctx_build_lock:   # ★ v3.9.157b: check-then-set のレースで通知が連打される穴を塞ぐ
+    with _ctx_build_lock:
         _nowm = time.monotonic()
         if (_opend_down_last_note_mono is not None
                 and _nowm - _opend_down_last_note_mono < 120):
@@ -13009,20 +11721,9 @@ def _note_opend_down(what: str, detail: str) -> None:
 
 
 def _make_ctx_bounded(factory, what: str):
-    """★ v3.9.157: SDK コンテキストを「二段構え」で生成する（v3.9.147 の
-    _opend_state_line と同じ型を、実際に毎回使う生成経路へ展開）。
-      ① 素の TCP で当たりを取り、繋がらなければ SDK を触らない
-      ② 繋がっても応答しない場合に備え、別スレッドで期限を切る
-    期限内に返らなければ OpenDUnavailableError（無限ブロックの代替）。
-    期限後に遅れて生成が成功した場合は、その場で close して資源を漏らさない。
+    """
     """
     global _ctx_build_inflight, _ctx_build_backoff_until
-    # ★ v3.9.157b/c: 直近のタイムアウト直後はスレッドを起こさず即例外（ブレーカー）。
-    #   上限の確認と予約は同一ロック区間で原子的に行い、カウンタは「生存中の
-    #   生成スレッド数」として生成スレッド自身の finally で減算する（Codex指摘——
-    #   呼出元の15秒で減算するとハング中のスレッドが数に入らず、35秒ごとに
-    #   堆積し続ける。生存数で数えれば上限3本で頭打ちになり、OpenD 復帰で
-    #   ハングが解けた時に自然に枠が戻る）。
     with _ctx_build_lock:
         if time.monotonic() < _ctx_build_backoff_until:
             raise OpenDUnavailableError(f"OpenD 応答なし（直前のタイムアウトから待機中・{what}）")
@@ -13048,9 +11749,6 @@ def _make_ctx_bounded(factory, what: str):
                     _res["err"] = _e_b
                     _done.set()
                 return
-        # ★ v3.9.157b: 公開かcloseかの判断はロック下で原子的に行う（レビュー3レーンの
-        #   一致指摘——is_set() 確認と格納の間に main 側の set が割り込むと、生成済み
-        #   ctx が誰にも close されずに漏れていた）。
             with _ctx_build_lock:
                 if _late.is_set():
                     _should_close = True
@@ -13065,7 +11763,7 @@ def _make_ctx_bounded(factory, what: str):
                     pass
         finally:
             with _ctx_build_lock:
-                _ctx_build_inflight -= 1   # ★ v3.9.157c: 生存数はスレッド終了で減る
+                _ctx_build_inflight -= 1
     _th = threading.Thread(target=_build, daemon=True, name=f"ctx-build-{what}")
     _th.start()
     _th.join(MOOMOO_CTX_BUILD_TIMEOUT_SEC)
@@ -13085,8 +11783,8 @@ def _make_ctx_bounded(factory, what: str):
 
 
 def _apply_ctx_timeout(ctx):
-    """★ v3.9.129: 接続READY待ちの無限待ちを有限化する（OpenD無応答ハング対策）。
-    SDKに set_sync_query_connect_timeout が無い旧版でも壊れないよう getattr で防御。"""
+    """
+    """
     try:
         _setter = getattr(ctx, "set_sync_query_connect_timeout", None)
         if callable(_setter) and MOOMOO_CONNECT_TIMEOUT_SEC > 0:
@@ -13098,7 +11796,7 @@ def _apply_ctx_timeout(ctx):
 
 def _make_quote_ctx() -> OpenQuoteContext:
     """OpenQuoteContext を生成して返す。 MOOMOO_RSA_KEY が空・None・存在しないファイルの場合は security_data_path を渡さず「暗号化なし」で接続する。
-    ★ v3.9.157: 生成は _make_ctx_bounded 経由（OpenD 停止時の無限ブロック対策）。"""
+    """
     if MOOMOO_RSA_KEY and isinstance(MOOMOO_RSA_KEY, str) and os.path.isfile(MOOMOO_RSA_KEY):
         return _apply_ctx_timeout(_make_ctx_bounded(lambda: OpenQuoteContext(
             host=MOOMOO_HOST, port=MOOMOO_PORT,
@@ -13120,16 +11818,15 @@ def _make_trade_ctx() -> OpenSecTradeContext:
     ), "trade"))
 
 
-# ★ v2.86: ctx リソースリーク対策の context manager
 # `_make_trade_ctx()` 直呼びは API 例外時に close() されず OpenD 接続が滞留する問題あり。
 # `with _trade_ctx() as ctx:` で例外時も確実に close される。
 import contextlib as _contextlib
 
-_thread_loop_local = threading.local()   # ★ v3.9.191: スレッドごとの asyncio ループ
+_thread_loop_local = threading.local()
 
 
 def _ensure_thread_event_loop() -> None:
-    """★ v3.9.71: 現スレッドに asyncio イベントループを保証する。
+    """
 
     モメンタム実発注は `await asyncio.to_thread(place_short/place_buy, ...)` で
     ワーカースレッド実行され、そのスレッドにはイベントループが無い。moomoo SDK
@@ -13144,12 +11841,6 @@ def _ensure_thread_event_loop() -> None:
         return  # 実行中ループあり (メインスレッド等) → 何もしない
     except RuntimeError:
         pass
-    # ★ v3.9.191: asyncio.get_event_loop_policy() を使わない（認定サポーターの指摘）。
-    #   Python 3.14 で非推奨になり、**照会・発注・OVN 巡回のたびに stderr へ警告**が
-    #   出ていた。標準出力が塞がれた凍結では、この警告の書き込みでワーカースレッドが
-    #   先に止まる（py-spy で sync_positions と OVN 照会がこの行で停止していた）。
-    #   代わりに「このスレッドで作ったループ」をスレッドローカルに覚えておく。
-    #   to_thread のワーカーは使い回されるので、スレッドごとに1つで足りる。
     _lp = getattr(_thread_loop_local, "loop", None)
     if _lp is not None and not _lp.is_closed():
         # ★ 配布前レビュー（Gemini）: 他のライブラリが set_event_loop(None) で束縛を
@@ -13171,7 +11862,7 @@ def _ensure_thread_event_loop() -> None:
 @_contextlib.contextmanager
 def _trade_ctx():
     """使用例: / with _trade_ctx() as ctx: / ret, data = ctx.place_order(...) / # この時点で ctx は閉じられている（例外が出ても）"""
-    _ensure_thread_event_loop()  # ★ v3.9.71: ワーカースレッドの no-event-loop 例外を防止
+    _ensure_thread_event_loop()
     ctx = _make_trade_ctx()
     try:
         yield ctx
@@ -13198,7 +11889,7 @@ def _quote_ctx():
 
 
 def _opend_state_line(timeout_sec: float = 10.0) -> str:
-    """★ v3.9.147: OpenD の版数とログイン状態を1行で返す（起動バナー用）。
+    """
 
     不具合の相談で「OpenD が古い」「相場サーバーに繋がっていない」が原因の
     ケースが繰り返し起きているため、ログだけで切り分けられるようにする。
@@ -13294,7 +11985,7 @@ def _tokutei_kwargs(trd_env: TrdEnv, is_short: bool = False) -> dict:
 
 
 def _cover_trd_side(trd_env: TrdEnv):
-    """★ v3.9.63: SHORT 建玉の決済 (買い戻し) に使う TrdSide を環境別に返す。
+    """
 
     - 実口座 (TrdEnv.REAL / FUTUJP 信用): TrdSide.BUY_BACK
         moomoo サポート (2026-05-08) 確認の正規仕様。
@@ -13351,10 +12042,6 @@ def get_price_finnhub(symbol: str) -> float:
         if resp.status_code == 200:
             data  = resp.json()
             price = float(data.get("c", 0) or 0)
-            # ★ v3.9.156b: Alpaca 側に鮮度検査を入れた結果、時間外はこの経路の通過率が
-            #   上がる。Finnhub の t（unix秒）も同じ上限で検査しないと「古値が指値基準と
-            #   価格履歴に入る」穴がここに残る（新規Claudeレビュアーの指摘）。
-            #   t が無い・読めない場合は従来挙動（fail-open）。
             try:
                 _t_fin = float(data.get("t", 0) or 0)
                 if _t_fin > 0 and (time.time() - _t_fin) > ALPACA_QUOTE_MAX_AGE_SEC:
@@ -13377,23 +12064,11 @@ ALPACA_QUOTE_MAX_AGE_SEC: int = int(os.environ.get("ALPACA_QUOTE_MAX_AGE_SEC", "
 def _alpaca_quote_age_ok(t_raw) -> bool:
     """Alpaca 気配のタイムスタンプが十分新しいか。
 
-    ★ v3.9.156: Alpaca フォールバックは OpenD の相場が全滅したときだけ通る経路で、
-    IEX フィードの稼働時間外は数時間前の気配が返る。鮮度を見ずに使うと、古い価格が
-    指値の基準と _INDEX_PRICE_HISTORY（乖離検査の基準）に入り、履歴が古値で
-    自己参照化して乖離検査が恒久的に素通りする（5日分レビュー）。
-    タイムスタンプが読めない場合は従来挙動を保つ（fail-open・ログのみ）。
     """
     try:
         t_str = str(t_raw or "").strip()
         if not t_str:
             return True   # フィールド無し → 判定不能は従来挙動
-        # ★ v3.9.157 (A-3): 小数秒の「超過桁だけ」を削り、オフセットは保持する
-        #   （認定サポーターの指摘・修正案どおり）。旧実装は "." で分割して先頭6桁
-        #   だけ残すため -04:00 等のオフセットごと落ち、さらに無条件の
-        #   replace(tzinfo=UTC) が解釈を捨てて時刻の数字を UTC として読み、
-        #   オフセット付き表記では逆の判定になっていた（-04:00 の新しい気配を
-        #   「古い」と誤判定・実測で再現）。現行 Alpaca は Z 表記のため実害は
-        #   未発生だが、仕様上はオフセット付き RFC3339 も許容される。
         t_str = re.sub(r"(\.\d{6})\d+", r"\1", t_str)
         if t_str.endswith("Z"):
             t_str = t_str[:-1] + "+00:00"
@@ -13433,7 +12108,6 @@ def get_quote_alpaca(symbol: str) -> dict:
             quote = data.get("quote", {})
             ask   = float(quote.get("ap", 0) or 0)
             bid   = float(quote.get("bp", 0) or 0)
-            # ★ v3.9.156: 古い気配は使わない（時間外の IEX は数時間前の気配を返す）
             if (ask > 0 or bid > 0) and not _alpaca_quote_age_ok(quote.get("t")):
                 log.info(
                     f"[Alpaca Quote] {symbol}: 気配が古いため破棄"
@@ -13448,7 +12122,6 @@ def get_quote_alpaca(symbol: str) -> dict:
     return {"ask": 0.0, "bid": 0.0}
 
 
-# ★ v3.9.77 (B-3): get_order_book がセッション内で失敗した銘柄を記憶し、以降は
 # ORDER_BOOK 購読/取得をスキップして get_stock_quote を直接使う (無駄な失敗呼出と
 # ログノイズの削減)。セッションが変わったらリセット。
 _orderbook_fail_symbols: set = set()
@@ -13472,28 +12145,13 @@ def get_quote(symbol: str) -> dict:
                     片側でも last で埋めた合成値なら False（スプレッド検査の軸）。
     取得失敗時は数値すべて 0.0・フラグは False。片側だけの板のときは
     その片側と last を返すことがある（two_sided=False）。
-    ★ v3.9.156: 新しい return を足すときは必ず両フラグを実態どおり設定すること
-    （tests/test_regressions.py の契約テストが検査する）。
 
-    ★ v2.90: ctx 管理を with _quote_ctx() コンテキストマネージャに統一。
-    旧コード（v2.89 まで）も `try/except + 例外時 ctx.close()` で保護されており
-    実害はなかったが、v2.86 で導入したコンテキストマネージャパターンと
-    整合させて可読性を向上。挙動は完全に同一。
     """
     code = to_moomoo_code(symbol)
-    # ★ v3.9.154: 返した ask/bid が板（ORDER_BOOK）由来かどうか。板が空で last を
-    #   代替に使った場合は False にして、ログと呼び出し側で区別できるようにする
-    #   （認定サポーターの指摘§5）。
     _quote_from_book = True
-    # ★ v3.9.155: ask/bid が「独立に観測された両側の気配」か（新規Claudeレビュアーの指摘）。
-    #   スプレッド検査の適用軸はこちら。板でなくても LV1・Alpaca の ask/bid は実在の
-    #   気配なので検査対象に残す。last で片側でも埋めた合成値だけを検査対象外にする
-    #   （合成値は ask==bid で spread が必ず 0 になり、検査が意味を持たないため）。
     _quote_two_sided = True
     try:
-        # ★ v2.90: with _quote_ctx() による自動 close。早期 return / 例外でも
         # __exit__ が呼ばれて ctx.close() が確実に実行される。
-        # ★ v3.9.77 (B-3): セッション変化でフェイルキャッシュをリセット
         global _orderbook_fail_session
         try:
             _cur_sess, _ = get_session_info()
@@ -13511,8 +12169,6 @@ def get_quote(symbol: str) -> dict:
                 _r_quote, _e_quote = ctx.subscribe([code], [SubType.QUOTE], subscribe_push=False)
                 if _r_quote != RET_OK:
                     log.debug(f"[subscribe] {symbol} QUOTE: {_e_quote}（取得は続行）")
-                # ★ v3.9.77 (B-3): 当セッションで get_order_book 失敗実績がある銘柄は
-                #   ORDER_BOOK 購読/取得をスキップし get_stock_quote に直行（無駄呼出削減）。
                 if not _skip_ob:
                     _r_ob, _e_ob = ctx.subscribe([code], [SubType.ORDER_BOOK], subscribe_push=False)
                     if _r_ob != RET_OK:
@@ -13548,17 +12204,14 @@ def get_quote(symbol: str) -> dict:
                     except (IndexError, TypeError, KeyError, AttributeError) as ex:
                         log.warning(f"[get_quote] {symbol}: OrderBook パース失敗（{ex}）→ get_stock_quote にフォールバック")
                 elif not _skip_ob:
-                    # ★ v3.9.31: get_order_book ret=-1 は get_stock_quote フォールバックが
                     # 正常動作するため実害なし。受講生が誤ってエラーと認識する問い合わせが
                     # 多発したため WARNING → DEBUG に降格 (ファイルログには引き続き記録)。
-                    # ★ v3.9.77 (B-3): この銘柄は当セッション中スキップ対象として記憶。
                     _orderbook_fail_symbols.add(symbol)
                     log.debug(f"[get_quote] {symbol}: get_order_book ret={ret_ob} 失敗 → このセッション中は get_stock_quote へフォールバック（セッション切替後に再試行）")
 
                 # ── 基本株価（last / ask・bid の補完）─────────────────────────────────
                 ret_sq, data_sq = ctx.get_stock_quote([code])
                 if ret_sq == RET_OK and _df_has_rows(data_sq):
-                    # ★ v2.75: moomoo が 'N/A' 文字列を返すフィールドを安全に変換するヘルパー
                     # float('N/A') は ValueError を出し、get_quote 全体がクラッシュしていた問題を修正。
                     def _sf(v, d=0.0):
                         """'N/A'・None・非数値を安全に float へ変換"""
@@ -13603,8 +12256,6 @@ def get_quote(symbol: str) -> dict:
                             last = cur
 
                         # ask_price / bid_price が ORDER_BOOK より精度が高い場合は補完
-                        # ★ v3.9.154: get_stock_quote で補完した側は板由来ではない
-                        #   （Codexレビュー指摘）。片側でも補完したらフラグを落とす。
                         if ask <= 0 and ask_sq > 0:
                             ask = ask_sq
                             _quote_from_book = False
@@ -13616,62 +12267,40 @@ def get_quote(symbol: str) -> dict:
                         log.warning(f"[get_quote] {symbol}: get_stock_quote パース失敗 ({type(ex).__name__}: {ex})")
                         last = 0.0
                     # OrderBook が空だった場合は last を ask/bid の代替に使う
-                    # ★ v3.9.154: 代替で埋めたことを記録する（認定サポーターの指摘§5）。
-                    #   従来はここで ask=bid=last になり、返却ログも板由来と同じ文面
-                    #   だったため、ログから板の取得可否を判定できなかった。
                     if ask <= 0:
                         ask = last
                         _quote_from_book = False
-                        _quote_two_sided = False   # ★ v3.9.155: 合成値
+                        _quote_two_sided = False
                     if bid <= 0:
                         bid = last
                         _quote_from_book = False
                         _quote_two_sided = False
 
         except OpenDUnavailableError:
-            # ★ v3.9.157b: OpenD 不達でも Alpaca/Finnhub フォールバックへ落とす
-            #   （新規Claudeレビュアーの指摘——従来は末尾の except に直行して全ゼロを
-            #   返し、フォールバックが一度も使われない「盲目監視」になっていた。
-            #   通知は _note_opend_down が120秒間引きで出すため、ここでは静かに続行）。
             ask, bid, last = 0.0, 0.0, 0.0
             _quote_from_book = False
             _quote_two_sided = False
-        # ★ v2.90: with ブロックを抜けた時点で ctx.close() 済み
         # 以降の return は ctx を使わないため with の外に配置（フォールバック含む）
 
         # ── OpenD ORDER_BOOK が有効なら即リターン（最優先）────────────────────
         if ask > 0 and bid > 0:
-            # ★ v3.9.156: 片側を last で埋めた合成クォート（two_sided=False）では
-            #   中値を捏造しない（5日分レビュー）。実在しない (実気配+last)/2 が
-            #   乖離検査の対象と価格履歴に入るのを防ぐ。合成時は埋めた元の last が
-            #   必ず正なので、last=0 になる経路は増えない。
             if _quote_two_sided:
                 last = (ask + bid) / 2.0
             if _quote_from_book:
                 log.debug(f"[get_quote] {symbol}: OpenD ORDER_BOOK ask=${ask:.2f} bid=${bid:.2f} → ${last:.2f}")
             else:
-                # ★ v3.9.154: 板が取れなかった回。文面を分けて集計できるようにする。
-                #   （LV1 の ask/bid で埋めた場合と last で埋めた場合の両方を含む）
                 log.debug(f"[get_quote] {symbol}: 板なし→LV1/last代替 ask=${ask:.2f} bid=${bid:.2f} → ${last:.2f}")
             return {"ask": ask, "bid": bid, "last": last,
                     "from_book": _quote_from_book, "two_sided": _quote_two_sided}
 
-        # ★ v3.9.156: 旧「ORDER_BOOK が取れなかった場合」ブロックは到達不能のため
-        #   削除（5日分レビューで2名が独立に証明: last>0 になるのは ret_sq==RET_OK の
-        #   分岐内だけで、その末尾の埋め処理で必ず ask>0 and bid>0 → 上の return で
-        #   返っている。パース失敗時は last=0）。
 
         # ── Alpaca にフォールバック ───────────────────────────────────────────
         if ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY:
             _alp = get_quote_alpaca(symbol)
             if _alp["ask"] > 0 and _alp["bid"] > 0:
                 last = (_alp["ask"] + _alp["bid"]) / 2.0
-                _quote_from_book = False   # ★ v3.9.154: Alpaca 由来は板ではない
+                _quote_from_book = False
                 log.debug(f"[get_quote] {symbol}: OpenD取得失敗 → Alpaca ${last:.2f}")
-                # ★ v3.9.154: 板由来ではないので spread 検査の対象外にする
-                # ★ v3.9.155: Alpaca の ask/bid は実在の両側気配。板ではないが
-                #   スプレッド検査の対象に残す（新規Claudeレビュアーの指摘——
-                #   OpenD 不調時こそ板薄ガードが要る場面なのに外れていた）。
                 return {"ask": _alp["ask"], "bid": _alp["bid"], "last": last,
                         "from_book": False, "two_sided": True}
 
@@ -13680,19 +12309,13 @@ def get_quote(symbol: str) -> dict:
             finn_price = get_price_finnhub(symbol)
             if finn_price > 0:
                 log.debug(f"[get_quote] {symbol}: OpenD/Alpaca失敗 → Finnhub ${finn_price:.2f}")
-                # ★ v3.9.154: ask=bid=last の合成値。spread 検査は意味を持たない
                 return {"ask": finn_price, "bid": finn_price, "last": finn_price,
                         "from_book": False, "two_sided": False}
 
-        # ★ v3.9.155b/156: ここに来るのは全ソース枯渇（または片側だけの板）のとき。
-        #   両側そろっていれば上（:11192付近）で返っているため、ここでは常に
-        #   「両側気配なし」。フラグは無条件に False で返す（旧 if ガードは
-        #   常に真だったので無条件化・5日分レビュー）。
         return {"ask": ask, "bid": bid, "last": last,
                 "from_book": False, "two_sided": False}
 
     except Exception as e:
-        # ★ v2.90: with _quote_ctx() が __exit__ で ctx.close() を保証するため、
         # 旧コードにあった「except 内での明示的な ctx.close()」は不要になった。
         log.warning(f"[価格取得] {symbol}: {e}")
         return {"ask": 0.0, "bid": 0.0, "last": 0.0,
@@ -13700,10 +12323,6 @@ def get_quote(symbol: str) -> dict:
 
 
 
-# ★ v3.9.171: async から get_quote を呼ぶための入口。get_quote は OpenD への
-#   同期RPC（接続生成＋subscribe＋板＋気配）で、await せずに呼ぶとイベントループ
-#   ごと止まる。各所で to_thread を手書きすると必ず書き漏れる（初版が実際に
-#   3箇所中1箇所しか直せなかった）ので、経路を1本にする。
 #
 #   ★ 期限と警報をセットで持つ理由（配布前レビューの指摘）
 #   イベントループから逃がすと、**故障が静かになる**。従来は同期呼び出しが
@@ -13737,12 +12356,6 @@ _QUOTE_TIMEOUT_ALERT_AT: int = 3
 def quote_price(q: dict) -> float:
     """気配値から「いまの値段」を1つ選ぶ。last → bid → ask の順。
 
-    ★ v3.9.171: 同じ選び方が risk_monitor_loop の中だけで3通りに分かれており、
-      板が片側しか無いとき（薄いプレ・一時中断明け）に、ある枝は価格を出せて
-      別の枝は「価格取得失敗」になっていた。とくに損切り・トレールを動かす枝が
-      ask を見ておらず、Ask 側だけの板では監視が丸ごと飛んでいた
-      （表示だけの枝は価格を出しているので、利用者には正常に見える）。
-      板のどちら側が残るかで監視が生き死にするのはおかしいので、1本に揃える。
     """
     return q.get("last", 0) or q.get("bid", 0) or q.get("ask", 0) or 0.0
 
@@ -13784,10 +12397,8 @@ def unlock_trade_if_needed(trd_env: TrdEnv) -> bool:
     return True
 
 
-# ★ v3.9.63: sync_positions 全パターン失敗ログの間引き用 (5分に1回)
 _sync_fail_last_warn_at: Optional["datetime.datetime"] = None
 
-# ★ v3.9.77 (B-4): sync_positions の健全性状態。連続失敗で health_warning_loop が
 # 端末赤字(5分)＋Discord(30分)で警告する。成功でリセット。
 _sync_health: dict = {
     "consecutive_fail": 0,
@@ -13797,19 +12408,9 @@ _sync_health: dict = {
 }
 
 
-# ★ v3.9.150b: 直近の建玉照会で「口座に実在した」銘柄。設定の絞り込みより前に
-#   集めるので、TRIGGER_TICKERS 等から外れた銘柄も入る。起動時の整合性検査で使う。
 _account_symbols_seen: set = set()
-# ★ v3.9.150c: 上の集合が「走査を完走した結果」かどうか（Codexレビュー指摘）。
-#   空集合は「建玉なし」と「照会できていない」の両方でありうるため、
-#   有効性を別に持たないと、検査が黙って成功したふりをする。
 _account_scan_valid: bool = False
-# ★ v3.9.156b: 完全な建玉スキャンが完走するたびに増える世代番号。
-#   _account_scan_valid は一度 True になると戻らない「累積フラグ」のため、
-#   「いま実行した同期が完走したか」の判定には使えない（Codexレビュー指摘——
-#   決済後の裏取りが、照会失敗＋事前ゼロクリアの組で偽成功する穴）。
 _account_scan_seq: int = 0
-# ★ v3.9.156: 建玉ゼロ口座での発注ブロック解除の再照会スロットル（10分に1回）
 _startup_zero_recheck_at: float = 0.0
 
 
@@ -13831,8 +12432,6 @@ def _accinfo_confirms_flat(trd_env: TrdEnv) -> bool:
             try:
                 _v = float(_data_f[_f].iloc[0] if hasattr(_data_f, "iloc") else _data_f[_f][0])
                 if not math.isfinite(_v):
-                    # ★ v3.9.156b: NaN は float() が通り abs(NaN)>0 も False のため
-                    #   「$0」に化ける（Codexレビュー指摘）。読めなかった扱い＝解除しない。
                     return False
                 _read_n += 1
                 if abs(_v) > 0:
@@ -13848,22 +12447,11 @@ def sync_positions(trd_env: TrdEnv) -> None:
     """moomoo からポジションを取得して state に同期する。
     ret=-1 が返ってきた場合、パラメータを変えながら最大4パターンを試みる。
 
-    ★ v2.98: moomoo サポート (2026-05-06) からの正式回答に基づき全面書き換え。
-       - qty < 0 は OpenD のキャッシュバグではなく、SHORT 建玉の正規表現
-         (position_side='SHORT', qty<0 が moomoo JP の仕様)。
-       - qty=0 のレコードは決済済み・クリア待ちの残骸 (settlement 後に消える)。
-       - 同一銘柄で LONG (qty>0) と SHORT (qty<0) のレコードが共存しうる
-         (JP 信用口座は建玉ごとに position_id で個別管理)。
-       - 決済は position_id 指定で行うため、ここで取得・state に保存する。
 
        v2.94.1〜v2.96 の qty<0 異常判定 (_negative_qty_warned, accinfo.short_mv 検証)
        はすべて削除。SHORT は正規ポジションとして扱う。
     """
     global _startup_position_unknown, _ghost_miss_count
-    # ★ v3.9.156b: この呼び出しで完全な走査が完走したか（世代番号の前進）を後段で
-    #   判定するため、入口の世代を控える。_account_scan_valid は累積フラグのため
-    #   「いまの回」の判定には使えない（新規Claudeレビュアーの指摘——data=None の
-    #   0件走査の回に、過去の完走フラグで発注ブロック解除の判定へ進んでいた）。
     _seq_at_entry = _account_scan_seq
     # 冒頭ガード: 自前追跡コストが 0 の銘柄は state を一旦リセット (後で API 結果で上書き)
     for sym in ALL_TICKERS:
@@ -13873,23 +12461,8 @@ def sync_positions(trd_env: TrdEnv) -> None:
             ts.avg_cost     = 0.0
             # position_ids も併せてクリア (sync 後に再構築)
             ts.position_ids = {"LONG": [], "SHORT": []}
-            # ★ v3.9.133: 建玉が無くなったら「実際に適用された損切り%」もクリアする。
-            #   残したままだと、同一銘柄の次の建玉が監視ループに評価される前に決済された
-            #   場合（戦略が モメンタム⇄ニュース で変わった等）、前の建玉の値が記録に紛れる。
-            #   None にしておけば記録側が設計値で補完する。
             ts.enforced_stop_pct = None
-            # ★ v3.9.175: 出口条件一式も同じ理由でクリアする
-            #   （損切りだけ消えて時間切れ・トレールが前の建玉のまま残るのを防ぐ）。
             ts.enforced_exit = None
-            # ★ v3.9.178: 出口条件の断面は TickerState に置かない。決済ごとに
-            #   _check_order_filled へ引数で渡すので、ここで消すものは無い
-            #   （共有状態に置いていた頃は、決済発注→約定確認の8〜17秒の窓で
-            #   消える／次の建玉の値が紛れる、を何度も踏んだ）。
-    # ★ v3.9.167c: 取り込みの通知は sync 全体の try より外で管理する
-    #   （新規Claudeレビュアーの指摘——取り込みは1件ごとに台帳へ即永続化されるのに、
-    #   まとめ送信はループの後ろにあるため、途中の例外で通知だけが消える。台帳に
-    #   載った銘柄は次回から取り込み分岐を通らないので、通知は二度と送られない）。
-    #   送ったら空にする＝正常経路と例外経路のどちらか一方からしか送られない。
     _absorbed_syms: list = []
 
     def _flush_absorbed_notice() -> None:
@@ -13910,17 +12483,8 @@ def sync_positions(trd_env: TrdEnv) -> None:
         _absorbed_syms.clear()
 
     try:
-        # ★ v2.86: with _trade_ctx() で例外時の ctx.close() を保証
         with _trade_ctx() as ctx:
             # ── 試行パターン（ret=-1 が続く場合に段階的にパラメータを変える）──
-            # ★ v3.9.125: 実口座では acc_id=0 のフォールバックを廃止（利用者B報告 2026-07-23）。
-            #   SDK の position_list_query(acc_id=0) は「全口座」ではなく
-            #   _get_acc_id_by_acc_index(acc_index=0) ＝「口座リストの先頭口座」を意味する。
-            #   さらに戻り DataFrame に acc_id 列が無い（col_list に非含有）ため、
-            #   取得後に「どの口座の建玉か」を判別・フィルタできない。
-            #   結果、設定口座(REAL_ACC_ID)が0件でも先頭口座の建玉を取り込み、
-            #   その position_id を設定口座で決済しようとして Invalid position ID が
-            #   無限リトライする事故が発生した。実口座は REAL_ACC_ID 固定のみとする。
             _is_real = (trd_env == TrdEnv.REAL)
             # ── 試行パターン: acc_id × refresh × asset_category の組み合わせ ──────
             # jp_acc_type は place_order 専用パラメータ。
@@ -13933,23 +12497,18 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 # ★ moomoo サポート回答 (2026-04-30): refresh_cache=True は30秒間に10回の
                 #    レート制限あり。頻繁に呼ぶとエラー（空返却）になるため、
                 #    refresh_cache=False を優先パターンに変更。
-                # ★ v3.9.29: 新 SDK は asset_category が必須化された (5/20 利用者K 29件失敗)
-                #    旧 SDK は asset_category キーワード不対応 → TypeError フォールバック
-                #    asset_category 付きを先に試行する順序に変更。
-                # ★ v3.9.125: acc_id は REAL_ACC_ID に固定（他口座の建玉混入を構造的に防止）。
-                #   ret=-1 のフォールバックは asset_category の有無のみで行う。
                 _patterns = [
-                    (REAL_ACC_ID, False, _asset_cat_us),  # ★ v3.9.29: 新 SDK 優先
+                    (REAL_ACC_ID, False, _asset_cat_us),
                     (REAL_ACC_ID, False, None),           # 旧 SDK / fallback
                 ]
             else:
                 _patterns = [
-                    (0, False, _asset_cat_us),  # ★ v3.9.29: デモも asset_category 付きを優先
+                    (0, False, _asset_cat_us),
                     (0, False, None),            # 旧 SDK / fallback
                 ]
 
             ret, data = -1, None
-            _ok_empty_data = None   # ★ v3.9.118: RET_OK かつ空（＝建玉0件の正常応答）を保持
+            _ok_empty_data = None
             for _try_idx, (_acc, _refresh, _asset_cat) in enumerate(_patterns):
                 _kwargs = dict(
                     trd_env      = trd_env,
@@ -13961,7 +12520,6 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 try:
                     ret, data = ctx.position_list_query(**_kwargs)
                 except TypeError as _te:
-                    # ★ v3.9.29: 新 SDK で asset_category 必須 / 旧 SDK で TypeError の両対応
                     # 旧 SDK が asset_category キーワードを受け付けない場合のフォールバック
                     if "asset_category" in str(_te) and _asset_cat is not None:
                         _kwargs.pop("asset_category", None)
@@ -13978,14 +12536,9 @@ def sync_positions(trd_env: TrdEnv) -> None:
                                 f" refresh={_refresh}{_cat_label}）"
                             )
                         break
-                    # ★ v3.9.118: ret=OK だが空＝「建玉0件の正常応答」。moomoo JP の
-                    #   position_list_query は不安定（建玉があっても空を返す事あり）なので
-                    #   行付き結果を探して試行は続けるが、この正常応答を保持し、後続パターンの
-                    #   ret=-1 に上書きされないようにする（建玉ゼロ口座の誤「取得失敗」を防止）。
                     _ok_empty_data = data if data is not None else _ok_empty_data
                     log.debug(f"[sync_positions] パターン{_try_idx+1}: データ空(ret=OK・0件正常) → 念のため次も試行")
                 else:
-                    # ret=-1 → 次のパターンへ。★ v3.9.63: 段階的フォールバックの
                     # 途中経過は DEBUG に降格 (Network interruption 等で 1 日 555 件の
                     # WARNING ログ膨張を確認・正常なリトライ動作のためノイズ)。
                     log.debug(
@@ -13995,18 +12548,12 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     )
         # with を抜けた時点で ctx は close 済み
 
-        # ★ v3.9.118: 行付き成功で break しなかったが、いずれかのパターンが RET_OK(空) を
-        #   返していれば「ポジションなし(正常)」。後続パターン（旧SDK向け asset_category なし
-        #   照会等）の ret=-1 が、先に取れた正常な0件応答を上書きして「取得失敗」に誤分類する
-        #   のを防ぐ。建玉ゼロ口座で sync_positions が連続失敗するバグ（受講生報告 2026-07）。
         if ret != RET_OK and _ok_empty_data is not None:
             ret, data = RET_OK, _ok_empty_data
 
         if ret != RET_OK:
-            # ★ v3.9.77 (B-4): 連続失敗カウント＋直近エラーを記録 (health_warning_loop が使用)
             _sync_health["consecutive_fail"] = int(_sync_health.get("consecutive_fail", 0)) + 1
             _sync_health["last_error"] = str(data)[:60]
-            # ★ v3.9.63: 全パターン失敗の最終警告は 5 分に 1 回へ間引き (305 件→数件)。
             global _sync_fail_last_warn_at
             _now_sf = datetime.datetime.now()
             if (_sync_fail_last_warn_at is None
@@ -14019,7 +12566,6 @@ def sync_positions(trd_env: TrdEnv) -> None:
             else:
                 log.debug(f"[sync_positions] ポジション取得失敗 (間引き中): ret={ret}")
             return
-        # ★ v3.9.77 (B-4): 取得成功 → 健全性をリセット
         _sync_health["consecutive_fail"] = 0
         _sync_health["last_success_at"] = datetime.datetime.now()
         if not _df_has_rows(data):
@@ -14029,14 +12575,11 @@ def sync_positions(trd_env: TrdEnv) -> None:
             log.debug("[sync_positions] ポジションなし（正常）")
 
 
-        # ── ★ v2.98: LONG/SHORT 別の集約 (position_id 取得・保存) ────────────────
         # moomoo サポート (2026-05-06) 確認: SHORT は qty<0 + position_side='SHORT'
         # qty=0 は決済済み残骸 / 同銘柄 LONG/SHORT 共存可 / 部分約定で複数 pid に分割可
         # _agg 構造: {sym: {"LONG":{qty,cost_sum,ids:[{pid,qty,cost},..]}, "SHORT":{同}}}
         # ids は決済時に建玉ごとに個別 place_order で閉じるため (1注文1建玉)。
         _agg: dict = {}
-        # ★ v3.9.150b: この回の照会で口座に実在した銘柄。走査後にまとめて確定させる
-        #   （途中で足すと、照会が途中で壊れた回に不完全な集合が残る）。
         _seen_this_sync: set = set()
         for _, row in (data.iterrows() if _df_has_rows(data) else []):
             row_qty_raw = int(float(row.get("qty", 0) or 0))
@@ -14044,9 +12587,6 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 # qty=0 は決済済み残骸 (moomoo JP 仕様) → スキップ
                 continue
             sym = from_moomoo_code(str(row["code"]))
-            # ★ v3.9.150b: 設定で絞り込む前に、口座にあった銘柄を控えておく
-            #   （認定サポーターの指摘 2-2）。ここで捨ててしまうと、設定を変えた
-            #   あとに残った建玉が「監視から外れている」ことを誰も検出できない。
             try:
                 if row_qty_raw != 0:
                     _seen_this_sync.add(sym)
@@ -14079,32 +12619,17 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     "cost": cost,
                 })
 
-        # ★ v3.9.150b: 走査を完走できたのでここで確定させる。
-        # ★ v3.9.150c: data が None（照会は成功扱いだが中身が無い）は「0件の走査」
-        #   であって「建玉ゼロの確認」ではない（Codexレビュー指摘）。有効にしない。
         if data is not None and hasattr(data, "empty"):
             globals()["_account_symbols_seen"] = _seen_this_sync
-            # ★ v3.9.190c: 監視対象外の建玉を毎回ここで入れ替える。
-            #   OVN が所有している銘柄は OVN 巡回が決済するので外す
-            #   （v3.9.156 で塞いだ誤警報と同じ理由）。
             try:
                 _mon_now = set(ALL_TICKERS) | _momentum_live_symbols()
-                # ★ v3.9.190d: OVN の所有権は、その銘柄が実際に口座にあるときだけ
-                #   見る（配布前レビュー2者の指摘）。_ovn_owns_now は状態ファイルを
-                #   読み、所有権フラグの自己修復まで行う関数で、無関係な口座で
-                #   毎回の照会ごとに走らせてよいものではない。数行下の照合が
-                #   「名簿に居るときだけ呼ぶ」としているのとも揃える。
                 if OVN_SYMBOL in _seen_this_sync and _ovn_owns_now():
                     _mon_now.add(OVN_SYMBOL)
-                # ★ v3.9.190d: clear() → update() の2段だと、その隙間に読み手が
-                #   走って**空集合を見る**（配布前レビュー2者の指摘）。監視対象外の
-                #   建玉が「無い」と表示され、6時間ごとの再送からも落ちる。
-                #   作ってから一撃で差し替える。
                 globals()["_unmonitored_holdings"] = _seen_this_sync - _mon_now
             except Exception as _e_unmon:
                 log.debug(f"[sync_positions] 監視対象外の一覧を作れませんでした: {_e_unmon}")
             globals()["_account_scan_valid"] = True
-            globals()["_account_scan_seq"] = _account_scan_seq + 1   # ★ v3.9.156b: 完走の世代を進める
+            globals()["_account_scan_seq"] = _account_scan_seq + 1
 
         # ── 各銘柄を state に反映 ─────────────────────────────────────────────────
         for sym, sides in _agg.items():
@@ -14168,14 +12693,6 @@ def sync_positions(trd_env: TrdEnv) -> None:
 
             ts.position_qty = total_qty
             _bot_qty = abs(_tracked_qty.get(sym, 0))
-            # ★ v3.9.101: 約定確認待ちフラグの解除は「実約定単価が確定したとき」に限定する。
-            #   発注直後 avg_cost は指値の仮設定で、これを建値として判定すると建玉トレール/
-            #   強制損切りが指値基準で誤発火する（5/13 SPY・6/29 SMH 事例）。
-            #     ・確定済み(_check_order_filledで実約定反映済): 従来どおりボット値を維持して解除
-            #       （demo の cost_price=昨日終値の上書き防止）。
-            #     ・未確定 + APIの実建玉単価あり: 指値の仮設定を捨て、APIの実建玉単価を建値に
-            #       採用して解除（外部/初回認識ポジションも同経路）。
-            #     ・未確定 + API単価なし: 解除せずロック維持（次サイクル/約定確認で確定するまで）。
             if ts.avg_cost_confirmed and _bot_qty > 0 and ts.avg_cost > 0:
                 # 実約定確定済み → ボット追跡値を維持して解除
                 ts.entry_pending_fill = False
@@ -14184,7 +12701,6 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     _warn_key = f"_cost_warn_{sym}"
                     _already_warned = getattr(sync_positions, _warn_key, False)
                     if not _already_warned:
-                        # ★ v3.8.5: 防御的維持動作 (実害なし) のため WARNING → INFO に降格
                         log.info(
                             f"[sync_positions] {sym}: APIのcost_price=${api_avg:.2f}"
                             f" vs ボット追跡avg=${ts.avg_cost:.2f}（乖離{_api_diff*100:.1f}%）"
@@ -14223,22 +12739,12 @@ def sync_positions(trd_env: TrdEnv) -> None:
             # ── 外部保有ポジション検出時の _tracked_position_cost 仮設定 ──────
             # 前回セッション持越・手動発注で _tracked_cost=0 のまま → 次回 sync で
             # 「<=0 → position_qty=0」リセットを誘発する問題への対策で仮設定。
-            # ★ v2.70: 決済注文 pending 中は仮設定スキップ (約定直後の API 遅延対応)
-            # ★ v2.98: SHORT も abs(total_qty) で評価。
-            # ★ v3.9.190c: スナップショットを取ってから回す（配布前レビューの指摘）。
-            #   _pending_orders への挿入・削除はイベントループ側と別スレッドで起きる。
-            #   走査中に大きさが変わると RuntimeError で**同期がまるごと中断**する。
             _has_pending_close = any(
                 info.get("is_close") and info.get("symbol") == sym
                 for info in list(_pending_orders.values())
             )
             if total_qty != 0 and _tracked_position_cost.get(sym, 0.0) <= 0:
-                if sym == OVN_SYMBOL and _ovn_owns_now():   # ★ v3.9.159b: 二重ソース判定
-                    # ★ v3.9.146 (A-11): OVN が建てた建玉は日中予算 (BUDGET_USD) に
-                    #   計上しない。OVN は OVN_BUDGET_USD の別枠で管理しており、
-                    #   ここで計上すると保有中の日中新規発注枠がその分だけ狭まる。
-                    #   手動建玉 (externally_held) の計上は従来どおり残す
-                    #   （口座全体の露出を保守的に数える長年の仕様）。
+                if sym == OVN_SYMBOL and _ovn_owns_now():
                     log.debug(
                         f"[sync_positions] 【{sym}】 OVN 保有のため日中予算に計上しません"
                     )
@@ -14251,9 +12757,6 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     _est_cost = abs(total_qty) * api_avg
                     _tracked_position_cost[sym] = _est_cost
                     _side_label = "SHORT" if total_qty < 0 else "LONG"
-                    # ★ v3.9.138: 旧文言「外部保有ポジション検出」は v3.9.134 で入れた
-                    #   建玉台帳の「Bot 以外の建玉」と紛らわしく、誤って不具合と読まれた。
-                    #   ここは予算計上額の補正のみで、自動売買の停止とは無関係。
                     log.info(
                         f"[sync_positions] 【{sym}】 建玉あり・予算計上が未設定 ({_side_label})"
                         f" → 予算計上額を ${_est_cost:,.0f} に補正"
@@ -14263,27 +12766,15 @@ def sync_positions(trd_env: TrdEnv) -> None:
         # ── 起動時ポジション不明フラグの自動解除 ──────────────────────────────
         # 実際のポジション行 (qty != 0) が見つかった場合のみ解除する。
         # _df_has_rows=True でも全行 qty=0（決済済み残骸のみ）の場合は解除しない。
-        # ★ v2.98: _agg は LONG/SHORT 両方を含むため、いずれかに qty>0 があれば OK。
         _has_any_position = any(
             (s["LONG"]["qty"] > 0 or s["SHORT"]["qty"] > 0) for s in _agg.values()
         )
-        # ★ v3.9.190c: 監視対象**外**の建玉しか持たない口座でも解除する
-        #   （配布前レビューの指摘）。_agg は ALL_TICKERS を通った銘柄しか持たない
-        #   ため、たとえば設定から外した NVDA だけを保有していると
-        #   _has_any_position は永久に偽。建玉ゼロ側の経路（下の elif）も
-        #   accinfo が $0 でないので通らず、**実口座の新規発注が再起動しても
-        #   止まったまま**になっていた。今回の機能が動くべき場面そのもの。
         #
         #   このフラグの意味は「何を持っているか分からない」。明細が完走して
         #   建玉が見えたなら、監視対象かどうかに関わらず**分かった**ので解除する。
         #   監視対象外であることは、下の照合が名指しで警告する。
         _listing_shows_positions = bool(_seen_this_sync) and _account_scan_seq > _seq_at_entry
         _can_unblock = _has_any_position or _listing_shows_positions
-        # ★ v3.9.190b: フラグの「見て・倒す」を排他する（配布前レビューの指摘）。
-        #   ロックを名簿にだけ掛けていたので、2スレッドが同時にこの枝へ入り、
-        #   別々の口座スナップショットから解除の行を2本出す競合が残っていた。
-        #   sync_positions を直列化するものはどこにも無い（place_buy /
-        #   place_short / place_close_all / 週末決済がすべて to_thread で走る）。
         _unlock_now = False
         if _startup_position_unknown and _can_unblock:
             with _STARTUP_UNKNOWN_LOCK:
@@ -14291,26 +12782,12 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     _startup_position_unknown = False
                     _unlock_now = True
         if _unlock_now:
-            # ★ v3.9.190: 「建玉が1つ見えた」は照会が回復した証拠であって、
-            #   起動時に見えていなかった建玉が見えるようになった証拠ではない。
-            #   解除そのものは続ける（止めると照会が一時的に失敗した口座で
-            #   発注が再起動まで止まる・v3.9.156 で塞いだ side）。ただし
-            #   起動時に名指しした監視対象外の建玉が**今も口座にある**なら、
-            #   解除の行でそのまま言う。無言で「取得成功」と出すと、
-            #   未監視の建玉まで解決したと読めてしまう（認定サポーターの指摘）。
             #
             #   ★ 診断のための表示なので、ここで何が起きても同期は止めない
             #     （配布前レビューの指摘——例外が出ると sync_positions が中断し、
             #     以降の建玉同期がまるごと飛ぶ。表示のために売買の土台を落とす
             #     のは本末転倒）。
             try:
-                # ★ v3.9.190b: 突き合わせる相手は _seen_this_sync（この回の照会で
-                #   口座に実在した銘柄・ALL_TICKERS のふるいより前で作る）。
-                #   v3.9.190 は _agg から作った集合と引き算していたが、_agg は
-                #   `if sym not in ALL_TICKERS: continue` を通った銘柄しか持たない。
-                #   一方 orphan は `_account_symbols_seen - set(ALL_TICKERS)` なので、
-                #   **2つは定義上まったく重ならない**。引き算は何も解決せず、警告が
-                #   無条件に出ていた（配布前レビューの指摘・実際に成立を確認）。
                 #
                 #   向きも逆だった。危ないのは「今も持っていて監視されていない」建玉で、
                 #   明細から消えた銘柄は決済済み＝警告する理由がない。積集合で取る。
@@ -14320,9 +12797,6 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     # OVN が所有権を取った銘柄は OVN 巡回が決済する。起動時は
                     # 監視対象外でも、いま所有していれば「効きません」は誤り
                     # （v3.9.156 で同じ誤警報を塞いだのと同じ理由）。
-                    # ★ v3.9.190b: 名簿に居るときだけ呼ぶ。_ovn_owns_now は
-                    #   状態ファイルを読み、所有権フラグの自己修復まで行うので、
-                    #   関係のない口座で毎回走らせてよいものではない。
                     if OVN_SYMBOL in _orphans_at_start and _ovn_owns_now():
                         _orphans_at_start.discard(OVN_SYMBOL)
                     _still_unmonitored = sorted(_orphans_at_start & _seen_this_sync)
@@ -14331,18 +12805,12 @@ def sync_positions(trd_env: TrdEnv) -> None:
                         f"（今回見えた建玉: {', '.join(_seen_now) or 'なし'}）"
                     )
                     if _still_unmonitored:
-                        # ★ v3.9.190b: リストの repr をそのまま出さない。
-                        #   ['DRAM', 'NVDA'] だと、moomoo の検索窓へ貼るときに
-                        #   括弧と引用符まで写る（4行上の成功行は join 済み）。
                         log.warning(
                             f"  ⚠️ [整合性警告] 起動時に警告した建玉"
                             f" {', '.join(_still_unmonitored)} は、今も口座にあり"
                             f" 監視対象外のままです。損切り・時間切れ・週末決済の"
                             f" いずれも効きません。moomoo アプリでご確認ください"
                         )
-                    # ★ v3.9.190b: 名簿を消すのは報告できた回だけ（配布前レビューの
-                    #   指摘）。先に消すと、途中で例外が出た回に唯一の控えが永久に
-                    #   失われる。ロックの中なので、並行スレッドの二重報告は起きない。
                     _startup_unmonitored_symbols.clear()
             except Exception as _e_unk:
                 # 表示に失敗しても解除は済んでいる。1行だけは必ず出す。
@@ -14350,11 +12818,6 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 log.info("[起動時復元] ✅ ポジション取得成功 → 発注ブロックを解除しました")
         elif (_startup_position_unknown and not _can_unblock
                 and _account_scan_seq > _seq_at_entry):
-            # ★ v3.9.156: 建玉ゼロの口座では従来「建玉が見つかる」ことでしか解除されず、
-            #   起動時の一時的な照会失敗が再起動まで発注を止め続けた（5日分レビュー）。
-            #   建玉明細が完全な形でゼロを示し、かつ accinfo の3列すべてが $0 の
-            #   ときだけ解除する（起動時の「確定ゼロ」と同じ基準）。空応答が紛れる
-            #   余地を残さないため、accinfo の裏取りは10分に1回だけ行う。
             _nowm = time.monotonic()
             if _nowm >= _startup_zero_recheck_at:
                 globals()["_startup_zero_recheck_at"] = _nowm + 600
@@ -14368,12 +12831,8 @@ def sync_positions(trd_env: TrdEnv) -> None:
         # ── ゴースト防止: 連続 N 回「不在」で初めてクリア ──────────────────────
         # moomoo JP の position_list_query は返り値が不安定 (建玉返ったり返らなかったり)。
         # 1回不在でクリアすると正規ポジションが消える → _GHOST_MISS_THRESHOLD 回連続で初解除。
-        # ★ v2.98: SHORT 含む実在判定 (qty!=0 のいずれか方向)。
         global _ghost_miss_count
         _absence_confirmed = set()
-        # ★ v3.9.190d: スナップショットはループの手前で1回だけ取る
-        #   （配布前レビュー2者の指摘）。銘柄ごとにコピーを作ると、銘柄数ぶんの
-        #   無駄なコピーが出るうえ、**銘柄ごとに違う時点の値**を見ることになる。
         _pending_snapshot = list(_pending_orders.values())
         for _sym_chk in ALL_TICKERS:
             _sides_chk = _agg.get(_sym_chk)
@@ -14387,12 +12846,6 @@ def sync_positions(trd_env: TrdEnv) -> None:
                   or _ledger_has(_sym_chk, trd_env)
                   or getattr(state.get(_sym_chk), "externally_held", False)):
                 _ts_chk = state.get(_sym_chk)
-                    # ★ v3.9.190c: スナップショットを取ってから回す（配布前レビューの指摘）。
-                    #   _pending_orders への挿入・削除はイベントループ側（約定見張り・
-                    #   決済追いかけ）と別スレッドの発注登録で起きる。sync_positions は
-                    #   to_thread で走る唯一の読み手なので、走査中に大きさが変わると
-                    #   RuntimeError で**同期がまるごと中断**する（この file の他6箇所は
-                    #   すべて list(...) で囲っている）。
                 _has_pending_order = any(
                     info.get("symbol") == _sym_chk
                     for info in _pending_snapshot
@@ -14422,16 +12875,8 @@ def sync_positions(trd_env: TrdEnv) -> None:
                         _ts_chk.entry_count = 0
                         log.debug(f"【{_sym_chk}】 ポジション解消 → entry_count リセット")
 
-        # ── ★ v3.9.134: ゴースト判定後に台帳と突き合わせる ──────────────────
         # API が1回だけ建玉を返さなくても externally_held を解除せず、既存の
         # _GHOST_MISS_THRESHOLD 回連続不在を満たした場合だけ解除・台帳削除する。
-        # ★ v3.9.165: ALL_TICKERS に OVN 銘柄が入らない構成（TRIGGER から外し、
-        #   モメンタムもシャドー専用にした場合）では保護ループを素通りし、
-        #   名指しの保護通知と6時間ごとの再送が出ない（認定サポーターの指摘）。
-        # ★ v3.9.165b: 追加は **OVN を使っている人だけ**（新規Claudeレビュアーの指摘——
-        #   OVN 無効の既定構成では状態ファイルが常に「読めない」ので、QQQ を手で
-        #   持っているだけの利用者に「夜間持ち越しの記録が読めません」という
-        #   事実と違う通知が6時間ごとに届く。Bot が元々触らない銘柄なので保護も不要）。
         _prot_syms = list(ALL_TICKERS)
         _ovn_extra = bool(OVN_ENABLED) and OVN_SYMBOL not in _prot_syms
         if _ovn_extra:
@@ -14449,56 +12894,24 @@ def sync_positions(trd_env: TrdEnv) -> None:
             elif _held_j and not _ledger_has(_sym_j, trd_env):
                 _q = _sides_j["LONG"]["qty"] or _sides_j["SHORT"]["qty"]
                 _sd = "ロング" if _sides_j["LONG"]["qty"] > 0 else "ショート"
-                # ★ v3.9.160c/163: 状態が読めない OVN 銘柄は初回移行で取り込まない。
-                #   ただし v3.9.160c は _ext_set_held(False) と書いており、これは
-                #   「外部建玉ではない＝Bot が触ってよい」の意味だった（新規Claude
-                #   レビュアーの指摘）。OVN が無効な既定構成では安全網も効かないため、
-                #   利用者が手で持っている QQQ の保護（v3.9.134）が毎周回剥がされ、
-                #   損切り・時間切れで決済され得た（v3.9.133 の事故の再現）。
-                #   取り込まないなら「Bot の記録に無い建玉」として守るのが正しい。
-                # ★ v3.9.167: この枝に OVN_ENABLED が抜けていた（認定サポーターの指摘）。
-                #   既定構成（OVN 無効・QQQ は TRIGGER に入る）では状態ファイルが
-                #   そもそも無いので `_ovn_state_readable()` は常に False。その結果、
-                #   (1) OVN を使っていない利用者に「夜間持ち越しの記録も読めません」と
-                #   事実と違う理由が出る、(2) **台帳を作る最初の起動で QQQ だけが
-                #   取り込まれず**、リスク監視のループから外れて損切り・時間切れ・
-                #   トレール・上限超過のいずれも評価されなくなる。
-                #   OVN が無効なら、そもそも守るべき夜間持ち越しの建玉が存在しない。
                 if OVN_ENABLED and _sym_j == OVN_SYMBOL and not _ovn_state_readable():
                     _ext_set_held(
                         _sym_j, True,
                         f"口座に {_sd} {int(abs(_q))}株 ありますが、Bot の記録にありません"
                         f"（夜間持ち越しの記録も読めません）。")
                 elif _ledger_first_run and _sym_j == OVN_SYMBOL and _ovn_extra:
-                    # ★ v3.9.165b: 初回起動の取り込みは「Bot が普段から売買する銘柄で
-                    #   通知が二重に出るのを防ぐ」ためのもの（新規Claudeレビュアーの指摘）。
-                    #   売買対象に入っていない OVN 銘柄まで取り込むと、利用者が手で
-                    #   持っている QQQ を Bot の建玉にしてしまう。守る側へ倒す。
                     _ext_set_held(
                         _sym_j, True,
                         f"口座に {_sd} {int(abs(_q))}株 ありますが、Bot の記録にありません"
                         f"（日中の売買対象に入っていない銘柄です）。")
                 elif _ledger_first_run:
-                    # ★ v3.9.134: 台帳を作る最初の起動。旧版は口座の建玉をすべて
-                    #   Bot のものとして扱っていたので、ここでも取り込む。
-                    #   これをしないと、起動時復元より先にこの sync が走ったときに
-                    #   「停止します」→「再開します」の紛らわしい通知が2通飛ぶ
-                    #   （実機で確認済み。全利用者の初回起動で毎回起きる）。
                     _ledger_mark(
                         _sym_j, trd_env, state.get(_sym_j).entry_time,
-                        # ★ v3.9.150: 由来が分かるとき（メモリ上の値があるとき）だけ
-                        #   種別を記録する。銘柄からの推定はしない（誤確信になる）。
                         category=getattr(state.get(_sym_j), "entry_ai_category", None) or None)
                     log.info(
                         f"[建玉台帳] 【{_sym_j}】 台帳の初回作成: 既存の建玉"
                         f"（{_sd} {int(abs(_q))}株）を Bot の建玉として登録しました"
                     )
-                    # ★ v3.9.167: この取り込みは **無音**だった。初回起動の時点では
-                    #   台帳が無く「Bot が建てた建玉」と「利用者が手で持っている建玉」を
-                    #   区別できないため、後者も自動売買の対象にしてしまう（過去に事故に
-                    #   なった形）。何を引き受けたかを必ず知らせる。
-                    # ★ v3.9.167b: 銘柄ごとに送ると、建玉が多い人ほど Discord の
-                    #   レート制限で落ちる（レビュー指摘）。ループの後で1通にまとめる。
                     _absorbed_syms.append(f"{_sym_j}（{_sd} {int(abs(_q))}株）")
                 else:
                     _ext_set_held(_sym_j, True,
@@ -14518,26 +12931,12 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     if _sym_j in _absence_confirmed:
                         _ledger_unmark(_sym_j, trd_env)
 
-        # ★ v3.9.150 (認定サポーターの指摘 1-4): 建玉があるのに entry_time が
-        #   無い状態を、ここで自己修復する。
-        #   決済は「注文を出せた」時点で完了扱いにして entry_time を消すため、
-        #   その注文が後から未約定・取消・拒否になると、建玉が残っているのに
-        #   時間切れ監視だけが外れたままになる。戻す経路は起動時復元しか無く、
-        #   再起動しない限り復帰しなかった。毎回の同期で見て、必要なら戻す。
-        # ★ v3.9.167b: 初回の取り込みを1通にまとめて知らせる（銘柄ごとに送ると
-        #   建玉が多い人ほど Discord のレート制限で落ち、いちばん要る人に届かない）。
         _flush_absorbed_notice()
 
-        # ★ v3.9.190d: 同上。ループの手前で1回だけ。
         _pending_snapshot_h = list(_pending_orders.values())
         for _sym_h in ALL_TICKERS:
             try:
                 _ts_h = state.get(_sym_h)
-                # ★ v3.9.150b: 決済注文が処理待ちの間は戻さない（Codexレビュー指摘）。
-                #   受付済みの指値が約定する前に時計を戻すと、次のリスク監視で
-                #   時間切れが再発火し、生きている決済注文を自分で取り消して
-                #   出し直す循環に入る（時間外の指値ほど当たりやすい）。
-                # ★ v3.9.190c: 同上。スナップショットを取ってから回す。
                 _pending_close_h = any(
                     _i.get("is_close") and _i.get("symbol") == _sym_h
                     for _i in _pending_snapshot_h
@@ -14546,10 +12945,6 @@ def sync_positions(trd_env: TrdEnv) -> None:
                         and not _pending_close_h
                         and not _is_other_owner(_sym_h)
                         and _ledger_has(_sym_h, trd_env)):
-                    # ★ v3.9.150c: _pending_orders はプロセスの記憶なので、再起動を
-                    #   またいだ決済注文を知らない（Codexレビュー指摘）。復元候補に
-                    #   なったときだけ（毎回の同期ではない）、証券会社側に生きている
-                    #   注文が無いかを確かめ、有れば復元を見送る（照会失敗も見送り）。
                     if _has_live_broker_order(_sym_h, trd_env):
                         log.info(
                             f"[ポジション同期] 【{_sym_h}】 生きている注文があるため"
@@ -14567,18 +12962,10 @@ def sync_positions(trd_env: TrdEnv) -> None:
                 pass
         _ext_remind_if_due()
     except Exception as e:
-        # ★ v3.9.167c: 途中で失敗しても、既に台帳へ書いた取り込みは知らせる
-        #   （黙って引き受けたままにしない）。
         try:
             _flush_absorbed_notice()
         except Exception:
             pass
-        # ★ v3.9.130: 例外失敗も consecutive_fail に計上する。
-        #   従来はここで log.warning のみ＝失敗カウントを進めず、health_warning_loop の
-        #   発火条件 (consecutive_fail>=3) を満たせなかった。OpenDプロセス消滅時に
-        #   _trade_ctx()/照会が「ret=-1」ではなく「例外」を投げると、失敗がここで
-        #   握りつぶされ、数時間ポジション取得できなくてもDiscord通知ゼロになる不具合
-        #   (利用者報告: 約5時間の停止・通知ゼロの実測と一致)。グレースフル失敗と同列に扱う。
         _sync_health["consecutive_fail"] = int(_sync_health.get("consecutive_fail", 0)) + 1
         _sync_health["last_error"] = str(e)[:60]
         log.warning(f"[ポジション同期] エラー: {e}")
@@ -14587,12 +12974,6 @@ def sync_positions(trd_env: TrdEnv) -> None:
 def calc_order_size(confidence: float) -> float:
     """confidence に基づいて注文目標金額を「山型」で算出する。
 
-    ★ v3.9.20: 過去 1,293 件のトレード分析で、勝率と利益効率は conf 0.80 を
-    ピークとした山型曲線になることが判明:
-      ・conf 0.78-0.82 (スイートスポット): 平均 +$11/件 (最高効率)
-      ・conf 0.83 以上 (超強気帯):           平均 -$10/件 (個別株サージ過反応)
-      ・conf 0.70 未満 (弱シグナル帯):       平均 -$23/件 (損失)
-    そこで一律サイズではなく、conf 帯に応じた「山型」のサイズ配分を採用。
 
     配分:
       0.60-0.69 :  BUDGET × 30%   (弱シグナル → ロット縮小)
@@ -14619,7 +13000,6 @@ def calc_order_size(confidence: float) -> float:
 def limit_price_base(quote: dict, action: str) -> float:
     """指値の基準にする気配値。BUY は ask、SELL は bid（無ければ last）。
 
-    ★ v3.9.176b: 観察ログの「判定時価格」もこれを使う（外部レビュー指摘）。
 
       指値の基準と同じものを使うことで、
         ・発注の根拠になった値を必ず拾う（指値だけがバッファ分ずれる状態を解消）
@@ -14659,13 +13039,10 @@ def calc_limit_price(quote: dict, action: str, symbol: Optional[str] = None) -> 
       BUY  : ask（正値） → last（正値） → 0.0（発注スキップ）
       SELL : bid（正値） → last（正値） → 0.0（発注スキップ）
 
-    ★ v2.99.4: symbol を受け取り、ETF/個別株でバッファを自動切替。
-       symbol が None の場合は後方互換で LIMIT_BUFFER_PCT (旧値) を使用。
     """
     base = limit_price_base(quote, action)
     if base <= 0:
         return 0.0
-    # ★ v2.99.4: シンボル種別に応じたバッファ選択
     buf = get_limit_buffer_pct(symbol) if symbol else LIMIT_BUFFER_PCT
     return round(base * ((1 + buf) if action == "BUY" else (1 - buf)), 2)
 
@@ -14683,13 +13060,6 @@ async def _check_order_filled(
 ) -> None:
     """発注後 wait_sec 秒待ってから order_list_query で約定状態を確認し 結果を Discord に通知する。 デモ口座（SIMULATE）でも呼び出し可能。
 
-    ★ v3.9.178: exit_snapshot は「この決済に適用されていた出口条件」。
-      place_close_all が発注の瞬間に切り出して渡す。銘柄ごとの共有状態
-      （TickerState）に置くと、約定確認までの8〜17秒のあいだに
-      同じ銘柄の次の建玉が入って上書き・消去されうる。実際、決済→1秒→
-      エントリーの反転経路が4本あり、退避を state に置いた実装は
-      そこで断面を失っていた（外部レビュー指摘）。
-      引数で持てば、寿命は決済1件ぶんに閉じてクリアも順序も要らない。
 
       **None は「監視ループが評価する前に決済された」ことを意味する確定値**であって
       「未指定」ではない。したがって現在値へフォールバックしてはいけない。
@@ -14700,7 +13070,6 @@ async def _check_order_filled(
     tag = f"【{symbol}】"
     await asyncio.sleep(wait_sec)
     try:
-        # ★ v2.86: with _trade_ctx() で例外時の close を保証
         with _trade_ctx() as ctx:
             _acc_id_check = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
             ret, data = ctx.order_list_query(
@@ -14736,10 +13105,6 @@ async def _check_order_filled(
             except (ValueError, TypeError):
                 avg_price = f"  約定均価: {ap}"
         log.info(f"{tag} [約定確認] orderId={order_id}  status={status}  約定数={filled}{avg_price}")
-        # ★ v3.9.105 (C1計測・挙動不変): moomoo が実際に返す order_status の生値を収集する。
-        #   現行判定は部分文字列（"filled" は FILLED_PART にも一致）のため、enum厳密比較へ
-        #   移行する前に、実環境（実口座/デモ）でのステータス表記を確認する目的。
-        #   部分約定の疑い（dealt_qty < qty）も件数把握のため WARNING で記録（処理は従来どおり）。
         try:
             global _SEEN_ORDER_STATUSES
             if status not in _SEEN_ORDER_STATUSES:
@@ -14756,11 +13121,6 @@ async def _check_order_filled(
         # Filled / PartiallyFilled の場合は Discord に通知
         status_lower = status.lower()
         if "filled" in status_lower or "dealt" in status_lower:
-            # ★ v3.9.120: 部分約定の厳密化（C1計測で予告済み・外部AIレビュー指摘 High）。
-            #   旧実装は "filled" の部分文字列一致が FILLED_PART にも一致し、部分約定でも
-            #   全量約定として処理（決済系では残株があるのにポジション全クリア）していた。
-            #   部分約定時は注文を watchdog 管理に残し（残量はタイムアウトでキャンセル→
-            #   決済系なら既存機構が残量を再発注）、state は残量を反映する。
             try:
                 _dealt_chk2 = float(_get_val(data, "dealt_qty", qty) or qty)
             except (ValueError, TypeError):
@@ -14776,7 +13136,6 @@ async def _check_order_filled(
                 )
             else:
                 _unregister_pending_order(order_id)  # 全量約定 → 管理辞書から削除
-            # ★ v2.90: Discord PnL表示用の退避変数（SELL決済時のみ計算結果が入る）
             # 旧コードでは pending_avg_cost をクリア(下記参照)した後、Discord 通知作成時に
             # 再度 pending_avg_cost を参照していたため、SELL 決済時に PnL が表示されなくなっていた。
             # 計算済みの値をローカル変数に退避し、Discord 通知時はこれを参照する。
@@ -14793,7 +13152,6 @@ async def _check_order_filled(
                     ts_upd = state.get(symbol)
                     # ロング約定: position_qty と avg_cost を正確な値で上書き
                     if "[空売り]" not in mode:
-                        # ★ v2.99.3: place_close_all は side_label="ロング決済" を渡すため、
                         # 旧来の "[決済]" だけでは検出できず Discord PnL 表示が消えていた。
                         # "ロング決済" / "[決済]" のいずれかを SELL 決済として扱う。
                         if "[決済]" in mode or "ロング決済" in mode:
@@ -14804,20 +13162,13 @@ async def _check_order_filled(
                             if prev_avg <= 0 and ts_upd.pending_avg_cost > 0:
                                 prev_avg = ts_upd.pending_avg_cost
                                 log.debug(f"{tag} [確定損益] avg_cost=0のためpending_avg_cost={prev_avg:.2f}を使用")
-                            # ★ v3.9.179b: 決済し終えた建玉の entry_time を、**ガードの外で無条件に**控える。
-                            #   下の `if prev_avg > 0 and filled_price > 0:` の中で控えると、
-                            #   その条件が偽のとき未定義になり、決済確定の処理が途中で例外に落ちる
-                            #   （建玉ゼロなのに発注額が残る＝この版が消そうとしている表示そのものを作る）。
-                            #   pending_entry_time はこの後クリアされるので、使う場所での再評価もできない。
                             _closed_et = ts_upd.pending_entry_time or ts_upd.entry_time
                             if prev_avg > 0 and filled_price > 0:
                                 realized = (filled_price - prev_avg) * filled_qty
-                                # ★ v2.90: Discord PnL表示用に退避（pending_avg_cost クリア前に取得）
                                 _realized_for_disc = realized
                                 _realized_pct_for_disc = (realized / (prev_avg * filled_qty) * 100
                                                           if prev_avg > 0 else 0.0)
                                 _realized_qty_for_disc = int(filled_qty)
-                                # ★ v3.9.9: 視認性向上 — 絵文字 + ANSI 色付き損益サマリ + フローを前置き。
                                 # 端末では緑 (利益) / 赤 (損失) で表示、ログファイルは _PlainFormatter が
                                 # ANSI コードを除去するためプレーンテキスト。両方の視認性を両立。
                                 # 構造化部分 (realized_pnl=... sell_avg=... buy_avg=... qty=...) は
@@ -14879,31 +13230,23 @@ async def _check_order_filled(
                                         ts_upd.entry_news_source,
                                         ts_upd.pending_close_reason,
                                     ),
-                                    kwargs={  # ★ v2.95: GAS連携用の追加フィールド
+                                    kwargs={
                                         "headlines":     ts_upd.entry_headlines,
                                         "beneficiaries": ts_upd.entry_beneficiaries,
                                         "victims":       ts_upd.entry_victims,
                                         "price_trend":   ts_upd.entry_price_trend,
                                         "peak_pnl":      ts_upd.entry_peak_pnl,
-                                        # ★ v3.1.0: ロング決済として明示
                                         "trade_type":    "LONG",
-                                        # ★ v3.9.133: 決済時点の「実際に適用された損切り%」をスナップショットして渡す
-                                        #   （別スレッドで state を読むと次の建玉の値に入れ替わりうるため）
                                         "enforced_stop_pct": stop_snapshot,
-                                        # ★ v3.9.175: 損切りだけでなく、タイムアウトと
-                                        #   トレールも同じスナップショットで渡す。
                                         "enforced_exit": exit_snapshot,
                                     },
                                     daemon=True,
                                 ).start()
                                 # TRADE_RESULT出力後、pending_entry_time / pending_avg_cost をクリア
-                                # ★ v3.9.120: 部分約定時は残量の決済PnL計算に必要なためクリアしない
                                 if not _is_partial_fill:
                                     ts_upd.pending_entry_time = None
                                     ts_upd.pending_avg_cost   = 0.0
                             if _is_partial_fill:
-                                # ★ v3.9.120: 部分決済 → 残量をポジションとして保持
-                                #   （全クリアすると残株が監視外になる・外部AIレビュー指摘 High）
                                 _rem_long = max(0, int(round(float(qty) - filled_qty)))
                                 ts_upd.position_qty = _rem_long
                                 if prev_avg > 0:
@@ -14918,10 +13261,6 @@ async def _check_order_filled(
                             else:
                                 ts_upd.position_qty = 0
                                 ts_upd.avg_cost     = 0.0
-                                # ★ v3.9.179: 「どの建玉を決済し終えたか」を残す。
-                                #   entry_time 自体はここで消さない——複数建玉の1本だけが
-                                #   約定した場合や、決済→1秒→反転エントリーの経路で、
-                                #   残玉や次の建玉の時間切れ時計を止めてしまうため。
                                 ts_upd.last_closed_entry_time = _closed_et
                                 ts_upd.is_short     = False  # ショートカバー完了
                                 ts_upd.entry_pending_fill = False  # v3.9.17: クローズ完了 → フラグリセット
@@ -14929,18 +13268,12 @@ async def _check_order_filled(
                                 _tracked_qty[symbol]           = 0
                                 log.info(f"{tag} [約定反映] qty=0株  avg_cost=$0.00  tracked=$0.00")
                         elif "[ショートカバー]" in mode:
-                            # ★ v2.91: SHORTカバー約定の確定損益 + TRADE_RESULT 記録。
                             # ショート利益 = (エントリー価格 - 買戻価格) × 株数 (高売-安買)。
                             # v2.90 までは BUY 分岐で position_qty 設定のみで PnL 計算漏れ。
                             prev_avg_sc = ts_upd.avg_cost
                             if prev_avg_sc <= 0 and ts_upd.pending_avg_cost > 0:
                                 prev_avg_sc = ts_upd.pending_avg_cost
                                 log.debug(f"{tag} [確定損益(SC)] avg_cost=0のためpending_avg_cost={prev_avg_sc:.2f}を使用")
-                            # ★ v3.9.179b: 決済し終えた建玉の entry_time を、**ガードの外で無条件に**控える。
-                            #   下の `if prev_avg_sc > 0 and filled_price > 0:` の中で控えると、
-                            #   その条件が偽のとき未定義になり、決済確定の処理が途中で例外に落ちる
-                            #   （建玉ゼロなのに発注額が残る＝この版が消そうとしている表示そのものを作る）。
-                            #   pending_entry_time はこの後クリアされるので、使う場所での再評価もできない。
                             _closed_et_sc = ts_upd.pending_entry_time or ts_upd.entry_time
                             if prev_avg_sc > 0 and filled_price > 0:
                                 realized_sc = (prev_avg_sc - filled_price) * filled_qty
@@ -14949,7 +13282,6 @@ async def _check_order_filled(
                                 _realized_pct_for_disc = (realized_sc / (prev_avg_sc * filled_qty) * 100
                                                           if prev_avg_sc > 0 else 0.0)
                                 _realized_qty_for_disc = int(filled_qty)
-                                # ★ v3.9.9: 視認性向上 — 絵文字 + ANSI 色付き損益サマリ + フローを前置き。
                                 # 端末では緑 (利益) / 赤 (損失) で表示、ログファイルは _PlainFormatter が
                                 # ANSI コードを除去するためプレーンテキスト。
                                 # 構造化部分 (realized_pnl=... cover_avg=... short_avg=... qty=...) は
@@ -15010,32 +13342,23 @@ async def _check_order_filled(
                                         ts_upd.entry_news_source,
                                         ts_upd.pending_close_reason,
                                     ),
-                                    kwargs={  # ★ v2.95: GAS連携用の追加フィールド
+                                    kwargs={
                                         "headlines":     ts_upd.entry_headlines,
                                         "beneficiaries": ts_upd.entry_beneficiaries,
                                         "victims":       ts_upd.entry_victims,
                                         "price_trend":   ts_upd.entry_price_trend,
                                         "peak_pnl":      ts_upd.entry_peak_pnl,
-                                        # ★ v3.1.0: ショートカバーとして明示
                                         "trade_type":    "SHORT",
-                                        # ★ v3.9.133: 決済時点の「実際に適用された損切り%」をスナップショットして渡す
-                                        #   （別スレッドで state を読むと次の建玉の値に入れ替わりうるため）
                                         "enforced_stop_pct": stop_snapshot,
-                                        # ★ v3.9.175: 損切りだけでなく、タイムアウトと
-                                        #   トレールも同じスナップショットで渡す。
                                         "enforced_exit": exit_snapshot,
                                     },
                                     daemon=True,
                                 ).start()
                                 # クリア
-                                # ★ v3.9.120: 部分約定時は残量の決済PnL計算に必要なためクリアしない
                                 if not _is_partial_fill:
                                     ts_upd.pending_entry_time = None
                                     ts_upd.pending_avg_cost   = 0.0
                             if _is_partial_fill:
-                                # ★ v3.9.120: 部分カバー → 残りのショートを復元して保持
-                                #   （place_close_all が発注時に is_short を下ろしているため、
-                                #    ここで復元しないと残ショートが監視外になる）
                                 _rem_sc = max(0, int(round(float(qty) - filled_qty)))
                                 ts_upd.position_qty = -_rem_sc
                                 if prev_avg_sc > 0:
@@ -15050,10 +13373,6 @@ async def _check_order_filled(
                                 # ショートカバー完了 → ポジション状態を 0 にクリーン化
                                 ts_upd.position_qty = 0
                                 ts_upd.avg_cost     = 0.0
-                                # ★ v3.9.179: 「どの建玉を決済し終えたか」を残す。
-                                #   entry_time 自体はここで消さない——複数建玉の1本だけが
-                                #   約定した場合や、決済→1秒→反転エントリーの経路で、
-                                #   残玉や次の建玉の時間切れ時計を止めてしまうため。
                                 ts_upd.last_closed_entry_time = _closed_et_sc
                                 ts_upd.is_short     = False
                                 ts_upd.entry_pending_fill = False  # v3.9.17: クローズ完了 → フラグリセット
@@ -15083,14 +13402,12 @@ async def _check_order_filled(
                 log.debug(f"{tag} [約定反映] 更新スキップ: {_ue}")
             # ── 約定確認Discord送信 ─────────────────────────────────────────
             # SELL確定時は実測PnL・判定理由・ニュースを追記
-            # ★ v2.90: 退避した _realized_for_disc を参照することで、
             # 上で pending_avg_cost = 0.0 にクリア済みでも PnL を表示できる。
             _fill_extra = ""
             try:
                 if _realized_for_disc is not None:
                     _fill_extra += f"\n{discord_pnl(_realized_for_disc, _realized_pct_for_disc, _realized_qty_for_disc)}"
                 # 判定理由の追記（SELL/COVER 時のみ）
-                # ★ v2.99.3: mode 文字列 ("ロング決済"/"ショートカバー") も判定対象に追加
                 _is_close_event = (
                     "sell" in status_lower
                     or "ロング決済" in mode
@@ -15146,7 +13463,6 @@ async def _check_order_filled(
             for _retry in range(3):
                 await asyncio.sleep(3)
                 try:
-                    # ★ v2.86: with _trade_ctx() で例外時の close を保証
                     with _trade_ctx() as ctx2:
                         _acc2 = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
                         ret2, data2 = ctx2.order_list_query(
@@ -15159,13 +13475,8 @@ async def _check_order_filled(
                         f"{tag} [約定確認リトライ {_retry+1}/3]"
                         f" orderId={order_id}  status={status2}"
                     )
-                    # ★ v3.9.141: 部分約定を全約定として扱わない（認定サポーターからの指摘）。
-                    #   "filled" の部分文字列一致は FILLED_PART にも当たるため、
-                    #   10株中4株の約定でも pending 追跡を外し、建玉を 0 にしていた。
-                    #   主経路は v3.9.120 で厳密化済みだったが、このリトライ経路だけ
-                    #   旧判定が残っていた。部分約定は追跡に残し、watchdog に委ねる。
                     _is_part2 = ("part" in status2)
-                    _dq2 = 0.0   # ★ v3.9.150c: 変換失敗時の未定義参照を防ぐ（Codexレビュー指摘）
+                    _dq2 = 0.0
                     try:
                         _dq2 = float(_get_val(data2, "dealt_qty", 0) or 0)
                         if 0 < _dq2 < float(qty):
@@ -15173,13 +13484,6 @@ async def _check_order_filled(
                     except (TypeError, ValueError):
                         pass
                     if _is_part2:
-                        # ★ v3.9.150c: 追跡に残すだけでなく、残数も更新する
-                        #   （Codexレビュー指摘）。主経路（:11531 付近）は残数を
-                        #   書き戻すが、この経路は書いていなかったため、watchdog の
-                        #   再発注が元の株数（約定済みぶんを含む）で出て、
-                        #   売りすぎ・ドテンの恐れがあった。
-                        #   qty は発注時の株数のまま変わらないので、
-                        #   「qty - 約定済み」の上書きは何度通っても二重に引かない。
                         try:
                             if 0 < _dq2 < float(qty) and order_id in _pending_orders:
                                 _rem2 = max(0, int(round(float(qty) - _dq2)))
@@ -15195,7 +13499,6 @@ async def _check_order_filled(
                     if "filled" in status2 or "dealt" in status2:
                         # リトライで約定を確認 → 通常の約定処理に合流
                         _unregister_pending_order(order_id)
-                        # ★ v2.90: Discord PnL表示用の退避変数（リトライ用）
                         _realized_for_disc2: Optional[float] = None
                         _realized_pct_for_disc2: float = 0.0
                         _realized_qty_for_disc2: int = 0
@@ -15206,30 +13509,17 @@ async def _check_order_filled(
                             if filled_qty2 > 0 and filled_price2 > 0:
                                 ts_upd2 = state.get(symbol)
                                 if "[空売り]" not in mode:
-                                    # ★ v2.99.3: "ロング決済" も検出対象に追加 (上記と同じ理由)
                                     if "[決済]" in mode or "ロング決済" in mode:
                                         prev_avg2 = ts_upd2.avg_cost
                                         if prev_avg2 <= 0 and ts_upd2.pending_avg_cost > 0:
                                             prev_avg2 = ts_upd2.pending_avg_cost
-                                        # ★ v3.9.179b: 決済し終えた建玉の entry_time を、**ガードの外で無条件に**控える。
-                                        #   下の `if prev_avg2 > 0 and filled_price2 > 0:` の中で控えると、
-                                        #   その条件が偽のとき未定義になり、決済確定の処理が途中で例外に落ちる
-                                        #   （建玉ゼロなのに発注額が残る＝この版が消そうとしている表示そのものを作る）。
-                                        #   pending_entry_time はこの後クリアされるので、使う場所での再評価もできない。
                                         _closed_et2 = ts_upd2.pending_entry_time or ts_upd2.entry_time
                                         if prev_avg2 > 0 and filled_price2 > 0:
                                             realized2 = (filled_price2 - prev_avg2) * filled_qty2
-                                            # ★ v2.90: Discord PnL表示用に退避
                                             _realized_for_disc2 = realized2
                                             _realized_pct_for_disc2 = (realized2 / (prev_avg2 * filled_qty2) * 100
                                                                        if prev_avg2 > 0 else 0.0)
                                             _realized_qty_for_disc2 = int(filled_qty2)
-                                            # ★ v3.9.164: 通常経路と同じ絵文字つきの
-                                            #   決済行も出す（認定サポーターの指摘——
-                                            #   リトライ経路だけ「決済益／決済損」の行が
-                                            #   無く、ログを目で数えると件数が合わなかった。
-                                            #   集計は [確定損益(...)] を拾うので従来から
-                                            #   正しいが、読み手の数え方と食い違っていた）。
                                             _e2, _l2, _c2 = (
                                                 ("📈", "LONG決済益", "\033[1;32m") if realized2 > 0
                                                 else ("📉", "LONG決済損", "\033[1;31m") if realized2 < 0
@@ -15280,18 +13570,14 @@ async def _check_order_filled(
                                                     ts_upd2.entry_news_source,
                                                     ts_upd2.pending_close_reason,
                                                 ),
-                                                kwargs={  # ★ v2.95: GAS連携用の追加フィールド
+                                                kwargs={
                                                     "headlines":     ts_upd2.entry_headlines,
                                                     "beneficiaries": ts_upd2.entry_beneficiaries,
                                                     "victims":       ts_upd2.entry_victims,
                                                     "price_trend":   ts_upd2.entry_price_trend,
                                                     "peak_pnl":      ts_upd2.entry_peak_pnl,
-                                                    # ★ v3.1.0: ロング決済（リトライ）として明示
                                                     "trade_type":    "LONG",
-                                                    # ★ v3.9.133: 決済時点の「実際に適用された損切り%」をスナップショットして渡す
-                                                    #   （別スレッドで state を読むと次の建玉の値に入れ替わりうるため）
                                                     "enforced_stop_pct": stop_snapshot,
-                                                    # ★ v3.9.175: 出口条件を1組で渡す
                                                     "enforced_exit": exit_snapshot,
                                                 },
                                                 daemon=True,
@@ -15300,22 +13586,15 @@ async def _check_order_filled(
                                             ts_upd2.pending_avg_cost   = 0.0
                                         ts_upd2.position_qty = 0
                                         ts_upd2.avg_cost     = 0.0
-                                        # ★ v3.9.179: 決済し終えた建玉の entry_time（上の注記を参照）
                                         ts_upd2.last_closed_entry_time = _closed_et2
                                         ts_upd2.is_short     = False
                                         _tracked_position_cost[symbol] = 0.0
                                         _tracked_qty[symbol]           = 0
                                         log.info(f"{tag} [約定反映(リトライ)] qty=0株  avg_cost=$0.00")
                                     elif "[ショートカバー]" in mode:
-                                        # ── ★ v2.91: ショートカバー約定（リトライ）: PnL + TRADE_RESULT を記録 ──
                                         prev_avg_sc2 = ts_upd2.avg_cost
                                         if prev_avg_sc2 <= 0 and ts_upd2.pending_avg_cost > 0:
                                             prev_avg_sc2 = ts_upd2.pending_avg_cost
-                                        # ★ v3.9.179b: 決済し終えた建玉の entry_time を、**ガードの外で無条件に**控える。
-                                        #   下の `if prev_avg_sc2 > 0 and filled_price2 > 0:` の中で控えると、
-                                        #   その条件が偽のとき未定義になり、決済確定の処理が途中で例外に落ちる
-                                        #   （建玉ゼロなのに発注額が残る＝この版が消そうとしている表示そのものを作る）。
-                                        #   pending_entry_time はこの後クリアされるので、使う場所での再評価もできない。
                                         _closed_et_sc2 = ts_upd2.pending_entry_time or ts_upd2.entry_time
                                         if prev_avg_sc2 > 0 and filled_price2 > 0:
                                             realized_sc2 = (prev_avg_sc2 - filled_price2) * filled_qty2
@@ -15323,8 +13602,6 @@ async def _check_order_filled(
                                             _realized_pct_for_disc2 = (realized_sc2 / (prev_avg_sc2 * filled_qty2) * 100
                                                                        if prev_avg_sc2 > 0 else 0.0)
                                             _realized_qty_for_disc2 = int(filled_qty2)
-                                            # ★ v3.9.164: ショートカバー側のリトライ経路にも
-                                            #   絵文字つきの決済行を出す（認定サポーターの指摘）。
                                             _e3, _l3, _c3 = (
                                                 ("📈", "SHORT決済益", "\033[1;32m") if realized_sc2 > 0
                                                 else ("📉", "SHORT決済損", "\033[1;31m") if realized_sc2 < 0
@@ -15376,18 +13653,14 @@ async def _check_order_filled(
                                                     ts_upd2.entry_news_source,
                                                     ts_upd2.pending_close_reason,
                                                 ),
-                                                kwargs={  # ★ v2.95: GAS連携用の追加フィールド
+                                                kwargs={
                                                     "headlines":     ts_upd2.entry_headlines,
                                                     "beneficiaries": ts_upd2.entry_beneficiaries,
                                                     "victims":       ts_upd2.entry_victims,
                                                     "price_trend":   ts_upd2.entry_price_trend,
                                                     "peak_pnl":      ts_upd2.entry_peak_pnl,
-                                                    # ★ v3.1.0: ショートカバー（リトライ）として明示
                                                     "trade_type":    "SHORT",
-                                                    # ★ v3.9.133: 決済時点の「実際に適用された損切り%」をスナップショットして渡す
-                                                    #   （別スレッドで state を読むと次の建玉の値に入れ替わりうるため）
                                                     "enforced_stop_pct": stop_snapshot,
-                                                    # ★ v3.9.175: 出口条件を1組で渡す
                                                     "enforced_exit": exit_snapshot,
                                                 },
                                                 daemon=True,
@@ -15396,7 +13669,6 @@ async def _check_order_filled(
                                             ts_upd2.pending_avg_cost   = 0.0
                                         ts_upd2.position_qty = 0
                                         ts_upd2.avg_cost     = 0.0
-                                        # ★ v3.9.179: 決済し終えた建玉の entry_time（上の注記を参照）
                                         ts_upd2.last_closed_entry_time = _closed_et_sc2
                                         ts_upd2.is_short     = False
                                         _tracked_position_cost[symbol] = 0.0
@@ -15418,13 +13690,10 @@ async def _check_order_filled(
                                     ts_upd2.avg_cost_confirmed = True   # v3.9.101
                         except Exception as _re:
                             log.debug(f"{tag} [約定確認リトライ] 反映処理例外: {_re}")
-                        # ★ v2.90: リトライ約定確認でもPnL表示を統一
                         _fill_extra2 = ""
                         try:
                             if _realized_for_disc2 is not None:
                                 _fill_extra2 += f"\n{discord_pnl(_realized_for_disc2, _realized_pct_for_disc2, _realized_qty_for_disc2)}"
-                            # ★ v2.91: ショートカバーも判定理由を表示するよう判定条件を拡張
-                            # ★ v2.99.3: "ロング決済" / "ショートカバー" の文字列も検出対象に追加
                             if (
                                 "[決済]" in mode or "ロング決済" in mode
                                 or "[ショートカバー]" in mode or "ショートカバー" in mode
@@ -15493,10 +13762,10 @@ def place_buy(
     category: str     = "MACRO",
     news_source: str  = "",
     headlines: Optional[List[str]] = None,
-    beneficiaries: Optional[List[str]] = None,  # ★ v2.95: AI beneficiaries (GAS送信用)
-    victims: Optional[List[str]]       = None,  # ★ v2.95: AI victims (GAS送信用)
-    entry_pct_5m: Optional[float]      = None,  # ★ v3.9.149: モメンタムのエントリー時5分%
-    entry_pct_15m: Optional[float]     = None,  # ★ v3.9.149: 同 15分%
+    beneficiaries: Optional[List[str]] = None,
+    victims: Optional[List[str]]       = None,
+    entry_pct_5m: Optional[float]      = None,
+    entry_pct_15m: Optional[float]     = None,
 ) -> bool:
     """
     指値買い注文を moomoo に発行する。
@@ -15509,8 +13778,6 @@ def place_buy(
     mode    = "【デモ】" if trd_env == TrdEnv.SIMULATE else "【実注文】"
     session, _ = get_session_info()
 
-    # ★ v3.9.134: Bot 以外の建玉がある銘柄には新規エントリーしない。
-    #   決済は銘柄単位の全決済なので、混ぜると自分の分だけ決済できなくなる。
     if _skip_if_externally_held(symbol, "新規ロング"):
         return False
 
@@ -15518,7 +13785,6 @@ def place_buy(
         log.info(f"{tag} 週末セッション: BUY をスキップ")
         return False
 
-    # ★ v2.87: 休日も発注スキップ（防御的ガード — 通常は market_open_event で停止済）
     if session == SESSION_HOLIDAY:
         log.info(f"{tag} 休場日セッション: BUY をスキップ")
         return False
@@ -15535,25 +13801,18 @@ def place_buy(
         )
         return False
 
-    # ★ v2.98: SHORT 残存チェック (place_short 側の対称ロジック)。
     # SHORT 保有中の新規 BUY は moomoo が買戻と区別できず両建てになる可能性。
     # 先に買戻 → return → 次のシグナルでロング試行 (非対称解消順)。
     sync_positions(trd_env)
     ts_pre_buy = state.get(symbol)
     if ts_pre_buy.position_qty < 0:
         _abs_short = abs(ts_pre_buy.position_qty)
-        # ★ v3.9.89: L/S転換の抑制（MOMENTUM_REVERSE_EXIT=false）。
-        #   反対(SHORT)保有中は強制決済せず新規LONGを"見送る"だけにする。既存SHORTは
-        #   自身の損切り/トレール/時間切れ/建玉トレールに委ねる。反対シグナルは相場が
-        #   逆行した時に出るため、転換決済はほぼ必ず含み損確定(実データ WR0%・-$750/日規模)。
-        #   その純出血を回避する。既定(true)は従来どおり買い戻して向きを変える。
         if not MOMENTUM_REVERSE_EXIT:
             log.info(
                 f"{tag} [BUY前チェック] ショート {_abs_short}株 保有中 → "
                 f"転換せず新規LONGを見送り（MOMENTUM_REVERSE_EXIT=false・既存SHORTは損切り/トレールに委ねる）"
             )
             return False
-        # ★ v3.8.5: 正常なフロー (ショート→ロング切替) のため WARNING → INFO に降格
         log.info(
             f"{tag} [BUY前チェック] ショートポジション {_abs_short}株 が残存 "
             f"→ 先に買い戻してからロングを試みます（今回はスキップ）"
@@ -15567,7 +13826,6 @@ def place_buy(
         place_close_all(symbol, trd_env, "ロング前ショート強制決済")
         return False
 
-    # ── ★ v2.99.4: 決済 FAILED 中の同銘柄新規 BUY ブロック (最優先) ───────────
     # 直前の place_close_all が全 position_id 失敗で True を返さなかった銘柄は、
     # 既存ポジションの解消が完了するまで新規 BUY をブロックする。
     # サポーター v2.97 実口座運用フィードバックへの対応。
@@ -15579,7 +13837,6 @@ def place_buy(
         )
         return False
 
-    # ── ★ v3.9.10: 終盤エントリーブロック (強制決済の N 分前以内なら新規禁止) ──
     # 5/12 ログ分析でデモ日次決済 (15:45 ET) 直前 1 分間に 22 件の新規 BUY が
     # 集中し、買って数秒後の強制決済で全件損切り (-$74.27 / 勝率 4.5%) という
     # 構造的バグを修正。close_trigger_time の 15 分前以降は新規エントリー禁止。
@@ -15596,7 +13853,6 @@ def place_buy(
                          block_reason=f"強制決済まで残り {_mins_to_close:.1f}分")
         return False
 
-    # ── ★ v2.93: 下落トレンド検知時の新規ロング一時停止 ──────────────────────
     # 構成 A: 急落直後の同一銘柄ブロック (直近 NEW_LONG_BLOCK_SEC 秒)
     # 5/4 (NY11時 Oracle事案) や 5/5 (SMH 終日下落で Alpaca 59件ロング) の
     # 「損切り直後にまた同じ銘柄でロングを撃ち続ける」問題への対策。
@@ -15629,22 +13885,13 @@ def place_buy(
                          block_reason=_dt_reason)
         return False
 
-    # ── ★ v2.94: SMH 固有の追加チェック ──────────────────────────────────────
     # 5/5 SMH 終日下落事案で、QQQ は横ばい (構成 B が発火しない) でも SMH だけが
     # 下落するケースがあった。SMH 固有のセクター下落を別途検知する。
     if symbol == "SMH":
         # 修正項目 2: SMH 専用 Confidence しきい値
         # SMH のみ SMH_CONFIDENCE_THRESHOLD を要求 (他銘柄は既存設定維持)。
         # 730 件分析で SMH 0.75 帯の損失が -$212 と最大だったことへの対策。
-        # ★ v3.9.190: ここには v3.9.10 で下げる前の古い数値が直書きされていた。
-        #   数値を2箇所に持つと必ずずれるので、定数だけを見る形にした。
         if confidence < SMH_CONFIDENCE_THRESHOLD:
-            # ★ v3.9.170: 「同じ conf なのに片方だけ弾かれる」と読めるため、
-            #   このしきい値が買い（LONG）専用であることをログに出す
-            #   （認定サポーターのログ解析で指摘。空売り側に同じ関門は無い）。
-            # ★ v3.9.190: 小数第3位まで出す（認定サポーターの指摘）。
-            #   実値 0.779 と定数の側が :.2f では両方 0.78 に見え、
-            #   「0.78 < 0.78」という成立しない不等式がログに残っていた。
             log.info(
                 f"{tag} 🚫 [SMH 専用厳格化] confidence={confidence:.4f} "
                 f"< {SMH_CONFIDENCE_THRESHOLD:.4f} → SMH の新規買いをスキップ"
@@ -15671,7 +13918,6 @@ def place_buy(
                              block_reason=_smh_dt_reason)
             return False
 
-    # ── ★ v3.9.5: SPY 固有の追加チェック ──────────────────────────────────────
     # SPY は QQQ より約 40% 低ボラのため、QQQ ベースの構成 B (-0.30%/-0.70%) では
     # SPY 単独下落の検知精度が低い。SPY 専用の閾値 (-0.20%/-0.45%) で補完する。
     if symbol == "SPY":
@@ -15688,7 +13934,6 @@ def place_buy(
                              block_reason=_spy_dt_reason)
             return False
 
-    # ── ★ v2.99.4: 構成 D - 個別株固有の下落トレンド検知 ────────────────────
     # STOCK_TICKERS に含まれる銘柄のみ判定対象。QQQ/SMH 系の構成 B/C では
     # 拾えない「個別株の単独急落」を検知する。
     if symbol in STOCK_TICKERS:
@@ -15707,7 +13952,6 @@ def place_buy(
 
     # ── リアルタイム価格の取得（Quote Right 対応・推定値は使わない）──────────────
     quote       = get_quote(symbol)
-    # ★ v3.9.78 (#2): 異常クォートガード（板薄/異常値での発注を遮断）
     _qok, _qreason = _quote_sanity_ok(symbol, quote)
     if not _qok:
         log.warning(f"{tag} 🚫 発注見送り（異常クォートガード）: {_qreason}")
@@ -15717,12 +13961,11 @@ def place_buy(
                          outcome="blocked", block_stage="quote_sanity",
                          block_reason=_qreason, quote_sanity=0)
         return False
-    limit_price = calc_limit_price(quote, "BUY", symbol)  # ★ v2.99.4: シンボル別バッファ
+    limit_price = calc_limit_price(quote, "BUY", symbol)
     if limit_price <= 0:
         log.warning(f"{tag} リアルタイム価格取得失敗: BUY をスキップ（ask={quote['ask']}, last={quote['last']}）")
         return False
 
-    # ── ★ v3.9.20: ピラミッディング撤去・既存ポジションあれば新規追加スキップ ──
     # 旧 v3.9.19 までは「同方向に複数回追加 (PYRAMID_MAX_ENTRIES)」を許可していたが、
     # 1) 実データで一度も発動していなかった (タイムアウト 10分 / 再エントリー禁止 30分 と衝突)
     # 2) スキャル戦略 (短時間決済) と「上昇継続中に増し玉」の思想が根本的に合わない
@@ -15730,11 +13973,6 @@ def place_buy(
     # ため撤去。既存ポジション保有中の同シグナル再送はシンプルにスキップ。
     ts_check = state.get(symbol)
 
-    # ★ v3.9.121: 既存 LONG 保有中の新規追加スキップを qty 指定経路にも適用（利用者H指摘②-2）。
-    #   旧実装は if qty is None: の内側のみ＝ショートカバー等を想定した抜け道だったが、
-    #   qty 明示のモメンタムBUY・動的個別株BUYが意図せずバイパスし、ニュースLONG保有中の
-    #   同銘柄に追い玉が入り得た（entry_time 上書きでタイムアウト起点・成績帰属もズレる）。
-    #   ショートカバーは position_qty < 0 のため本チェックには掛からず、従来どおり通過する。
     if ts_check.position_qty > 0:
         log.info(
             f"{tag} 既存 LONG ポジション保有中 (qty={ts_check.position_qty}株) → 新規発注スキップ"
@@ -15753,7 +13991,6 @@ def place_buy(
             _size_label = "★スイートスポット 100%"
         else:
             _size_label = "超強気帯 40%"
-        # ★ v3.9.32: 高ボラ銘柄はサイズを ÷ 倍率 で縮小 (損切り幅拡大とセット)
         # 損切り幅を N 倍に拡げる代わりにサイズを 1/N に縮小し、1 トレードの
         # 想定最大損失額 (ドル) を ETF と同水準に保つ (リスクパリティ)。
         _hv_mult = _symbol_loss_mult(symbol)
@@ -15790,7 +14027,6 @@ def place_buy(
             f"現在合計: ${portfolio_total:,.0f} / 上限: ${_BUDGET_USD:,.0f}\n"
             f"→ 新規発注をブロックしました"
         ))
-        # ★ v3.9.193: 観察ログに残す（記録されない4種の1つ）
         _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
                          category=category, headlines=headlines,
                          beneficiaries=beneficiaries, victims=victims,
@@ -15826,11 +14062,7 @@ def place_buy(
     # ── ④ 個別株・決算銘柄の1銘柄上限チェック（STOCK_MAX_PCT, v2.40）────────
     _is_stock_sym = symbol in STOCK_TICKERS or symbol in EARNINGS_PRE_TICKERS or symbol in EARNINGS_AFTER_TICKERS
     if _is_stock_sym and STOCK_MAX_USD > 0:
-        # ★ v2.90: 旧コードにあった `_cur_stock_cost` 計算は死コード（後続で未使用）
         # のため削除。実際の上限判定は下記 `_sym_cost`（銘柄単体のtracked cost）で行う。
-        # ★ v3.9.105 (H2): getattr(TradeState, '_tracked_position_cost') は存在しない
-        #   属性の参照で常に 0 を返し、個別株の1銘柄上限チェックが事実上無効だった。
-        #   モジュールレベルの辞書 _tracked_position_cost が正しい参照先。
         _sym_cost = _tracked_position_cost.get(symbol, 0.0) or 0
         if _sym_cost >= STOCK_MAX_USD:
             log.info(
@@ -15851,13 +14083,7 @@ def place_buy(
 
     if qty is None:
         qty = max(1, math.floor(order_size / limit_price))
-        # ★ v3.9.157 (C-1): 1株への切り上げが残余力を超えないか確認する（認定
-        #   サポーターの指摘——目標額が残余力以下でも、残余力 < 1株の値段のとき
-        #   max(1, ...) がそのまま送られ BUDGET_USD を超過していた。同じ関数の
-        #   qty 明示側には v3.9.108 で入っている判定が、計算側に無かった）。
         _rb_calc = _BUDGET_USD - portfolio_total
-        # ★ v3.9.157b: 個別株は銘柄上限（STOCK_MAX_USD）の残余も併用する
-        #   （レビュー指摘——予算側だけ塞いでも銘柄上限を1株切り上げで超えられた）。
         if symbol in STOCK_TICKERS:
             _rb_calc = min(_rb_calc,
                            STOCK_MAX_USD - (_tracked_position_cost.get(symbol, 0.0) or 0))
@@ -15872,10 +14098,6 @@ def place_buy(
             log.info(f"{tag} 残余力に合わせて数量を調整: {qty} → {_qty_fit}株")
             qty = _qty_fit
     else:
-        # ★ v3.9.108 (レビューH1): qty明示の「新規買い」（モメンタムLONG・動的個別株）にも
-        #   残余力（BUDGET_USD − 既存建玉合計）を適用する。従来は無チェックで送信され
-        #   BUDGET_USD を超過し得た。ショートカバー（既存SHORTの買い戻し＝露出減）は
-        #   決済を止めないためキャップしない。
         _ts_bq = state.get(symbol)
         if _ts_bq is None or _ts_bq.position_qty >= 0:
             _rb_buy = _BUDGET_USD - get_tracked_portfolio_total()
@@ -15910,9 +14132,6 @@ def place_buy(
     ))
 
     # ── 発注（デモ口座・実口座ともに place_order を実行）──────────────────────
-    # ★ v3.9.52: 例外ハンドリングを 2 段階に分離
-    #   ① API 送信 (place_order) の例外 → ERROR + return False (注文未送信)
-    #   ② API 送信成功後の後処理例外 → WARNING + 処理継続 (注文は moomoo サーバへ到達済み)
     # 旧版は両方とも同じ try で包まれており、後処理 (非同期約定確認スケジュール等) で
     # 例外が出ると "注文は成功しているのに ERROR + return False" になり、ts_state の
     # entry_time/peak_price が設定されず risk_monitor が追跡できないことがあった
@@ -15920,7 +14139,6 @@ def place_buy(
     # 返却され、結局 watchdog の 2 分後タイムアウト確認まで放置されていた事象)。
     order_id = None
     try:
-        # ★ v2.86: with _trade_ctx() で例外時の close を保証
         with _trade_ctx() as ctx:
             _acc_id_buy = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
             ret, data = ctx.place_order(
@@ -15937,10 +14155,11 @@ def place_buy(
             )
         if ret != RET_OK:
             log.error(f"{tag} [ORDER] BUY 失敗: {data}")
+            _mark_order_fail(symbol, f"moomoo が発注を拒否: {data}")
             # 取引ロックエラーを検出 → 赤い警告を表示
             if "unlock" in str(data).lower():
                 _trade_locked = True
-                _trade_lock_at = datetime.datetime.now()   # ★ v3.9.135: 失敗時刻を残す
+                _trade_lock_at = datetime.datetime.now()
                 _trade_lock_last_warned = None  # 即時表示させる
                 _trade_lock_last_probe = None
                 _warn_trade_locked()
@@ -15949,14 +14168,12 @@ def place_buy(
         log.info(f"{tag} [ORDER] BUY  orderId={order_id}  qty={qty}  price={limit_price}")
     except Exception as e:
         log.error(f"{tag} [ORDER] BUY API例外: {e}", exc_info=True)
+        _mark_order_fail(symbol, f"発注APIの例外: {e}")
         return False
 
     # ── ここから API 送信成功確定 ─────────────────────────────────────────────
     # 注文は moomoo サーバへ到達済み。以降の例外は WARNING に降格し、
     # ポジション追跡 (ts_state) や risk_monitor 引継ぎを止めないようにする。
-    # ★ v3.9.149 (C-9): エントリー時の5分/15分%は、約定確認を仕掛ける前に確定させる。
-    #   後から書くと、先に走り出した約定記録が前回の建玉の値を読む
-    #   （連続したモメンタム建玉で発生・Codexレビュー指摘）。
     try:
         state.get(symbol).entry_pct_5m  = entry_pct_5m
         state.get(symbol).entry_pct_15m = entry_pct_15m
@@ -15978,7 +14195,6 @@ def place_buy(
 
     ts_state = state.get(symbol)
     ts_state.total_orders += 1
-    # ── ★ v2.95: GAS連携用フィールドの設定 ─────────────────────────────
     # v3.9.20: ピラミッディング撤去により常に新規エントリー (上書き)。
     ts_state.entry_headlines     = (headlines or [])[:3]
     ts_state.entry_beneficiaries = beneficiaries or []
@@ -15987,10 +14203,6 @@ def place_buy(
     ts_state.entry_price_trend   = get_index_pct_change(symbol, 5) or 0.0
     ts_state.entry_peak_pnl      = 0.0           # エントリー時は 0.0 で初期化
     ts_state.entry_count         = 1             # v3.9.20: 常に 1 (ピラミッド撤去)
-    # ★ v3.9.178: 新しい建玉なので、前の建玉の出口条件を捨てる（外部レビュー指摘）。
-    #   これらは記録専用で売買判定には使われないため、消しても挙動は変わらない。
-    #   消さないと、新建玉が監視ループに評価される前に決済されたとき（一斉決済・
-    #   パニック等）、前の建玉の値が「正しい値の顔で」記録に載る。
     ts_state.enforced_exit     = None
     ts_state.enforced_stop_pct = None
     ts_state.entry_time   = datetime.datetime.now()   # 時間切れ決済の起点
@@ -16000,8 +14212,6 @@ def place_buy(
     ts_state.entry_ai_score    = 1  # BUYはブル
     ts_state.entry_ai_conf     = confidence
     ts_state.entry_ai_category = category
-    # ★ v3.9.149 (C-9): entry_pct_5m / entry_pct_15m は、約定確認を仕掛ける前
-    #   （上の「API 送信成功確定」の直後）で確定済み。ここでは触らない。
     ts_state.entry_news_source = news_source
     ts_state.entry_reason      = reason
     # 自前ポジション管理に発注コストと株数を記録
@@ -16031,21 +14241,8 @@ def place_buy(
         f"{_reason_str}"
         f"{_headlines_str}"
     ))
-    # ★ v3.9.7: 観察ログ — 発注成功パス
-    # ★ v3.9.176b: 2桁に丸めるのは、シートに載る値（GAS ペイロードで round(_,2)）と
-    #   PnL の基準を一致させるため。ただし丸めで 0.00 に潰れると観察ログ側が
-    #   同期 get_quote を引き直してしまうので、その場合だけ生の基準値を使う
-    #   （外部レビュー指摘。指値は buffer を掛けてから丸めるため 0 にならず、
-    #   ここだけ 0 になる価格帯が理論上ある）。
     _px_basis = limit_price_base(quote, "BUY")
     _px_basis = round(_px_basis, 2) or _px_basis
-    # ★ v3.9.176: 判定時価格には「実勢価格」を渡す（認定サポーターの報告）。
-    #   従来は発注指値 limit_price を渡していたが、指値は約定しやすさのために
-    #   実勢から意図的にずらしてある（calc_limit_price）。これを理論上の建値に
-    #   使うと、そのズレがまるごと成績の歪みとして観察ログに乗る。
-    #   観察ログ 11,833件を実約定価格と突き合わせた実測では、60分評価が
-    #   LONG で +0.14%・SHORT で +0.06% 不利側に歪んでいた（合計 約 +61,101$）。
-    #   実際の売買・確定損益には影響しない。狂っていたのは判断を測る物差しのほう。
     _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
                      category=category, headlines=headlines,
                      beneficiaries=beneficiaries, victims=victims,
@@ -16064,10 +14261,10 @@ def place_short(
     category: str     = "MACRO",
     news_source: str  = "",
     headlines: Optional[List[str]] = None,
-    beneficiaries: Optional[List[str]] = None,  # ★ v2.95: AI beneficiaries (GAS送信用)
-    victims: Optional[List[str]]       = None,  # ★ v2.95: AI victims (GAS送信用)
-    entry_pct_5m: Optional[float]      = None,  # ★ v3.9.149: モメンタムのエントリー時5分%
-    entry_pct_15m: Optional[float]     = None,  # ★ v3.9.149: 同 15分%
+    beneficiaries: Optional[List[str]] = None,
+    victims: Optional[List[str]]       = None,
+    entry_pct_5m: Optional[float]      = None,
+    entry_pct_15m: Optional[float]     = None,
 ) -> bool:
     """空売り（新規SELL）注文を moomoo に発行する。 信用口座でベア局面時に SPY/QQQ を空売りする。 決済は place_cover（買い戻し）で行う。"""
     global _trade_locked, _trade_lock_at, _trade_lock_last_warned, _trade_lock_last_probe  # 取引ロック状態管理
@@ -16075,7 +14272,6 @@ def place_short(
     mode = "【デモ】" if trd_env == TrdEnv.SIMULATE else "【実注文】"
     session, _ = get_session_info()
 
-    # ★ v3.9.134: Bot 以外の建玉がある銘柄には新規エントリーしない（place_buy と同様）
     if _skip_if_externally_held(symbol, "新規ショート"):
         return False
 
@@ -16083,7 +14279,6 @@ def place_short(
         log.info(f"{tag} 週末セッション: SHORT をスキップ")
         return False
 
-    # ★ v2.87: 休日も発注スキップ（防御的ガード — 通常は market_open_event で停止済）
     if session == SESSION_HOLIDAY:
         log.info(f"{tag} 休場日セッション: SHORT をスキップ")
         return False
@@ -16091,12 +14286,6 @@ def place_short(
     # ★ テスト結果確認済み（2026-05-01）: デモ口座は SELL_SHORT（信用空売り）非対応
     #   全jp_acc_typeパターン（未指定/JP_TOKUTEI_SHORT/JP_GENERAL_SHORT）で
     #   "Order side must be BUY or SELL..." エラー。
-    # ★ v3.9.28: デモでもシャドー SHORT (仮想 PnL シミュレート) を記録。
-    # ★ v3.9.65: DEMO_SHORT_ENABLED=true なら、デモをネッティング口座として扱い
-    #   「プレーン SELL で新規ショート（保有0株からの売り）」を実発注する。
-    #   この場合はスキップせず通常フローへ進む（後段でロング残存・既存SHORTを確認し、
-    #   発注時の trd_side をプレーン SELL に切替）。決済は _cover_trd_side()=BUY。
-    # ── ★ v3.9.69: 実口座の買い専用オプション (REAL_SHORT_ENABLED=false) ──────
     # 実口座でショートを一括停止する共通ゲート (ニュース駆動・モメンタム両方を遮断)。
     # SHORT 判定はシャドー記録のみに転送し、買いだけを実発注する運用を可能にする。
     if trd_env == TrdEnv.REAL and not REAL_SHORT_ENABLED:
@@ -16138,9 +14327,6 @@ def place_short(
         )
         return False
 
-    # ★ v3.9.144: 決済失敗ロック中の新規SHORTを止める（認定サポーターの指摘 A-8）。
-    #   place_buy には v2.97 からあった検査が、SHORT 側に無かった。決済が失敗して
-    #   建玉が残っている可能性がある間に追加のショートを出さない。
     _is_fc_locked_s, _fc_elapsed_s = _is_failed_close_locked(symbol)
     if _is_fc_locked_s:
         log.warning(
@@ -16149,7 +14335,6 @@ def place_short(
         )
         return False
 
-    # ── ★ v3.9.10: 終盤エントリーブロック (強制決済の N 分前以内なら新規禁止) ──
     # SHORT 側にも対称ガードを適用 (LONG と同じく終盤の新規エントリーは即決済リスク)。
     _late_block_s, _mins_to_close_s = _is_late_session_entry_blocked()
     if _late_block_s:
@@ -16164,7 +14349,6 @@ def place_short(
                          block_reason=f"強制決済まで残り {_mins_to_close_s:.1f}分")
         return False
 
-    # ── ★ v3.8.1: マクロ上昇トレンド検知時の SHORT 一時停止 (構成 B' / 対称版) ──
     # place_buy の is_macro_downtrend() に対応する SHORT 側の対称ガード。
     # 旧 v3.1.3 はフォールバック経路のみ上昇トレンドを検査していたため、AI が
     # 明示的に victims=['QQQ'] を返したケースでは無防備だった。
@@ -16184,7 +14368,6 @@ def place_short(
                              outcome="blocked", block_stage="macro_uptrend",
                              block_reason=_ut_reason)
             return False
-        # ── ★ v3.9.5: SPY 固有の追加チェック ─────────────────────────────────
         # SPY は QQQ より約 40% 低ボラのため、QQQ ベース (+0.10%/+0.25%) では
         # SPY 単独上昇の検知精度が低い。SPY 専用閾値 (+0.07%/+0.15%) で補完。
         if symbol == "SPY":
@@ -16214,7 +14397,6 @@ def place_short(
                              block_reason=_ut_reason)
             return False
 
-    # ── ★ v3.8.2: 構成 D' - 個別株上昇トレンド検知時の SHORT 一時停止 ──
     # place_buy の is_stock_downtrend() に対応する SHORT 側の対称ガード。
     # STOCK_TICKERS に含まれる銘柄のみ判定対象 (env で監視対象に設定した銘柄)。
     # 急騰中の個別株に悪材料ニュースで飛びついた SHORT が逆行する事案への対策。
@@ -16241,15 +14423,12 @@ def place_short(
     sync_positions(trd_env)
     ts_pre = state.get(symbol)
     if ts_pre.position_qty > 0:
-        # ★ v3.9.89: L/S転換の抑制（MOMENTUM_REVERSE_EXIT=false）。反対(LONG)保有中は
-        #   強制決済せず新規SHORTを見送る。既存LONGは自身の損切り/トレール/時間切れに委ねる。
         if not MOMENTUM_REVERSE_EXIT:
             log.info(
                 f"{tag} [SHORT前チェック] ロング {ts_pre.position_qty}株 保有中 → "
                 f"転換せず新規SHORTを見送り（MOMENTUM_REVERSE_EXIT=false・既存LONGは損切り/トレールに委ねる）"
             )
             return False
-        # ★ v3.8.5: 正常なフロー (ロング→ショート切替) のため WARNING → INFO に降格
         log.info(
             f"{tag} [SHORT前チェック] ロングポジション {ts_pre.position_qty}株 が残存 "
             f"→ 先に決済してからショートを試みます（今回はスキップ）"
@@ -16267,7 +14446,6 @@ def place_short(
     #    発注後のエラーレスポンスで在庫なしを判定する（下記のエラーハンドリングを参照）。
 
     quote       = get_quote(symbol)
-    # ★ v3.9.78 (#2): 異常クォートガード（板薄/異常値での発注を遮断）
     _qok, _qreason = _quote_sanity_ok(symbol, quote)
     if not _qok:
         log.warning(f"{tag} 🚫 空売り見送り（異常クォートガード）: {_qreason}")
@@ -16277,12 +14455,11 @@ def place_short(
                          outcome="blocked", block_stage="quote_sanity",
                          block_reason=_qreason, quote_sanity=0)
         return False
-    limit_price = calc_limit_price(quote, "SELL", symbol)   # ★ v2.99.4: シンボル別バッファ
+    limit_price = calc_limit_price(quote, "SELL", symbol)
     if limit_price <= 0:
         log.warning(f"{tag} 価格取得失敗: SHORT をスキップ")
         return False
 
-    # ── ★ v3.9.20: ピラミッディング撤去・既存 SHORT 保有中はスキップ ──────
     ts_check = state.get(symbol)
     if ts_check.position_qty < 0:
         log.info(
@@ -16295,7 +14472,6 @@ def place_short(
     log.info(f"{tag} [空売り上限チェック] ポートフォリオ合計=${portfolio_total:,.0f} / 上限=${_BUDGET_USD:,.0f}")
     if portfolio_total >= _BUDGET_USD:
         log.info(f"{tag} ポートフォリオ上限到達 → 空売りブロック")
-        # ★ v3.9.193: 観察ログに残す（記録されない4種の1つ）
         _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
                          category=category, headlines=headlines,
                          beneficiaries=beneficiaries, victims=victims,
@@ -16307,12 +14483,6 @@ def place_short(
     remaining_budget = _BUDGET_USD - portfolio_total
 
     if qty is None:
-        # ★ v3.9.122 (利用者B報告 7/20): $ベースの発注額計算（confidence山型・高ボラ÷倍率）を
-        #   qty is None 経路の内側へ移動（place_buy と対称化）。従来はこのブロックが
-        #   qty 明示発注でも無条件に実行され、「高ボラ銘柄サイズ調整 ÷3.0 = $3,000」の
-        #   ログが出るのに実発注には使われない＝実態と異なる表示になっていた。
-        #   モメンタム実発注はサイズ縮小を行わない方針（v3.9.123・PAN決定）のため、
-        #   渡された qty＝モメンタム側の設計サイズをそのまま尊重する（残余力キャップのみ適用）。
         # 発注金額：confidence の「山型」配分で計算
         order_size = calc_order_size(confidence)
         if confidence < 0.70:
@@ -16323,7 +14493,6 @@ def place_short(
             _size_label = "★スイートスポット 100%"
         else:
             _size_label = "超強気帯 40%"
-        # ★ v3.9.32: 高ボラ銘柄はサイズを ÷ 倍率 で縮小 (損切り幅拡大とセット)
         _hv_mult = _symbol_loss_mult(symbol)
         if _hv_mult > 1.0:
             _order_size_before = order_size
@@ -16350,12 +14519,6 @@ def place_short(
                          price_at_decision=quote_price(quote))
                 return False
             order_size = remaining_budget
-        # ── ★ v3.9.169b: 個別株の1銘柄上限を空売り側にも適用する ────────────
-        #   認定サポーターの実測報告（2026-08-24・デモ）: 起動バナーは
-        #   「$1,000/銘柄」なのに SHORT だけ $3,957 で発注されていた。
-        #   place_buy には :14260 に同じチェックがあるのに、place_short には
-        #   ポートフォリオ全体の上限しか無く、銘柄単位の歯止めが効いていなかった
-        #   （v3.9.167 以前も同様＝退行ではなく実装漏れ）。
         _is_stock_sym_s = (symbol in STOCK_TICKERS
                            or symbol in EARNINGS_PRE_TICKERS
                            or symbol in EARNINGS_AFTER_TICKERS)
@@ -16379,7 +14542,6 @@ def place_short(
                     log.info(f"{tag} 個別株上限後に残余力不足 → 空売りスキップ")
                     return False
         qty = max(1, math.floor(order_size / limit_price))
-        # ★ v3.9.157 (C-1): place_buy と同じ切り上げ超過ガード（空売り側）。
         if qty * limit_price > remaining_budget:
             _qty_fit_s = math.floor(remaining_budget / limit_price)
             if _qty_fit_s < 1:
@@ -16391,11 +14553,6 @@ def place_short(
             log.info(f"{tag} 残余力に合わせて数量を調整: {qty} → {_qty_fit_s}株")
             qty = _qty_fit_s
     else:
-        # ★ v3.9.108 (レビューH1・利用者B報告 7/2 実害確認): qty明示指定（モメンタム実発注等）
-        #   でも残余力（BUDGET_USD − 既存建玉合計）を必ず適用する。従来は $ベースの調整
-        #   （confidence配分・高ボラ縮小・残余力キャップ）が qty に一切反映されず、
-        #   QQQ $7.9k 保有中に SMH 13株 $7.8k がそのまま送られて BUDGET_USD 超過
-        #   →「Insufficient buying power」拒否が発生していた。
         _max_qty_budget = math.floor(remaining_budget / limit_price)
         if _max_qty_budget < 1:
             log.info(
@@ -16426,17 +14583,10 @@ def place_short(
         trd_env=trd_env, confidence=confidence, amount=order_cost,
     ))
 
-    # ★ v3.9.52: place_buy と同じ 2 段階例外ハンドリング (API送信 vs 後処理)
     order_id = None
     try:
-        # ★ v2.86: with _trade_ctx() で例外時の close を保証
         with _trade_ctx() as ctx:
             _acc_id_short = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
-            # ★ v3.9.65: 新規ショートのサイドを環境別に切替。
-            #   実口座 (FUTUJP 信用): TrdSide.SELL_SHORT + jp_acc_type=JP_TOKUTEI_SHORT
-            #   デモ (ネッティング): プレーン TrdSide.SELL (保有0株からの売り=ショート新規)。
-            #     ※ ここに到達する時点でロング残存チェック(9851)・既存SHORTチェック(9877)を
-            #       通過済み = position_qty==0 (flat) のため、SELL は確実にショート新規になる。
             if trd_env == TrdEnv.REAL:
                 _open_side = TrdSide.SELL_SHORT
                 _open_kwargs = _tokutei_kwargs(trd_env, is_short=True)
@@ -16462,9 +14612,6 @@ def place_short(
             # 「insufficient positions」「cannot borrow」「short sell」等が含まれる場合は
             # 貸株在庫なしと判断してDiscordに通知する。
             err_str = str(data).lower()
-            # ★ v3.9.106: 「Insufficient buying power（信用余力不足）」を貸株在庫なしと
-            #   誤表示していた問題の修正。裸の "insufficient" が貸株キーワードに含まれて
-            #   いたため、余力不足も貸株判定に一致していた。余力系を先に判定する。
             if "buying power" in err_str or "purchasing power" in err_str or "余力" in err_str:
                 log.warning(
                     f"{tag} 🚫 ショートスキップ: 信用余力不足\n"
@@ -16497,26 +14644,25 @@ def place_short(
             elif "unlock" in err_str:
                 # 取引ロックエラー → 赤い警告を表示
                 _trade_locked = True
-                _trade_lock_at = datetime.datetime.now()   # ★ v3.9.135: 失敗時刻を残す
+                _trade_lock_at = datetime.datetime.now()
                 _trade_lock_last_warned = None
                 _trade_lock_last_probe = None
                 _warn_trade_locked()
             else:
                 log.error(f"{tag} [ORDER] SHORT 失敗: {data}")
+            _mark_order_fail(symbol, f"moomoo が発注を拒否: {data}", side="SHORT")
             return False
         order_id = str(data["order_id"][0])
         log.info(f"{tag} [ORDER] SHORT orderId={order_id}  qty={qty}  price={limit_price}")
-        _clear_trade_lock("新規ショート")   # ★ v3.9.135: 発注が通った＝ロックは解けている
+        _clear_trade_lock("新規ショート")
     except Exception as e:
         log.error(f"{tag} [ORDER] SHORT API例外: {e}", exc_info=True)
+        _mark_order_fail(symbol, f"発注APIの例外: {e}", side="SHORT")
         return False
 
     # ── ここから API 送信成功確定 ─────────────────────────────────────────────
     # 注文は moomoo サーバへ到達済み。以降の例外は WARNING に降格し、
     # ポジション追跡 (ts_state) や risk_monitor 引継ぎを止めないようにする。
-    # ★ v3.9.149 (C-9): エントリー時の5分/15分%は、約定確認を仕掛ける前に確定させる。
-    #   後から書くと、先に走り出した約定記録が前回の建玉の値を読む
-    #   （連続したモメンタム建玉で発生・Codexレビュー指摘）。
     try:
         state.get(symbol).entry_pct_5m  = entry_pct_5m
         state.get(symbol).entry_pct_15m = entry_pct_15m
@@ -16535,7 +14681,6 @@ def place_short(
 
     ts_state = state.get(symbol)
     ts_state.total_orders += 1
-    # ── ★ v2.95: GAS連携用フィールドの設定 ─────────────────────────────
     # v3.9.20: ピラミッディング撤去により常に新規エントリー (上書き)。
     ts_state.entry_headlines     = (headlines or [])[:3]
     ts_state.entry_beneficiaries = beneficiaries or []
@@ -16546,7 +14691,6 @@ def place_short(
     ts_state.entry_count         = 1             # v3.9.20: 常に 1 (ピラミッド撤去)
     ts_state.entry_time    = datetime.datetime.now()
     ts_state.position_qty -= qty   # 空売りはマイナスで管理（発注成功後のみここに到達）
-    # ★ v3.1.3: avg_cost を limit_price で仮設定 (約定確認/sync で実価格に上書き)。
     # _check_order_filled が走る前にリスク監視が PnL=(0-price)*qty で誤検知する
     # race condition への対策。
     if ts_state.avg_cost <= 0:
@@ -16556,15 +14700,12 @@ def place_short(
     # 誤発動 → 即 BUY_BACK で自己決済の race condition への根本対策。
     ts_state.entry_pending_fill = True
     ts_state.avg_cost_confirmed = False  # v3.9.101: 実約定単価が入るまで未確定（指値仮設定）
-    # ★ v3.9.178: 新しい建玉なので前の建玉の出口条件を捨てる（LONG 側と同じ理由）。
     ts_state.enforced_exit     = None
     ts_state.enforced_stop_pct = None
     ts_state.is_short          = True  # 意図的なショート中フラグ（リスク監視の誤検知防止）
     ts_state.entry_ai_score    = -1  # SHORTはベア
     ts_state.entry_ai_conf     = confidence
     ts_state.entry_ai_category = category
-    # ★ v3.9.149 (C-9): entry_pct_5m / entry_pct_15m は、約定確認を仕掛ける前
-    #   （上の「API 送信成功確定」の直後）で確定済み。ここでは触らない。
     ts_state.entry_news_source = news_source
     track_position_add(symbol, order_cost, qty=qty)
     _headlines_str = (
@@ -16590,13 +14731,8 @@ def place_short(
         f"セッション: {session.upper()}  時間外: {outside_rth}"
         f"{_headlines_str}"
     ))
-    # ★ v3.9.7: 観察ログ — 発注成功パス (SHORT)
-    # ★ v3.9.176b: 丸めの扱いは BUY 側と同じ（上の注記を参照）。
     _px_basis = limit_price_base(quote, "SELL")
     _px_basis = round(_px_basis, 2) or _px_basis
-    # ★ v3.9.176: 判定時価格には「実勢価格」を渡す（BUY 側と同じ理由・上の注記を参照）。
-    #   報告はショートの事例だったが、実測では LONG のほうが 2.5 倍歪んでいた。
-    #   買いのほうが指値を実勢から離す幅が大きいため。両方向とも直す。
     _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
                      category=category, headlines=headlines,
                      beneficiaries=beneficiaries, victims=victims,
@@ -16606,27 +14742,13 @@ def place_short(
 
 # 起動時ポジション不明フラグ
 _startup_position_unknown: bool = False
-# ★ v3.9.190: 起動時の整合性警告で名指しした「監視対象外の建玉」。
-#   建玉不明フラグの解除は「明細に建玉が1つでも見えたら」で行うが、それは
-#   照会が動くようになった証拠にすぎず、起動時に見えていなかった建玉が
-#   見えるようになった証拠ではない。解除の行で照合するために残す
-#   （認定サポーターの指摘——新規 SMH が見えただけで「取得成功」と出たが、
-#   同じ回の起動時に警告した DRAM / NVDA の可否は何も分かっていなかった）。
-#   ★ 再代入せず中身を入れ替える。globals() 越しの代入も global 宣言も要らず、
-#     名前の追跡が静的解析で切れない（配布前レビュー Gemini の指摘）。
 _startup_unmonitored_symbols: set = set()
-# ★ v3.9.190: 建玉不明フラグの「読んで消す」を1スレッドに限る
-#   （配布前レビュー Codex の指摘）。sync_positions は place_buy / place_short /
-#   place_close_all / 週末決済から呼ばれ、それらは asyncio.to_thread で走るため
-#   実スレッドで並行しうる。守らないと2スレッドが別々の口座スナップショットで
-#   同時に解除に入り、「今回見えた建玉」と「まだ見えない建玉」が食い違う2行が出る。
 _STARTUP_UNKNOWN_LOCK = threading.Lock()
 
 # 起動時ニュース無視期間（秒）
 STARTUP_NEWS_IGNORE_SEC: int = int(os.environ.get("STARTUP_NEWS_IGNORE_SEC", "60"))
 _BOT_START_TIME: datetime.datetime = datetime.datetime.now()
 
-# ── ★ v3.9.56: セッション切替直後の古いニュース対策 ───────────────────────────
 # OVERNIGHT / WEEKEND / 取引不可セッション中も Alpaca News WebSocket や
 # Yahoo Finance / Finnhub の RSS は受信を続ける (蓄積される)。
 # セッションが PREMARKET 等に切り替わった瞬間、これら蓄積ニュースが一斉に
@@ -16643,7 +14765,6 @@ _last_session_change_at: Optional[datetime.datetime] = None
 _ghost_miss_count: dict[str, int] = {sym: 0 for sym in ALL_TICKERS}
 _GHOST_MISS_THRESHOLD = 3  # 連続N回「不在」で初めてクリア
 
-# ── ★ v2.97: RSS フィード健全性管理 ──────────────────────────────────────────
 # 受講生 5日間 DEBUG ログ8万行汚染 (Reuters/AP DNS失敗 5秒毎継続) への恒久対策。
 # _rss_fail_count: 連続失敗回数 / _rss_excluded: 動的除外セット (閾値超で追加)
 # _rss_warn_emitted: 初回 WARNING 出力済みフラグ
@@ -16657,7 +14778,6 @@ _rss_warn_emitted:  set[str]       = set()
 # {symbol: 保有コスト（発注額）}
 _tracked_position_cost: dict[str, float] = {sym: 0.0 for sym in ALL_TICKERS}
 
-# ★ v3.9.105 (C1計測): 実環境で観測した order_status の生値集合（初回のみログ出力）。
 _SEEN_ORDER_STATUSES: set = set()
 # BUY約定時の正確な株数を保持。sync_positionsのAPI瞬間値が変動しても
 # place_close_all がこちらを優先参照することで売り株数の食い違いを防ぐ。
@@ -16668,14 +14788,12 @@ _dynamic_calls_today: int = 0
 _dynamic_calls_date:  Optional[str] = None  # "2026-04-27" 形式（ET）で日付管理
 _DYNAMIC_EXCLUDE: set = set(ALL_TICKERS)    # 通常・決算銘柄は除外（重複防止）
 
-# ── ★ v2.92: マクロ環境（QQQ/SPY 直近騰落率）の文脈を AI に渡すための価格履歴 ──
 # 5/4 Oracle事案 (相場下落中の単発好材料への過剰反応) への対策。
 # AI 判定時に直近 5/15/60 分の QQQ/SPY/SMH 騰落率を添えて confidence を調整。
 # データ構造: {"QQQ": [(datetime, price), ...], ...} 60 分以内のみ保持。
 # 既存 get_quote 結果を流用するため追加 API コールなし。
 # v2.94: SMH 独立追跡 (QQQ 横ばいでも SMH 単独下落を検知)
 # v2.99.4: STOCK_TICKERS も追跡 (is_stock_downtrend / 5分ごと市場ログで使用)
-# ★ v3.9.33: IWM (Russell 2000 小型株 ETF) を価格履歴トラッキング対象に追加。
 # シャドーモメンタム観察専用。MOMENTUM_SYMBOLS と整合させる。
 _INDEX_PRICE_HISTORY: dict[str, list] = {
     sym: [] for sym in (set(["QQQ", "SPY", "SMH", "IWM"]) | set(STOCK_TICKERS) | set(MOMENTUM_SYMBOLS))
@@ -16685,7 +14803,6 @@ _INDEX_PRICE_HISTORY_MAX_SEC: int = 4500  # 75分 (v3.9.5: 60分ルックアッ�
 # 「t ≤ target」を満たす candidate が見つからず「60分 データ不足」となる境界バグが発生。
 # 保持期間を 75分に広げ、60分ルックアップが常に安定して候補を見つけられるよう余裕を持たせる。
 
-# ── ★ v3.9.78 (#2): 異常クォートガード ───────────────────────────────────────
 # 板薄プリマーケット等で取得した異常クォート（直近価格から大きく乖離）での発注を
 # 構造的に遮断する。6/9 の CRM entry$868→exit$174(0分・premarket・-$8,332)、
 # TSLA(-$2,900) のようなテール事故を防ぐ。正常な取引は一切制限しない（fail-open設計）。
@@ -16727,17 +14844,7 @@ def _quote_sanity_ok(symbol: str, quote: dict):
             if dev > QUOTE_SANITY_DEVIATION_PCT:
                 return False, (f"現値 ${price:.2f} が直近基準 ${ref:.2f} から "
                                f"{dev:.1f}% 乖離 (上限 {QUOTE_SANITY_DEVIATION_PCT:.0f}%)")
-        # ★ v3.9.154/155: スプレッド検査は「両側が独立に観測された気配」のときだけ
-        #   意味を持つ（認定サポーターの指摘§5-2＋新規Claudeレビュアーの指摘）。
-        #   last で埋めた合成値は ask == bid になり spread が必ず 0 ＝ 素通りする。
-        #   逆に、板でなくても LV1・Alpaca の ask/bid は実在の気配なので検査に残す
-        #   （v3.9.154 は from_book を軸にしており、Alpaca 経由の板薄を見逃していた）。
         _two_sided = bool(quote.get("two_sided", quote.get("from_book", True)))
-        # ★ v3.9.156: クロス気配（bid > ask）は時刻の異なるソース混在の兆候で、
-        #   「独立に観測された正常な両側」ではないため不合格にする。
-        # ★ v3.9.156b: スプレッド上限（既定0=無効）のオプトインとは独立の関心事
-        #   なので、上限が無効でも検査する（新規Claudeレビュアーの指摘——既定構成
-        #   では一度も実行されない位置に置いていた）。bid == ask（ロック気配）は通す。
         if ask > 0 and bid > 0 and _two_sided and bid > ask:
             return False, (f"クロス気配 bid ${bid:.2f} > ask ${ask:.2f}"
                            f"（時刻の異なる気配ソース混在の疑い）")
@@ -16763,7 +14870,6 @@ def record_index_price(symbol: str, price: float) -> None:
     risk_monitor_loop から呼ばれる前提。get_quote の追加コールは不要で、
     既存の get_quote 結果を引数として受け取る。
     記録時に 60 分より古いエントリーは自動削除する。
-    ★ v2.99.4: STOCK_TICKERS にも対応。_INDEX_PRICE_HISTORY を動的に拡張済み。
     """
     if symbol not in _INDEX_PRICE_HISTORY or price <= 0:
         return
@@ -16776,7 +14882,6 @@ def record_index_price(symbol: str, price: float) -> None:
         _hist.pop(0)
 
 
-# ★ v3.9.3: 起動時バックフィル ─────────────────────────────────────────────
 # Bot 再起動のたびに _INDEX_PRICE_HISTORY が空になり、起動から最大 60 分間
 # トレンドフィルタ (構成 B/B'/C/C'/D/D') が「データ不足」で無効化される問題への対策。
 # moomoo OpenD の request_history_kline で直近 60 分の 1 分足を取得し、メモリ上の
@@ -16809,7 +14914,6 @@ def _backfill_index_price_history() -> None:
     # 1) ET の "今" を計算 (システム locale 非依存)
     now_local = datetime.datetime.now()
     now_et = datetime.datetime.now(_ET).replace(tzinfo=None)
-    # 2) ★ v3.9.57: ET 基準で 20 時間前から現在まで
     # 前営業日の AFTERHOURS (ET 16:00-20:00) を必ずカバー。OVN 中の起動でも
     # データを取得できる。cutoff 75 分で古いデータは結局削除されるため、
     # メモリ使用量は変わらない (PRE/RTH/AFTER の活性バーのみが残る)。
@@ -16836,7 +14940,7 @@ def _backfill_index_price_history() -> None:
                         start=start,
                         end=end,
                         ktype=KLType.K_1M,
-                        max_count=1000,           # ★ v3.9.57: 200 → 1000 (20時間カバーのため)
+                        max_count=1000,
                         extended_time=True,   # ★ PREMARKET/AFTERHOURS も含む
                     )
                     if ret != RET_OK or klines is None:
@@ -16868,14 +14972,6 @@ def _backfill_index_price_history() -> None:
                         if price > 0:
                             _bars.append((ts_local, price))
                     _bars.sort(key=lambda x: x[0])
-                    # ★ v3.9.157b (C-4 の裁定変更): 一度「合成時刻で夜間の空白を詰める」
-                    #   案を実装したが、4レーンレビューが一致して反証した——ギャップを
-                    #   1分に圧縮すると、5/15/60分の変化率・モメンタム検知・気配の乖離
-                    #   基準・AIへの市場文脈のすべてが「前日の値動き」を「直近の値動き」
-                    #   と誤認する（この履歴の読者はトレンドガードだけではなかった）。
-                    #   時刻は実時刻のまま保存し、75分より古い分は従来どおり削除する。
-                    #   セッション開始直後に約60分ガードが効かないのは fail-open の
-                    #   設計として明示する（下の INFO ログ）。
                     cnt = 0
                     for _ts_real, _bprice in _bars:
                         _INDEX_PRICE_HISTORY[sym].append((_ts_real, _bprice))
@@ -16948,8 +15044,8 @@ def get_index_pct_change(symbol: str, minutes: int) -> Optional[float]:
 
 
 def _market_trend_pct() -> Optional[float]:
-    """★ v3.9.103: 当日トレンドの代理指標。SPY（無ければQQQ）の
-    MOMENTUM_TREND_LOOKBACK_MIN 分騰落率(%)。履歴不足時は None。"""
+    """
+    """
     for _sym in ("SPY", "QQQ"):
         _v = get_index_pct_change(_sym, MOMENTUM_TREND_LOOKBACK_MIN)
         if _v is not None:
@@ -16983,7 +15079,6 @@ def build_market_context() -> str:
     )
 
 
-# ── ★ v2.93: 下落トレンド検知時の新規ロング一時停止 ────────────────────────
 # 5/4 Oracle・5/5 SMH 下落トレンド中の新規ロング損失事案への対策。
 # 構成A: 急落直後の銘柄別ブロック (損切り/パニック/トレイル発動から NEW_LONG_BLOCK_SEC 秒)
 # 構成B: QQQ 15/60分の下落幅が閾値超で全銘柄ブロック (反発で自動解除)
@@ -16997,7 +15092,6 @@ NEW_LONG_BLOCK_SEC: int = 900  # 15 分 (固定値、敏感設定)
 MACRO_DOWNTREND_15M_PCT: float = -0.3  # 直近 15 分の QQQ 騰落率 ≤ -0.3% でトレンド検知
 MACRO_DOWNTREND_60M_PCT: float = -0.7  # 直近 60 分の QQQ 騰落率 ≤ -0.7% でトレンド検知
 
-# ★ v3.1.3: 上昇トレンド判定 (SHORT fallback ブロック用)
 # AI が victims を明示しなかった単発の個別株悪材料で bear ETF を空売りする前に、
 # QQQ/SMH が上昇傾向にあるかを確認する。下落判定 (構成 B/C) より敏感に設定:
 # 個別株悪材料 → ETF fallback ショートは元々エッジが薄いため、軽微な上昇でも
@@ -17007,7 +15101,6 @@ MACRO_UPTREND_60M_PCT: float = 0.25  # 直近 60 分の QQQ 騰落率 ≥ +0.25%
 SMH_UPTREND_15M_PCT:   float = 0.15  # SMH はボラ大のため QQQ より少し緩め
 SMH_UPTREND_60M_PCT:   float = 0.40
 
-# ── ★ v2.94 + v3.9.10: SMH 専用の追加チェック用定数 ────────────────────────
 # SMH のみ Confidence しきい値を一段引き上げてハードコード。730 件分析で SMH の
 # 0.75 帯損失が -$212 と最大だったため。他銘柄は既存閾値を維持し SMH のみ厳格化。
 # v3.9.10: 5/12 観察ログで smh_strict が 6 件発火・もし通していたら平均
@@ -17021,7 +15114,6 @@ SMH_CONFIDENCE_THRESHOLD: float = 0.78  # SMH 発注の最低 confidence (固定
 SMH_DOWNTREND_15M_PCT: float = -0.5  # 直近 15 分の SMH 騰落率 ≤ -0.5% でトレンド検知
 SMH_DOWNTREND_60M_PCT: float = -1.0  # 直近 60 分の SMH 騰落率 ≤ -1.0% でトレンド検知
 
-# ── ★ v3.9.5: SPY 専用のトレンド判定 (QQQ ベース構成 B/B' とは独立) ──────────
 # SPY は QQQ より約 40% 低ボラ (15分σ 0.05% / 60分σ 0.07% vs QQQ 0.08%/0.15%)。
 # QQQ と同じ閾値 (-0.30%/-0.70% 下落, +0.10%/+0.25% 上昇) を使うと SPY では 6〜10σ
 # 相当の極端な閾値となり、上昇 60分は P90=+0.20% に対し +0.25% で発火率ほぼ 0%。
@@ -17032,7 +15124,6 @@ SPY_DOWNTREND_60M_PCT: float = -0.45  # 直近 60 分の SPY 騰落率 ≤ -0.45
 SPY_UPTREND_15M_PCT:   float = 0.07   # 直近 15 分の SPY 騰落率 ≥ +0.07% で上昇判定 (~1.4σ)
 SPY_UPTREND_60M_PCT:   float = 0.15   # 直近 60 分の SPY 騰落率 ≥ +0.15% で上昇判定 (~2.1σ)
 
-# ── ★ v2.99.4 + v3.8.2: 構成 D - 個別株固有のトレンド判定 (env 化 + 対称版) ──
 # 個別株自身の直近騰落率から下落/上昇トレンドを判定。QQQ ベース (構成 B) や
 # SMH ベース (構成 C) と独立に「個別株が単独で急落/急騰」しているケースを検知。
 # 個別株は ETF よりボラが大きいため、閾値は SMH より緩めに設定。
@@ -17093,7 +15184,7 @@ def is_macro_downtrend() -> tuple[bool, str]:
 
 
 def is_macro_uptrend() -> tuple[bool, str]:
-    """★ v3.1.3: QQQ の上昇トレンドを判定する (SHORT fallback ブロック用)。
+    """
 
     is_macro_downtrend() の対称版。AI が victims を明示しなかった単発の悪材料
     (例: TTD 決算ミス) で QQQ ショート fallback が動作するのを抑止する。
@@ -17112,9 +15203,7 @@ def is_macro_uptrend() -> tuple[bool, str]:
 
 
 def is_smh_uptrend() -> tuple[bool, str]:
-    """★ v3.1.3: SMH の上昇トレンドを判定する (is_smh_downtrend の対称版)。
-    SHORT fallback で SMH を空売りする前のガード。
-    戻り値: (True/False, 説明文字列) データ不足時は (False, "") を返す。
+    """
     """
     pct_15 = get_index_pct_change("SMH", 15)
     pct_60 = get_index_pct_change("SMH", 60)
@@ -17126,7 +15215,7 @@ def is_smh_uptrend() -> tuple[bool, str]:
 
 
 def is_smh_downtrend() -> tuple[bool, str]:
-    """★ v2.94: SMH 固有の下落トレンドを判定する (place_buy 内 symbol=='SMH' 時に使用)。
+    """
 
     QQQ ベースの is_macro_downtrend() とは独立し、SMH 自身の直近騰落率から判定。
     5/5 SMH 終日下落事案では QQQ は横ばいでも SMH だけが終日下落しており、
@@ -17146,7 +15235,7 @@ def is_smh_downtrend() -> tuple[bool, str]:
 
 
 def is_spy_uptrend() -> tuple[bool, str]:
-    """★ v3.9.5: SPY 固有の上昇トレンドを判定する (place_short 内 symbol=='SPY' 時に使用)。
+    """
 
     SPY は QQQ より約 40% 低ボラ (15分σ 0.05% / 60分σ 0.07%) のため、QQQ ベースの
     is_macro_uptrend() (+0.10%/+0.25%) では発火率がほぼ 0% になる。
@@ -17165,7 +15254,7 @@ def is_spy_uptrend() -> tuple[bool, str]:
 
 
 def is_spy_downtrend() -> tuple[bool, str]:
-    """★ v3.9.5: SPY 固有の下落トレンドを判定する (place_buy 内 symbol=='SPY' 時に使用)。
+    """
 
     QQQ ベースの is_macro_downtrend() とは独立。SPY は QQQ より低ボラのため、
     QQQ ベースの構成 B (-0.30%/-0.70%) では SPY 単独下落の検知精度が低い。
@@ -17184,7 +15273,7 @@ def is_spy_downtrend() -> tuple[bool, str]:
 
 
 def is_stock_downtrend(symbol: str) -> tuple[bool, str]:
-    """★ v2.99.4: 構成 D - 個別株固有の下落トレンドを判定する。
+    """
 
     place_buy 内で symbol が STOCK_TICKERS に含まれる場合のみ呼ばれる。
     QQQ/SMH 系の構成 B/C では拾えない「個別株の単独急落」を検知する。
@@ -17209,7 +15298,7 @@ def is_stock_downtrend(symbol: str) -> tuple[bool, str]:
 
 
 def is_stock_uptrend(symbol: str) -> tuple[bool, str]:
-    """★ v3.8.2: 構成 D' - 個別株固有の上昇トレンドを判定する (place_short 用)。
+    """
 
     is_stock_downtrend の対称版。place_short 内で symbol が STOCK_TICKERS に
     含まれる場合のみ呼ばれる。QQQ/SMH 系のマクロ判定では拾えない「個別株の
@@ -17236,7 +15325,7 @@ def is_stock_uptrend(symbol: str) -> tuple[bool, str]:
 
 
 def log_market_state() -> None:
-    """★ v2.99.4: 5分ごとの市場状態を INFO レベルで出力する。
+    """
 
     内容:
       - ETF (QQQ/SPY/SMH): 5分・15分・60分の3点騰落率
@@ -17262,7 +15351,6 @@ def log_market_state() -> None:
         except Exception:
             pass  # quote 取得失敗時は静かにスキップ (ログノイズ回避)
 
-    # ── ★ v3.9.14: 市場状態の表示を色付き 3 行展開に改善 ───────────────────
     # 旧 v3.9.13 までは 1 行に QQQ/SPY/SMH を詰め込んで読みにくかった。
     # 視認性向上のため、銘柄ごとに 1 行 + 各 % を ANSI 色付き表示 + 銘柄ヘッドに
     # 60min ベースの方向絵文字 (📈/📉/➡️) を追加。
@@ -17301,7 +15389,6 @@ def log_market_state() -> None:
     _etf_lines: List[str] = []           # 旧形式 (互換のため変数は残す・後段で未使用)
     _data_status = []
     _has_any_etf = False
-    # ★ v3.9.33: IWM (シャドーモメンタム観察銘柄) も市場状態表示に追加
     for sym in ("QQQ", "SPY", "SMH", "IWM"):
         if sym not in _INDEX_PRICE_HISTORY:
             continue
@@ -17374,7 +15461,6 @@ def log_market_state() -> None:
     else:
         _stock_section = "(個別株は監視対象なし)"
 
-    # ── 出力 (★ v3.9.14: 色付き 3 行展開・銘柄ごと 1 行 + 個別株は従来形式) ──
     if _etf_display_lines and _has_any_etf:
         log.info("[市場状態]")
         for _line in _etf_display_lines:
@@ -17396,9 +15482,6 @@ def get_tracked_portfolio_total() -> float:
 
 def track_position_add(symbol: str, order_cost: float, qty: int = 0) -> None:
     """発注成功時にポジションコストと株数を加算"""
-    # ★ v3.9.134: この銘柄で Bot が建玉を持ったことを台帳に記録する。
-    #   発注が通った時点で記録するのは意図的。約定確認前に Bot が落ちても
-    #   「自分の建玉」と分かるようにするため（見失うと損切りが止まる）。
     _ledger_mark(symbol, None, getattr(state.get(symbol), "entry_time", None),
                  category=getattr(state.get(symbol), "entry_ai_category", None))
     _tracked_position_cost[symbol] = _tracked_position_cost.get(symbol, 0.0) + order_cost
@@ -17412,14 +15495,12 @@ def track_position_add(symbol: str, order_cost: float, qty: int = 0) -> None:
 
 def track_position_clear(symbol: str, clear_ledger: bool = True) -> None:
     """決済時にポジションコストと株数をゼロにリセット"""
-    # ★ v3.9.134: 建玉が無くなったので台帳からも消す
     if clear_ledger:
         _ledger_unmark(symbol, None)
     prev_cost = _tracked_position_cost.get(symbol, 0.0)
     prev_qty  = _tracked_qty.get(symbol, 0)
     _tracked_position_cost[symbol] = 0.0
     _tracked_qty[symbol] = 0
-    # ★ v2.99.4: ポジション完全解消 → 決済FAILEDロックアウトを自動解除
     _clear_failed_close(symbol)
     log.info(
         f"[ポジション管理] {symbol} クリア（-${prev_cost:,.0f}  -{prev_qty}株）"
@@ -17435,7 +15516,6 @@ try:
 except ValueError:
     ORDER_CANCEL_MINUTES = 1  # 発注から何分後にキャンセルするか
 
-# ── ★ v3.9.20: ピラミッディング撤去済 ───────────────────────────────────
 # 旧 v3.9.19 までは PYRAMID_ALLIN_THRESHOLD / PYRAMID_MAX_ENTRIES / PYRAMID_STEP_PCT
 # の 3 env で多段エントリーを制御していたが、実データ分析で:
 #   1) 1,293 件の運用記録で一度もピラミッド追加発注が発動していなかった
@@ -17449,7 +15529,6 @@ def _cancel_order(order_id: str, symbol: str, trd_env: TrdEnv, reason: str = "")
     """指定した注文IDをキャンセルする。成功したら True を返す。"""
     tag = f"【{symbol}】"
     try:
-        # ★ v2.86: with _trade_ctx() で例外時の close を保証
         with _trade_ctx() as ctx:
             _acc_id_cancel = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
             ret, data = ctx.modify_order(
@@ -17494,14 +15573,11 @@ async def pending_order_watchdog() -> None:
     ② 同一銘柄に複数の未約定注文が積み上がっている場合、古い順にキャンセル
        （大量約定防止: 1銘柄あたり未約定は常に最新1件のみ残す）
 
-    ★ v2.87: 休日中はタイムアウト判定を停止
-       約定するはずがないので、無駄なキャンセル発火と再発注を防ぐ。
     """
     log.info(f"=== 未約定注文ウォッチドッグ 開始（タイムアウト: {ORDER_CANCEL_MINUTES}分）===")
     while True:
         await asyncio.sleep(60)  # 1分ごとにチェック
 
-        # ★ v2.87: 休日中はタイムアウト判定をスキップ
         # 取引が走らないので未約定がそのまま残るが、市場再開後に通常通り判定される。
         today_et = datetime.datetime.now(_ET).date()
         if is_nyse_holiday(today_et):
@@ -17514,11 +15590,6 @@ async def pending_order_watchdog() -> None:
         from collections import defaultdict
         sym_orders: dict = defaultdict(list)
         for oid, info in list(_pending_orders.items()):
-            # ★ v3.9.105 (C2): 決済注文(is_close)も除外する。place_close_all は建玉
-            #   (position_id)ごとに複数の決済注文を同時発注し、発注時点で内部状態を
-            #   クリア済みのため、ここで「重複」と誤認してキャンセルすると
-            #   「決済済み扱いなのに実際は未決済」の建玉が生まれ、損切り監視なしで残る。
-            #   従来はショートカバー(is_cover)のみ除外していた。
             if not info.get("is_cover") and not info.get("is_close"):
                 sym_orders[info["symbol"]].append((oid, info))
 
@@ -17565,7 +15636,6 @@ async def pending_order_watchdog() -> None:
                 # キャンセルAPIが失敗した場合でも FAILED ステータスの注文は除去する
                 # （FAILEDはすでに無効なので残しても意味がない）
                 try:
-                    # ★ v2.86: with _trade_ctx() で例外時の close を保証
                     with _trade_ctx() as ctx:
                         _acc_id_wdog = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
                         ret, data = ctx.order_list_query(
@@ -17575,19 +15645,7 @@ async def pending_order_watchdog() -> None:
                         )
                     if ret == RET_OK and not data.empty:
                         status_str = str(data["order_status"].iloc[0]).upper()
-                        # ★ v3.9.150c: CANCELED（一L綴り）と DISABLED（失効）が漏れて
-                        #   いた（Codexレビュー指摘）。漏れると失効済みの注文が管理表に
-                        #   残り続け、その銘柄の時計復元（1-4 の自己修復）が永久に
-                        #   見送られる。共通ヘルパーで判定する。
-                        #   ただし FILLED（約定済み）は「取消済み」と同じに扱わない。
-                        #   ok=True で下の再発注ブロックに入ると、position 同期が
-                        #   追いつく前に残数があるように見えて二重決済しうる
-                        #   （Codexレビュー指摘・4回目）。約定済みは管理から外すだけ。
                         if "FILLED_ALL" in status_str:
-                            # ★ v3.9.150c: 全約定だけを外す。FILLED_PART（部分約定）を
-                            #   ここで外すと、残数の決済がどの機構からも見えなくなる
-                            #   （Codexレビュー指摘・5回目）。部分約定は従来どおり
-                            #   管理に残し、タイムアウト時の既存機構で残数を扱う。
                             log.info(
                                 f"【{sym}】 [watchdog] 注文は全約定済みでした → 管理から外します"
                                 f"（決済の反映は次の同期に任せます）: {order_id}"
@@ -17637,12 +15695,6 @@ async def pending_order_watchdog() -> None:
                 # （"約定済みのため削除" で ok=True になったケースを含む）
                 _actual_qty  = ts.position_qty
                 _tracked_val = _tracked_position_cost.get(sym, 0.0)
-                # ★ v3.9.120: SHORT カバーの誤スキップ修正（外部AIレビュー指摘・High）。
-                #   ショート建玉は position_qty が負（-N）で保持され、place_close_all は
-                #   カバー発注時点で tracked と is_short を先にクリアするため、旧判定
-                #   （qty<=0 and tracked<=0）は「未約定のまま残っている生きたショート」
-                #   まで『約定済み』と誤判断して再発注をスキップしていた。
-                #   → カバー注文は「qty==0（完全にフラット）」の場合のみスキップする。
                 _side_pend = str(info.get("side", "LONG"))
                 if is_cover or _side_pend == "SHORT":
                     _already_flat = (_actual_qty == 0)
@@ -17679,7 +15731,6 @@ async def pending_order_watchdog() -> None:
                         f"{retry_desc}  qty={qty}株\n"
                         f"理由: {info.get('reason', '')}"
                     ))
-                    # ★ v2.98: position_id を必須化。pending_orders に保存された
                     # position_id を利用して再発注。SHORT/LONG も方向情報から判別。
                     _pid_retry  = info.get("position_id", "")
                     _side_retry = info.get("side", "LONG")
@@ -17694,7 +15745,6 @@ async def pending_order_watchdog() -> None:
                             f"moomoo アプリで手動決済してください。"
                         ))
                         continue
-                    # ★ v3.5.2/v3.9.63: SHORT 決済サイドは環境別 (_cover_trd_side)。
                     # 実口座=BUY_BACK / デモ=BUY (デモは BUY_BACK 非対応)。
                     _trd_side_retry = _cover_trd_side(trd_env) if _side_retry == "SHORT" else TrdSide.SELL
                     ret, oid_or_msg = _close_one_position_id(
@@ -17724,11 +15774,8 @@ async def pending_order_watchdog() -> None:
                             "position_id": _pid_retry,
                             "side":        _side_retry,
                         }
-                        # ★ v3.8.5: 再発注「成功」は INFO に降格 (失敗ケースは log.error で別系統)
                         log.info(f"【{sym}】 🔄 損切り再発注成功 orderId={new_oid}")
                     elif ret == RET_OWNED_SKIP:
-                        # ★ v3.9.145: 所有権が変わった建玉（OVN/手動）への再発注は見送り。
-                        #   エラーではないので失敗ログを出さず、リトライも続けない。
                         log.info(f"【{sym}】 🛡️ 所有権が変わったため損切り再発注を見送り（新しい所有側が管理します）")
                     else:
                         log.error(f"【{sym}】 🔄 損切り再発注失敗: {oid_or_msg}")
@@ -17768,7 +15815,6 @@ def _unregister_pending_order(order_id: str) -> None:
         _pending_orders.pop(order_id)
 
 
-# ── ★ v2.98: position_id ベース決済ヘルパー (JP 信用建玉ごとの個別決済用) ──────
 # moomoo SDK 10.4+ の place_order が受ける隠しパラメータ。
 # moomoo サポート (2026-05-06) 回答により決済時 position_id 必須化を採用 (PAN 指示)。
 # 1注文=1建玉 (1 pid) なので複数建玉時は各 pid に対し個別 place_order を発行する。
@@ -17782,11 +15828,6 @@ def _get_position_ids_for_close(
     return list(ts.position_ids.get(side_key, []))
 
 
-# ★ v3.9.145: 「所有権による見送り」の番兵。
-# ★ v3.9.148: -2 は同ファイルの _RET_ALREADY_CLOSED(:3535・v3.9.63〜) と衝突していた。
-#   同じ _close_one_position_id が両方を返すため、place_close_all が見送りを
-#   「既に決済済み」と読み、1本も発注していない回に成功(True)を返していた。
-#   RET_OK(0) / RET_ERROR(-1) / _RET_ALREADY_CLOSED(-2) のいずれとも重ならない値にする。
 RET_OWNED_SKIP = -3
 
 
@@ -17797,7 +15838,7 @@ def _close_one_position_id(
     position_id: str,
     qty: int,
     limit_price: float,
-    trd_side,           # ★ v3.5.2: LONG決済は TrdSide.SELL / SHORT決済は TrdSide.BUY_BACK 必須
+    trd_side,
     order_type,         # OrderType.NORMAL or OrderType.MARKET
     is_cover: bool,
     reason: str,
@@ -17812,25 +15853,9 @@ def _close_one_position_id(
     呼び出し側は ret==RET_OK のときのみ _pending_orders 登録 / 約定監視を行う。
     成行 (MARKET) の場合は price=0、それ以外は limit_price を使用。
 
-    ★ v3.5.2: trd_side / is_cover の整合性を厳格に検証する。
-       moomoo サポート (2026-05-08) からの正式回答:
-         "use BUY and SELL_SHORT for opening positions, and use SELL and
-          BUY_BACK for closing positions"
-       これに従い、call site が直接正規定数を指定する設計に統一。
-       旧 v3.1.1〜v3.5.1 の hasattr ベースの silent 自動変換は廃止。
-       (古い SDK で hasattr=False になると BUY のまま送信され、moomoo 側で
-        order failure が発生していた問題を解消)。
 
-    ★ v2.99.2: moomoo SDK 10.4 は position_id を int 型で期待するため、
-       sync_positions で str 化された値を int に変換してから place_order に渡す。
-       旧コードは str のまま渡していたため、SDK 内部の Protobuf 型チェックで
-       「Cannot set Trd_PlaceOrder.C2S.positionID to '...': has type <class 'str'>,
-        but expected one of: (<class 'int'>,)」エラーが発生し、
-       全ての決済 (時間切れ・損切り・トレール・ニュース起点) が失敗していた。
     """
     tag = f"【{symbol}】"
-    # ★ v3.9.134: 台帳に無い建玉（Bot が建てたものではない）は決済しない。
-    #   決済経路は複数あるが、実際に発注する低レベル関数を含めてすべてここで塞ぐ。
     if _is_other_owner(symbol):
         log.warning(f"[建玉台帳] 【{symbol}】 Bot 以外の建玉のため決済しません（{reason}）")
         _k = f"_ext_close_notified_{symbol}"
@@ -17842,15 +15867,10 @@ def _close_one_position_id(
                 f"発動した処理: {reason}\n"
                 f"決済する場合は moomoo アプリで操作してください。"
             ))
-        # ★ v3.9.144: 宣言どおり tuple を返す（認定サポーターの指摘 A-6）。
-        # ★ v3.9.145: 番兵を -1 から RET_OWNED_SKIP に変更。-1 は SDK の
-        #   RET_ERROR そのもので、「所有権による見送り」が「SDKエラー」と区別
-        #   できず、watchdog・チェイサーが毎周回リトライを続けていた。
         return RET_OWNED_SKIP, "Bot 以外の建玉のため見送り"
 
     use_market = (order_type == OrderType.MARKET)
 
-    # ── ★ v2.99.2 hotfix: position_id を int に変換 ───────────────────────────
     _pos_id_str = str(position_id) if position_id is not None else ""
     if not _pos_id_str:
         log.error(f"{tag} [{log_label}] position_id が空のため発注不可")
@@ -17872,14 +15892,11 @@ def _close_one_position_id(
     try:
         with _trade_ctx() as ctx:
             _acc_id_close = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
-            # ── ★ v3.5.2/v3.9.63: trd_side / is_cover の整合検証 (環境別) ──────
             # FUTUJP 実口座の正規仕様 (moomoo サポート 2026-05-08 確認):
             #   新規 LONG  : TrdSide.BUY        + jp_acc_type=JP_TOKUTEI
             #   新規 SHORT : TrdSide.SELL_SHORT + jp_acc_type=JP_TOKUTEI_SHORT
             #   LONG 決済  : TrdSide.SELL       + jp_acc_type=JP_TOKUTEI
             #   SHORT 決済 : TrdSide.BUY_BACK   + jp_acc_type=JP_TOKUTEI_SHORT
-            # ★ v3.9.63: デモ口座は BUY_BACK 非対応 → SHORT 決済はプレーン BUY。
-            #   期待サイドは _cover_trd_side(trd_env) で環境別に決まる。
             if is_cover:
                 _expected_short = _cover_trd_side(trd_env)
                 if _expected_short is None:
@@ -17918,7 +15935,7 @@ def _close_one_position_id(
                 # 成行は fill_outside_rth=False 必須 (moomoo 制約)
                 fill_outside_rth = (not use_market),
                 acc_id           = _acc_id_close,
-                position_id      = _pos_id_int,   # ★ v2.99.2: int で渡す (旧 str)
+                position_id      = _pos_id_int,
                 # SHORT 建玉決済は JP_TOKUTEI_SHORT 区分必須
                 **_tokutei_kwargs(trd_env, is_short=is_cover),
             )
@@ -17930,10 +15947,9 @@ def _close_one_position_id(
                 f"qty={qty} price={'MKT' if use_market else f'${limit_price:.2f}'} "
                 f"trd_side={trd_side} orderId={order_id}"
             )
-            _clear_trade_lock("決済")   # ★ v3.9.135: 発注が通った＝ロックは解けている
+            _clear_trade_lock("決済")
             return ret, order_id
         else:
-            # ★ v3.9.63: 「Not enough positions」= 建玉は既に決済済み (二重決済レース等)。
             # 失敗 (ERROR + 無限リトライ) ではなく「解決済み」扱いにして state をクリアさせる。
             _msg_low = str(data).lower()
             if "not enough position" in _msg_low or "no enough position" in _msg_low:
@@ -17942,10 +15958,6 @@ def _close_one_position_id(
                     f"解決済み扱い pid={_pos_id_str[:12]}..."
                 )
                 return _RET_ALREADY_CLOSED, "already_closed"
-            # ★ v3.9.125: 「Invalid position ID」= その建玉は当該口座に存在しない
-            #   (別口座の建玉を誤って取り込んだ／既に消滅した残骸)。リトライしても永久に
-            #   成功しないため「解決済み」扱いにして state から除去させる。
-            #   利用者B報告 2026-07-23: 60秒ごとの決済失敗ループと15分の新規ブロックを防ぐ。
             if "invalid position id" in _msg_low or "invalid positionid" in _msg_low:
                 log.warning(
                     f"{tag} [{log_label}] この口座に存在しない建玉 (Invalid position ID) → "
@@ -17966,9 +15978,6 @@ def _close_one_position_id(
         return -1, f"exception: {e}"
 
 
-# ★ v3.9.73: 残留決済失敗通知の間引き (symbol+side ごとに once per N分)。
-#   リスク監視ループ (60秒毎) が同じ残留に対し決済を試み続けるため、無通知だと
-#   Discord が埋まる。下記スロットルで「残留している間は N分に1回だけ」通知する。
 _close_fail_notify_at: dict = {}
 _CLOSE_FAIL_NOTIFY_INTERVAL_MIN = 15
 
@@ -17984,9 +15993,6 @@ def _notify_close_failed_no_pid(
 
     原因: sync_positions の API 取得失敗 / qty=0 残骸のみ / SDK バージョン古い /
           デモ(ネッティング)口座で建玉が position_id を持たない、等。
-    ★ v3.9.73: trd_env / qty を受け取り、デモ SHORT 残留 (DRAM/SMH 事例) を明示。
-       symbol+side ごとに _CLOSE_FAIL_NOTIFY_INTERVAL_MIN 分に1回だけ Discord 通知
-       (リスク監視ループの再試行による通知連投を防止)。ログ (error) は毎回出す。
     """
     tag = f"【{symbol}】"
     _is_demo = (trd_env == TrdEnv.SIMULATE)
@@ -18044,17 +16050,9 @@ def place_close_partial(
     place_close_all と異なり qty を外部から指定できる。
 
     戻り値: 1件でも決済注文を出せたら True、1件も出せなければ False。
-      ★ v3.9.141: 従来は常に None を返しており、呼び出し側の成否判定
-      （v3.9.139 で追加）が必ず「失敗」に倒れていた。認定サポーターからの指摘。
 
-    ★ v2.98: position_id 必須化。LONG ポジション (qty>0) のみ対象。
-       state.position_ids["LONG"] から先頭の建玉を1つ取り出し、その position_id
-       を指定して place_order を発行する。1建玉から `qty` 株だけ部分決済する形式。
-       要求 qty が建玉 qty より大きい場合は、複数建玉にまたがって決済する。
     """
     tag  = f"【{symbol}】"
-    # ★ v3.9.134: 台帳に無い建玉（Bot が建てたものではない）は決済しない。
-    #   決済経路は複数あるが、実際に発注する低レベル関数を含めてすべてここで塞ぐ。
     if _is_other_owner(symbol):
         log.warning(f"[建玉台帳] 【{symbol}】 Bot 以外の建玉のため決済しません（{reason}）")
         _k = f"_ext_close_notified_{symbol}"
@@ -18072,10 +16070,6 @@ def place_close_partial(
     if qty <= 0:
         return False
 
-    # ★ v3.9.141b: 未約定の決済注文が残っている間は重ねて出さない（Codexレビュー指摘）。
-    #   部分決済は place_close_all の二重決済ガードを通らないため、証券会社側の
-    #   建玉数が減る前に次の巡回が来ると、同じ超過分をもう一度売ってしまう。
-    #   上限を超えて売却し、最悪ショート反転になりうる。
     _open_closes = [oid for oid, info in list(_pending_orders.items())
                     if info.get("symbol") == symbol and info.get("is_close")]
     if _open_closes:
@@ -18085,7 +16079,6 @@ def place_close_partial(
         )
         return False
 
-    # ── ★ v2.98: position_id 取得 (必須) ────────────────────────────────────
     long_pids = _get_position_ids_for_close(symbol, "LONG")
     if not long_pids:
         _notify_close_failed_no_pid(symbol, "LONG", f"部分決済要求 qty={qty} ({reason})")
@@ -18093,7 +16086,7 @@ def place_close_partial(
 
     session, _ = get_session_info()
     quote       = get_quote(symbol)
-    limit_price = calc_limit_price(quote, "SELL", symbol)  # ★ v2.99.4: シンボル別バッファ
+    limit_price = calc_limit_price(quote, "SELL", symbol)
     if limit_price <= 0:
         log.warning(f"{tag} [部分決済] 価格取得失敗: スキップ")
         return False
@@ -18139,8 +16132,8 @@ def place_close_partial(
                 "qty":         order_qty,
                 "limit_price": limit_price,
                 "reason":      reason,
-                "position_id": pid,        # ★ v2.98: 再発注時に再利用
-                "side":        "LONG",     # ★ v2.98: 方向情報
+                "position_id": pid,
+                "side":        "LONG",
             }
             remaining -= order_qty
         else:
@@ -18166,26 +16159,6 @@ def place_close_partial(
         return False
 
 
-# ★ v3.9.141b: 「決済を見送った」銘柄の記録。発注失敗と区別するために使う。
-#   見送りは安全側の判断であり、連続失敗カウントを進める理由にならない。
-# ★ v3.9.149: 見送りだけでなく「どこまで決済できたか」を伝える記録に一般化した
-#   （認定サポーターの指摘）。place_close_all の戻り値 True は「1本でも発注できた」で
-#   あって「全量さばけた」ではないため、一部しか決済できなかった回に
-#   一斉決済の再試行が回らず、entry_time も消せてしまっていた。
-#   戻り値の型は変えず（呼び出し13箇所のうち8箇所は戻り値を見ない）、
-#   結果の内訳はこの記録で受け渡す。
-#     "full"    … 対象をすべて発注できた（完了扱いにしてよい）
-#     "partial" … 発注はしたが建玉が残っている（完了扱いにしない・警報も出さない）
-#     "owned"   … Bot 以外の建玉なので対象外（失敗ではない）
-#     "pending" … 既存の決済注文の処理待ち（あとで再試行が要る）
-#     "failed"  … 発注できなかった
-# ★ v3.9.148: スレッドローカルにする（Codexレビュー指摘）。
-#   この印は「いま自分が呼んだ place_close_all の結果」を意味するもので、
-#   place_close_all は呼び出し元と同じスレッドで動き、呼び出し元は直後に読む。
-#   グローバルな辞書のままだと、週末の一斉決済（ワーカースレッド）と
-#   リスク監視が同じ銘柄を同時に扱ったときに互いの印を消し合い、
-#   本当の失敗が見送り扱いで握り潰される。スレッドごとに分ければこの窓は消える。
-#   30秒の期限は、印を消し忘れた経路の保険として残す。
 _close_deferred_tls = threading.local()
 
 
@@ -18198,12 +16171,12 @@ def _close_deferred_map() -> dict:
 
 
 def _mark_close_result(symbol: str, outcome: str) -> None:
-    """★ v3.9.149: 直前の place_close_all の結果を、呼び出し元のスレッドに残す。"""
+    """"""
     _close_deferred_map()[symbol] = (datetime.datetime.now(), outcome)
 
 
 def _take_close_result(symbol: str) -> str:
-    """★ v3.9.149: 直前に自分が呼んだ place_close_all の結果を取り出す（消費する）。
+    """
 
     記録が無い／古い（30秒超）ときは空文字。呼び出し元は必ず1回だけ読むこと。
     """
@@ -18217,32 +16190,129 @@ def _take_close_result(symbol: str) -> str:
     return _outcome
 
 
+_order_fail_tls = threading.local()
+
+
+def _order_fail_map() -> dict:
+    _m = getattr(_order_fail_tls, "m", None)
+    if _m is None:
+        _m = {}
+        _order_fail_tls.m = _m
+    return _m
+
+
+_ORDER_FAIL_TTL_SEC = 30
+
+
+def _mark_order_fail(symbol: str, why: str, side: str = "BUY") -> None:
+    """
+
+    ★ 配布前レビュー（Codex / Gemini / Claude 別人格）: 印に売買の別を持たせる。
+    持たせないと、買いの失敗理由が同じ30秒のうちに空売りのまとめ行へ混ざりうる。
+    数字の長い連なり（口座番号など）は伏せる。まとめ行は質問時にそのまま貼られる行なので、
+    ERROR 行より露出が広い。"""
+    try:
+        _w = _mask_secrets(str(why))
+        _w = re.sub(r"\d{6,}", "……", _w)[:80]
+        _order_fail_map()[f"{side}:{symbol}"] = (datetime.datetime.now(), _w)
+    except Exception:
+        pass
+
+
+def _clear_order_fails(symbols, side: str = "BUY") -> None:
+    """
+
+    配布前レビュー（Codex / Gemini）: place_buy は、まとめ行を出さない経路
+    （モメンタム・個別株・動的銘柄）からも呼ばれる。そこで置かれた印が残っていると、
+    別の回の「全銘柄スキップ」に無関係な理由として混ざる。回の頭で落としておけば、
+    まとめ行が読むのは必ずその回に置かれた印になる。"""
+    _m = _order_fail_map()
+    for _s in symbols:
+        _m.pop(f"{side}:{_s}", None)
+
+
+def _take_order_fails(symbols, side: str = "BUY") -> str:
+    """
+
+    記録が無い／古い（_ORDER_FAIL_TTL_SEC 超）ものは無視する。呼び出し元は必ず1回だけ読むこと。
+    あわせて、読み手のいない経路が置いた古い印も掃除する（溜め込まない）。"""
+    _m = _order_fail_map()
+    _now_of = datetime.datetime.now()
+    for _k in [_k for _k, _v in list(_m.items())
+               if (_now_of - _v[0]).total_seconds() >= _ORDER_FAIL_TTL_SEC]:
+        _m.pop(_k, None)
+    _out: list = []
+    for _s in symbols:
+        _rec = _m.pop(f"{side}:{_s}", None)
+        if _rec is None:
+            continue
+        _t, _why = _rec
+        if (_now_of - _t).total_seconds() >= _ORDER_FAIL_TTL_SEC:
+            continue
+        _out.append(f"{_s}: {_why}")
+    return " / ".join(_out)
+
+
+def _sync_stall_notice(nfail, stale_s: str, serr: str, held) -> tuple:
+    """(端末に出す文, Discord に出す文, Discord の最短間隔[秒]) を返す。"""
+    _common = ("OpenD の起動・接続(Connected)とネットワークをご確認ください。\n"
+               "直らない場合は moomoo アプリ側で建玉をご確認ください。\n")
+    if held is None:
+        return (
+            f"[sync_positions] 🚨 ポジション取得が連続失敗中 ({nfail}回・建玉の有無は不明): "
+            f"最終成功 {stale_s} / 直近: {serr}\n"
+            f"  → 建玉があれば損切りも時間切れも働きません。OpenD の起動/接続(Connected)と "
+            f"ネットワークを確認し、直らなければ moomoo アプリ側で建玉をご確認ください "
+            f"(本警告は5分ごと・復旧で自動解除)",
+            "🚨 【継続中】 ポジション取得が連続失敗（建玉の有無は不明）\n"
+            f"連続失敗 {nfail}回 / 最終成功 {stale_s}。\n"
+            "起動から一度も同期できていないため、建玉があるかどうか分かりません。\n"
+            "建玉があれば損切りも時間切れも働きません。\n" + _common + "（本通知は10分おき）",
+            600,
+        )
+    if held:
+        _disp = ",".join(held)
+        return (
+            f"[sync_positions] 🚨 建玉を持ったままポジション取得が連続失敗中 "
+            f"({nfail}回・最後に分かっていた建玉: {_disp}): 最終成功 {stale_s} / 直近: {serr}\n"
+            f"  → いまは損切りも時間切れも働きません。OpenD の起動/接続(Connected)と "
+            f"ネットワークを確認し、直らなければ moomoo アプリ側で建玉をご確認ください "
+            f"(本警告は5分ごと・復旧で自動解除)",
+            "🚨 【継続中】 建玉を持ったままポジション取得が連続失敗\n"
+            f"連続失敗 {nfail}回 / 最終成功 {stale_s}。\n"
+            f"最後に分かっていた建玉: {_disp}\n"
+            "いまは損切りも時間切れも働きません。\n" + _common + "（本通知は10分おき）",
+            600,
+        )
+    return (
+        f"[sync_positions] 🚨 ポジション取得が連続失敗中 ({nfail}回): "
+        f"最終成功 {stale_s} / 直近: {serr}\n"
+        f"  → OpenD の起動/接続(Connected)とネットワークを確認してください "
+        f"(本警告は5分ごと・復旧で自動解除・いまは建玉なし)",
+        "🚨 【継続中】 ポジション取得が連続失敗\n"
+        f"連続失敗 {nfail}回 / 最終成功 {stale_s}。\n"
+        "OpenD の起動・接続(Connected)とネットワークをご確認ください。\n"
+        "（いまは建玉なし・建玉があると決済判断が効きません・本通知は30分おき）",
+        1800,
+    )
+
+
 def _mark_close_deferred(symbol: str, reason: str = "owned") -> None:
     """見送りを記録する。
 
-    ★ v3.9.148: 理由を持たせる（Codexレビュー指摘）。見送りには性質の違う2種類がある。
-      - "owned"   : Bot 以外の建玉になった → こちらが決済してはいけない。再試行も不要
-      - "pending" : 既存の決済注文の処理待ち → あとで再試行しないと建玉が残る
-    まとめて「失敗ではない」と扱うと、後者のとき境界の一斉決済が完了扱いになり、
-    未約定注文が結局通らなかった場合に建玉が残ったまま再試行されない。
     """
     _close_deferred_map()[symbol] = (datetime.datetime.now(), reason)
 
 
 
 def _cancel_pending_closes_for_symbol(symbol: str, trd_env: TrdEnv, reason: str = "") -> int:
-    """★ v3.9.64: 同一銘柄に既に出ている未約定の決済注文をすべてキャンセルし、
-    _pending_orders から除外する。新たな決済を出す前に必ず呼ぶ (cancel-replace)。
+    """
 
     5/27 デモ QQQ -8 ショート化の根本対策:
       時間切れ決済とデモ日次決済(15:45 ET)が同一の +8 ロングに対し同時に SELL を発注。
       時間外の指値 SELL(299110) が即約定せず、その間に日次決済が 2 本目(299111)を発注。
       両方が遅れて約定 → 計 16 株売り → +8 から -8 へ反転 (ネッティング口座で
       「保有を超える SELL = ショート新規」)。決済注文を常に 1 本だけに保てば防げる。
-    戻り値: ★ v3.9.141 で「取消が確定した件数」に変更（認定サポーターからの指摘）。
-      従来は len(targets)＝試みた件数を返しており、取消に失敗して生きた決済注文が
-      残っていても、呼び出し側は「取消できた」と解釈して差し替えを発注していた。
-      同じ建玉に決済が2本並ぶ起点になる。
     """
     targets = [
         oid for oid, info in list(_pending_orders.items())
@@ -18256,11 +16326,6 @@ def _cancel_pending_closes_for_symbol(symbol: str, trd_env: TrdEnv, reason: str 
         except Exception as _e:
             log.debug(f"【{symbol}】[決済前キャンセル] orderId={oid} 例外: {_mask_secrets(_e)}")
             _ok = False
-        # ★ v3.9.130: 取消が成功した時だけ追跡から外す。
-        #   従来は finally で成否に関わらず pop していたため、取消失敗（生きた決済注文が
-        #   残った状態）でも追跡から消え、watchdog のタイムアウト取消も重複整理も届かず、
-        #   古い決済＋新しい決済が両方約定 → 売り過ぎ（5/27 ショート反転）の起点になり得た。
-        #   未確定時は追跡に残置し、watchdog のタイムアウト取消に後始末を委ねる。
         if _ok:
             _pending_orders.pop(oid, None)
             _confirmed += 1
@@ -18287,34 +16352,11 @@ def place_close_all(
     保有ポジションを全決済する (LONG / SHORT 両対応)。
     Panic Sell 時も指値で発注（moomoo は時間外の成行を制限する場合がある）。
 
-    ★ v2.98: position_id 必須化。
-       state.position_qty の符号で方向を判定し、state.position_ids[side] の
-       全建玉に対して個別の place_order を発行する (1建玉=1注文)。
-       moomoo SDK 10.4 の隠しパラメータ position_id を使用する仕様変更で、
-       JP 信用口座の建玉ごと管理に対応。
-    ★ v2.99: ETF (TRIGGER_TICKERS) の場合、決済時刻を記録して
-       ETF_REENTRY_LOCKOUT_MIN 分間は再エントリーを禁止する。
-    ★ v2.99.2: 戻り値を bool に変更。
-       True  = 1件以上の position_id で発注成功 (placed_orders >= 1)
-       False = 全 position_id で発注失敗 / 対象ポジションなし / 早期 return
-       ★ v3.9.149/150: 呼び出し側は戻り値ではなく _take_close_result() の結果
-       （full / partial / unknown / owned / pending / failed）で判断する。
-       戻り値は後方互換のために残しているだけで、参照している箇所は無い。
-       旧記述: 呼び出し側 (タイムアウト・損切り・トレール) はこの戻り値を見て
-       entry_time のクリア可否を判断する。失敗時に entry_time を残すことで
-       次のリスク監視ループで再発動できるようにする。
     """
     tag = f"【{symbol}】"
-    # ★ v3.9.148: 見送りの印は「直前の1回」だけを表すべきもの。前回の見送りが
-    #   30秒以内に残っていると、今回の本当の失敗をそれで打ち消してしまう
-    #   （Codexレビュー指摘）。呼ばれた時点で必ず消し、今回の結果だけを残す。
     _close_deferred_map().pop(symbol, None)
-    # ★ v3.9.134: 台帳に無い建玉（Bot が建てたものではない）は決済しない。
-    #   決済経路は複数あるが、実際に発注する低レベル関数を含めてすべてここで塞ぐ。
     if _is_other_owner(symbol):
         log.warning(f"[建玉台帳] 【{symbol}】 Bot 以外の建玉のため決済しません（{reason}）")
-        # ★ v3.9.148: これは発注失敗ではなく「対象外」。印を付けて、呼び出し側が
-        #   決済失敗の連続カウントやアラートに数えないようにする。
         _mark_close_deferred(symbol, "owned")
         _k = f"_ext_close_notified_{symbol}"
         if not getattr(place_close_all, _k, False):
@@ -18329,28 +16371,15 @@ def place_close_all(
 
     ts  = state.get(symbol)
 
-    # ★ v3.9.178: この決済に適用されていた出口条件を、**ここで**切り出す
-    #   （外部レビュー指摘）。以前は発注直前に置いていたが、この関数は途中で
-    #   sync_positions() を呼ぶことがあり（取消してからの再決済など）、その
-    #   冒頭ガードが「_tracked_position_cost <= 0」で ts.enforced_exit を消す。
-    #   決済発注→track_position_clear で必ずその条件が立つので、再決済では
-    #   断面が常に None になっていた（記録の列54-58 が必ず空欄）。
-    #   ts を取った直後なら、まだ誰も消していない。
-    #   実体コピーにするのは、切り出した後に書き換えられても断面を保つため。
     _exit_snap = (dict(ts.enforced_exit)
                   if isinstance(ts.enforced_exit, dict) else None)
-    # ★ v3.9.178: 損切り%も同じ理由で同時に切り出す（外部レビュー指摘）。
-    #   従来は約定確認の8〜17秒後に共有状態から読んでおり、出口条件で塞いだ穴と
-    #   同型のまま残っていた。
     _stop_snap = ts.enforced_stop_pct
 
-    # ── ★ v2.99: ETF 再エントリー禁止タイマー開始 ─────────────────────────────
     # 決済発注時点でタイマーを開始する (約定確認まで待たない)。
     # 同じニュースが繰り返し流れた際の即時再エントリーを防ぐのが主目的のため、
     # 厳密な約定タイミングよりも素早いブロックを優先する。
     _mark_etf_close(symbol)  # ETF でない場合は内部で何もしない
 
-    # ── ★ v2.93: リスクイベントの記録 (構成 A: 急落直後の新規ロングブロック) ──
     # 「強制損切り」「パニックセル」「トレイリングストップ」のいずれかで決済した場合、
     # 直近 NEW_LONG_BLOCK_SEC 秒間は同一銘柄への新規ロングをブロックする。
     # 時間切れ決済 / 通常クローズ / シグナル決済等は記録対象外。
@@ -18371,7 +16400,6 @@ def place_close_all(
     # ── 売却株数の確定 ─────────────────────────────────────────────────────────
     # moomoo API の position_qty は sync 中に瞬間変動 (38買→23→3→12→23 等)。
     # _tracked_qty (BUY/SHORT 約定確認時の正確値) の絶対値が大きければ優先。
-    # ★ v2.98: SHORT (qty<0) も絶対値ベースで補正。
     api_qty     = ts.position_qty
     tracked_qty = _tracked_qty.get(symbol, 0)
     # API側 qty の符号を維持しつつ、絶対値が大きい方を採用
@@ -18392,25 +16420,16 @@ def place_close_all(
         qty = api_qty
 
     if qty == 0:
-        # ★ v3.9.150: ここを "full" と名乗らせない（認定サポーターの指摘 1-2）。
-        #   証券会社の建玉照会は「本当に無い」と「今回は返ってこなかった」を
-        #   どちらも空で返すため、内部数量が 0 でも建玉が残っている場合がある。
-        #   v3.9.149 で "full" にしたせいで、一斉決済が残玉ごと完了扱いになり
-        #   週末停止へ進む（しかもログも通知も出ない）経路を作ってしまった。
-        #   "unknown" として、完了にも失敗にも倒さず呼び出し元に判断させる。
         log.warning(
             f"{tag} 決済対象の数量が 0 です。建玉照会の応答が欠けている可能性が"
             f"あるため、完了扱いにしません（次の巡回で再確認します）"
         )
         _mark_close_result(symbol, "unknown")
-        return False  # ★ v2.99.2: 対象なし
+        return False
 
     # ── 方向判定と position_id 取得 ────────────────────────────────────────────
     if qty < 0:
         side       = "SHORT"
-        # ★ v3.5.2/v3.9.63: SHORT 決済サイドは環境別 (_cover_trd_side)。
-        #   実口座=BUY_BACK (moomoo 2026-05-08 回答) / デモ=BUY (デモは BUY_BACK 非対応で
-        #   「Order side must be BUY or SELL」を返し決済全失敗→ショート残留していた)。
         trd_side   = _cover_trd_side(trd_env)
         side_label = "ショートカバー"
         _is_real_cover = (trd_env == TrdEnv.REAL)
@@ -18423,15 +16442,10 @@ def place_close_all(
         order_label = "SELL(決済)"
         action     = "SELL"
 
-    # ── ★ v3.9.64: 二重決済レース防止 (5/27 デモ QQQ -8 ショート化の根本対策) ──
     # 新たな決済を出す前に、同銘柄に出ている未約定の決済注文を必ずキャンセルする。
     # これにより「時間切れ決済」と「デモ日次決済」等が同一建玉に 2 本の決済を出し、
     # 時間外指値の遅延約定で売り過ぎ → ショート反転する事故を防ぐ (常に決済 1 本)。
     _cancelled_n = _cancel_pending_closes_for_symbol(symbol, trd_env, reason)
-    # ★ v3.9.141: 取消できなかった決済注文が残っているなら、差し替えを出さない。
-    #   出すと同じ建玉に決済が2本並び、両方が遅れて約定して売り過ぎ（ショート反転）
-    #   になりうる。残注文は watchdog のタイムアウト取消に委ね、次の巡回で再挑戦する。
-    #   （認定サポーターからの指摘）
     _still_open = [oid for oid, info in list(_pending_orders.items())
                    if info.get("symbol") == symbol and info.get("is_close")]
     if _still_open:
@@ -18439,10 +16453,6 @@ def place_close_all(
             f"{tag} [二重決済防止] 取消できていない決済注文が {len(_still_open)} 件残っています"
             f" → 今回は決済を見送ります（watchdog の取消後、次の巡回で再挑戦）"
         )
-        # ★ v3.9.141b: 「安全のため見送った」は発注失敗ではない（Codexレビュー指摘）。
-        #   区別せずに False を返すと、時間切れ決済側の連続失敗カウントが進み、
-        #   誤って「決済が本当に失敗しています」の重大通知や強制同期に至る。
-        #   ★ v3.9.148: ただしこれは「あとで再試行が要る」側の見送り。
         _mark_close_deferred(symbol, "pending")
         return False
     if _cancelled_n:
@@ -18455,8 +16465,6 @@ def place_close_all(
         except Exception as _e_sync0:
             log.debug(f"{tag} [二重決済防止] 再同期例外: {_mask_secrets(_e_sync0)}")
 
-    # ★ v2.98: position_id 必須化。取得できなければ決済中止 + 通知。
-    # ★ v3.9.15: 注文受付直後の sync 遅延に対応するリトライを追加。
     # 5/13 認定サポーター環境で「SHORT 発注 14ms 後の panic sell で position_id 空」
     # 事例が発覚。moomoo は注文受付から約定確認 (= 新ポジション報告) まで
     # 数秒のラグがあるため、2 秒 × 最大 3 回のリトライで sync を待つ。
@@ -18470,9 +16478,6 @@ def place_close_all(
         )
         if _has_state_position:
             import time as _time_retry
-            # ★ v3.9.73: リトライ 3→5 回に強化 + 漸増バックオフ (2,2,3,3,4=計14秒)。
-            #   デモ(ネッティング)口座の SHORT は sync 反映が遅く、3 回 (6秒) では
-            #   取り切れず DRAM/SMH 等が残留する事例があったため待ち時間を延長。
             _backoffs = [2, 2, 3, 3, 4]
             log.info(
                 f"{tag} [{side_label}] position_id 取得失敗・内部状態は {_state_qty}株 保有中"
@@ -18493,10 +16498,9 @@ def place_close_all(
                     )
                     break
         if not pids:
-            # ★ v3.9.73: 取得不能 → 残留通知 (qty/環境を渡してデモSHORT残留を明示)。
             _notify_close_failed_no_pid(symbol, side, reason, trd_env=trd_env, qty=qty)
-            _mark_close_result(symbol, "failed")   # ★ v3.9.149: 記録漏れを塞ぐ
-            return False  # ★ v2.99.2: position_id 取得失敗
+            _mark_close_result(symbol, "failed")
+            return False
 
     # 取得した建玉の合計 qty と要求 qty の整合性チェック
     _avail_total = sum(int(e["qty"]) for e in pids)
@@ -18532,12 +16536,11 @@ def place_close_all(
         use_market = False
         order_type_to_use = OrderType.NORMAL
         # SHORT カバー: ask の指値で買い戻し / LONG 決済 (時間外): bid の指値
-        # ★ v2.99.4: シンボル種別に応じた指値バッファを適用
         if side == "SHORT":
             limit_price = calc_limit_price(quote, "BUY", symbol)
             order_desc  = f"指値 ${limit_price:.2f}（ask基準/買戻）  時間外={outside_rth}"
         else:
-            buf_pct     = get_limit_buffer_pct(symbol)  # ★ v2.99.4: ETF=0.3% / 個別株=0.5%
+            buf_pct     = get_limit_buffer_pct(symbol)
             bid         = quote.get("bid") or quote.get("last") or 0.0
             limit_price = round(bid * (1 - buf_pct), 2) if bid > 0 else 0.0
             order_desc  = f"指値 ${limit_price:.2f}（bid基準{buf_pct*100:.1f}%下）  時間外={outside_rth}"
@@ -18546,8 +16549,8 @@ def place_close_all(
                 f"{tag} 価格取得失敗: {order_label} をスキップ"
                 f"（bid={quote.get('bid')}, last={quote.get('last')}, ask={quote.get('ask')}）"
             )
-            _mark_close_result(symbol, "failed")   # ★ v3.9.149: 記録漏れを塞ぐ
-            return False  # ★ v2.99.2: 価格取得失敗
+            _mark_close_result(symbol, "failed")
+            return False
         log.info(_fmt_order_log(
             symbol, order_label, _req_qty, limit_price, session,
             trd_env=trd_env, reason=reason[:35],
@@ -18560,18 +16563,12 @@ def place_close_all(
         ts.pending_entry_time = ts.entry_time
     if ts.avg_cost > 0:
         ts.pending_avg_cost = ts.avg_cost
-    # ★ v3.9.175b: 出口条件も同じ理由で退避する（外部レビュー指摘）。
-    #   この直後の track_position_clear() で _tracked_position_cost が 0 になり、
-    #   約定確認（8秒後・リトライなら最大17秒後）までの間に sync_positions が
-    #   走ると enforced_exit が None にされる。退避しないと列54-58 が
-    #   高確率で空欄になる（enforced_stop_pct は設計値で推測するため表面化
-    #   していなかった）。
 
     # ── 各 position_id に対して個別 place_order ──────────────────────────────
     placed_orders: list[tuple[str, int]] = []   # (order_id, qty)
     failed_count = 0
-    already_closed_count = 0   # ★ v3.9.63: Not enough positions = 既決済 pid 数
-    owned_skip_count = 0       # ★ v3.9.148: 所有権が途中で変わり見送った pid 数
+    already_closed_count = 0
+    owned_skip_count = 0
     remaining = _req_qty
     for entry in pids:
         if remaining <= 0:
@@ -18597,8 +16594,6 @@ def place_close_all(
         if ret != RET_OK and use_market:
             err_str = oid_or_msg.lower() if isinstance(oid_or_msg, str) else ""
             if "rth" in err_str or "market order" in err_str or "only place" in err_str:
-                # ★ v2.99.4: シンボル別バッファ × 3 倍でフォールバック
-                # ★ v3.8.5: 自動リカバリ動作のため WARNING → INFO に降格
                 _buf_fb = get_limit_buffer_pct(symbol) * 3.0
                 log.info(
                     f"{tag} 成行拒否（pid={pid[:12]}...）→ 指値フォールバック（{_buf_fb*100:.1f}%バッファ）"
@@ -18631,23 +16626,17 @@ def place_close_all(
                 "qty":         order_qty,
                 "limit_price": limit_price,
                 "reason":      reason,
-                "position_id": pid,         # ★ v2.98: 再発注で再利用
-                "side":        side,        # ★ v2.98: "LONG" or "SHORT"
+                "position_id": pid,
+                "side":        side,
             }
             log.info(f"{tag} [注文管理] {side_label}注文を監視登録 orderId={oid_or_msg}")
             remaining -= order_qty
         elif ret == RET_OWNED_SKIP:
-            # ★ v3.9.148: 入口(:14500 付近)の所有権チェック以降に、並行する
-            #   sync_positions が externally_held を立てて所有権が反転した。
-            #   建玉は口座に残っているので remaining を消化してはいけない
-            #   （消化すると「全部さばいた」形になり完了扱いへ倒れる）。
-            #   失敗でもないので failed_count にも数えず、下で見送りとして返す。
             owned_skip_count += 1
             log.info(
                 f"{tag} [{side_label}] pid={pid[:12]}... は Bot 以外の建玉になったため見送ります"
             )
         elif ret == _RET_ALREADY_CLOSED:
-            # ★ v3.9.63: この建玉は既に決済済み → 失敗扱いにせず残数を消化。
             already_closed_count += 1
             remaining -= order_qty
         else:
@@ -18672,9 +16661,8 @@ def place_close_all(
             # SHORT カバー → is_short フラグを下ろす (発注時点で意図的に下ろす)
             ts.is_short = False
 
-    # ★ v3.9.157 (A-1): スイープ文脈なら、出した注文を収集器へ記録する
     if getattr(_sweep_oid_ctx, "oids", None) is not None:
-        try:   # ★ v3.9.157b: 記録の失敗で決済結果の確定を妨げない
+        try:
             for _c_oid, _c_q in placed_orders:
                 _sweep_oid_ctx.oids.append(
                     {"oid": str(_c_oid), "symbol": symbol,
@@ -18708,13 +16696,6 @@ def place_close_all(
             + (f"\n※ {owned_skip_count}件は Bot 以外の建玉になったため対象外です"
                if owned_skip_count else "")
         )
-        # ★ v3.9.149: 「全量さばけた」と「一部だけ」を区別して呼び出し元へ渡す。
-        #   残玉が出るのは (a) 発注失敗があった (b) 要求数量より多く持っていた
-        #   (14782-14787 の _avail_total > _req_qty) の2通り。
-        #   所有権による対象外は別戦略の管理下なので残玉には数えない。
-        #   ★ v3.9.149b: 不足側（_avail_total < _req_qty）も未完了として扱う。
-        #   内部の把握より建玉照会の数量が少ないときは 14842 で「取得済建玉のみ」を
-        #   決済しており、口座側に残りがある可能性を否定できない（Codexレビュー指摘）。
         _leftover = (failed_count > 0) or (_avail_total != _req_qty)
         _mark_close_result(symbol, "partial" if _leftover else "full")
         if _leftover:
@@ -18724,12 +16705,8 @@ def place_close_all(
                 f" / 対象建玉 {_avail_total}株 vs 要求 {_req_qty}株）"
                 f" → 完了扱いにせず、次の巡回で残りを決済します"
             )
-        return True  # ★ v2.99.2: 1件以上の発注成功
+        return True
     elif owned_skip_count > 0 and failed_count == 0:
-        # ★ v3.9.148: 1本も発注できず、見送りが含まれる回。
-        #   建玉は口座に残っているので「完了」に倒してはいけない。既存の
-        #   見送り機構（_mark_close_deferred）に載せて False を返し、呼び出し側が
-        #   決済失敗の連続カウントを進めないようにする（:18604 付近）。
         log.info(
             f"{tag} [{side_label}] 対象建玉 {owned_skip_count} 件は Bot 以外の建玉に"
             f"なったため決済の対象外です（既決済 {already_closed_count} 件 / 失敗 {failed_count} 件）"
@@ -18738,12 +16715,7 @@ def place_close_all(
         _mark_close_deferred(symbol, "owned")
         return False
     elif already_closed_count > 0 and failed_count == 0:
-        # ★ v3.9.63: 対象建玉がすべて「既に決済済み (Not enough positions)」だった。
         # 実害なし → 内部状態をクリーンにして成功扱いで返し、無限リトライを止める。
-        # ★ v3.9.148: 旧文言は「(entry_time クリア)」と書いていたが、この分岐は
-        #   entry_count / トレール / 台帳しか触らない。entry_time を消すかどうかは
-        #   True を受け取った呼び出し側の判断で、損切り・トレール経路から呼ばれた
-        #   場合はどこでも消えない。実態に合わせて書き換える。
         log.info(
             f"{tag} [{side_label}] 対象建玉 {already_closed_count} 件はすべて既に決済済み "
             f"→ 建玉の内部状態をクリアして完了扱い"
@@ -18759,19 +16731,14 @@ def place_close_all(
             ts.is_short = False
         # 実態を反映させるため非同期で再同期
         _threadsafe_future(asyncio.to_thread(sync_positions, trd_env))
-        _mark_close_result(symbol, "full")   # ★ v3.9.149: 建玉は無い＝完了
+        _mark_close_result(symbol, "full")
         return True
     else:
-        # ★ v3.9.148: 見送りと失敗が混在した回に「全 position_id 発注失敗」と書くと
-        #   実態とずれる（Codexレビュー指摘）。内訳を出す。
-        # ★ v3.9.148: 数量ゼロの建玉レコードは黙って飛ばしているので、どのカウンタも
-        #   立たないままここへ来ることがある。「0件失敗」と書かないよう内訳を出す。
         _skip_note = (
             f"（発注失敗 {failed_count} 件 / 対象外 {owned_skip_count} 件"
             f" / 既決済 {already_closed_count} 件 / 全 {len(pids)} 建玉）"
         )
         log.error(f"{tag} [{side_label}] 決済の発注ができませんでした{_skip_note}")
-        # ★ v3.9.19: ショートカバー全失敗時のみアラート音 (損失拡大リスク大)
         if side == "SHORT":
             _play_alert_sound("short_cover_all_failed")
         _threadsafe_future(asyncio.to_thread(
@@ -18782,8 +16749,8 @@ def place_close_all(
             f"理由: {reason}\n"
             f"moomoo アプリで手動確認してください。"
         ))
-        _mark_close_result(symbol, "failed")   # ★ v3.9.149
-        return False  # ★ v2.99.2: 全 position_id 失敗 → 呼び出し側で entry_time を維持して再発動可能に
+        _mark_close_result(symbol, "failed")
+        return False
 
 # ── 緊急全決済（Panic Sell） ───────────────────────────────────────────────────────
 async def panic_sell_all(
@@ -18791,24 +16758,16 @@ async def panic_sell_all(
     trigger_symbol: str,
     reason: str,
 ) -> None:
-    # ★ v3.9.61: モメンタム実発注銘柄も panic sell 対象に含める (LONG 監視漏れ防止)
-    # ★ v3.9.151: 個別株・決算銘柄も含める（認定サポーターの指摘）。従来この関数だけが
-    #   STOCK_TICKERS / EARNINGS_* を含んでおらず、急落時に個別株・決算銘柄のロング
-    #   だけが逃げ遅れる形だった（意図的でないことを確認済み）。
     exec_syms = ({sym for syms in EXECUTION_MAP.values() for sym in syms}
                  | set(STOCK_TICKERS)
                  | set(EARNINGS_PRE_TICKERS) | set(EARNINGS_AFTER_TICKERS)
                  | _momentum_live_symbols())
-    # ★ v3.9.15: LONG (position_qty > 0) のみを panic sell 対象にする。
     # 旧 v2.98 では SHORT (qty<0) も対象にしていたが、5/13 認定サポーター環境で
     # 「高 conf ネガニュース → 新規 SHORT 発注 → 直後に panic_sell_all で自分の
     # SHORT を閉じようとして決済失敗 (position_id 取得不能)」という矛盾が発覚。
     # 本来 panic_sell の意図は「悪材料で LONG を急いで切る」ことなので、SHORT は
     # 既にネガティブシグナルへの応答ポジションのため panic で閉じる必要なし。
     targets = [sym for sym in exec_syms if state.get(sym).position_qty > 0]
-    # ★ v3.9.151: Bot 以外の建玉（OVN・手動）は place_close_all が入口で見送るため、
-    #   通知を組む前にここで除いておく（Codexレビュー指摘）。除かないと
-    #   「決済します」と告知した銘柄に実際は手を出さない食い違いが起きる。
     _skipped_owned_ps = [sym for sym in targets if _is_other_owner(sym)]
     targets = [sym for sym in targets if not _is_other_owner(sym)]
     if _skipped_owned_ps:
@@ -18821,7 +16780,6 @@ async def panic_sell_all(
         log.info(f"[パニックセル] {trigger_symbol} → 決済対象 LONG ポジションなし")
         return
 
-    # ── ★ v3.9.17: peak リトレース ガード ──────────────────────────────────
     # peak (LONG なら最高値) から既に PANIC_RETRACE_SKIP_PCT 以上戻している場合は
     # 「急落の底で売って傷を広げる」誤発動の可能性が高いのでスキップする。
     # 5/13 22:49 hma SPY -$23.78 パニックセル誤発動 (直後 SHORT 組は 60min 後
@@ -18884,7 +16842,6 @@ async def panic_sell_all(
     ))
 
     for sym in targets:
-        # ★ v2.86: 銘柄単位ロックで race 防止
         async with _get_sym_lock(sym):
             place_close_all(sym, trd_env, f"パニックセル: {trigger_symbol}急落", is_panic=True)
 
@@ -18913,7 +16870,6 @@ async def process_headlines(
     if _elapsed < STARTUP_NEWS_IGNORE_SEC:
         log.info(f"[起動待機中] {STARTUP_NEWS_IGNORE_SEC - int(_elapsed)}秒後に発注開始 → {len(new)}件を既読登録のみ")
         return
-    # ── ★ v3.9.56: セッション切替直後のクワイエットウィンドウ ──────────────
     # OVERNIGHT/WEEKEND 等の停止セッション中に Alpaca WebSocket / RSS が蓄積
     # した古いニュースが、セッション再開の瞬間に一斉処理されることを防ぐ。
     # SESSION_CHANGE_QUIET_SEC 秒間は新着ニュースを「既読登録のみ」してスキップ。
@@ -18932,28 +16888,18 @@ async def process_headlines(
     # SPY/QQQのフィルタチェーンとは独立して並列処理する（ensure_future）。
     # bypass_filter=True でprefix重複チェックをバイパスして個別株AIを確実に起動。
     # is_new_article による重複チェックは process_stock_news 内で引き続き行う。
-    # ★ v3.9.156: 決算銘柄（EARNINGS_PRE/AFTER）はこのルートに含めない（5日分レビュー）。
-    #   決算戦略は専用機構（WS決算ブロック＋2秒ポーリング）が「30秒待機→±N%の方向確認
-    #   →決算セッションゲート」の順で扱う設計。直行ルートが即時にAI判定→発注すると、
-    #   scope 付き既読が先に付いて方向確認ゲートが丸ごと素通りになる退行が
-    #   v3.9.154（already_deduped でこのルートが実動化した版）から発生していた。
-    #   v3.9.155 の対処（0.80 の引き継ぎ）はしきい値だけで、待機は復元できていなかった。
     _env_route_syms = [t for t in dict.fromkeys(STOCK_TICKERS) if t not in _all_earnings_set]
     if _env_route_syms:
         import re as _re_env
         for _h in new:
             _hl_upper = _h.headline.upper()
             for _rsym in _env_route_syms:
-                # ★ v3.9.153 (B-3): ティッカーに加えて社名でも拾う。見出しは
-                #   "Nvidia" 表記が大半で、"NVDA" だけでは直行ルートが空振りしていた。
                 _hit_alias = None
                 for _alias in _TICKER_ALIASES.get(_rsym, (_rsym,)):
                     if _re_env.search(rf"\b{_re_env.escape(_alias)}\b", _hl_upper):
                         _hit_alias = _alias
                         break
                 if _hit_alias:
-                    # ★ v3.9.153 (B-4): この経路は従来ログが無く、回ったかどうかを
-                    #   切り分けられなかった。INFO で残す。
                     log.info(
                         f"[個別株ルーティング] {_rsym} ← \"{_hit_alias}\" で一致: "
                         f"{_h.headline[:80]}"
@@ -18962,19 +16908,12 @@ async def process_headlines(
                         process_stock_news(
                             client, trd_env_real, _rsym, [_h],
                             bypass_filter=True,
-                            already_deduped=True,   # ★ v3.9.154: 上の new で判定済み
-                            # ★ v3.9.156: 決算銘柄はこのルートに来なくなったため
-                            #   v3.9.155 の thresh_override は撤去。しきい値の防衛線は
-                            #   process_stock_news 側に集約（どの経路から来ても効く）。
+                            already_deduped=True,
                         )
                     )
                     break  # 1ニュースにつき最初にマッチした1銘柄のみルーティング
 
     # ── 無関係ニュースの事前フィルタリング ────────────────────────────────────
-    # ★ v3.9.153: キーワード表と判定はモジュールスコープの
-    #   _SKIP_KEYWORDS_CI / _SKIP_ACRONYMS_CS / _match_skip_keyword に移設
-    #   （単語境界つき正規表現・認定サポーターNの指摘A）。
-    # ── ★ v3.8.3: 1 日 1 回ノイズフィルタ統計を出力 (日付変わり時のみ実行) ──
     _maybe_log_noise_filter_summary()
 
     filtered = []
@@ -18985,13 +16924,11 @@ async def process_headlines(
             log.debug(f"[フィルタ] 短文スキップ({word_count}語): {h.headline}")
             continue
         # ② キーワードフィルタ
-        # ★ v3.9.153: 単語境界つき正規表現で判定（旧: 部分一致で inflation 等を誤除外）
         matched = _match_skip_keyword(h.headline)
         if matched:
             _record_skip_keyword_hit(matched)
             log.debug(f"[フィルタ] キーワードスキップ({matched!r}): {h.headline}")
             continue
-        # ②.5 ★ v3.8.3: 高信頼度ノイズパターン (常に score=0 確実 → AI 呼出を節約)
         # 5/4-9 ログ分析で全 AI 判定の 48% が score=0、月 $40-90 のコスト削減見込み。
         _noise_label = _check_noise_pattern(h.headline)
         if _noise_label:
@@ -19011,7 +16948,6 @@ async def process_headlines(
     # ── ニュース一覧をログに出力（1回だけ）────────────────────────────────────
     log.info(f"[ニュース] 新着 {len(new)}件 → AI判定（1回）...")
     for h in new:
-        # ★ v2.99: ニュースソース二段表示 [finnhub:reuters] 等
         log.info(f"  ・[{_format_news_source(h)}] {h.headline}")
 
     texts = [h.headline for h in new]
@@ -19022,14 +16958,8 @@ async def process_headlines(
         log.info(f"[トピック重複] スキップ: {_topic_reason}")
         return
 
-    # ── ★ v3.9.8: ③' 正規化ヘッドライン重複チェック ────────────────────────
     # TOPIC_KEYWORDS では拾えない「同一ヘッドラインの繰り返し配信」を 60 分 dedup。
     # Yahoo Finance が GUID 更新で同一記事を 5 分おきに再配信するパターン等を吸収。
-    # ★ v3.9.154: 1件ずつ選別する（認定サポーターの指摘§3）。
-    #   旧実装は先頭1件が既出ならバッチ全体を捨てており、同じバッチに入っていた
-    #   新規の見出しも巻き添えで失われていた。個別株側（v3.9.153）と同じ形に揃える。
-    #   記録側も先頭しか mark していなかったため、2件目以降は dedup 辞書に
-    #   一度も入っていなかった（この層が守れていたのは実質「先頭の見出し」だけ）。
     if texts:
         _fresh_h, _fresh_t = [], []
         for _h_i, _t_i in zip(new, texts):
@@ -19041,9 +16971,6 @@ async def process_headlines(
                 )
                 state.mark_headline_seen(_t_i)  # hit_count をインクリメント
                 continue
-            # ★ v3.9.154: 印は判定と同時に付ける（Codexレビュー指摘・個別株側と同型）。
-            #   AI 呼出（await）の後に付けると、その間に別フィードの同一見出しが
-            #   「未見」と判定され、二重に AI へ回る。
             state.mark_headline_seen(_t_i)
             _fresh_h.append(_h_i)
             _fresh_t.append(_t_i)
@@ -19059,14 +16986,11 @@ async def process_headlines(
                  f"  score={cached['score']}  confidence={cached['confidence']:.2f}")
         result = cached
     else:
-        # ★ v2.92: マクロ環境(直近 5/15/60 分の QQQ/SPY 騰落率)を AI に文脈として渡す
         # 5/4 NY11時の急落事案で、相場全体の流れを AI が考慮できなかった問題への対策。
         # 履歴が不十分な場合は build_market_context が空文字を返し、従来通りの動作。
         _mkt_ctx = build_market_context()
         if _mkt_ctx:
             log.debug(f"[市場文脈] AI に文脈付与: {_mkt_ctx[:120]}...")
-        # ★ v3.9.154: 既読の印は上の選別時に付与済み（reserve）。AI 呼出が例外で
-        #   落ちたら戻す（個別株側と同じ形・Codexレビュー指摘）。
         try:
             result = await analyze_news(client, texts, "SHARED", market_context=_mkt_ctx)
         except BaseException:
@@ -19087,16 +17011,12 @@ async def process_headlines(
     victims       = result["victims"]
     category      = result.get("category", "MACRO").upper()
 
-    # ── ★ v2.99: ETF 影響ガード ─────────────────────────────────────────────
     # AI が beneficiaries/victims に ETF を入れたとき、ニュース内容に主要構成銘柄
     # またはセクター語が登場するか検証する。Azenta のような小型株の決算ミスを
     # QQQ への victims と誤判定するケースに対する二重防御。
     # 除外時は log.warning で記録される。
-    # ★ v3.1.3: bear ETF フォールバック抑止のため、フィルタ前後の ETF 構成を保持
-    # ★ v3.8.1: 強化版で空リスト検知に使用 (元AI指定があったか / 元から空かのログ用)
     _orig_beneficiaries_etfs = [s for s in (beneficiaries or []) if s in _ETF_MAJOR_MAP]
     _orig_victims_etfs       = [s for s in (victims       or []) if s in _ETF_MAJOR_MAP]
-    # ── ★ v3.9.193: AI が根拠にした見出しが分かる回は、その1本だけで検証する ──
     # 従来はバッチの見出しを全部つないで照合していたため、AI が読んですらいない
     # 別の記事に構成銘柄名があるだけでガードを通っていた（認定サポーターの実例:
     # AI の採用記事とは別の 9 件目の見出しの `Hormuz` が根拠になっていた）。
@@ -19120,7 +17040,6 @@ async def process_headlines(
     victims       = _validate_etf_impact(_guard_texts, victims,       "victims")
 
     # ── ④ ニュースソースの信頼度重み付け ─────────────────────────────────────
-    # ★ v2.93: 730件の実トレード分析で重み再調整 (STEP1, 1-2週後 STEP2 判断)。
     # 旧版は業界一般論ベースで、実勝率と完全に逆評価していた:
     #   Yahoo (旧0.85→0.95): 実勝率54.2% 合計+$366 (唯一プラス、過小評価)
     #   Alpaca (旧1.00→0.95): 実勝率48.3% 合計-$329 (過大評価)
@@ -19134,7 +17053,6 @@ async def process_headlines(
     # 最も信頼度の高いソースの重みを使用
     _sources = [getattr(h, "source", "Unknown") for h in new]
     _max_weight = max((_SOURCE_WEIGHTS.get(s, 0.90) for s in _sources), default=0.90)
-    # ★ v2.88: ログ用 _top_source も _max_weight と同一の選択ロジックに統一。
     # 旧版は _sources[0] 固定で、max_weight 算出元とずれて TRADE_RESULT 勝率相関を歪めていた。
     _top_source = max(
         _sources,
@@ -19149,16 +17067,13 @@ async def process_headlines(
             f"confidence {_orig_conf:.2f}→{confidence:.2f}"
         )
 
-    # ── ★ v2.93: Finnhub × 個別株の追加ディスカウント (process_stock_news側で実装) ──
     # 730 件の実データ分析で、Finnhub × 個別株は勝率 35.6%・平均 -$9.65 と特に悪い
     # ことが判明 (Finnhub × ETF は勝率 70%・平均 +$1.09 で問題なし)。
     # process_headlines は通常 ETF 銘柄 (SPY/QQQ/SMH) に発注するため、Finnhub 個別株
     # ディスカウントは process_stock_news 側でのみ適用する (個別株 AI 判定の直後)。
 
     # ニュースソースを記録（TRADE_RESULT分析用）
-    # ★ v2.88: 最大重みソースを記録（_sources[0] 固定から変更）
     _news_src = _top_source
-    # ★ v3.9.2: 中立矢印に Variation Selector (U+FE0F) を追加してカラー絵文字に
     # 強制描画する。"➡ 中立" は地味なテキスト字形でターミナルでの見た目が
     # 📈/📉 と統一されていなかったため、"➡️" に変更して 3 種類とも emoji 表示に。
     score_label = {1: "📈 ポジティブ", 0: "➡️ 中立", -1: "📉 ネガティブ"}.get(score, "?")
@@ -19170,7 +17085,6 @@ async def process_headlines(
 
     if score == 0:
         log.info("[AI判定] → 中立: 何もしない")
-        # ★ v3.9.7: META 倒錯ガード等で AI 元判定を 0 に書き換えたケースを観察ログに記録
         # (元の score は reason 欄の追記文字列で判別)
         _reason_full = (result.get("reason") or "")
         _CATEGORY_TO_SYM = {"SEMI_STRONG": _semi_sym, "TECH": _tech_sym, "MACRO": _macro_sym}
@@ -19185,8 +17099,6 @@ async def process_headlines(
                 block_reason=_reason_full[:300],
             )
         elif "META疑問形" in _reason_full:
-            # 疑問形は score=±1 両方ありえる。★ v3.9.193: 方向は未定として記録する
-            #   （BUY 仮定だと方向で層別する分析がこの行を BUY に数える）
             _log_observation(
                 symbol=_would_be_sym, side="-", confidence=confidence, score=1,
                 category=category, headlines=texts,
@@ -19196,7 +17108,6 @@ async def process_headlines(
             )
         return
 
-    # ── ★ v3.8.1: ETFガード後の空リスト → カテゴリ単独発動を停止 ──────────────
     # AI が特定銘柄を指名したがETFガードで全件除外されたケース、または AI が
     # 元から空リストを返したケースのいずれも、resolve_execution_symbols が
     # EXECUTION_MAP[trigger_sym] (例: TECH→QQQ) へフォールバックする経路は
@@ -19212,11 +17123,10 @@ async def process_headlines(
             f"[ETFガード強化] beneficiaries 空 → カテゴリ単独発動を停止{_detail}  "
             f"reason={reason}"
         )
-        # ★ v3.9.193: この回は観察ログのどこにも残っていなかった（認定サポーターの指摘）。
-        #   配布前レビュー: AI が元から空を返した回（SellTheNews 抑制など）は対象外。
         if _orig_beneficiaries_etfs:
             _log_etf_guard_empty(category=category, score=1, confidence=confidence, texts=texts,
-                                 orig_etfs=_orig_beneficiaries_etfs, reason=reason)
+                                 orig_etfs=_orig_beneficiaries_etfs, reason=reason,
+                                 guard_texts=_guard_texts)
         return
     if score == -1 and not victims:
         _detail = f" (元AI指定ETF: {_orig_victims_etfs})" if _orig_victims_etfs else ""
@@ -19226,10 +17136,10 @@ async def process_headlines(
         )
         if _orig_victims_etfs:
             _log_etf_guard_empty(category=category, score=-1, confidence=confidence, texts=texts,
-                                 orig_etfs=_orig_victims_etfs, reason=reason)
+                                 orig_etfs=_orig_victims_etfs, reason=reason,
+                                 guard_texts=_guard_texts)
         return
 
-    # ── ★ v2.94: SEMI_STRONG/SEMI の二段階カテゴリ判定 ─────────────────────────
     # 5/4-5/5 「半導体っぽいニュース」→ SMH 流入損失事案への対策。
     # SEMI_STRONG: 大型半導体 (NVDA/TSM/AVGO/AMD) の明確好材料・セクター波及確定 → SMH発注
     # SEMI:        中堅小型・観測記事・確度低 → 発注しない (QQQ にも流用なし)
@@ -19244,28 +17154,19 @@ async def process_headlines(
     # ── カテゴリからトリガー銘柄を決定（発注先を特定）────────────────────────
     # SEMI_STRONG → SMH（TRIGGER_TICKERSにSMH含む場合）or QQQ / TECH → QQQ / MACRO → SPY
     _CATEGORY_TO_TRIGGER: Dict[str, str] = {
-        "SEMI_STRONG": _semi_sym,  # ★ v2.94: 強い半導体ニュースのみ SMH 発注対象
+        "SEMI_STRONG": _semi_sym,
         "TECH":        _tech_sym,
         "MACRO":       _macro_sym,
     }
     trigger_sym = _CATEGORY_TO_TRIGGER.get(category, _macro_sym)
     tag = f"【{trigger_sym}】"
 
-    # ── ★ v3.9.169: ニュース選抜プロファイル v1 の判定（止めるのは新規建てだけ）──
     # 既定オフ（NEWS_PROFILE_SELECT=false）では短絡評価で何も実行されない。
     # ★ 重要（Codexレビュー指摘）: ここで return してはいけない。この先には
     #   「ネガティブニュースで既存ロングを決済する」「ポジティブニュースで既存
     #   ショートを買い戻す」というリスクを減らす動作が含まれる。カテゴリで
     #   丸ごと止めると、保有中の建玉がニュースによる退避を失う。
     #   選抜が止めるのは新規エントリーだけで、決済は従来どおり通す。
-    # ★ v3.9.169b: 選抜 v1 は「検証済みルール一式」として、他の設定より優先する
-    #   （PAN指示・モメンタムの select_v1 と同じ思想）。利用者が時間帯の設定を
-    #   どう書いていても、選抜中の新規建ては RTH のみ。
-    #   根拠（6週・$100k未満）: 採用カテゴリの優位性は RTH に集中している——
-    #     RTH        1,485件 平均 +0.020%（t=+3.3）
-    #     プリマーケット 62件 平均 -0.004%（t=-0.1・優位性なし）
-    #     アフターアワーズ 16件（母数不足・平均 -0.068%）
-    #   決済・パニックセルは時間帯に関わらず従来どおり動く（止めるのは新規建てのみ）。
     _sess_now = get_session_info()[0]
     _select_v1_off_category = (
         NEWS_PROFILE_SELECT and category not in NEWS_SELECT_V1_CATEGORIES
@@ -19284,7 +17185,6 @@ async def process_headlines(
     else:
         exec_targets = resolve_execution_symbols(texts, trigger_sym, victims)
 
-    # ── ★ v2.91 → v2.94: SEMI_STRONG は _semi_sym (通常 SMH) のみに絞る ────────
     # AI が beneficiaries=['QQQ', 'SMH'] と返す場合の同時発注防止。SMH 構成なら
     # _semi_sym=SMH、SPY+QQQ 構成なら _semi_sym=QQQ となり QQQ のみが残る。
     if category == "SEMI_STRONG" and _semi_sym in exec_targets:
@@ -19296,18 +17196,14 @@ async def process_headlines(
                 f"(元: {_orig_targets} → {exec_targets})"
             )
 
-    # ★ v3.9.157: await を伴わない同期呼び出しはイベントループを塞ぐ
-    #   （OpenD 停止時の4時間23分凍結の特定経路・認定サポーターの機序特定）。
     await asyncio.to_thread(sync_positions, trd_env_real)
 
     # ── score=-1: ショート（空売り or 既存ロング決済）────────────────────────────
     if score == -1:
-        # ★ v3.8.1: 旧 v3.1.3 の `_victims_all_etfs_rejected` 分岐は削除済み。
         # EXECUTION_MAP が常に非空 ([trigger_sym]) を返すため `not exec_targets`
         # 条件が事実上 False となり機能していなかった。代わりに上流の
         # 「ETFガード強化 (空リスト→中立化)」が同等以上のガードを提供する。
 
-        # ★ v3.1.3: ETF を bear fallback で空売りする前に、当該 ETF の上昇トレンドを確認。
         # is_macro_uptrend / is_smh_uptrend が True なら QQQ/SMH ショートをスキップ。
         # AI が明示的に victims を返した場合 (exec_targets あり) はこのチェックをかけず、
         # 純粋なフォールバック時のみ適用 (AI 判断を覆さない)。
@@ -19334,19 +17230,16 @@ async def process_headlines(
 
         # 発注対象銘柄を決定（カテゴリ対応）
         short_targets = exec_targets if exec_targets else [LEVERAGED_MAP.get(category, {}).get("bear", "SPY")]
+        _clear_order_fails(short_targets, side="SHORT")
 
         _thresh = get_confidence_threshold()
         if confidence >= _thresh:
             # ① 既存ロングポジションをまず全決済
-            # ★ v2.86: 銘柄単位ロックで race 防止（process_stock_news との並列発注抑止）
             sold = []
             for sym in short_targets:
                 async with _get_sym_lock(sym):
                     if state.get(sym).position_qty > 0:
                         place_close_all(sym, trd_env_real, f"ショートシグナルのためロング決済: {reason}")
-                        # ★ v3.9.153: 全量さばけた回は時間切れの時計を返す
-                        #   （認定サポーターの指摘④）。残さないと、決済の数分後に
-                        #   「時間切れ（建玉なし）」の不要な再照会と通知が出る。
                         if _take_close_result(sym) == "full":
                             state.get(sym).entry_time = None
                         sold.append(sym)
@@ -19355,22 +17248,16 @@ async def process_headlines(
                 await asyncio.sleep(1)  # 決済後に少し待機
 
             # ② 空売り新規エントリー
-            # ★ v3.9.190: 行頭の {tag} はニュースの紐づき先（記事が SPY の記事なら
-            #   【SPY】）で、発注先 short_targets とは別物。victims=['QQQ'] なのに
-            #   【SPY】と出るため「SPYの話なのにQQQが見送られた」と読めていた
-            #   （認定サポーター2名の指摘）。発注先を行の中で名指しする。
             log.info(f"{tag} → ネガティブシグナル: ショート新規エントリー {short_targets}"
                      f"（【】はニュースの紐づき先・発注先は {'/'.join(short_targets)}）")
             ordered_short = []
-            # ★ v3.9.29: 「既存ショートあり or 余力不足」を分離して表示
             # 5/20 PAN ログで「余力不足」表示が実は既存 SHORT 保有中のケースだった事例。
             # 受講生の誤解 (「証券口座の残高が足りないのか?」) を防ぐため分岐ログ。
             _skipped_existing_short: list = []   # 既存 SHORT 保有でスキップ
             _skipped_etf_reentry:    list = []   # ETF 再エントリー禁止でスキップ
             _skipped_with_long:      list = []   # 同銘柄 LONG 保有のためスキップ (まずは LONG 決済が必要)
-            _skipped_select_v1_s:    list = []   # ★ v3.9.169: 選抜で新規建てを見送り
+            _skipped_select_v1_s:    list = []
             for sym in short_targets:
-                # ★ v2.99: ETF 再エントリー禁止チェック (決済から N 分以内ならスキップ)
                 if _is_etf_ticker(sym):
                     _locked, _elapsed = _is_etf_reentry_locked(sym)
                     if _locked:
@@ -19381,7 +17268,6 @@ async def process_headlines(
                             f"(SHORT スキップ)"
                         )
                         _skipped_etf_reentry.append(sym)
-                        # ★ v3.9.193: 観察ログに残す（記録されない4種の1つ）
                         _log_observation(
                             symbol=sym, side="SELL_SHORT", confidence=confidence, score=-1,
                             category=category, headlines=texts,
@@ -19401,18 +17287,8 @@ async def process_headlines(
                         # LONG 保有中 → ショート前に LONG 決済が必要
                         _skipped_with_long.append(sym)
                         continue
-                    # ★ v3.9.169: ここまで来た銘柄＝選抜が無ければ実際に発注されていた
-                    #   銘柄。既存ショート保有・LONG保有・ETF再エントリー禁止で
-                    #   元々止まる分を数えると、機会損失を過大評価してしまう。
-                    #   記録はロックの外・パニックセルの後でまとめて出す。
                     if _select_v1_block_entry:
                         _skipped_select_v1_s.append(sym)
-                        # ★ v3.9.169b（レビュー指摘）: SHORT を止めるときはシャドー記録へ
-                        #   転送する（実口座の買い専用ゲート :14507 と同じ扱い）。
-                        #   これが無いと、デモ口座では place_short が本来やっていた
-                        #   唯一の仕事＝仮想SHORTの記録が消え、MACRO のシャドー成績が
-                        #   丸ごと欠測する。モメンタムの select_v1 も
-                        #   「シャドー観察は全銘柄・全サイド・全時間帯で継続」が原則。
                         if SHADOW_SHORT_ENABLED:
                             try:
                                 _shadow_short_open(
@@ -19429,11 +17305,12 @@ async def process_headlines(
                                      trigger=trigger_sym, reason=f"[ベア] {reason}",
                                      category=category, news_source=_news_src,
                                      headlines=texts[:3],
-                                     beneficiaries=beneficiaries, victims=victims)  # ★ v2.95
+                                     beneficiaries=beneficiaries, victims=victims)
                     if ok:
                         ordered_short.append(sym)
             if ordered_short:
                 ordered_str = ", ".join(ordered_short)
+                _take_order_fails(short_targets, side="SHORT")
                 log.info(f"{tag} ✅ ショートエントリー完了: {ordered_str}（カテゴリ {category} の対応銘柄={trigger_sym}／発注先={ordered_str}）")
                 _threadsafe_future(asyncio.to_thread(
                     send_discord_message,
@@ -19444,7 +17321,6 @@ async def process_headlines(
                     f"--- ニュース ---\n" + "\n".join(f"・{t}" for t in texts[:3])
                 ))
             else:
-                # ★ v3.9.29: 全件スキップの理由を明示 (受講生が「余力不足」と誤解しないよう)
                 _reasons = []
                 if _skipped_existing_short:
                     _reasons.append(f"既存 SHORT 保有中: {','.join(_skipped_existing_short)}")
@@ -19452,16 +17328,16 @@ async def process_headlines(
                     _reasons.append(f"LONG 保有中・SHORT 不可: {','.join(_skipped_with_long)}")
                 if _skipped_etf_reentry:
                     _reasons.append(f"ETF 再エントリー禁止: {','.join(_skipped_etf_reentry)}")
-                if _skipped_select_v1_s:   # ★ v3.9.169: 選抜で見送った分も理由に併記
+                if _skipped_select_v1_s:
                     _reasons.append(f"ニュース選抜v1で見送り: {','.join(_skipped_select_v1_s)}")
+                _fail_why_s = _take_order_fails(short_targets, side="SHORT")
+                if _fail_why_s:
+                    _reasons.append(_fail_why_s)
                 if not _reasons:
                     # 上記いずれにも該当しない場合 = place_short() 内で却下 (余力不足/急変動/トレンドガード等)
                     _reasons.append("place_short() 内でブロック (詳細は直前ログ参照)")
                 log.info(f"{tag} → 空売り試行: 全銘柄スキップ ({' / '.join(_reasons)})（カテゴリ {category} の対応銘柄={trigger_sym}）")
 
-            # ★ v3.9.169: 見送りの記録はパニックセルの後・ロックの外で出す。
-            #   先に出すと同期の照会がイベントループを塞ぎ、いちばん急ぐ緊急退避を遅らせる。
-            #   パニックセルが例外で落ちても記録は残す（finally・Codex指摘）。
             try:
                 if confidence >= PANIC_CONFIDENCE:
                     await panic_sell_all(trd_env_real, trigger_sym, reason)
@@ -19484,7 +17360,6 @@ async def process_headlines(
                     )
                 else:
                     log.info(f"{tag} → ショートシグナルだが決済対象ポジションなし・confidence不足で空売りもスキップ")
-                # ★ v3.9.7: 観察ログ — confidence 閾値ブロック (SHORT)
                 for _sym in short_targets:
                     _log_observation(symbol=_sym, side="SELL_SHORT", confidence=confidence, score=-1,
                                      category=category, headlines=texts,
@@ -19494,9 +17369,7 @@ async def process_headlines(
         return
 
     # ── score=1: ロング (現物買い or 既存ショート決済) ────────────────────────
-    # ★ v2.70: victims ガード - score=1 でも victims に対象銘柄含むなら BUY ブロック
     # (例: 輸出規制で beneficiaries=[] victims=['QQQ'] なのに score=1 ケース)
-    # ★ v2.90: 検出は WARNING ログのみで Discord 通知抑制 (受講生問合せ増対応)。
     _victim_blocked = [sym for sym in exec_targets if sym in victims]
     if _victim_blocked:
         log.warning(
@@ -19504,8 +17377,6 @@ async def process_headlines(
             f" victims={victims} に含まれています（AI内部矛盾を検出）。"
             f" reason={reason}"
         )
-        # ★ v2.90: Discord 通知は抑制（log.warning のみ残す）
-        # ★ v3.9.7: 観察ログ — victim ガードブロック
         for _sym in _victim_blocked:
             _log_observation(symbol=_sym, side="BUY", confidence=confidence, score=1,
                              category=category, headlines=texts,
@@ -19516,7 +17387,6 @@ async def process_headlines(
     _thresh = get_confidence_threshold()
     if confidence < _thresh:
         log.info(f"{tag} → confidence={confidence:.4f} < {_thresh:.4f} 発注見送り（セッション別しきい値・発注先={','.join(exec_targets) or '-'}）")
-        # ★ v3.9.7: 観察ログ — confidence 閾値ブロック (BUY)
         for _sym in exec_targets:
             _log_observation(symbol=_sym, side="BUY", confidence=confidence, score=1,
                              category=category, headlines=texts,
@@ -19529,9 +17399,9 @@ async def process_headlines(
         return
 
     ordered = []
-    _skipped_select_v1: list = []   # ★ v3.9.169: 選抜で新規買いを見送った銘柄
+    _skipped_select_v1: list = []
+    _clear_order_fails(exec_targets, side="BUY")
     for sym in exec_targets:
-        # ★ v2.99: ETF 再エントリー禁止チェック (決済から N 分以内ならスキップ)
         # v3.9.20: ピラミッド撤去により「既存ポジ無し」のときだけチェック。
         # 既存ポジションがあれば place_buy 内で「保有中スキップ」される。
         if _is_etf_ticker(sym) and state.get(sym).position_qty == 0:
@@ -19543,7 +17413,6 @@ async def process_headlines(
                     f"{_elapsed:.1f}分前に決済済 → あと{_remaining:.1f}分待機 "
                     f"(BUY スキップ)"
                 )
-                # ★ v3.9.193: 観察ログに残す（記録されない4種の1つ）
                 _log_observation(
                     symbol=sym, side="BUY", confidence=confidence, score=1,
                     category=category, headlines=texts,
@@ -19553,19 +17422,14 @@ async def process_headlines(
                     price_at_decision=_last_recorded_price(sym), skip_quote=True,
                 )
                 continue
-        # ★ v2.86: 銘柄単位ロックで「ショート決済→BUY」一連を atomic に
         async with _get_sym_lock(sym):
             # 既存ショートがあれば先に買い戻し
             if state.get(sym).position_qty < 0:
                 log.info(f"{tag} 既存ショートを買い戻し → {sym}")
                 place_close_all(sym, trd_env_real, f"ロングシグナルのためショート決済: {reason}")
-                # ★ v3.9.153: 全量さばけた回は時間切れの時計を返す（指摘④・上と同じ）
                 if _take_close_result(sym) == "full":
                     state.get(sym).entry_time = None
                 await asyncio.sleep(1)
-            # ★ v3.9.169: 既存ショートの買い戻し（上のブロック）は済ませたうえで、
-            #   新規の買いだけ見送る。記録はロックの外でまとめて出す（ロックを
-            #   握ったまま照会とファイル追記をすると後続銘柄が直列に待たされる）。
             if _select_v1_block_entry:
                 # ★ 見送りに数えるのは建玉ゼロの銘柄だけ。place_buy は保有中(>0)でも
                 #   買い戻し残り(<0)でも発注しないので、それらを数えると機会損失を
@@ -19577,16 +17441,13 @@ async def process_headlines(
                            trigger=trigger_sym, reason=reason,
                            category=category, news_source=_news_src,
                            headlines=texts[:3],
-                           beneficiaries=beneficiaries, victims=victims)  # ★ v2.95
+                           beneficiaries=beneficiaries, victims=victims)
             if ok:
                 ordered.append(sym)
 
     if ordered:
         ordered_str = ", ".join(ordered)
-        # ★ v3.9.191: 行頭の {tag} と「トリガー」はカテゴリに対応づけた銘柄で、
-        #   発注先とは別物（beneficiaries があればそちらが優先される）。
-        #   「【SMH】連動買い完了: QQQ」と出て「SMH の話なのに QQQ を買った」と
-        #   読めていた（認定サポーターの指摘）。両方を名指しする。
+        _take_order_fails(exec_targets, side="BUY")
         log.info(f"{tag} ✅ 連動買い完了: {ordered_str}"
                  f"（カテゴリ {category} の対応銘柄={trigger_sym}／発注先={ordered_str}）")
         _threadsafe_future(asyncio.to_thread(
@@ -19598,8 +17459,7 @@ async def process_headlines(
             f"--- ニュース ---\n" + "\n".join(f"・{t}" for t in texts[:3])
         ))
     elif _skipped_select_v1:
-        # ★ v3.9.169: 選抜で見送った回に「余力不足」と誤記録しない。
-        #   他の理由と混在する回もあるので、全件一致ではなく併記する。
+        _take_order_fails(exec_targets, side="BUY")
         _other = [x for x in exec_targets if x not in _skipped_select_v1]
         log.info(
             f"{tag} → 新規買いなし（ニュース選抜v1で見送り: "
@@ -19608,8 +17468,12 @@ async def process_headlines(
             + "）"
         )
     else:
-        log.info(f"{tag} → 発注試行したが全銘柄スキップ（余力不足または価格取得失敗・発注先={','.join(exec_targets) or '-'}）")
-    # ★ v3.9.169: 見送りの記録はロックの外・全銘柄の処理が終わってから出す。
+        _fail_why = _take_order_fails(exec_targets, side="BUY")
+        log.info(
+            f"{tag} → 発注試行したが全銘柄スキップ（"
+            + (_fail_why or "余力不足または価格取得失敗")
+            + f"・発注先={','.join(exec_targets) or '-'}）"
+        )
     _news_select_v1_flush_skips(
         _skipped_select_v1, category=category, score=score, confidence=confidence,
         texts=texts, beneficiaries=beneficiaries, victims=victims, tag=tag,
@@ -19642,7 +17506,6 @@ def _fetch_finnhub() -> list[SimpleNamespace]:
                 article_id = f"finnhub-{item.get('id', item.get('datetime', ''))}"
                 headline   = item.get("headline", "").strip()
                 if headline:
-                    # ★ v2.99: source_detail に元媒体名を保持 (Reuters / Bloomberg / Yahoo 等)
                     _detail = (item.get("source", "") or "").strip()
                     results.append(SimpleNamespace(
                         articleId=article_id, headline=headline,
@@ -19684,7 +17547,6 @@ def _fetch_stock_news_alpaca_batch(symbols: List[str], days: int = 7) -> Dict[st
     空dict: APIキー未設定 / エラー時
     """
     import time as _time
-    # ★ v3.9.42: サニタイズ済みのモジュールレベル定数を使用
     alpaca_key    = ALPACA_API_KEY_ID
     alpaca_secret = ALPACA_API_SECRET_KEY
     if not alpaca_key or not alpaca_secret:
@@ -19780,7 +17642,7 @@ def _fetch_stock_news(symbol: str) -> List[SimpleNamespace]:
                     articleId = article_id,
                     headline  = headline,
                     source    = f"Finnhub({symbol})",
-                    source_detail = (item.get("source", "") or "").strip(),  # ★ v2.99
+                    source_detail = (item.get("source", "") or "").strip(),
                     symbol    = symbol,
                 ))
             return results
@@ -19819,7 +17681,6 @@ async def process_stock_news(
         for art in articles:
             state.is_new_article(art.articleId)
         return
-    # ── ★ v3.9.56: セッション切替直後のクワイエットウィンドウ ──────────────
     # 5/28 GOOGL Insider Trading 記事のような OVN 中蓄積ニュースが PREMARKET
     # 切替の瞬間に発注されることを防ぐ。SESSION_CHANGE_QUIET_SEC 秒間は既読
     # 登録のみで発注スキップ。
@@ -19855,14 +17716,6 @@ async def process_stock_news(
     # bypass_filter=True（決算監視経由）はheadline prefixフィルタをスキップ。
     # process_headlinesが先読みしてprefixを"既読"にしても個別株AIを止めない。
     if already_deduped:
-        # ★ v3.9.154: 呼び出し元が同じ記事で既に is_new_article を通している場合だけ、
-        #   ここでの articleId 判定を飛ばす（認定サポーターの指摘§1）。
-        #   is_new_article は「判定と同時に既読へ記録する」副作用を持つため、
-        #   直行ルート（process_headlines →ここ）では必ず False になり、
-        #   個別株AIに一度も到達していなかった。
-        #   ★ 決算監視ループ（:17023/:17038）は毎回フィードから取り直すため
-        #   この引数は渡さない。渡すと同じ記事を毎ポーリング再判定してしまう
-        #   （Codexレビュー指摘・重複発注の恐れ）。
         new = list(articles)
     elif bypass_filter:
         new = [a for a in articles if state.is_new_article(a.articleId)]
@@ -19872,7 +17725,6 @@ async def process_stock_news(
     if not new:
         return
 
-    # ── ★ v3.8.4: 個別株モードにもノイズフィルタを適用 (AI コスト削減) ──────
     # process_headlines と同じ高信頼度ノイズパターンで pre-filter する。
     # 個別株モードでもアナリスト目標株価変更/transcript/個人金融などは常に score=0
     # を返すため、AI 呼出を節約できる。
@@ -19892,19 +17744,12 @@ async def process_stock_news(
     texts = [a.headline for a in new]
     log.info(f"{tag} [個別株ニュース] 新着{len(texts)}件 → 重複確認のうえAI判定")
     for a in new:
-        # ★ v2.99: ニュースソース二段表示
         log.info(f"  ・[{_format_news_source(a)}] {a.headline}")
 
     # ニュースソースをarticleから自動検出（v2.85）
     # _fetch_stock_news_alpaca_batch は source=f"Alpaca({sym})"
     # _fetch_stock_news（Finnhub）      は source=f"Finnhub({symbol})"
     # を各記事に付与しているため、呼び出し元を変更せずに正確なソースを記録できる。
-    # ── ★ v3.9.8/v3.9.153: 正規化ヘッドライン重複チェック (個別株モード) ────────
-    # ★ v3.9.153 (B-1/B-2・認定サポーターNの指摘):
-    #   ①scope=銘柄で判定する。通常News（市場全体への影響を判定）と既読を共有すると、
-    #     先着する通常News側の印で個別株側が全滅していた（AI への問いが違う）。
-    #   ②バッチ先頭1件ではなく1件ずつ判定する。先頭が既出なだけでバッチ全体を
-    #     捨てると、2件目以降の未見記事が失われる。
     if texts:
         _fresh_arts, _fresh_texts = [], []
         for _art, _txt in zip(new, texts):
@@ -19916,10 +17761,6 @@ async def process_stock_news(
                 )
                 state.mark_headline_seen(_txt, scope=symbol)
                 continue
-            # ★ v3.9.153b: 印は判定と同時に付ける（Codexレビュー指摘）。
-            #   AI 呼出（await）の後に付けると、同じ正規化見出しを持つ別記事の
-            #   タスクが await の間に「未見」と判定し、二重に AI へ回る。
-            #   このループ内には await が無いので、ここで付ければ原子的。
             state.mark_headline_seen(_txt, scope=symbol)
             _fresh_arts.append(_art)
             _fresh_texts.append(_txt)
@@ -19927,8 +17768,6 @@ async def process_stock_news(
             return
         new, texts = _fresh_arts, _fresh_texts
 
-    # ★ v3.9.153b: ソースの特定は dedup の後で行う（Codexレビュー指摘）。
-    #   前に置くと、重複で除かれた先頭記事のソースが残りの記事に付いてしまう。
     _detected_source = (
         new[0].source
         if new and hasattr(new[0], "source") and new[0].source
@@ -19939,10 +17778,6 @@ async def process_stock_news(
     # 市場全体モードを使うとGS→"Big Tech好調"のような誤判定が起きるため
     # 「このニュースは {symbol} に直接関係するか」を厳密に判定させる
     # v1.3.0: target_symbol で個別株モードを指定。SYSTEM_PROMPT は統合版で共通。
-    # ★ v3.9.153b: 既読の印は判定時に付与済み（reserve）。AI 呼出が例外で落ちたら
-    #   印を戻す（Codexレビュー指摘）。戻さないと、一時的な失敗で同じ見出しが
-    #   60分間ずっと再判定されない。なお API エラー・解析エラーは analyze_news が
-    #   中で握って中立を返すため、ここに来る例外は稀（Cancel・想定外のみ）。
     try:
         result = await analyze_news(client, texts, symbol, target_symbol=symbol)
     except BaseException:
@@ -19957,7 +17792,6 @@ async def process_stock_news(
     reason     = result.get("reason", "")
     horizon    = result.get("horizon", "unknown")
 
-    # ── ★ v3.9.49: 個別株のソース別ディスカウントを撤去 ─────────────────────
     # 旧 v2.93 〜 v3.9.48 までは Finnhub/Alpaca 個別株に対して confidence を
     # 機械的に減衰させていた:
     #   Alpaca: × 0.95 (5%減)
@@ -19979,7 +17813,6 @@ async def process_stock_news(
 
     if score == 0:
         log.info(f"{tag} [個別株] 中立 → 何もしない")
-        # ★ v3.9.7: 個別株 META 倒錯/疑問形で score を 0 に書き換えたケースを観察ログ記録
         _reason_full = (result.get("reason") or "")
         if "METAネガ語幹" in _reason_full:
             _log_observation(
@@ -20000,15 +17833,11 @@ async def process_stock_news(
     if thresh_override is not None:
         _thresh = thresh_override
     elif symbol in _all_earnings_set:
-        # ★ v3.9.156: 決算リスト掲載銘柄がどの経路から来ても、決算しきい値と
-        #   セッション別しきい値の厳しい方で判定する（5日分レビュー）。
-        #   決算機構は明示の thresh_override（既定0.80）を渡すので従来どおり。
         _thresh = max(EARNINGS_CONFIDENCE, get_confidence_threshold())
     else:
         _thresh = get_confidence_threshold()
     if confidence < _thresh:
         log.info(f"{tag} [個別株] confidence={confidence:.4f} < {_thresh:.3f} → 発注見送り")
-        # ★ v3.9.7: 個別株 confidence 閾値ブロックを観察ログ記録
         _side = "BUY" if score == 1 else "SELL_SHORT"
         _log_observation(
             symbol=symbol, side=_side, confidence=confidence, score=score,
@@ -20018,7 +17847,6 @@ async def process_stock_news(
         )
         return
 
-    # ── ★ v2.99: 個別株クールダウンチェック ───────────────────────────────────
     # 同じ銘柄に対する直近の発注から COOLDOWN_STOCK_MIN 分以内なら新規発注をスキップ。
     # 同じニュースが複数フィードから繰り返し流れても誤発注を抑制する。
     _cool, _cool_elapsed = _is_stock_cooldown(symbol)
@@ -20029,7 +17857,6 @@ async def process_stock_news(
             f"{_cool_elapsed:.1f}分前に発注済 → あと{_cool_remaining:.1f}分待機 "
             f"(score={score} confidence={confidence:.4f} スキップ)"
         )
-        # ★ v3.9.193: 観察ログに残す（認定サポーターの指摘・記録されない4種の1つ）
         _log_observation(
             symbol=symbol, side=("BUY" if score == 1 else "SELL_SHORT"),
             confidence=confidence, score=score, category="STOCK", headlines=texts,
@@ -20039,9 +17866,8 @@ async def process_stock_news(
         )
         return
 
-    await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+    await asyncio.to_thread(sync_positions, trd_env)
 
-    # ★ v2.86: 銘柄単位ロックで race 防止（process_headlines との並列発注抑止）
     async with _get_sym_lock(symbol):
         if score == 1:
             # ポジティブ → 直接BUY
@@ -20050,9 +17876,9 @@ async def process_stock_news(
                       trigger=symbol, reason=reason,
                       category="STOCK", news_source=_detected_source,
                       headlines=texts[:3],
-                      beneficiaries=[symbol], victims=[])  # ★ v2.95
+                      beneficiaries=[symbol], victims=[])
             if _ok_buy:
-                _mark_stock_order(symbol)  # ★ v2.99: クールダウンタイマー開始
+                _mark_stock_order(symbol)
 
         elif score == -1:
             # ネガティブシグナル
@@ -20068,9 +17894,9 @@ async def process_stock_news(
                             trigger=symbol, reason=reason,
                             category="STOCK", news_source=f"Earnings({symbol})",
                             headlines=texts[:3],
-                            beneficiaries=[], victims=[symbol])  # ★ v2.95
+                            beneficiaries=[], victims=[symbol])
                 if _ok_short:
-                    _mark_stock_order(symbol)  # ★ v2.99
+                    _mark_stock_order(symbol)
             else:
                 # 通常の個別株: ネガティブ → SHORT（貸株確認付き）
                 log.info(f"{tag} [個別株] ネガティブシグナル → SHORT（貸株確認）")
@@ -20082,9 +17908,9 @@ async def process_stock_news(
                             trigger=symbol, reason=reason,
                             category="STOCK", news_source=_detected_source,
                             headlines=texts[:3],
-                            beneficiaries=[], victims=[symbol])  # ★ v2.95
+                            beneficiaries=[], victims=[symbol])
                 if _ok_short:
-                    _mark_stock_order(symbol)  # ★ v2.99
+                    _mark_stock_order(symbol)
 
 
 # ── 個別株ニュース監視ループ（既存ループと並列動作） ────────────────────────────────────────────────
@@ -20191,8 +18017,6 @@ async def _earnings_momentum_check(
     """
     global _earnings_momentum_in_progress
     tag = f"【{sym}】"
-    # ★ v3.9.159: 複数記事の一括判定に対応（2秒ポーリング委譲用）。単一記事の
-    #   呼び出し（WebSocket側）は従来どおり動く。
     earn_arts = earn_art if isinstance(earn_art, list) else [earn_art]
     if not earn_arts:
         return
@@ -20201,13 +18025,6 @@ async def _earnings_momentum_check(
         if not wait_if_busy:
             log.info(f"[決算モメンタム] {tag} すでに監視中 → スキップ")
             return
-        # ★ v3.9.159: ポーリング委譲では記事のIDを消費済みのため、ここで捨てると
-        #   フェッチ層の既読化により二度と回収できない（新規Claudeレビュアーの指摘）。
-        #   監視終了を待ってから判定する（in_progress は try/finally で必ず解放される
-        #   ため有限。上限は保険）。
-        # ★ v3.9.159b: 120秒では実運用の連鎖（30秒待機＋AI判定＋発注リトライが複数本）で
-        #   容易に超過し、消費済み記事が失われる（レビュー指摘）。in_progress は
-        #   try/finally で必ず解放されるため待機は有限——上限は純粋な保険として大きく取る。
         _busy_deadline = time.monotonic() + max(900, EARNINGS_MOMENTUM_WAIT_SEC * 2 + 300)
         while _earnings_momentum_in_progress.get(sym):
             if time.monotonic() > _busy_deadline:
@@ -20217,7 +18034,6 @@ async def _earnings_momentum_check(
     _earnings_momentum_in_progress[sym] = True
 
     try:
-        # ★ v3.9.159b: 窓の終端が近い委譲は待機を省く（override=0）。
         _wait_sec = (EARNINGS_MOMENTUM_WAIT_SEC if wait_sec_override is None
                      else int(wait_sec_override))
         # モメンタム待機なし（EARNINGS_MOMENTUM_WAIT_SEC=0 または override=0）→ 即AI判定
@@ -20230,7 +18046,7 @@ async def _earnings_momentum_check(
             return
 
         # ── 検知時点の株価を記録 ────────────────────────────────────────────
-        _q_before  = await asyncio.to_thread(get_quote, sym)   # ★ v3.9.159b: ループを塞がない
+        _q_before  = await asyncio.to_thread(get_quote, sym)
         price_before = _q_before.get("last") or _q_before.get("bid") or 0.0
         if price_before <= 0:
             log.warning(
@@ -20259,7 +18075,7 @@ async def _earnings_momentum_check(
         await asyncio.sleep(_wait_sec)
 
         # ── 待機後の株価を取得 ─────────────────────────────────────────────
-        _q_after   = await asyncio.to_thread(get_quote, sym)   # ★ v3.9.159b: ループを塞がない
+        _q_after   = await asyncio.to_thread(get_quote, sym)
         price_after = _q_after.get("last") or _q_after.get("bid") or 0.0
         if price_after <= 0:
             log.warning(f"[決算モメンタム] {tag} 待機後の株価取得失敗 → スキップ")
@@ -20316,8 +18132,8 @@ async def _earnings_momentum_check(
         _earnings_momentum_in_progress[sym] = False
 # ─────────────────────────────────────────────────────────────────────────────
 def _earn_window_remaining_sec(sym: str):
-    """★ v3.9.159b: 決算監視ウィンドウ（PRE 04:00-09:30 / AFTER 16:00-20:00 ET）の
-    残り秒数。対象外なら None。窓の終端間際は待機を省いて即時判定するために使う。"""
+    """
+    """
     try:
         _now = datetime.datetime.now(ZoneInfo("America/New_York"))
         _secs = _now.hour * 3600 + _now.minute * 60 + _now.second
@@ -20332,15 +18148,11 @@ def _earn_window_remaining_sec(sym: str):
 
 
 _EARN_PENDING_MAX = 5      # 銘柄ごとの保留上限（AIが実際に見るのは先頭5件のため・新しい方を残す）
-_EARN_PENDING_TTL_SEC = 600  # ★ v3.9.159b: 保留の鮮度上限。窓の終端で残った記事が翌日の
-                             #   窓で「新着」として委譲される事故（3レーン一致の指摘——
-                             #   前日の決算見出しで発注し得る・WS側と別IDのため二重判定
-                             #   にもなり得る）を根治する。超過分は破棄してログに残す。
+_EARN_PENDING_TTL_SEC = 600
 
 
 def _poll_dispatch_earn(client, trd_env, sym: str, articles: list, pending: dict) -> None:
-    """★ v3.9.159: 2秒ポーリングの記事を保留バッファへ集約し、監視が空いていれば
-    未消費分を一括で「30秒待機→方向確認」（_earnings_momentum_check）へ委譲する。
+    """
 
     - 監視中は消費せずバッファに保持（フェッチ層の既読化で再取得できないため、
       ここで捨てると永久消失する）
@@ -20374,15 +18186,9 @@ def _poll_dispatch_earn(client, trd_env, sym: str, articles: list, pending: dict
     if not _bucket or _earnings_momentum_in_progress.get(sym):
         return
     # 新しい順のラッパー列（AIは先頭5件を見る）。pop はスケジュール成功後に行う
-    #   （★ v3.9.159b: _threadsafe_future がループ停止間際に失敗すると coroutine ごと
-    #   閉じられ、先に pop していると記事が消える——レビュー指摘）。
     _items = sorted(_bucket.items(), key=lambda kv: kv[1]["ts"], reverse=True)
     _wraps, _dispatch_keys, _consume_keys = [], [], []
     for _oid, _ent in _items:
-        # ★ v3.9.159c: ここでは「非破壊の既読確認」だけを行う（Codex指摘——
-        #   is_new_article は判定と同時に既読登録するため、スケジュール失敗の
-        #   再試行時に自分の登録を「他経路で判定済み」と誤読して破棄していた）。
-        #   実際の消費（既読登録）はスケジュール成功後に行う。
         _seen_at = state.seen_articles.get(_oid)
         if (_seen_at is not None
                 and (datetime.datetime.now() - _seen_at).total_seconds() < NEWS_DEDUP_SEC):
@@ -20401,8 +18207,6 @@ def _poll_dispatch_earn(client, trd_env, sym: str, articles: list, pending: dict
         for _k in _dispatch_keys:
             _bucket.pop(_k, None)
         return
-    # ★ v3.9.159b: 窓の終端が近いときは待機を省いて即時判定（旧挙動）。
-    #   30秒待つとセッションゲートで捨てられ、消費済み記事だけが残る（レビュー指摘）。
     _wait_sec = None
     _rem = _earn_window_remaining_sec(sym)
     if _rem is not None and _rem < EARNINGS_MOMENTUM_WAIT_SEC + 15:
@@ -20420,7 +18224,7 @@ def _poll_dispatch_earn(client, trd_env, sym: str, articles: list, pending: dict
         log.warning(f"[決算監視] {sym}: 委譲のスケジュールに失敗 → 保留のまま次の周回で再試行します")
         return
     for _k in _consume_keys:
-        state.is_new_article(_k)   # ★ v3.9.159c: 消費（既読登録）は成功後
+        state.is_new_article(_k)
     for _k in _dispatch_keys:
         _bucket.pop(_k, None)
 
@@ -20455,11 +18259,6 @@ async def earnings_monitor_loop(
     if not _all_earn:
         log.info("[決算監視] EARNINGS_PRE/AFTER 未設定 → スキップ")
         return
-    # ★ v3.9.159: 銘柄ごとの保留バッファ（{sym: {orig_id: article}}）。
-    #   フェッチ層は取得時点で記事を既読化するため（_STOCK_NEWS_CACHE）、
-    #   「見送って次の周回で拾う」は成立しない（新規Claudeレビュアーの指摘——
-    #   v3.9.158 初版は監視中の見送り・2件目以降の記事が無音で永久消失していた）。
-    #   取得した記事はまずここへ貯め、監視が空いたら未消費分を一括で委譲する。
     _earn_pending: Dict[str, dict] = {}
 
     _alpaca_key = ALPACA_API_KEY_ID  # v3.9.42: サニタイズ済み
@@ -20580,9 +18379,8 @@ async def process_dynamic_stock(
         )
         return
 
-    await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+    await asyncio.to_thread(sync_positions, trd_env)
 
-    # ★ v2.86: 銘柄単位ロックで race 防止
     async with _get_sym_lock(symbol):
         # ── 1銘柄あたりのポジション上限チェック・発注額計算 ─────────────────────
         # DYNAMIC_STOCKS_MAX_POSITION_USD > 0 の場合:
@@ -20624,7 +18422,7 @@ async def process_dynamic_stock(
                 category="STOCK", news_source="Alpaca-Dynamic",
                 headlines=headlines[:3],
                 qty=_dyn_qty,
-                beneficiaries=[symbol], victims=[],  # ★ v2.95
+                beneficiaries=[symbol], victims=[],
             )
         elif score == -1:
             # ショート: ロングが残っていれば先に決済
@@ -20653,7 +18451,7 @@ async def process_dynamic_stock(
                             category="STOCK", news_source="Alpaca-Dynamic",
                             headlines=headlines[:3],
                             qty=_dyn_qty_s,
-                            beneficiaries=[], victims=[symbol])  # ★ v2.95
+                            beneficiaries=[], victims=[symbol])
 
 
 async def alpaca_news_loop(
@@ -20672,19 +18470,15 @@ async def alpaca_news_loop(
 
     _ALPACA_WS_URL = "wss://stream.data.alpaca.markets/v1beta1/news"
     _RECONNECT_WAIT = 10   # 切断時の再接続待機秒数 (通常切断・接続応答異常)
-    # ★ v3.9.11: 認証失敗時の指数バックオフ設定
     # 5/11 ログで「同じ Alpaca キーを Mac/Windows で同時使用 → connection limit
     # exceeded (code 406)」が 738 件発生。固定間隔 10秒で再接続を試みていたため
     # ログ汚染が膨大に。指数バックオフ (10s → 20s → 40s ... 最大 10分) で抑制。
     # 認証成功時は _auth_fail_count を 0 にリセット。
     _AUTH_BACKOFF_BASE_SEC = 10
     _AUTH_BACKOFF_MAX_SEC = 600
-    # ★ v3.9.89: 認証失敗が連続でこの回数に達したら、このセッションのAlpaca News受信を停止する。
-    #   402(無効/未購読キー)・406(キー併用)は復旧見込みが薄く、無限再接続はログ汚染の最大要因。
-    #   Alpacaはニュース源の1つで、停止してもRSS/Finnhubでニュース取得は継続する。再開はBot再起動。
     _AUTH_FAIL_GIVEUP = 20
     _auth_fail_count = 0
-    _last_auth_log_at_local: Optional[datetime.datetime] = None  # ★ v3.9.63: 認証失敗ログ間引き用
+    _last_auth_log_at_local: Optional[datetime.datetime] = None
     _seen_alpaca: set = set()
 
     log.info("=== Alpaca News WebSocket ループ開始（Benzingaリアルタイム）===")
@@ -20692,16 +18486,11 @@ async def alpaca_news_loop(
     while True:
         # market_open_event が clear されている間は待機
         await market_open_event.wait()
-        # ★ v3.9.184: 各周回は「未接続」から始める。前の周回の値が残ると、
-        #   本物の切断を「接続は生きていて静かなだけ」と誤って軽く扱う。
         _alpaca_news_health["connected_at"] = None
-        # ★ v3.9.186b: 試行の開始時刻を更新する。市場が閉じている間の滞留を
-        #   持ち越すと、再開の1回目でいきなり 🚨 が出る。
         _alpaca_news_health["started_at"] = datetime.datetime.now()
 
         try:
             import websockets
-            # ★ v3.9.21: websockets ライブラリのバージョン互換性対応
             # 5/16 受講生環境で 21 件発生していたエラー:
             #   "BaseEventLoop.create_connection() got an unexpected keyword
             #    argument 'additional_headers'"
@@ -20741,7 +18530,6 @@ async def alpaca_news_loop(
                 raw = await ws.recv()
                 auth_msg = json.loads(raw)
                 if not (isinstance(auth_msg, list) and auth_msg[0].get("T") == "success"):
-                    # ★ v3.9.11: 認証失敗時の指数バックオフ
                     # connection limit exceeded (code 406) や auth failed (code 402) を
                     # 数秒間隔で再試行するとログ膨張と Alpaca サーバへの負荷増を招くため、
                     # 10秒 → 20秒 → 40秒 ... 最大 10分 で間隔を倍々に延ばす。
@@ -20750,13 +18538,11 @@ async def alpaca_news_loop(
                         _AUTH_BACKOFF_BASE_SEC * (2 ** (_auth_fail_count - 1)),
                         _AUTH_BACKOFF_MAX_SEC
                     )
-                    # ★ v3.9.63: connection limit (code 406 = 同一キーを複数 PC で同時使用)
                     # を専用判定し、専用の案内文を出す。
                     _auth_str = str(auth_msg).lower()
                     _is_conn_limit = ("406" in _auth_str
                                       or "connection limit" in _auth_str
                                       or "limit exceeded" in _auth_str)
-                    # ★ v3.9.63: ログ間引き。毎リトライ出すと 1 日数百件に膨らむため
                     # (5/25-6/1 で 757 件確認)、初回 + 2 回目のみ即時、以降は 5 分に 1 回。
                     _now_auth = datetime.datetime.now()
                     _should_log = (
@@ -20782,34 +18568,25 @@ async def alpaca_news_loop(
                                 f"(同じ Alpaca キーを複数 PC で同時使用していないかご確認ください"
                                 f"・5 分ごとに間引き表示)"
                             )
-                    # ★ v3.9.31: 健全性状態を記録 (health_warning_loop が参照)
                     _alpaca_news_health["auth_fail_count"] = _auth_fail_count
                     _alpaca_news_health["last_error"] = f"認証失敗 {auth_msg}"
-                    # ★ v3.9.89: 連続失敗が上限に達したら Alpaca News を停止（無限再接続のログ汚染を回避）。
-                    #   RSS/Finnhub でニュース取得は継続。再開は Bot 再起動。
                     if _auth_fail_count >= _AUTH_FAIL_GIVEUP:
                         log.error(
                             f"[Alpaca News] 認証失敗が {_auth_fail_count} 回連続 → "
                             f"このセッションの Alpaca News 受信を停止します（RSS/Finnhub でニュースは継続）。"
                             f"APIキー/購読/キー併用(406)を確認のうえ、再開は Bot 再起動。"
                         )
-                        # ★ v3.9.189d: 以前はここで health["stopped"]=True も立てていたが、
-                        #   読み手がどこにも無かったので消した（last_warning_at と同じ）。
-                        #   停止したことは last_error と、上限に達したまま残る
-                        #   auth_fail_count（判定が「本物の障害」を出し続ける根拠）で伝わる。
                         _alpaca_news_health["last_error"] = f"認証失敗{_auth_fail_count}回で停止"
                         return
                     await asyncio.sleep(_backoff_sec)
                     continue
 
-                # ★ v3.9.11: 認証成功 → 失敗カウンタリセット
                 if _auth_fail_count > 0:
                     log.info(
                         f"[Alpaca News] ✅ 認証復旧 ({_auth_fail_count}回失敗の後) "
                         f"→ バックオフカウンタをリセット"
                     )
                     _auth_fail_count = 0
-                # ★ v3.9.31: 認証成功 → 健全性状態を更新
                 _alpaca_news_health["auth_fail_count"] = 0
                 _alpaca_news_health["last_success_at"] = datetime.datetime.now()
                 _alpaca_news_health["last_error"] = ""
@@ -20818,7 +18595,6 @@ async def alpaca_news_loop(
                 await ws.send(json.dumps({"action": "subscribe", "news": ["*"]}))
                 raw = await ws.recv()
                 _sub_resp = json.loads(raw)
-                # ★ v2.90: "already authenticated" レスポンスは実害なし
                 # （認証済み状態でのサーバ通知）のため、ログレベルを DEBUG に下げる。
                 # 受講生が WARNING/エラーと誤認しないようにするため。
                 # それ以外のレスポンスは従来通り INFO で表示。
@@ -20836,24 +18612,12 @@ async def alpaca_news_loop(
                     log.info(f"[Alpaca News] 購読開始: {_sub_resp}")
 
                 log.info("[Alpaca News] ✅ WebSocket接続・認証・購読完了（Benzingaリアルタイム受信中）")
-                # ★ v3.9.184: ここから先は接続が生きている。受信が途切れても
-                #   「切断」ではないことを health_warning_loop へ伝える。
                 _alpaca_news_health["connected_at"] = datetime.datetime.now()
 
                 # メッセージ受信ループ
                 async for raw_msg in ws:
-                    # ★ v3.9.39: メッセージを 1 件でも受信できた = WebSocket 接続・
-                    #   購読が生きている証拠。受信のたびに最終正常受信時刻を更新する。
-                    #   旧実装は認証成功時 (12146 行) にしか last_success_at を
-                    #   更新せず、接続が 20 分以上続くと正常受信中でも
-                    #   health_warning_loop が「Alpaca News 接続不全」を誤発火して
-                    #   いた (5/22 ログで確認: 22:24:04 にニュース受信 →
-                    #   22:24:05 に誤警告)。
                     _alpaca_news_health["last_success_at"] = datetime.datetime.now()
                     _alpaca_news_health["last_error"] = ""
-                    # ★ v3.9.185: 受信できた＝この接続は生きている。フラッピングの
-                    #   カウンタを戻す（戻さないと、一度荒れた環境が復旧しても
-                    #   静かな時間帯のたびに 🚨 が出続ける）。
                     _alpaca_news_health["reconnects"] = 0
                     # market_open_event がクリアされたら受信は続けるが AI判定はスキップ
                     articles = json.loads(raw_msg)
@@ -20872,7 +18636,6 @@ async def alpaca_news_loop(
                         # seen_alpacaが肥大化しないよう最大5000件に制限
                         if len(_seen_alpaca) > 5000:
                             _seen_alpaca.clear()
-                        # ★ v2.99: source_detail に元媒体名 (Benzinga 等) を保持
                         _alpaca_detail = (art.get("source", "") or "").strip()
                         new_items.append(SimpleNamespace(
                             articleId=article_id,
@@ -20918,7 +18681,7 @@ async def alpaca_news_loop(
                                             articleId=f"earn-{_art_raw.get('id','')}-{_sym}",
                                             headline=_art_raw.get("headline", ""),
                                             source="Alpaca-Earnings",
-                                            source_detail=(_art_raw.get("source", "") or "").strip(),  # ★ v2.99
+                                            source_detail=(_art_raw.get("source", "") or "").strip(),
                                         )
                                         log.info(
                                             f"[決算監視] 🔔 {_sym} のニュース検知 "
@@ -20928,7 +18691,7 @@ async def alpaca_news_loop(
                                         _threadsafe_future(
                                             _earnings_momentum_check(
                                                 client, trd_env, _sym, _earn_art,
-                                                wait_if_busy=True,   # ★ v3.9.159b: busy時に記事を捨てない
+                                                wait_if_busy=True,
                                             )
                                         )
                     # ── 通常の SPY/QQQ ルーティング ──────────────────────────
@@ -20950,17 +18713,13 @@ async def alpaca_news_loop(
                                 )
                     log.info(
                         f"[Alpaca News] 新着 {len(new_items)}件 → AI判定..."
-                        # ★ v2.99: ニュースソース二段表示 [alpaca:benzinga] 等
                         + "".join(f"\n  ・[{_format_news_source(a)}] {a.headline}" for a in new_items[:5])
                     )
                     await process_headlines(None, client, new_items, trd_env)
 
-                # ★ v3.9.184: 受信ループを抜けた＝この接続は終わっている。
-                #   例外を伴わない正常クローズもここを通る。
                 _alpaca_news_health["connected_at"] = None
 
         except ImportError:
-            # ★ v3.9.29: 5/20 集計で 利用者J / 利用者I で 4 件発生。
             # 旧版は return で永久スキップ → 受講生が気づかず Alpaca News が来ない状態継続。
             # 新版は 5 分ごとに目立つ警告を継続表示し、インストール後の自動復旧も可能に。
             _RED    = "\033[91m"
@@ -20988,25 +18747,21 @@ async def alpaca_news_loop(
             continue
         except Exception as e:
             log.warning(f"[Alpaca News] 接続エラー・再接続待機 ({_RECONNECT_WAIT}秒): {_mask_secrets(e)}")
-            # ★ v3.9.31: 接続エラーも健全性状態に記録 (health_warning_loop が参照)
             _alpaca_news_health["last_error"] = f"接続エラー {_mask_secrets(e)}"[:120]
             if _alpaca_news_health.get("connected_at") is not None:
-                # ★ v3.9.185: 「つながっていたのに切れた」回だけ数える
-                #   （接続前の失敗を数えるとフラッピングと区別できない）。
                 _alpaca_news_health["reconnects"] = int(
                     _alpaca_news_health.get("reconnects", 0)) + 1
-            _alpaca_news_health["connected_at"] = None   # ★ v3.9.184: 切れた
+            _alpaca_news_health["connected_at"] = None
             await asyncio.sleep(_RECONNECT_WAIT)
 
 
-# ── ★ v3.9.31: 重大な健全性問題の 5 分おき警告ループ ──────────────────────────
 # 初回しか目立たず WARNING に埋もれてしまう 2 つの重大問題を、5 分間隔で端末に
 # 赤字で再表示する。受講生が「気づかないまま放置」する事態を防ぐ。
 #   ① Anthropic クレジット残高ゼロ (AI 判定が全件停止)
 #   ② Alpaca News 接続不全 (ニュースの約半分が来ない状態)
 async def _heartbeat_beat_loop() -> None:
-    """★ v3.9.131: 20秒ごとに鼓動を刻む。イベントループが凍結すると鼓動が止まり、
-    独立OSスレッドの監視(_heartbeat_watchdog_thread)が検知して警告する。"""
+    """
+    """
     global _last_heartbeat_mono
     while True:
         _last_heartbeat_mono = time.monotonic()
@@ -21014,11 +18769,8 @@ async def _heartbeat_beat_loop() -> None:
 
 
 def _hb_dispatch(msg: str, is_error: bool = True) -> None:
-    """★ v3.9.131: 警告/復帰の送信は使い捨てスレッドで行う（Codexレビュー対応）。
-    send_discord_message は HTTP 送信後に logging を呼ぶため、logging ロックが凍結に
-    巻き込まれた病的ケースでは送信スレッドがそこで固まり得る。使い捨てスレッドに
-    分離することで、監視本体（_heartbeat_watchdog_thread）は絶対に塞がれない。
-    ※HTTP POST は内部 logging より先に実行されるため、固まっても Discord 自体は届く。"""
+    """
+    """
     def _send():
         try:
             send_discord_message(f"[Bot] {msg}")
@@ -21050,18 +18802,8 @@ def _hb_print(text: str) -> None:
 
 
 def _heartbeat_watchdog_thread() -> None:
-    """★ v3.9.131: 独立OSスレッド。イベントループ凍結(型B)を『最後の鼓動からの経過』で検知。
-    asyncio が止まっても OS スレッドは動くため「通知ゼロ(型B)」を破れる。通知のみ・自動再起動なし。
-    ・Discord/log は使い捨てスレッド（_hb_dispatch）へ、端末表示も使い捨てスレッド
-      （_hb_print）へ分離（監視本体はどんな病的状態でも塞がれない）。
-      ★ v3.9.191: 以前は print を監視スレッドで直接行い「即時に出す」としていたが、
-        標準出力が塞がれた凍結では監視スレッド自身がそこで止まる（認定サポーターの実測・
-        配布前レビュー）。Discord を先に、画面は別スレッドへ。
-    ・鼓動が再開したら「約N分の無応答があった」と凍結時間つきで復帰を1回通知する
-      （凍結中の警告がネットワーク断で届かなかった場合でも、復帰通知だけで全容が伝わる）。
-    ・monotonic のスリープ横断はOS依存（macOS=スリープ除外/Windows=包含）。Windows では
-      長いスリープ復帰直後に「応答なし→復帰」のペア通知が1回出ることがあるが、
-      実質「Botが止まっていた」事実の通知であり許容（既知の挙動）。"""
+    """
+      """
     global _hb_last_alert_mono, _hb_alerted, _hb_freeze_start_mono
     _timeout = HEARTBEAT_TIMEOUT_MIN * 60
     while True:
@@ -21077,11 +18819,6 @@ def _heartbeat_watchdog_thread() -> None:
                     _mins = int(stale // 60)
                     msg = (f"🚨 Bot応答なし: 約{_mins}分間、内部の鼓動(ログ)が更新されていません。"
                            f"イベントループ凍結／OpenD無応答の可能性。OpenDの起動・接続とネットワークをご確認ください。")
-                    # ★ v3.9.191: **Discord を先に、画面を後に**（認定サポーターの指摘）。
-                    #   標準出力が塞がれた凍結では、手前の print で止まり _hb_dispatch に
-                    #   届かず、検知は済んでいたのに 8時間25分 Discord がゼロだった。
-                    #   _hb_dispatch は使い捨てスレッドで POST → logging の順なので、
-                    #   出力が塞がっていても Discord 自体は届く。
                     _hb_dispatch(msg, is_error=True)
                     _hb_print(f"\033[91m\033[1m[HEARTBEAT] {msg}\033[0m")
             elif _hb_alerted:
@@ -21095,22 +18832,19 @@ def _heartbeat_watchdog_thread() -> None:
                 rmsg = (f"✅ Bot応答が復帰しました（約{_fmin}分の無応答がありました）。"
                         f"時間切れを超過した建玉があれば直ちに決済されます。"
                         f"ポジション・注文状態を念のためご確認ください。")
-                _hb_dispatch(rmsg, is_error=False)   # ★ v3.9.191: 同上・Discord を先に
+                _hb_dispatch(rmsg, is_error=False)
                 _hb_print(f"\033[92m[HEARTBEAT] {rmsg}\033[0m")
         except Exception:
             pass
 
 
-# ── ★ v3.9.136: 夜間持ち越し（OVN）の実装 ──────────────────────────────────
 def _ovn_state_path() -> str:
-    """★ v3.9.145: 環境ごとにファイルを分ける（認定サポーターの指摘 A-4）。
+    """
 
     旧実装は単一パスで、REAL と DEMO のプロセスが同じ配置先を使うと、後から
     保存した側がもう一方の状態を丸ごと上書きした。読み直して書き戻す方式では
     競合の窓が残るため、ファイル自体を分けて競合の余地を消す。
 
-    ★ v3.9.183: 共通の `_state_path` へ（値は従来と同じ）。口座区分の判定を
-      写経していた6箇所のうちの1つだった。
     """
     return _state_path("ovn_state.json")
 
@@ -21119,9 +18853,6 @@ def _ovn_load() -> dict:
     try:
         _path = _ovn_state_path()
         if os.path.isfile(_path):
-            # ★ v3.9.156b: 新形式が存在するなら移行は完了扱い。マーカーが未設置なら
-            #   ここで補完する（移行保存が一度失敗した後に通常保存で新形式ができた
-            #   場合、マーカー無しのままだと新形式が消えた将来に旧状態が蘇る）。
             _mig_mark_bf = _path + ".migrated"
             if os.path.isfile(OVN_STATE_FILE) and not os.path.isfile(_mig_mark_bf):
                 try:
@@ -21130,20 +18861,11 @@ def _ovn_load() -> dict:
                     pass
             with open(_path, encoding="utf-8") as f:
                 return json.load(f) or {}
-        # ★ v3.9.145: 旧形式（単一ファイル）からの移行。環境タグが一致する場合
-        #   だけ、この環境で1回だけ引き継ぐ。旧ファイルは消さない（もう一方の
-        #   環境が読むかもしれない）。マーカーを置いて2回目以降は読まない
-        #   （新ファイルが後で消えたときに古い状態が蘇るのを防ぐ・Codexレビュー指摘）。
         _mig_mark = _path + ".migrated"
         if os.path.isfile(OVN_STATE_FILE) and not os.path.isfile(_mig_mark):
             with open(OVN_STATE_FILE, encoding="utf-8") as f:
                 _legacy = json.load(f) or {}
             if _legacy.get("trade_env") == _RUN_TRADE_ENV:
-                # ★ v3.9.156: 先に新形式ファイルへ保存し、成功したときだけマーカーを置く。
-                #   従来はマーカーだけ置いて dict を返しており、最初の読者（main の
-                #   所有権チェック）がマーカーを焼くと、2番目の読者（夜間持ち越しの
-                #   巡回ループ）が「新ファイル無し＋マーカー有り」で空を受け取り、
-                #   保有状態（phase=HELD 等）が失われていた（5日分レビューの指摘）。
                 if not _ovn_save(dict(_legacy)):
                     log.warning("[OVN] 旧形式からの引き継ぎ保存に失敗 → マーカーは置かず次回再試行します")
                     return _legacy
@@ -21159,7 +18881,7 @@ def _ovn_load() -> dict:
 
 
 def _ovn_report_trade(st: dict, exit_price: float, exit_reason: str) -> None:
-    """★ v3.9.140: 夜間持ち越しの1往復を、集計シート（GAS）と日次サマリへ記録する。
+    """
 
     日中のニュース売買とは経路を分けているため、これを呼ばないと OVN の売買は
     どこにも集計されない（Discord とログにしか残らない）。実装は
@@ -21189,9 +18911,6 @@ def _ovn_report_trade(st: dict, exit_price: float, exit_reason: str) -> None:
                   "ovn", 0, 0.0, "OVN", "", exit_reason),
             kwargs={
                 "trade_type": "LONG",
-                # ★ v3.9.175: 夜間持ち越しは損切りも時間切れもトレールも掛けない。
-                #   リスク監視は所有権を OVN に渡した時点で打ち切るため、
-                #   ここで明示しないと記録が「無し」ではなく「不明」になる。
                 "enforced_exit": {
                     "stop_pct":          None,
                     "timeout_min":       None,
@@ -21207,10 +18926,6 @@ def _ovn_report_trade(st: dict, exit_price: float, exit_reason: str) -> None:
             f"[夜間持ち越し] 集計へ記録しました: {entry:.2f} → {exit_price:.2f} × {qty}株 "
             f"= {realized:+.2f}（{exit_reason}）"
         )
-        # ★ v3.9.149 (C-3): 日次サマリの集計が拾える形の行も出す（認定サポーターの指摘）。
-        #   これが無いと、実際に売買した日だけ GAS の日次サマリから持ち越しが欠け、
-        #   「記録のみ」の日だけが載るという逆転が起きていた。
-        #   :21127 の rpnl 正規表現（【銘柄】…[確定損益]…realized_pnl=…qty=…）に合わせる。
         log.info(
             f"【{OVN_SYMBOL}】 [夜間持ち越し] [確定損益]"
             f"  realized_pnl={realized:+.2f}"
@@ -21223,7 +18938,7 @@ def _ovn_report_trade(st: dict, exit_price: float, exit_reason: str) -> None:
 
 
 def _ovn_invalidate_owns_cache() -> None:
-    """★ v3.9.159b: 所有権キャッシュを無効化（保存＝phase遷移の直後に呼ぶ）。"""
+    """"""
     with _ovn_owns_lock:
         _ovn_file_owns_cache["t"] = None
         _ovn_file_owns_cache["v"] = False
@@ -21232,32 +18947,17 @@ def _ovn_invalidate_owns_cache() -> None:
 def _ovn_save(st: dict) -> bool:
     """状態を永続化する。成功時だけ True（発注前の必須条件として使う）。"""
     try:
-        # ★ v3.9.145: 口座IDを記録する（認定サポーターの指摘 A-10）。
-        #   照合側は「記録が無い旧状態は通し、有って食い違うときだけ拒否」なので、
-        #   この版に上げた時点で保有中の建玉が管理を失うことはない。
         try:
             st["acc_id"] = int(REAL_ACC_ID) if (_RUN_TRADE_ENV == "REAL" and REAL_ACC_ID) else 0
         except (TypeError, ValueError):
             pass
-        # ★ v3.9.192: どの版が書いた状態かを残す（認定サポーターの提案⑨）。
-        #   版を跨いで持ち越した建玉の切り分けに使う。読み手は無い（余分な鍵は無視される）。
-        # ★ v3.9.193: 観察ログ・決済記録・日次と同じ TAGGED（"+select_v1" 等）に揃える。
-        #   注: 旧版がこの状態を読んで書き戻すと値が残る（「最後に保存した版」ではなく
-        #   「最後に保存した 192 以上の版」）。版を下げた切り分けには使えない。
         st["bot_version"] = BOT_VERSION_TAGGED
-        # ★ v3.9.183: 共通の書き手へ（一時ファイル名にスレッドIDが入る・
-        #   ディレクトリの fsync もそちらが持つ）。ここは `.tmp` 固定名だったため、
-        #   同一プロセスの2つの書き手が互いの書きかけを消しうる状態だった。
         _atomic_write_text(_ovn_state_path(),
                            json.dumps(st, ensure_ascii=False, indent=2))
-        _ovn_invalidate_owns_cache()   # ★ v3.9.159b: phase遷移を即キャッシュへ反映
+        _ovn_invalidate_owns_cache()
         return True
     except Exception as e:
         log.error(f"[OVN] 状態ファイルを保存できません（再起動で建玉を見失います）: {_mask_secrets(e)}")
-        # ★ v3.9.148: 通知を間引く（Codexレビュー指摘）。この版で、口座の状態が
-        #   読めないときに毎周回 _ovn_save を呼ぶ経路を8か所増やした。書込みが
-        #   継続的に失敗する環境では30秒ごとに通知が飛ぶことになる。
-        #   初回は即時、以後は30分ごとに繰り返す（止めてしまうと気づけないため）。
         _now_sf = datetime.datetime.now()
         _last_sf = getattr(_ovn_save, "_last_fail_notice", None)
         if _last_sf is None or (_now_sf - _last_sf).total_seconds() >= 1800:
@@ -21277,7 +18977,7 @@ def _ovn_say(msg: str, level: str = "info") -> None:
 
 
 def _ovn_note_ambiguous(st: dict, what: str) -> None:
-    """★ v3.9.148: 口座の状態が読めず確定を保留し続けている状況を可視化する。
+    """
 
     建玉照会が空を返し続ける・売り注文が終端にならない、といった曖昧な状態では
     安全側に倒して確定を保留する（誤って建玉を手放さないため）。ただし黙って
@@ -21318,7 +19018,7 @@ def _ovn_note_ambiguous(st: dict, what: str) -> None:
 
 
 def _ovn_clear_ambiguous(st: dict) -> None:
-    """★ v3.9.148: 状態を確認できたら曖昧マーカーを消す。
+    """
 
     消し漏れがあっても害が出ないよう、通知側は6時間ごとの繰り返しにしてある。
     """
@@ -21330,10 +19030,6 @@ def _ovn_clear_ambiguous(st: dict) -> None:
 def _ovn_daily_closes(symbol: str, n: int) -> list:
     """日足の終値を古い順で返す（失敗は空）。ブロッキングなので to_thread 経由で呼ぶ。
 
-    ★ v3.9.136: max_count は「範囲の先頭から N 本」を返す。1回の呼び出しで
-    済ませると期間の**古い側**しか取れず、200日移動平均も「前日終値」も
-    数か月前の値で判定してしまう（実測: 最終足が 2026-04-08、実際は 08-12）。
-    続きのページを最後まで手繰り、新しい側の N 本を使う。
     """
     try:
         now = datetime.datetime.now(_ET)
@@ -21403,7 +19099,7 @@ def _ovn_closed_days_ahead() -> int:
 
 def _ovn_long_holiday_ahead() -> bool:
     """連休（閉場3日以上）の前か。土日2日は通常の週末で、ここでは止めない。
-    週末も見送りたい場合は OVN_SKIP_WEEKEND を使う（★ v3.9.144・関心事を分離）。"""
+    """
     if not OVN_SKIP_LONG_HOLIDAY:
         return False
     return _ovn_closed_days_ahead() >= 3
@@ -21450,7 +19146,7 @@ def _ovn_order(trd_env, side, qty: int, price: float, *, reserve: bool = False,
 
 
 def _has_live_broker_order(symbol: str, trd_env) -> bool:
-    """★ v3.9.150c: その銘柄に非終端の注文が証券会社側に残っているか。
+    """
 
     entry_time（時間切れの時計）を復元する前の裏取りに使う。生きている決済注文が
     あるのに時計を戻すと、時間切れが再発火してその注文を取り消して出し直す循環に
@@ -21478,7 +19174,7 @@ def _has_live_broker_order(symbol: str, trd_env) -> bool:
 
 
 def _order_status_snapshot(order_id: str, symbol: str, trd_env) -> tuple[str, int, str]:
-    """★ v3.9.150c: 任意の注文の状態・約定数を返す。照会失敗は UNKNOWN。
+    """
 
     チェイサーが「取消失敗＝注文消滅」と誤認して管理表から落とさないための
     裏取りに使う（Codexレビュー指摘）。実装は _ovn_order_status と同じ。
@@ -21497,10 +19193,6 @@ def _order_status_snapshot(order_id: str, symbol: str, trd_env) -> tuple[str, in
         return "UNKNOWN", 0, f"{type(e).__name__}: {_mask_secrets(e)}"
 
 
-# ★ v3.9.150c: SDK (moomoo/common/constant.py OrderStatus) の語彙と突き合わせた終端集合。
-#   部分一致だと想定外の複合文字列を誤って終端扱いにして追跡から落とす恐れがある
-#   （Codexレビュー指摘）ため、完全一致にする。未知の値は非終端＝追跡を続ける安全側。
-#   FILLED_PART / CANCELLING_* / TIMEOUT は非終端（まだ動きうる・残数がある）。
 _TERMINAL_ORDER_STATUSES = frozenset({
     "FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FILL_CANCELLED",
     "SUBMIT_FAILED", "FAILED", "DELETED", "DISABLED",
@@ -21510,7 +19202,7 @@ _TERMINAL_ORDER_STATUSES = frozenset({
 
 
 def _is_terminal_order_status(status: str) -> bool:
-    """★ v3.9.150c: 終端（取消済み・失敗・全約定・失効）か。UNKNOWN・未知は非終端扱い。"""
+    """"""
     return str(status).strip().upper() in _TERMINAL_ORDER_STATUSES
 
 
@@ -21530,10 +19222,6 @@ def _ovn_order_status(trd_env, order_id: str) -> tuple[str, int, str]:
         return "UNKNOWN", 0, f"{type(e).__name__}: {_mask_secrets(e)}"
 
 
-# ★ v3.9.181: 新しいサイクルを始めるときに捨てる鍵。
-#   st は _ovn_load で1度読んだきりプロセス寿命ずっと使い回され、
-#   これらを消す場所がどこにも無かった（外部レビュー指摘）。
-#   前サイクルの値が残ると、次の建玉の記録がその値で作られる。
 _OVN_POSITION_SCOPED_KEYS = (
     "sell_oids",           # 決済単価が「数日前の約定単価」に化ける
     "sell_oid",            # 同上（旧形式）
@@ -21550,13 +19238,6 @@ _OVN_POSITION_SCOPED_KEYS = (
 def _ovn_backfill_cycle_stamp(st: dict) -> None:
     """版上げをまたいだ売り注文に、サイクル印を1度だけ補う。
 
-    ★ v3.9.182: v3.9.181 はこれを _ovn_sell_fill_avg の中に置いていたが、
-      **実運用のどの経路からも到達しなかった**（配布前レビュー10レーンが一致して
-      指摘・再現も取れた）。_ovn_exit_price を呼ぶ3箇所はすべて直前で
-      phase="DONE" にしてから呼ぶため、`phase == "RESERVED"` が真になることは無い。
-      検査が緑だったのは st を手で組んでいたからで、v3.9.180 で
-      sell_oids_cycle の書き手がゼロだったのと同じ型。
-      状態ファイルを読んだ直後——phase がまだ RESERVED のうち——に補う。
 
     phase=RESERVED は「その晩の売り注文を出し終えた」状態なので、そこに載っている
     注文IDは定義上その晩のもの。この条件でだけ補うなら、「数日前の注文IDを読んで
@@ -21578,32 +19259,15 @@ def _ovn_backfill_cycle_stamp(st: dict) -> None:
 def _ovn_new_cycle(st: dict) -> None:
     """新しいサイクルに入る前に、前の建玉に属する値を捨てる。
 
-    ★ v3.9.181: 鍵ごとに場当たりで pop していたのをやめ、境界を1箇所にした。
-      残しておくのは phase / trade_env / entry_date / ref_price / shadow_* など、
-      サイクルをまたいで意味を持つものだけ。
     """
     for _k in _OVN_POSITION_SCOPED_KEYS:
         st.pop(_k, None)
-    # ★ v3.9.181: 曖昧マーカーも建玉スコープ（外部レビュー指摘）。
-    #   _ovn_clear_ambiguous を呼ばずに DONE / IDLE へ抜ける経路が2つあり、
-    #   前サイクルの ambiguous_since が残ると、新しいサイクルの
-    #   **最初の一過性の曖昧でいきなり ERROR 通知**が飛ぶ
-    #   （「口座の状態を確認できない時間が続いています」という強い文面）。
-    #   新サイクルに入るのは口座照会が成功したときなので、ここで消すのが安全側。
     _ovn_clear_ambiguous(st)
 
 
 def _ovn_buy_fill_avg(trd_env, oid: str, want_qty: int) -> float:
     """OVN の買い注文の実約定単価。取れなければ 0.0。
 
-    ★ v3.9.188: 建値が発注直前の気配のまま残っていた（認定サポーター3環境の実測・
-      2026-08-30。ovn_state と証券会社アプリの取得単価が 0.022〜0.05 ずれ、
-      いずれも「気配のほうが安い」同じ向き）。v3.9.140 の上書きは日中ロジックの
-      avg_cost に頼っていたが、OVN 建玉は日中ロジックから切り離されており
-      （ovn_held）、そこが更新される経路が実質無い。
-      売り側 v3.9.181（_ovn_sell_fill_avg）と同じく、注文照会の dealt_avg_price
-      を直接取る。買いの約定確認は発注と同日なので期間つき照会で足りるが、
-      売り側と同様に空なら期間なしでもう一度だけ引く。
     """
     if not oid:
         return 0.0
@@ -21666,11 +19330,6 @@ def _ovn_fix_entry_price(trd_env, st: dict, pos: int) -> None:
 def _ovn_sell_fill_avg(trd_env, st: dict) -> float:
     """OVN の売り注文の、実約定単価（株数で加重した平均）を返す。取れなければ 0.0。
 
-    ★ v3.9.181: 確定損益の決済側が「その時点の気配」だった（認定サポーターの指摘）。
-      建値側は _check_order_filled が実約定単価へ上書きするのに、OVN の決済側には
-      同じ補正が無く、`get_quote` の値をそのまま exit_price にしていた。
-      確定処理が走るのは寄り（OVN_EXIT_ET=9:31）の数分後なので、
-      **いちばん動く時間帯の数分ぶんが、そのまま成績の誤差になる。**
 
       _ovn_order_status は3要素タプルを6箇所が受けているので契約は変えず、
       単価だけを取る関数を分ける（契約を変える前に読み手を数える方針）。
@@ -21680,11 +19339,6 @@ def _ovn_sell_fill_avg(trd_env, st: dict) -> float:
     一部しか見えていない平均を返すと、**気配より確からしい顔をした誤った数字**が
     記録に載る。分からないなら 0.0 を返して気配へ落とす（呼び出し側が WARNING を残す）。
     """
-    # ★ v3.9.181: その晩の注文だけを見る（外部レビュー指摘）。
-    #   st はプロセス寿命ずっと使い回され、sell_oids は BUY_INTENT でしか消えない。
-    #   HELD_NO_RESERVE へ落ちる経路や、旧版から持ち越した状態ファイルでは
-    #   **前サイクルの注文IDが残る**。それを読むと決済単価が「数日前の約定単価」に
-    #   化け、値が正なので気配へ落ちる警告も出ない。サイクル印で照合する。
     _cycle = str(st.get("entry_date", "") or "")
     if not _re_date_key.fullmatch(_cycle):
         log.debug("[夜間持ち越し] 建玉の日が分からないため、実約定単価は使いません")
@@ -21696,12 +19350,6 @@ def _ovn_sell_fill_avg(trd_env, st: dict) -> float:
     _ids = [str(x) for x in st.get("sell_oids", [st.get("sell_oid")]) if x]
     if not _ids:
         return 0.0
-    # ★ v3.9.181: 期間は「建玉の日 00:00:00 〜 今日の 23:59:59」。
-    #   **日付だけを渡してはいけない**——SDK の normalize_date_format は
-    #   時刻の無い日付を 00:00:00 に正規化するため、`end` が当日の始まりになり
-    #   **その日に出した注文がまるごと範囲外**になる（実測で確認）。
-    #   両端とも ET。entry_date が ET なので、片方だけローカル時刻にすると
-    #   ホストのタイムゾーン次第で範囲が壊れる。
     _now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
     _kw = {"start": f"{_cycle} 00:00:00",
            "end":   _now_et.strftime("%Y-%m-%d 23:59:59")}
@@ -21715,15 +19363,6 @@ def _ovn_sell_fill_avg(trd_env, st: dict) -> float:
                     _acc = (REAL_ACC_ID if trd_env == TrdEnv.REAL else 0)
                     ret, df = ctx.order_list_query(
                         trd_env=trd_env, order_id=_oid, acc_id=_acc, **_kw)
-                    # ★ v3.9.181: 範囲つきで空なら、範囲なしでもう一度引く。
-                    #   このファイルは2箇所（:7229 / :7247）で
-                    #   「order_list_query は当日の注文しか返さない」と書いており、
-                    #   OVN の主経路は「前日 16:05 ET に予約 → 翌朝の寄りで約定」。
-                    #   証券会社側が期間指定を受け付けない／効かない場合、
-                    #   **本命の経路で毎回空になり、常に気配へ落ちる**（配布前レビューで
-                    #   3系統が指摘。実機でしか確かめられないため、どちらに転んでも
-                    #   動く形にする）。
-                    #   余分な1往復は「範囲つきで取れなかったとき」だけ。
                     if ret != RET_OK or df is None or not _df_has_rows(df):
                         log.debug(f"[夜間持ち越し] 注文 {_oid} が期間つきの照会で"
                                   f"返りません（ret={ret}）→ 期間なしで再照会します")
@@ -21760,10 +19399,6 @@ def _ovn_sell_fill_avg(trd_env, st: dict) -> float:
         return 0.0
     if _qty <= 0:
         return 0.0
-    # ★ v3.9.181: 見えた株数が記録する株数に足りないなら使わない（外部レビュー指摘）。
-    #   _ovn_report_trade は st["qty"] に掛けるので、40株ぶんの単価を60株に
-    #   掛けるような記録になる。照会は全部通っていても起こるので、
-    #   「照会できたか」とは別に確かめる。
     _want = int(st.get("qty", 0) or 0)
     if _want > 0 and _qty != _want:
         log.debug(f"[夜間持ち越し] 約定が確認できたのは {_qty}/{_want}株"
@@ -21775,9 +19410,6 @@ def _ovn_sell_fill_avg(trd_env, st: dict) -> float:
 async def _ovn_exit_price(trd_env, st: dict) -> float:
     """OVN の決済単価。実約定単価を優先し、取れなければ気配へ落とす。
 
-    ★ v3.9.181: 従来はここが常に「その時点の気配」だった。確定処理が走るのは
-      寄り（9:31）の数分後なので、いちばん動く時間帯の数分ぶんが成績の誤差になる。
-      落ちた場合はログに残す——気配ベースの行が混ざったことが後から分かるように。
     """
     _px = await asyncio.to_thread(_ovn_sell_fill_avg, trd_env, st)
     if _px > 0:
@@ -21791,8 +19423,6 @@ async def _ovn_exit_price(trd_env, st: dict) -> float:
     return _px
 
 
-# ★ v3.9.144: SDK 定義の DISABLED（已失効）を追加（認定サポーターの指摘）。
-#   無いと失効した注文を生存扱いし、取消・再照会を反復し続ける。
 _OVN_TERMINAL_STATUSES = ("FILLED_ALL", "CANCELLED", "CANCELED", "FAILED", "DELETED", "REJECTED", "DISABLED")
 
 
@@ -21829,9 +19459,6 @@ def _ovn_broker_open_orders(trd_env) -> tuple[list[dict], str]:
 def _ovn_position_all(trd_env, refresh: bool = False) -> tuple[int, list[dict], int, str]:
     """QQQ のロング建玉数・position_id 一覧・ショート建玉数を取得。失敗時 long=-1。
 
-    ★ v3.9.144: ショートも数える（認定サポーターの指摘 A-1）。実口座はロングと
-    ショートが共存できるため、入口ガードがロングだけを見ると、ショートが残った
-    まま OVN が買い、銘柄単位の所有権ガードでショートまで監視から外れてしまう。
     """
     try:
         with _trade_ctx() as ctx:
@@ -21840,7 +19467,6 @@ def _ovn_position_all(trd_env, refresh: bool = False) -> tuple[int, list[dict], 
                 acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0),
                 # sync_positions と同様、頻繁な巡回でレート制限を踏まないよう
                 # キャッシュ照会を優先する。入口ガード（1日1回）だけ refresh=True で
-                # 直前に建った建玉も見る（★ v3.9.145・認定サポーターの補足）。
                 refresh_cache=refresh,
             )
             asset_cat_us = getattr(AssetCategory, "US", "US") if AssetCategory else None
@@ -21865,10 +19491,6 @@ def _ovn_position_all(trd_env, refresh: bool = False) -> tuple[int, list[dict], 
                 # デモは qty が負・実口座の形は未確認のため、絶対値で数える
                 short_qty += abs(raw)
             elif raw < 0:
-                # ★ v3.9.156: position_side が読めない行の負数量はショートとみなす
-                #   （sync_positions と同じ qty 符号フォールバック・5日分レビュー）。
-                #   従来はロングにもショートにも数えられず、ショート残存のまま
-                #   混在防止ガードを素通りする穴だった。
                 short_qty += abs(raw)
             elif raw > 0:
                 qty += raw
@@ -21916,11 +19538,11 @@ async def ovn_overnight_loop(trd_env) -> None:
     条件: 前日終値 > 200日移動平均 かつ VIXY の前日比が閾値以下。
     """
     st = _ovn_load()
-    _ovn_backfill_cycle_stamp(st)   # ★ v3.9.182: phase が DONE に変わる前に補う
+    _ovn_backfill_cycle_stamp(st)
     owns_persisted = (
         st.get("phase") in ("BUY_INTENT", "BUY_PENDING", "HELD", "RESERVED", "HELD_NO_RESERVE")
         and st.get("trade_env") == _RUN_TRADE_ENV
-        and _ovn_acc_matches(st)   # ★ v3.9.145: 別口座の状態で稼働しない（A-10）
+        and _ovn_acc_matches(st)
     )
     if not OVN_ENABLED and not owns_persisted:
         return
@@ -21936,9 +19558,6 @@ async def ovn_overnight_loop(trd_env) -> None:
         f"  口座={'実口座' if trd_env == TrdEnv.REAL else 'デモ'}"
     )
     # DEMO/REAL の状態を混ぜない。環境タグ無しも判別不能なので復元しない。
-    # ★ v3.9.145: 口座IDの食い違いも同じ扱い（Codexレビュー指摘）。ここを
-    #   通すと別口座の状態を ovn_held として復元し、以後の保存で由来が現在
-    #   口座に付け替わって検出不能になる。
     if st and (st.get("trade_env") != _RUN_TRADE_ENV or not _ovn_acc_matches(st)):
         if st.get("phase") in ("BUY_INTENT", "BUY_PENDING", "HELD", "RESERVED", "HELD_NO_RESERVE"):
             _ovn_say("環境タグの無い、または別口座の旧状態は復元しません。口座建玉を手動確認してください。", "error")
@@ -21949,7 +19568,6 @@ async def ovn_overnight_loop(trd_env) -> None:
         state.get(OVN_SYMBOL).ovn_held = True
         log.warning(f"🌙 [夜間持ち越し] 保有中の状態を復元しました（{st.get('phase')}）")
     else:
-        # ★ v3.9.159: 非保有でも読めた中身を明示する（診断可能化）
         log.info(f"🌙 [夜間持ち越し] 永続状態に保有なし（phase={st.get('phase', 'なし')}）")
 
     while True:
@@ -21960,17 +19578,6 @@ async def ovn_overnight_loop(trd_env) -> None:
             hm = (now.hour, now.minute)
             phase = st.get("phase", "IDLE")
 
-            # ★ v3.9.160b: 記録が読めず安全網（_ovn_unknown_state_guard）が
-            #   建玉を守っている状態は、放っておくと「誰も決済しない孤児」になる
-            #   （日中ロジックは触らず、OVN も状態が無いので売らない・週末決済や
-            #   パニックセルも対象外——Codex指摘）。ここで口座の建玉を採用して
-            #   HELD として引き受け、通常の「翌寄りで売る」流れに戻す。
-            # ★ v3.9.163: 「孤児の引き受け（口座の建玉を OVN として採用して売る）」は
-            #   撤回した（新規Claudeレビュアーの指摘）。記録が読めない状況では
-            #   「OVN が建てた建玉」と「利用者が手で持っている建玉」を区別する手段が
-            #   無く、引き受けは後者を翌寄りで売ってしまう。売る判断は自動で行わず、
-            #   触らずに知らせる側へ倒す（保護は _ovn_unknown_state_guard と
-            #   sync_positions の externally_held が担い、6時間ごとの再通知に載る）。
             if phase == "IDLE" and _ovn_unknown_guard.get("active"):
                 _pos_o, _ids_o, _dt_o = await asyncio.to_thread(_ovn_position, trd_env)
                 if _dt_o == "OK" and _pos_o == 0:
@@ -21993,7 +19600,7 @@ async def ovn_overnight_loop(trd_env) -> None:
                     _ovn_save(st)
                 elif pdetail == "OK" and odetail == "OK" and not buy_orders:
                     st["phase"] = "IDLE"
-                    _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
+                    _ovn_save(st)
                     state.get(OVN_SYMBOL).ovn_held = False
                 else:
                     _ovn_say(f"買い発注意図の復旧照会に失敗しました（position={pdetail[:80]} / order={odetail[:80]}）。", "error")
@@ -22017,26 +19624,17 @@ async def ovn_overnight_loop(trd_env) -> None:
                     pos, ids, pdetail = await asyncio.to_thread(_ovn_position, trd_env)
                 if pos > 0:
                     st.update(phase="HELD", qty=pos, position_ids=ids)
-                    # ★ v3.9.157: 約定確認をログに1行残す（従来は成功時に無言だった）。
                     log.info(
                         f"[夜間持ち越し] ✅ [約定確認] QQQ {pos}株 保有を確認しました"
                         f"（orderId={st.get('buy_oid', '不明')}）"
                     )
-                    # ★ v3.9.188: 建値を実約定単価に補正（従来 v3.9.140 は日中ロジックの
-                    #   avg_cost 頼みで実質効かず、気配が最終記録になっていた）
                     await asyncio.to_thread(_ovn_fix_entry_price, trd_env, st, pos)
                     _ovn_save(st)
                 elif pos == 0:
-                    # ★ v3.9.148 (A-3): 建玉照会は「本当にゼロ」と「空応答」を同じ 0 で
-                    #   返す。約定株数(dealt)が立っているのに 0 が返るのは矛盾なので、
-                    #   ここで所有権を手放すと、約定済みの建玉が OVN の管理外に出る
-                    #   （②の予約も③の売却も走らなくなる）。再照会で裏を取り、
-                    #   それでも食い違うなら所有権を保ったまま次の巡回に回す。
                     if dealt and dealt > 0:
                         pos2, ids2, pdetail2 = await asyncio.to_thread(_ovn_position, trd_env)
                         if pos2 > 0:
                             st.update(phase="HELD", qty=pos2, position_ids=ids2)
-                            # ★ v3.9.188: この経路でも建値を実約定単価に補正する
                             await asyncio.to_thread(_ovn_fix_entry_price, trd_env, st, pos2)
                             log.info(
                                 f"[夜間持ち越し] 建玉ゼロは一時的な応答でした"
@@ -22044,9 +19642,6 @@ async def ovn_overnight_loop(trd_env) -> None:
                             )
                             _ovn_save(st)
                             continue
-                        # ★ v3.9.148: ここは30秒ごとに再入する。Discord へ直接出すと
-                        #   不調が続いた日に数千通になるため、通知は
-                        #   _ovn_note_ambiguous の間引き（1時間後＋以後6時間ごと）に任せる。
                         log.warning(
                             f"[夜間持ち越し] 買い注文は {dealt}株 約定していますが、建玉が"
                             f"確認できません（{status} / {pdetail2[:80]}）→ 管理を続けたまま"
@@ -22056,7 +19651,7 @@ async def ovn_overnight_loop(trd_env) -> None:
                         _ovn_save(st)
                         continue
                     st.update(phase="IDLE", qty=0)
-                    _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
+                    _ovn_save(st)
                     state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say(f"買い注文は建玉を残さず終了しました（{status}）。", "warning")
                     continue
@@ -22071,9 +19666,6 @@ async def ovn_overnight_loop(trd_env) -> None:
                 st["entry_date"] = today
                 # QQQ は銘柄単位でしか安全に所有権分離できない。ニュース側・手動の
                 # 建玉や未約定注文がある日は混在させない。
-                # ★ v3.9.144: 一過性の照会失敗では entry_date を返上して、15:59 までの
-                #   残り巡回で再挑戦する（認定サポーターの指摘）。条件不成立・建玉の
-                #   混在による見送りは従来どおり1日1回で確定する。
                 pre_pos, _, pre_short, pre_msg = await asyncio.to_thread(
                     lambda: _ovn_position_all(trd_env, refresh=True))
                 pre_orders, pre_order_msg = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
@@ -22086,9 +19678,6 @@ async def ovn_overnight_loop(trd_env) -> None:
                     st.pop("entry_date", None)
                     st["phase"] = "IDLE"; _ovn_save(st); continue
                 if pre_pos != 0 or pre_short != 0 or pre_orders:
-                    # ★ v3.9.144: ショートの共存も混在として見送る（A-1）。実口座で
-                    #   ショートが残ったまま買うと、銘柄単位の所有権ガードでショートが
-                    #   監視から外れてしまう。
                     _ovn_say(f"QQQ に既存建玉/証券会社側注文があるため見送ります"
                              f"（long={pre_pos}, short={pre_short}, orders={len(pre_orders)}）。", "warning")
                     st["phase"] = "IDLE"; _ovn_save(st); continue
@@ -22105,11 +19694,6 @@ async def ovn_overnight_loop(trd_env) -> None:
                 trend_ok = last > sma
                 vix_ok = vchg <= _OVN_VIX_THRESH
                 holiday = _ovn_long_holiday_ahead()
-                # ★ v3.9.144: 週末（閉場2日）を見送る任意設定。既定は従来どおり持ち越す。
-                # ★ v3.9.156: == 2 の厳密一致だと OVN_SKIP_LONG_HOLIDAY=false の利用者が
-                #   「2日の週末は見送るのに、より長い3連休は持ち越す」逆転になっていた
-                #   （5日分レビュー）。週末を見送る設定なら、週末を含むより長い閉場も
-                #   見送る（>= 2）。連休機能が有効なときは従来どおり連休の理由を優先。
                 _closed_ahead = _ovn_closed_days_ahead()
                 weekend_skip = (OVN_SKIP_WEEKEND and _closed_ahead >= 2 and not holiday)
                 if not (trend_ok and vix_ok) or holiday or weekend_skip:
@@ -22127,7 +19711,6 @@ async def ovn_overnight_loop(trd_env) -> None:
                     _ovn_say("QQQ の発注直前価格を取得できないため見送ります（次の巡回で再挑戦）。", "warning")
                     st.pop("entry_date", None)
                     st["phase"] = "IDLE"; _ovn_save(st); continue
-                # ★ v3.9.138: 金額は必須。0（未設定）で勝手に1株買う旧仕様は廃止。
                 if OVN_BUDGET_USD <= 0:
                     _ovn_say("1回に使う金額（OVN_BUDGET_USD）が設定されていないため買いません。"
                              f"\n.env に金額を書いてください（QQQ は1株およそ ${last:,.0f} です）。", "warning")
@@ -22148,45 +19731,25 @@ async def ovn_overnight_loop(trd_env) -> None:
                     _ovn_save(st); continue
 
                 # 注文応答前クラッシュでも口座から回収できるよう、意図を先に永続化する。
-                # ★ v3.9.181: 前サイクルの売り注文IDをここで捨てる（外部レビュー指摘）。
-                #   sell_oids を消す箇所がどこにも無く、st はプロセス寿命ずっと
-                #   使い回される。v3.9.179 まで読み手は全て phase=RESERVED（＝その晩の
-                #   注文）だったので露見しなかったが、v3.9.180 で HELD / HELD_NO_RESERVE
-                #   の枝に読み手を足した。その枝は「その晩まだ売り注文を出していない」
-                #   ことを確かめて入るので、残っているIDは**必ず前サイクルのもの**になる。
-                #   放置すると決済単価が「数日前の約定単価」に化け、値が正なので
-                #   気配へ落ちる警告も出ない——直した欠陥より悪い形になる。
                 _ovn_new_cycle(st)
                 st.update(phase="BUY_INTENT", qty=qty, trade_env=_RUN_TRADE_ENV,
                           ref_price=round(last, 2))
                 if not _ovn_save(st):
                     st["phase"] = "IDLE"
                     continue
-                # ★ v3.9.146 (A-11/Codexレビュー): ovn_held は発注「前」に立てる。
-                #   発注→応答の間に sync_positions が走ると、約定済みの建玉が
-                #   日中予算に計上され、保有中ずっと残留するレースがあった。
-                #   失敗時は下で戻す（発注前なので約定は存在しない）。
                 state.get(OVN_SYMBOL).ovn_held = True   # 部分約定も日中ロジックから切り離す
                 oid, msg = await asyncio.to_thread(_ovn_order, trd_env, TrdSide.BUY, qty, 0.0)
                 if not oid:
                     st["phase"] = "IDLE"
-                    _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
+                    _ovn_save(st)
                     state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say(f"買い注文が通りませんでした: {msg[:120]}", "error")
                     continue
                 st.update(phase="BUY_PENDING", qty=qty, buy_oid=oid,
                           trade_env=_RUN_TRADE_ENV,
                           ref_price=round(last, 2),
-                          # ★ v3.9.140: 集計へ記録するための建値と時刻
                           entry_price=round(entry_price, 4),
                           entry_at=datetime.datetime.now().isoformat(timespec="seconds"))
-                # ★ v3.9.157: orderId をログに残す（認定サポーターの指摘——
-                #   受付1行だけでは約定可否をログから追えなかった）。
-                # ★ v3.9.190: 括弧内の値に名前を付ける（認定サポーター3名が同じ質問）。
-                #   先頭は日足の直近確定足（＝前営業日の終値）で、200日線と比べる
-                #   ためだけに使う値。建値は別に取った直前の気配から作るので、
-                #   日中に大きく動いた日は $9 ほど開く。名前が無いと現在値または
-                #   建値に読め、「建値が違う」という問い合わせになっていた。
                 _ovn_say(f"買い注文を受け付けました。QQQ {qty}株"
                          f"（前日終値 {last:.2f} / 200日線 {sma:.2f} / VIXY {vchg:+.2%}"
                          f"／発注直前の気配 {entry_price:.2f}）"
@@ -22199,22 +19762,16 @@ async def ovn_overnight_loop(trd_env) -> None:
             elif (phase == "HELD" and _live and trd_env == TrdEnv.REAL
                   and OVN_RESERVE_ET <= hm < (17, 0)):
                 pos, ids, pmsg = await asyncio.to_thread(_ovn_position, trd_env)
-                # ★ v3.9.144: 翌朝の分岐③と同じく、建玉照会の失敗・ゼロをここでも検査
-                #   （認定サポーターの指摘 A-2）。失敗を数量ゼロと誤解して予約を
-                #   出し損ね、その晩の「Botを止めても売れる」保険を失っていた。
                 if pos < 0:
                     _ovn_say(f"売り予約前の建玉照会に失敗しました（次の巡回で再試行）: {pmsg[:120]}", "error")
                     continue
                 if pos == 0:
-                    # ★ v3.9.144: 単発のゼロ応答で所有権を手放さない（Codexレビュー指摘）。
-                    #   キャッシュ照会の同期遅延で一時的に空に見えることがあるため、
-                    #   もう一度照会して両方ゼロのときだけ確定する。
                     pos2, _ids2, pmsg2 = await asyncio.to_thread(_ovn_position, trd_env)
                     if pos2 != 0:
                         log.info(f"[夜間持ち越し] 建玉ゼロは一時的な応答でした（再照会 {pos2}株）→ 続行")
                         continue
                     st["phase"] = "DONE"
-                    _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
+                    _ovn_save(st)
                     state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say("建玉が無いことを確認しました（予約は不要です）。")
                     continue
@@ -22284,22 +19841,14 @@ async def ovn_overnight_loop(trd_env) -> None:
                   and OVN_EXIT_ET <= hm < OVN_ENTRY_ET
                   and is_trading_day(now.date())):
                 if not _live:
-                    # ★ v3.9.160c: 記録のみモードで HELD に到達した場合（孤児の
-                    #   引き受け等）、フラグを落とさないと誰も触れない建玉になる
-                    #   （新規Claudeレビュアーの指摘）。保存→解除の順は v3.9.159b。
                     st["phase"] = "DONE"
                     _ovn_save(st)
                     state.get(OVN_SYMBOL).ovn_held = False
                     continue
                 pos, ids, pmsg = await asyncio.to_thread(_ovn_position, trd_env)
                 if pos > 0:
-                    # ★ v3.9.148: 建玉が見えた＝口座の状態を読めた。曖昧マーカーを
-                    #   ここで一本化して消す（個別の解決経路に散らすと消し漏れる）。
                     _ovn_clear_ambiguous(st)
                 if pos == 0:
-                    # ★ v3.9.148 (A-3): 空応答も 0 で返るため、単発のゼロで確定しない
-                    #   （②・BUY_PENDING と同じ形に揃える）。ここで即断すると、売り注文を
-                    #   1本も出していないのに実在しない往復の確定損益が集計へ送られる。
                     pos2, ids2, pmsg2 = await asyncio.to_thread(_ovn_position, trd_env)
                     if pos2 > 0:
                         log.info(
@@ -22308,7 +19857,6 @@ async def ovn_overnight_loop(trd_env) -> None:
                         pos, ids, pmsg = pos2, ids2, pmsg2
                         _ovn_clear_ambiguous(st)
                     elif pos2 < 0:
-                        # ★ v3.9.148: 毎周回 Discord に出さない（上と同じ理由）。
                         log.warning(
                             f"[夜間持ち越し] 建玉ゼロの裏取りに失敗しました → 次の巡回で再試行: {pmsg2[:120]}"
                         )
@@ -22316,17 +19864,8 @@ async def ovn_overnight_loop(trd_env) -> None:
                         _ovn_save(st)
                         continue
                     else:
-                        # ★ v3.9.148: 続けて2回ゼロでも、証券会社側の同じ不調が2回
-                        #   続いただけの可能性がある（独立した確認になっていない）。
-                        #   建玉照会とは別系統の注文照会が生きていることを確かめてから
-                        #   確定する。照会自体が失敗するなら「口座の状態が読めない」
-                        #   ということなので、確定させず次の巡回に回す。
                         _oo, _oo_detail = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
                         if _oo_detail != "OK":
-                            # ★ v3.9.148: ここは30秒ごとに再入するので Discord へは
-                            #   出さない（Codexレビュー指摘・24時間で数千通になる）。
-                            #   利用者への通知は _ovn_note_ambiguous が
-                            #   「1時間後＋以後6時間ごと」に間引いて出す。
                             log.warning(
                                 f"[夜間持ち越し] 建玉が見えませんが、注文照会も失敗しています"
                                 f"（{_oo_detail[:80]}）→ 確定させず次の巡回で再確認します"
@@ -22336,9 +19875,6 @@ async def ovn_overnight_loop(trd_env) -> None:
                             continue
                         _live_sells = [o for o in _oo if "SELL" in str(o.get("side", ""))]
                         if _live_sells:
-                            # ★ v3.9.148: 生きている売り注文があるなら、決済はまだ
-                            #   終わっていない。建玉照会が空でも DONE にしてはいけない
-                            #   （Codexレビュー指摘）。
                             log.warning(
                                 f"[夜間持ち越し] 建玉は見えませんが売り注文が {len(_live_sells)} 件"
                                 "生きています → 確定させず次の巡回で再確認します"
@@ -22348,7 +19884,7 @@ async def ovn_overnight_loop(trd_env) -> None:
                             continue
                         st["phase"] = "DONE"
                         _ovn_clear_ambiguous(st)
-                        _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
+                        _ovn_save(st)
                         state.get(OVN_SYMBOL).ovn_held = False
                         _ovn_say("建玉が無いことを確認しました。")
                         _exit_px = await _ovn_exit_price(trd_env, st)
@@ -22393,14 +19929,9 @@ async def ovn_overnight_loop(trd_env) -> None:
                   and hm >= (9, 35) and is_trading_day(now.date())):
                 pos, ids, pmsg = await asyncio.to_thread(_ovn_position, trd_env)
                 if pos > 0:
-                    # ★ v3.9.148: 建玉が見えた＝口座の状態を読めた（③と同じ扱い）。
                     _ovn_clear_ambiguous(st)
-                    st.pop("zero_unfilled_count", None)   # ★ v3.9.156: 未約定終端の連続カウンタも解除
+                    st.pop("zero_unfilled_count", None)
                 if pos == 0:
-                    # ★ v3.9.148 (A-3): 空応答も 0 で返る。ここで即断すると、売れて
-                    #   いないのに「約定しました」と告知し、実在しない往復の確定損益が
-                    #   集計へ送られる（予約注文は生きているので建玉自体は後から売れる）。
-                    #   再照会で裏を取ってから確定する。
                     pos2, ids2, pmsg2 = await asyncio.to_thread(_ovn_position, trd_env)
                     if pos2 > 0:
                         log.info(
@@ -22410,19 +19941,12 @@ async def ovn_overnight_loop(trd_env) -> None:
                         _ovn_save(st)
                         continue
                     if pos2 < 0:
-                        # ★ v3.9.148: -1 は照会失敗の番兵で、株数ではない（Codexレビュー指摘）。
-                        #   建玉ありと同じ扱いにすると、口座が読めない状態が
-                        #   いつまでも「一時的な応答」として記録されない。
                         log.warning(
                             f"[夜間持ち越し] 建玉ゼロの裏取りに失敗しました → 次の巡回で再試行: {pmsg2[:120]}"
                         )
                         _ovn_note_ambiguous(st, "建玉を照会できない（予約の約定確認）")
                         _ovn_save(st)
                         continue
-                    # ★ v3.9.148: ここは「予約が約定した」と断言する唯一の場所なので、
-                    #   建玉ゼロ（＝空応答と区別できない）だけを根拠にしない。
-                    #   売り注文そのものの状態で裏を取り、終端に達していなければ
-                    #   確定させず次の巡回に回す（Codexレビュー指摘）。
                     _sell_terminal = False
                     _sell_snaps = []
                     for _soid in [x for x in st.get("sell_oids", [st.get("sell_oid")]) if x]:
@@ -22431,11 +19955,6 @@ async def ovn_overnight_loop(trd_env) -> None:
                     if _sell_snaps:
                         _sell_terminal = all(_ovn_is_terminal(s[0]) for s in _sell_snaps)
                     else:
-                        # ★ v3.9.148: 旧版が書いた状態には sell_oids が無いことがある。
-                        #   個別の注文IDで裏取りできないので、代わりに全注文照会で
-                        #   「生きている売り注文が無い」ことを確かめる。照会が失敗する
-                        #   なら口座の状態が読めないということなので確定させない。
-                        #   （ここで単に待ち続けると DONE に到達できず巡回が終わらない）
                         _oo_r, _oo_r_detail = await asyncio.to_thread(_ovn_broker_open_orders, trd_env)
                         if _oo_r_detail != "OK":
                             log.warning(
@@ -22467,10 +19986,6 @@ async def ovn_overnight_loop(trd_env) -> None:
                         _ovn_note_ambiguous(st, "建玉は見えないが売り注文が終端でない")
                         _ovn_save(st)
                         continue
-                    # ★ v3.9.156: 「終端」は約定を意味しない（取消・拒否・失効を含む・
-                    #   5日分レビューのCodex指摘）。約定状態か約定数まで照合してから
-                    #   「約定しました」と確定する。_sell_snaps が無い旧状態のフォール
-                    #   バックは「建玉ゼロ＋生存売り注文なし」の2点確定なので従来どおり。
                     _dealt_total = sum(int(s[1] or 0) for s in _sell_snaps)
                     _target_qty  = int(st.get("qty", 0) or 0)
                     _sell_filled = (not _sell_snaps) or all(
@@ -22493,14 +20008,9 @@ async def ovn_overnight_loop(trd_env) -> None:
                         st["phase"] = "DONE"
                         st.pop("zero_unfilled_count", None)
                         _ovn_clear_ambiguous(st)
-                        _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順
+                        _ovn_save(st)
                         state.get(OVN_SYMBOL).ovn_held = False
                         if _dealt_total > 0:
-                            # ★ v3.9.181: 株数を先に直す（外部レビュー指摘）。
-                            #   _ovn_sell_fill_avg は「見えた株数 == st["qty"]」を必須に
-                            #   しているので、_target_qty のまま単価を取ると
-                            #   **この枝は構造的に必ず不一致**になり 100% 気配へ落ちる。
-                            #   単価だけ気配・株数だけ実数という混ざった記録になっていた。
                             st["qty"] = _dealt_total  # 損益記録は実約定数で送る
                             _exit_px = await _ovn_exit_price(trd_env, st)
                             _ovn_say(
@@ -22521,9 +20031,6 @@ async def ovn_overnight_loop(trd_env) -> None:
                     st["phase"] = "DONE"
                     st.pop("zero_unfilled_count", None)
                     _ovn_clear_ambiguous(st)
-                    # ★ v3.9.159b: フラグ解除はファイル保存の「後」（レビュー2レーンの
-                    #   一致指摘——解除→保存の間の await 中に自己修復がファイルの
-                    #   旧phaseを読み、ovn_held を誤って再ラッチする）。
                     _ovn_save(st)
                     state.get(OVN_SYMBOL).ovn_held = False
                     _ovn_say("予約していた注文が寄り付きで約定しました。")
@@ -22577,7 +20084,7 @@ async def ovn_overnight_loop(trd_env) -> None:
             # ── ⑤ 日付が変わったら次の日に備える ──────────────────────────
             elif phase == "DONE" and hm >= (10, 30):
                 st["phase"] = "IDLE"
-                _ovn_save(st)   # ★ v3.9.159b: 保存→フラグ解除の順（再ラッチ防止）
+                _ovn_save(st)
                 state.get(OVN_SYMBOL).ovn_held = False
         except Exception as e:
             log.warning(f"[夜間持ち越し] 巡回で例外（続行します）: {type(e).__name__}: {_mask_secrets(e)}")
@@ -22617,7 +20124,6 @@ async def health_warning_loop() -> None:
                     "╚════════════════════════════════════════════════════════════════╝"
                     f"{_RESET}"
                 )
-                # ★ v3.9.71: 30 分おきに Discord へも再通知 (端末を見ていなくても気づける)
                 global _anthropic_credit_last_discord_at
                 _now_d = datetime.datetime.now()
                 if (_anthropic_credit_last_discord_at is None
@@ -22636,14 +20142,6 @@ async def health_warning_loop() -> None:
 
             # ── ② Alpaca News 接続不全 ──────────────────────────────────────
             # Alpaca キーが設定済みの環境でのみ判定。
-            # ★ v3.9.40: 週末・OVERNIGHT・取引不可セッション中は alpaca_news_loop
-            #   が market_open_event.wait() で意図的に WebSocket を停止している。
-            #   この間は「正常受信なし」が当然の状態なので、誤警告を出さない
-            #   よう market_open_event.is_set() を必須条件に追加した。
-            # ★ v3.9.51: 表示を大きな ASCII アート枠から WARNING 1 行に変更し、ログを汚さない。
-            #   ★ v3.9.189: 同じ注記にあったセッション別の間引きの記述は外した。
-            #     実装されていないうえ、いまは 🚨 が本物の障害でしか出ないので不要
-            #     （経緯は _alpaca_news_health の定義側に書いた）。
             if (
                 ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY
                 and market_open_event.is_set()
@@ -22668,7 +20166,6 @@ async def health_warning_loop() -> None:
                             f"（この警告は30分ごと）"
                         )
                 if _alpaca_bad:
-                    # ★ v3.9.77 (B-1): 端末は赤字で 5 分おき / Discord は 30 分おき。
                     _now = datetime.datetime.now()
                     _err = (_h.get("last_error") or "詳細不明")[:60]
                     _stale_disp = (
@@ -22698,8 +20195,6 @@ async def health_warning_loop() -> None:
                         except Exception as _e_disc:
                             log.debug(f"[Alpaca News] 30分Discord通知失敗: {_e_disc}")
 
-            # ── ③ sync_positions 連続失敗 (OpenD/ネットワーク不安定) ★v3.9.77 B-4 ──
-            #   端末は赤字で 5 分おき / Discord は 30 分おき。成功で自動解除。
             if int(_sync_health.get("consecutive_fail", 0)) >= 3:
                 _now_s = datetime.datetime.now()
                 _last_ok_s = _sync_health.get("last_success_at")
@@ -22707,28 +20202,26 @@ async def health_warning_loop() -> None:
                             if _last_ok_s is not None else "起動後成功なし")
                 _serr = (_sync_health.get("last_error") or "詳細不明")[:60]
                 _nfail = _sync_health.get("consecutive_fail", 0)
-                log.error(
-                    f"{_RED}{_BOLD}[sync_positions] 🚨 ポジション取得が連続失敗中 ({_nfail}回): "
-                    f"最終成功 {_stale_s} / 直近: {_serr}\n"
-                    f"  → OpenD の起動/接続(Connected)とネットワークを確認してください "
-                    f"(本警告は5分ごと・復旧で自動解除){_RESET}"
-                )
+                # ★ 配布前レビュー（Claude 別人格）: 起動から一度も同期できていない回は、
+                #   建玉の有無を知らない。空だからといって「いまは建玉なし」と言うと、
+                #   前夜の持ち越しがある翌朝にいちばん危ない文言が出る。None＝不明にして
+                #   安全側（強い文言・10分おき）に倒す。走査で例外が出た回も同じ扱い。
+                try:
+                    _held_sync = None if _last_ok_s is None else sorted({
+                        _s_h for _s_h in list(state.tickers.keys())
+                        if state.get(_s_h).position_qty != 0
+                    })
+                except Exception:
+                    _held_sync = None
+                _term_s, _disc_s, _disc_gap_s = _sync_stall_notice(_nfail, _stale_s, _serr, _held_sync)
+                log.error(f"{_RED}{_BOLD}{_term_s}{_RESET}")
                 _last_disc_s = _sync_health.get("last_discord_at")
-                if (_last_disc_s is None or (_now_s - _last_disc_s).total_seconds() >= 1800):
+                if (_last_disc_s is None or (_now_s - _last_disc_s).total_seconds() >= _disc_gap_s):
                     _sync_health["last_discord_at"] = _now_s
                     try:
-                        _threadsafe_discord(
-                            "🚨 【継続中】 ポジション取得が連続失敗\n"
-                            f"連続失敗 {_nfail}回 / 最終成功 {_stale_s}。\n"
-                            "OpenD の起動・接続(Connected)とネットワークをご確認ください。\n"
-                            "（決済判断に影響する可能性あり・本通知は30分おき）"
-                        )
+                        _threadsafe_discord(_disc_s)
                     except Exception as _e_ds:
-                        log.debug(f"[sync_positions] 30分Discord通知失敗: {_e_ds}")
-            # ── ④ ★ v3.9.151: 分類できない AI 判定エラーの連続失敗（認定サポーターの提案）─
-            #   既知の形（残高400・認証401・支払い402）の列挙は、Anthropic 側の変更で
-            #   穴が開く。原因が分からなくても「続けて失敗している」こと自体で鳴らす。
-            #   一時的なもの（429/5xx/接続エラー）はカウンタ側で除外済み。
+                        log.debug(f"[sync_positions] Discord通知失敗: {_e_ds}")
             _ai_fail_n = int(_ai_unclassified_fail.get("consecutive", 0))
             if _ai_fail_n >= 3:
                 _ai_st = _ai_unclassified_fail.get("last_status")
@@ -22751,21 +20244,17 @@ async def health_warning_loop() -> None:
                             f"AI 判定が止まっている間、ニュース起点の発注は行われません。\n"
                             f"（損切り/トレール/時間切れ決済は通常どおり動作しています・"
                             f"本通知は30分おき）"
-                        )   # ★ v3.9.151: ①〜③と同じ fire-and-forget（Codexレビュー指摘）
+                        )
                     except Exception as _e_ai_ds:
                         log.debug(f"[AI判定] 30分Discord通知失敗: {_e_ai_ds}")
         except asyncio.CancelledError:
             raise
         except Exception as _e:
-            # ★ v3.9.151 (1b-3): debug だと端末に一切出ず、この周回の後続チェックが
-            #   飛んだことにも気づけない（認定サポーターの指摘）。「気づかせるための
-            #   ループ」が同じ形で気づけなくなる構造だったので、warning に上げる。
             log.warning(f"[health_warning] ループ例外 (継続): {_mask_secrets(_e)}")
         await asyncio.sleep(300)  # 5 分間隔
 
 
 # ── RSS 並列取得（Yahoo Finance） ─────────────────────────────────────────────────
-# ★ v2.97: 起動時 DNS 事前チェック
 # ─────────────────────────────────────────────────────────────────────────────
 def _rss_dns_precheck() -> None:
     """
@@ -22825,11 +20314,6 @@ def _fetch_rss_feed(feed: Dict[str, str]) -> List[SimpleNamespace]:
     1本の RSS フィードを取得してパースする（標準ライブラリのみ・追加依存なし）。
     遅延目安: Yahoo Finance ~5分
 
-    ★ v2.97: 連続失敗カウンタ + ログレベル段階制御
-    - 動的除外済みフィード (_rss_excluded) は即座にスキップ
-    - 例外発生時: 初回 WARNING / 以降 DEBUG にログレベルを段階制御
-    - 連続 _RSS_FAIL_THRESHOLD 回失敗で _rss_excluded に追加 + Discord 通知 1 回
-    - 成功時はカウンタをリセット
     """
     name = feed["name"]
     url  = feed["url"]
@@ -22875,7 +20359,6 @@ def _fetch_rss_feed(feed: Dict[str, str]) -> List[SimpleNamespace]:
         log.debug(f"[RSS:{name}] {len(results)}件取得")
         return results
     except Exception as e:
-        # ★ v2.97: 連続失敗カウンタを更新
         _rss_fail_count[name] = _rss_fail_count.get(name, 0) + 1
         _count = _rss_fail_count[name]
         # 初回のみ WARNING、以降は DEBUG
@@ -22910,7 +20393,7 @@ def _fetch_rss_feed(feed: Dict[str, str]) -> List[SimpleNamespace]:
 
 async def fetch_rss_all() -> List[SimpleNamespace]:
     """全 RSS フィードを並列取得して重複なしでまとめる
-    ★ v2.97: _rss_excluded に含まれるフィードはスキップ"""
+    """
     tasks = [
         asyncio.to_thread(_fetch_rss_feed, feed)
         for feed in _RSS_FEEDS
@@ -22974,11 +20457,6 @@ async def close_order_chaser() -> None:
                 # キャンセル
                 ok = _cancel_order(order_id, sym, trd_env, f"チェイス（旧${old_price:.2f}→新${new_price:.2f}）")
                 if not ok:
-                    # ★ v3.9.150c: 取消が失敗した＝注文が消えた、ではない
-                    #   （Codexレビュー指摘）。通信エラーや OpenD 側の失敗でも False が
-                    #   返るため、生きている決済注文を管理表から落としてしまい、
-                    #   「決済注文は無い」と誤認した監視が二重に決済を出しうる。
-                    #   終端（取消済み・失敗・約定）を照会で確認できたときだけ外す。
                     _st_chk, _dealt_chk, _detail_chk = _order_status_snapshot(order_id, sym, trd_env)
                     if _is_terminal_order_status(_st_chk):
                         log.info(
@@ -22993,17 +20471,6 @@ async def close_order_chaser() -> None:
                         )
                     continue
 
-                # ★ v3.9.130: 軽い緩和 — 取消の「受付」を「完了」と即断せず、1回だけ
-                #   状態照会で確認してから再発注する。modify_order(CANCEL) の戻りは「受付」
-                #   までで、実際に取り消せたかは含まれないため、未取消のまま再発注すると
-                #   「生きた決済2本 → 売りすぎ(5/27型ショート反転)」の恐れがある。
-                #   ・取消/失敗を確認     → 再発注（安全）
-                #   ・まだ生存 or 約定済み → 再発注しない（既存注文が有効 / 既に決済済み）
-                #   ・照会自体が失敗/不明 → ★ v3.9.150c: 再発注しない（Codexレビュー指摘）。
-                #     旧挙動の「不明なら再発注」は、取消が実際には通っていない注文と
-                #     新しい注文の2本が同時に生きる（5/27型の売りすぎ）方向に倒れていた。
-                #     不明のときは追跡に残したまま次の巡回で再確認する。
-                #   本格対応（非同期でのポーリング確認）は別途。ここは同期1回照会の軽量ガード。
                 _confirmed_gone = None
                 try:
                     with _trade_ctx() as _ctx_cf:
@@ -23014,8 +20481,6 @@ async def close_order_chaser() -> None:
                         )
                     if _ret_cf == RET_OK and _data_cf is not None and not _data_cf.empty:
                         _st_cf = str(_data_cf["order_status"].iloc[0]).upper()
-                        # ★ v3.9.150c: CANCELED（一L）・DISABLED を追加（Codexレビュー指摘）。
-                        #   FILLED は入れない——約定済みに再発注したら二重決済になる。
                         if any(s in _st_cf for s in
                                ("CANCELLED", "CANCELED", "FAILED", "DELETED", "REJECTED", "DISABLED")):
                             _confirmed_gone = True   # 取消確定 → 再発注OK
@@ -23040,7 +20505,6 @@ async def close_order_chaser() -> None:
 
                 # 現値で再発注
                 retry_count = info.get("retry_count", 0)
-                # ★ v2.98: position_id 必須化。pending_orders に保存されたものを再利用。
                 _pid_chase  = info.get("position_id", "")
                 _side_chase = info.get("side", "LONG")
                 if not _pid_chase:
@@ -23054,7 +20518,6 @@ async def close_order_chaser() -> None:
                         f"moomoo アプリで手動決済をご確認ください。"
                     ))
                     continue
-                # ★ v3.5.2/v3.9.63: SHORT 決済サイドは環境別 (_cover_trd_side)。
                 # 実口座=BUY_BACK / デモ=BUY (デモは BUY_BACK 非対応)。
                 _trd_side_chase = _cover_trd_side(trd_env) if _side_chase == "SHORT" else TrdSide.SELL
                 ret, oid_or_msg = _close_one_position_id(
@@ -23091,7 +20554,6 @@ async def close_order_chaser() -> None:
                         f"急落で旧指値 ${old_price:.2f} が刺さらず → ${new_price:.2f} で再発注"
                     ))
                 elif ret == RET_OWNED_SKIP:
-                    # ★ v3.9.145: 所有権が変わった建玉への再発注は見送り（エラーにしない）。
                     log.info(f"【{sym}】 🛡️ 所有権が変わったためチェイス再発注を見送り（新しい所有側が管理します）")
                 else:
                     log.error(f"【{sym}】 🏃 チェイス再発注失敗: {oid_or_msg}")
@@ -23111,7 +20573,6 @@ async def external_news_loop(
         # market_open_event が clear されている間はここで待機する。
         # 金曜 15:45 ET の週末決済後も clear されるため、
         # 月曜プリマーケット開始まで自動的にニュース取得・発注が停止する
-        # (★ v3.9.149: 週末決済後の停止維持を修正。それ以前は約60秒で再開していた)。
         await market_open_event.wait()
         try:
             articles = await fetch_external_news()
@@ -23129,8 +20590,6 @@ async def global_news_loop(
     """
     RSS を 5秒間隔で並列取得する高速ニュースループ。
 
-    ★ v2.97: Reuters/AP RSS は廃止のため削除。Yahoo Finance のみで稼働。
-    DNS 解決失敗 / 連続失敗フィードは _rss_excluded に動的追加され除外される。
 
     Finnhub REST（10秒間隔）と独立して並走し、合計で ~5 分遅延のニュースを
     ほぼリアルタイムに近い形で処理できる。
@@ -23141,9 +20600,7 @@ async def global_news_loop(
 
     週末決済後は market_open_event が clear されるため、
     月曜プリマーケット開始まで自動的にループが待機状態に入る
-    (★ v3.9.149 で停止維持を修正。それ以前は約60秒で再開していた)。
     """
-    # ★ v2.97: 起動時 DNS 事前チェックで _rss_excluded に登録されたフィードは除外
     feed_names = [f["name"] for f in _RSS_FEEDS if f["name"] not in _rss_excluded]
     if not feed_names:
         log.warning(
@@ -23160,7 +20617,6 @@ async def global_news_loop(
         # market_open_event が clear されている間はここで待機する。
         # 金曜 15:45 ET の週末決済後も clear されるため、
         # 月曜プリマーケット開始まで自動的にニュース取得・発注が停止する
-        # (★ v3.9.149: 週末決済後の停止維持を修正。それ以前は約60秒で再開していた)。
         await market_open_event.wait()
         try:
             articles = await fetch_rss_all()
@@ -23185,11 +20641,8 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
 
     週末決済後は market_open_event が clear されるため、
     月曜プリマーケット開始まで自動的にリスク監視が待機状態に入る
-    (★ v3.9.149 で停止維持を修正。それ以前は約60秒で再開していた)。
     """
     # SPY/QQQ等のETF対象 + 個別株（STOCK_TICKERS）+ 決算銘柄（EARNINGS）を監視する
-    # ★ v3.9.61: モメンタム実発注銘柄 (_momentum_live_symbols) を必ず含める。
-    #   「発注はできるが監視されない」ポジション (5/29 IWM orphan) の構造的防止。
     _etf_syms      = sorted({sym for syms in EXECUTION_MAP.values() for sym in syms})
     _all_earn_syms = list(dict.fromkeys(EARNINGS_PRE_TICKERS + EARNINGS_AFTER_TICKERS))
     _mom_live_syms = _momentum_live_symbols()
@@ -23200,11 +20653,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
         log.info(f"  (モメンタム実発注銘柄 {sorted(_mom_live_syms)} を監視対象に含めています)")
     log.info(
         f"  強制損切り: -{MAX_LOSS_PCT*100:.2f}%（ポジション評価額基準） / "
-        # ★ v3.9.170: .1f だと 0.22%→"0.2%"・0.15%→"0.1%" と丸まり、実設定と
-        #   食い違って見えた（認定サポーターのログ解析で指摘）。設定確認の
-        #   主要な手段なので桁を増やす。
-        #   注: .2f も万能ではなく、0.225% のような3桁の設定は表示だけ丸まる
-        #   （判定には元の値が使われる）。標準値 0.22 / 0.15 では問題にならない。
         f"トレール発動: +{TRAIL_TRIGGER_PCT*100:.2f}%（投下額基準） / "
         f"トレール幅: {TRAIL_DROP_PCT*100:.2f}%"
         + (f" / 時間切れ決済: {TIMEOUT_EXIT_MINUTES}分" if TIMEOUT_EXIT_MINUTES > 0 else "")
@@ -23219,7 +20667,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
 
     # ── 実行銘柄を一括サブスクライブ（get_quote の前提条件）─────────────────
     try:
-        # ★ v2.86: with _quote_ctx() で例外時の close を保証
         with _quote_ctx() as sub_ctx:
             sub_codes = [to_moomoo_code(s) for s in exec_syms]
             ret_sub, err_sub = sub_ctx.subscribe(
@@ -23239,7 +20686,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
 
     _status_interval = max(1, 60 // RISK_CHECK_SEC)  # 約60秒ごとに表示（例: 15秒×4=60秒）
     _status_counter  = 0
-    # ★ v2.99.4: 5分ごとの市場状態ログ用カウンタ
     _market_state_interval = max(1, 300 // RISK_CHECK_SEC)  # 約300秒(5分)ごと
     _market_state_counter  = 0
 
@@ -23247,17 +20693,15 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
         # market_open_event が clear されている間はここで待機する。
         # 金曜 15:45 ET の週末決済後も clear されるため、
         # 月曜プリマーケット開始まで自動的にリスク監視が停止する
-        # (★ v3.9.149: 週末決済後の停止維持を修正)。
         await market_open_event.wait()
         await asyncio.sleep(RISK_CHECK_SEC)
 
         # ── ポジション同期（1回の接続でまとめて取得）──────────────────────────
-        await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+        await asyncio.to_thread(sync_positions, trd_env)
 
         # ── 定期ステータス表示（約60秒ごと）──────────────────────────────────
         _status_counter += 1
 
-        # ── ★ v2.99.4: 5分ごとの市場状態ログ ─────────────────────────────
         _market_state_counter += 1
         if _market_state_counter >= _market_state_interval:
             _market_state_counter = 0
@@ -23269,10 +20713,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
         if _status_counter >= _status_interval:
             _status_counter = 0
 
-            # ★ v3.9.135: 取引ロックの定期的な鳴らし直しは廃止した。
-            #   発注が1日出ない日もあり、その間ずっと鳴り続けていた（利用者指摘）。
-            #   代わりに、ロック中と記録している間だけ10分おきに状態を確かめ、
-            #   解けていれば静かに消す。確認は注文を出さない方法で行う。
             if _trade_locked:
                 global _trade_lock_last_probe
                 _now_p = datetime.datetime.now()
@@ -23292,10 +20732,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         _clear_trade_lock("解除を確認")
                     elif _unlocked is False:
                         log.debug("[取引ロック] まだ解除されていません")
-            # ★ v3.9.179b: この判定は await より前に行う。以降の枝で
-            #   get_quote_async を待つあいだに決済が確定すると実態とずれるが、
-            #   ずれるのは1回ぶんの表示だけで、次の巡回（約60秒後）で揃う。
-            #   建玉ごとの行は await の後に読み直しているので、金額の食い違いは出ない。
             _has_any_pos = any(
                 state.get(s).position_qty != 0 or _tracked_position_cost.get(s, 0) > 0
                 for s in exec_syms
@@ -23305,20 +20741,14 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 session_now, _ = get_session_info()
                 _prices = []
                 for s in exec_syms:
-                    # ★ v3.9.179: 表示ティックだけ同期のまま残っていた（認定サポーターの
-                    #   受入確認）。約60秒に1度必ず通る枝で、建玉の数だけ直列に呼ぶため、
-                    #   OpenD が重いと監視が止まる時間がここだけ伸びる。
-                    #   価格の取り出しも quote_price() に統一する。統一されていないと、
-                    #   板が bid 側だけのとき「監視は価格を出せるのに表示だけ取得失敗」になる。
                     q = await get_quote_async(s)
                     _px = quote_price(q)          # 表示用（板が片側でも出せる）
                     _px_rec = q.get("last", 0)    # 記録用（従来どおり・売買の入力になる）
                     if _px > 0:
                         _prices.append(f"{s}:${_px:.2f}")
-                        # ★ v2.92/v2.94: QQQ/SPY/SMH の価格スナップショットを記録
                         # （AI 判定時のマクロ文脈に使う、追加 API コールなし）
                         # v2.94: SMH を追加 (SMH 固有の下落トレンド検知に使用)
-                        if s in _INDEX_PRICE_HISTORY and _px_rec > 0:  # ★ v2.99.4
+                        if s in _INDEX_PRICE_HISTORY and _px_rec > 0:
                             record_index_price(s, _px_rec)
                 price_str = "  ".join(_prices) if _prices else "価格取得失敗"
                 log.info(
@@ -23330,22 +20760,14 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 session_now, _ = get_session_info()
                 _prices = []
                 for s in exec_syms:
-                    # ★ v3.9.179: 表示ティックだけ同期のまま残っていた（認定サポーターの
-                    #   受入確認）。約60秒に1度必ず通る枝で、建玉の数だけ直列に呼ぶため、
-                    #   OpenD が重いと監視が止まる時間がここだけ伸びる。
-                    #   価格の取り出しも quote_price() に統一する。統一されていないと、
-                    #   板が bid 側だけのとき「監視は価格を出せるのに表示だけ取得失敗」になる。
                     q = await get_quote_async(s)
                     _px = quote_price(q)          # 表示用（板が片側でも出せる）
                     _px_rec = q.get("last", 0)    # 記録用（従来どおり・売買の入力になる）
                     if _px > 0:
                         _prices.append(f"{s}:${_px:.2f}")
-                        # ★ v2.92/v2.94: QQQ/SPY/SMH の価格スナップショットを記録
-                        if s in _INDEX_PRICE_HISTORY and _px_rec > 0:  # ★ v2.99.4
+                        if s in _INDEX_PRICE_HISTORY and _px_rec > 0:
                             record_index_price(s, _px_rec)
                 price_str = "  ".join(_prices) if _prices else "価格取得失敗"
-                # ★ v3.9.143: 発注が止まるのは実口座だけ。デモに「発注ブロック中」と
-                #   表示すると事実と異なる（Codexレビュー指摘）。
                 _blk = ("新規発注を停止中" if _RUN_TRADE_ENV == "REAL"
                         else "デモのため発注は継続")
                 log.warning(
@@ -23360,22 +20782,11 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     tracked = _tracked_position_cost.get(s, 0)
                     if ts_s.position_qty == 0 and tracked <= 0:
                         continue
-                    # ★ v3.9.179: 同上（表示ティック内・建玉の数だけ直列に呼ぶ箇所）
                     q = await get_quote_async(s)
                     price_now = quote_price(q)
-                    # ★ v3.9.179b: await の間に別タスク（約定確認）が走り、決済が確定すると
-                    #   position_qty も _tracked_position_cost も 0 になる。await より前に
-                    #   読んだ tracked を使うと「注文中（約定待ち・未ポジション） 発注額$…」
-                    #   という行が、正常に決済できた直後に出る。まさにこの版が消そうと
-                    #   している誤読なので、await の後に読み直す（外部レビュー指摘）。
                     tracked = _tracked_position_cost.get(s, 0)
-                    # ★ v2.92/v2.94: QQQ/SPY/SMH の価格スナップショットを記録（追加 API コールなし）
-                    # ★ v3.9.179b: 記録は従来の取り出し（last→ask）のまま。ここは表示専用では
-                    #   なく _quote_sanity_ok（乖離15%で発注を止める）・_momentum_high_chase_block・
-                    #   トレンドフィルタの入力になるため、取り出し方を変えると売買が変わる
-                    #   （外部レビュー指摘）。表示だけ quote_price に揃える。
                     _px_rec = q.get("last", 0) or q.get("ask", 0) or 0
-                    if s in _INDEX_PRICE_HISTORY and _px_rec > 0:  # ★ v2.99.4
+                    if s in _INDEX_PRICE_HISTORY and _px_rec > 0:
                         record_index_price(s, _px_rec)
                     qty   = ts_s.position_qty
                     cost  = ts_s.avg_cost
@@ -23416,7 +20827,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 _is_earn_sym = symbol in _all_earnings_set
                 _t_trigger   = EARNINGS_TRAIL_TRIGGER_PCT   if _is_earn_sym else TRAIL_TRIGGER_PCT
                 _t_drop      = EARNINGS_TRAIL_DROP_PCT       if _is_earn_sym else TRAIL_DROP_PCT
-                # ★ v3.9.47: モメンタム発注のポジションはニュースとは別のタイムアウト
                 # を適用 (ニュースの鮮度ベースではなく、トレンド継続時間ベース)。
                 # entry_ai_category == "MOMENTUM" で識別。優先順位: 決算 > モメンタム > 通常。
                 _is_momentum = (ts.entry_ai_category == "MOMENTUM")
@@ -23427,7 +20837,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 else:
                     _t_timeout = TIMEOUT_EXIT_MINUTES
 
-                # ★ v2.98: place_short で建てた SHORT のみ正規扱い。
                 # sync_positions は position_side='SHORT' で is_short=True を自動セット。
                 # is_short=False + qty<0 は同期遅延/手動取引のため自動カバーせず警告のみ。
                 if ts.position_qty < 0 and not ts.is_short:
@@ -23444,7 +20853,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     setattr(risk_monitor_loop, f"_unknown_short_warned_{symbol}", False)
 
                 # ── ポジションなし・entry_timeもなし・自前管理コストも0 → 完全スキップ ──
-                # ★ v2.98: SHORT (qty<0) を「ポジションなし」と誤判定しないよう == 0 に変更
                 _tracked_cost = _tracked_position_cost.get(symbol, 0.0)
                 if ts.position_qty == 0 and ts.avg_cost <= 0 and ts.entry_time is None and _tracked_cost <= 0:
                     if ts.trail_active:
@@ -23456,10 +20864,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 # トレールの判定へ入れない。低レベル決済ガードだけに任せると、
                 # 決済失敗カウントや再エントリーブロックが汚染される。
                 if _is_other_owner(symbol):
-                    # ★ v3.9.140: 夜間持ち越し(OVN)の建玉と、Bot 以外の建玉を区別して表示する。
-                    #   どちらも日中ロジックの対象外だが、意味がまったく違う。
-                    #   OVN は「別の機能が正しく管理中」、Bot 以外は「手動介入が必要かも」。
-                    #   実機で OVN の建玉に「Bot 以外の建玉」と出て、不具合と誤解された。
                     _ovn_owned = bool(getattr(ts, "ovn_held", False))
                     if _ovn_owned:
                         _own_note = ("  🌙 夜間持ち越しが管理中です"
@@ -23469,12 +20873,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         _own_note = ("  ⚠️ Bot 以外の建玉のため自動売買は停止中"
                                      "（決済しません。この建玉を決済すると再開します）")
                         _own_log = log.warning
-                    # ★ v3.9.171: 夜間持ち越し（OVN）の建玉を抱えている間、この分岐が
-                    #   毎ティック走り、continue するので下の③には到達しない。
-                    #   走る時間帯はプレ（04:00 ET）〜寄りでの OVN 売却まで。
-                    #   夜間セッション中はループ自体が market_open_event で停まっている。
-                    #   ちょうど ovn_overnight_loop が30秒ごとに気配を見に行く時間帯で、
-                    #   同期のままだとそこと競合したまま塞ぐ。
                     _ext_q = await get_quote_async(symbol)
                     _ext_price = quote_price(_ext_q)
                     if _ext_price > 0 and ts.avg_cost > 0 and ts.position_qty != 0:
@@ -23497,18 +20895,12 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 # v2.99 hotfix: SHORT の PnL 符号反転を修正、avg_cost>0 で旧entry_timeなら
                 # タイムアウト判定も実施。
                 if ts.position_qty == 0 and _tracked_cost > 0:
-                    # ★ v3.9.171: 発注直後〜建玉反映までの窓。リスクが最も高い
-                    #   時間帯なので、ここも塞がないようにする。
                     _fp  = await get_quote_async(symbol)
-                    # ★ v3.9.171: bid を見ていなかった。板が片側しか無いとき
-                    #   （薄いプレ・一時中断明けなど）、上の外部保有側は価格を
-                    #   出せるのにここだけ「価格取得失敗」になっていた。
                     _cur = quote_price(_fp)
                     if _cur > 0:
                         # avg_cost(約定反映済み)があれば正確なP&L、なければ推定
                         if ts.avg_cost > 0:
                             _shares_actual = round(_tracked_cost / ts.avg_cost)
-                            # ★ v2.99 hotfix: SHORT/LONG で計算式を分岐
                             if ts.is_short:
                                 _pnl_actual = (ts.avg_cost - _cur) * _shares_actual
                                 _pct_actual = (ts.avg_cost - _cur) / ts.avg_cost * 100
@@ -23523,7 +20915,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                 f"  {_shares_actual}株  取得単価:${ts.avg_cost:.2f}"
                             )
 
-                            # ★ v2.99.2: API未反映時のタイムアウト処理を堅牢化
                             # 旧 v2.99.1 は place_close_all を直接呼んでいたが v2.98 で
                             # position_id 必須化され API未反映時に決済失敗。
                             # ① 再同期を1回試行 ② 反映されれば通常経路で決済
@@ -23538,7 +20929,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                     )
                                     # ── ① 強制再同期 (moomoo 側の同期遅延を解消する最後の試み) ──
                                     try:
-                                        await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+                                        await asyncio.to_thread(sync_positions, trd_env)
                                     except Exception as _e_resync:
                                         log.warning(f"{tag} [強制再同期] エラー: {_e_resync}")
 
@@ -23550,7 +20941,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                             f"{tag} ✅ 再同期で qty={ts_after.position_qty} を取得 "
                                             f"→ place_close_all で決済発注"
                                         )
-                                        # ★ v2.99.2: 戻り値で発注成否を判定し、失敗時は entry_time を維持
                                         ts._last_close_attempt_at = datetime.datetime.now()
                                         _close_ok2 = place_close_all(
                                             symbol, trd_env,
@@ -23560,12 +20950,8 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                         if _res2 == "full":
                                             ts.entry_time = None  # 全量決済できた → クリア
                                             ts._last_close_attempt_at = None
-                                            _clear_failed_close(symbol)  # ★ v2.99.4
+                                            _clear_failed_close(symbol)
                                         elif _res2 in ("partial", "unknown"):
-                                            # ★ v3.9.149: 建玉が残っているので時計は戻さない。
-                                            #   ただし発注自体は通っているので、60秒クール
-                                            #   ダウンと決済失敗ロックは解く（Codexレビュー指摘）。
-                                            #   残したままだと残玉の再決済が遅れる。
                                             ts._last_close_attempt_at = None
                                             _clear_failed_close(symbol)
                                             log.warning(
@@ -23573,7 +20959,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                                 f"、次の巡回で残りを決済します"
                                             )
                                         elif _res2 in ("owned", "pending"):
-                                            # ★ v3.9.148: 見送りは発注失敗ではない（Codexレビュー指摘）。
                                             log.info(
                                                 f"{tag} ⏰ 再同期後の時間切れ決済は見送りました"
                                                 f"（既存の決済注文の処理待ち、または Bot 以外の建玉）"
@@ -23584,7 +20969,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                                 f"{tag} ⏰ 再同期後の時間切れ決済が全失敗 → "
                                                 f"entry_time 維持で次サイクル再試行"
                                             )
-                                            _mark_failed_close(symbol)  # ★ v2.99.4: 新規BUYブロック
+                                            _mark_failed_close(symbol)
                                     else:
                                         # ── ③ それでも API 未反映 → 警告 + Discord 通知 ──
                                         # 同じ警告を連発しないよう 5 分間隔で間引く
@@ -23636,20 +21021,17 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
 
                 # ── ポジションなし・entry_timeあり → 再同期してからタイムアウト判断 ──
                 # ポジション取得失敗（API不安定）や発注済み未約定のケースも含む
-                # ★ v2.98: SHORT を「ポジションなし」と誤判定しないよう == 0 に変更
                 if ts.position_qty == 0 and ts.avg_cost <= 0:
                     if _t_timeout > 0 and ts.entry_time is not None:
                         elapsed = (datetime.datetime.now() - ts.entry_time).total_seconds() / 60
                         if elapsed >= _t_timeout:
                             # 時間切れ前にもう一度sync_positionsで再確認
-                            await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
-                            if ts.position_qty != 0:   # ★ v2.98: SHORT も含めて検出
+                            await asyncio.to_thread(sync_positions, trd_env)
+                            if ts.position_qty != 0:
                                 # ポジション確認できた → 通常の時間切れ決済へ
                                 log.warning(
                                     f"{tag} ⏰ 時間切れ決済（再同期後確認）: エントリから {elapsed:.1f}分経過"
                                 )
-                                # ★ v2.86: 銘柄単位ロックで race 防止
-                                # ★ v2.99.2: 戻り値で発注成否を判定し、失敗時は entry_time を維持
                                 ts._last_close_attempt_at = datetime.datetime.now()
                                 async with _get_sym_lock(symbol):
                                     _close_ok3 = place_close_all(symbol, trd_env, f"時間切れ決済: {elapsed:.1f}分経過")
@@ -23658,11 +21040,8 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                     ts.forced_exits += 1
                                     ts.entry_time = None
                                     ts._last_close_attempt_at = None
-                                    _clear_failed_close(symbol)  # ★ v2.99.4
+                                    _clear_failed_close(symbol)
                                 elif _res3 in ("partial", "unknown"):
-                                    # ★ v3.9.149: 決済はまだ完了していないので
-                                    #   forced_exits は数えない（Codexレビュー指摘）。
-                                    #   発注は通っているのでクールダウンとロックは解く。
                                     ts._last_close_attempt_at = None
                                     _clear_failed_close(symbol)
                                     log.warning(
@@ -23670,7 +21049,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                         f"、次の巡回で残りを決済します"
                                     )
                                 elif _res3 in ("owned", "pending"):
-                                    # ★ v3.9.148: 見送りは発注失敗ではない（Codexレビュー指摘）。
                                     log.info(
                                         f"{tag} ⏰ 時間切れ決済(再同期後確認)は見送りました"
                                         f"（既存の決済注文の処理待ち、または Bot 以外の建玉）"
@@ -23681,26 +21059,8 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                         f"{tag} ⏰ 時間切れ決済(再同期後確認)が全失敗 → "
                                         f"entry_time 維持で次サイクル再試行"
                                     )
-                                    _mark_failed_close(symbol)  # ★ v2.99.4
+                                    _mark_failed_close(symbol)
                             else:
-                                # ★ v3.9.148: 建玉が無い理由は「注文が通らなかった」
-                                #   だけでなく「損切り・トレールで既に決済済み」でも
-                                #   起きる（決済経路は entry_time を消さないため、
-                                #   決済後もここへ来る）。旧文言の「未約定とみなし
-                                #   リセット」は後者のとき誤解を招くので、断定しない。
-                                # ★ v3.9.179: どちらだったかは記録から分かる（認定サポーターの報告）。
-                                #   この建玉より後に決済の確定があれば、正常に決済できた側。
-                                #   その場合は通知を出さない——パニックセル等で正常に決済した
-                                #   数分後に「建玉が無い」と届き、利用者には「決済に失敗したのか」
-                                #   と読めていた。
-                                #   entry_time はここで消す（従来どおり）。決済の確定を
-                                #   待たずに消すと、複数建玉の残玉や、決済→1秒→反転エントリー
-                                #   の次の建玉の時間切れ時計まで止めてしまう。
-                                #   照合は「決済し終えた建玉が、いま時計を持っている建玉と
-                                #   同じか」で行う。**時刻の前後では判定できない**——
-                                #   決済→1秒→反転エントリーでは、旧決済の約定確認（8〜17秒後）が
-                                #   新しい建玉より必ず後になり、新しい建玉を「決済済み」と
-                                #   誤判定して、出すべき警告のほうを消してしまう（外部レビュー指摘）。
                                 _closed_et = getattr(ts, "last_closed_entry_time", None)
                                 _was_closed = (_closed_et is not None
                                                and ts.entry_time is not None
@@ -23717,10 +21077,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                     )
                                 ts.entry_count = 0
                                 ts.entry_time  = None
-                                # ★ v3.9.179b: 使い終わった控えは捨てる（外部レビュー提案）。
-                                #   いまは entry_time が毎回マイクロ秒つきで振られるので
-                                #   古い控えと偶然一致する経路は無いが、起点の作り方が
-                                #   変わったときに誤って通知を止めないための余裕。
                                 ts.last_closed_entry_time = None
                                 if not _was_closed:
                                     _threadsafe_future(asyncio.to_thread(
@@ -23728,18 +21084,12 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                         f"[Bot] {tag} ⏰ 時間切れの確認（建玉なし）\n"
                                         f"エントリから {elapsed:.1f}分経過  上限: {_t_timeout}分\n"
                                         f"口座に建玉が無いため、内部の時刻管理をリセットしました。\n"
-                                        # ★ v3.9.181: 断定を戻した（認定サポーターの指摘）。
-                                        #   抑止が効くのは last_closed_entry_time が書かれた回だけで、
-                                        #   sync_positions は一度も書かない。手動決済・外部決済で
-                                        #   建玉が消えた回はここへ落ちるので、「注文が成立しなかった」
-                                        #   と断定すると事実と食い違う。
                                         f"（既に決済済み、または注文が成立しなかったケースです。"
                                         f"新たな決済は行っていません）"
                                     ))
                     continue
 
                 # ── ① ポジション上限超過チェック ────────────────────────────
-                # ★ v2.98: SHORT (position_qty<0) も評価額計算に含めるため abs() を使用。
                 # 以降のロジック (excess_qty 算出, place_close_partial 呼び出し等) は
                 # LONG 前提のため、SHORT の場合はチェックのみで部分決済は行わない。
                 _abs_qty       = abs(ts.position_qty)
@@ -23758,15 +21108,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         f"現在評価額: ${position_value:,.0f}  上限: ${_BUDGET_USD:,.0f}\n"
                         f"超過分 {excess_qty}株（約${excess_value:,.0f}）を部分決済します"
                     ))
-                    # ★ v3.9.139: 部分決済が失敗した場合は continue しない。
-                    #   従来は成否に関わらず次サイクルへ飛ばしていたため、上限超過が
-                    #   続くあいだ損切り・トレール・パニックがずっと評価されなかった。
-                    #   （認定サポーターからの指摘・position-cap-bypass）
-                    # ★ v3.9.141: place_close_partial が常に None を返しており、
-                    #   上の判定が必ず「失敗」に倒れていた（別の認定サポーターからの指摘）。
-                    #   成功時に continue しないと、未約定の部分決済を残したまま同じ
-                    #   サイクルで損切り・トレールが全決済を重ねて出し、売り過ぎ・
-                    #   ショート反転を起こしうる。成功時は必ず次サイクルへ送る。
                     _cap_ok = place_close_partial(
                         symbol, trd_env, excess_qty,
                         f"ポジション上限超過: ${position_value:,.0f} > ${_BUDGET_USD:,.0f}")
@@ -23777,11 +21118,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     )
 
                 # ── ② 時間切れ決済チェック ────────────────────────────────────
-                # ★ v3.9.139: この節を抜けても、下の ③〜⑤（株価取得・損切り・トレール）
-                #   へ必ず進む。従来は見送り・クールダウンで continue しており、
-                #   トレールが有効になった建玉がタイムアウト時刻を過ぎた瞬間から
-                #   損切りもトレールも二度と評価されなかった。
-                #   （認定サポーターからの指摘・trail-timeout-bypass）
                 _skip_timeout_close = True   # 既定は「決済しない」。条件成立時だけ False にする
                 _timeout_due = (_t_timeout > 0 and ts.entry_time is not None
                                 and (datetime.datetime.now() - ts.entry_time).total_seconds() / 60
@@ -23790,7 +21126,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     elapsed = (datetime.datetime.now() - ts.entry_time).total_seconds() / 60
                     _skip_timeout_close = False
                     if True:  # noqa: SIM103 （インデント維持のためのブロック）
-                        # ★ v3.9.59: モメンタム + トレール ON 中はタイムアウト見送り
                         # トレール ON = 既に利益確定モードに入っている (peak が
                         # TRAIL_TRIGGER_PCT 超え)。タイムアウトで早期切るとトレールが
                         # 捕捉できたはずの利益を取り逃がす。トレールは TRAIL_DROP_PCT
@@ -23810,7 +21145,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                 ts._timeout_bypass_logged_at = _now_check
                             # 見送るのは「時間切れ決済」だけ。損切り・トレールは下で評価する。
                             _skip_timeout_close = True
-                        # ★ v2.99.2: 決済発注失敗時の再試行クールダウン (60秒)
                         # entry_time を維持しつつ毎ループで再発注すると過剰トラフィックになるため、
                         # 直近の発注試行から60秒以内なら今回はスキップする。
                         if not _skip_timeout_close:
@@ -23822,12 +21156,10 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                         f"{tag} ⏰ 時間切れ {elapsed:.1f}分経過だが直近発注から {_elapsed_since_attempt:.0f}秒 "
                                         f"→ クールダウン中 (60秒待機)"
                                     )
-                                    # ★ v3.9.139: クールダウン中も監視は続ける（下の ③〜⑤ へ）
                                     _skip_timeout_close = True
                 if _timeout_due and not _skip_timeout_close:
                     if True:  # noqa: SIM103 （インデント維持のためのブロック）
 
-                        # ★ v3.8.5: 時間切れ決済は通常運用フロー (タイマー満了の自動決済) のため
                         # WARNING → INFO に降格。発注失敗時の error / panic ログは別経路で出力される。
                         log.info(
                             f"{tag} ⏰ 時間切れ決済！ エントリから {elapsed:.1f}分経過"
@@ -23839,8 +21171,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                             f"エントリから {elapsed:.1f}分経過  上限: {_t_timeout}分\n"
                             f"（ニュースのエッジ消失・タイムアウトによる強制決済）"
                         ))
-                        # ★ v2.86: 銘柄単位ロックで race 防止
-                        # ★ v2.99.2: 戻り値を受けて成功時のみ entry_time をクリア
                         ts._last_close_attempt_at = datetime.datetime.now()
                         async with _get_sym_lock(symbol):
                             _close_ok = place_close_all(symbol, trd_env, f"時間切れ決済: {elapsed:.1f}分経過")
@@ -23849,11 +21179,9 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                             ts.forced_exits += 1
                             ts.entry_time = None
                             ts._last_close_attempt_at = None  # 成功時はクールダウン解除
-                            ts.close_fail_count = 0          # ★ v3.9.31: 成功で失敗カウントリセット
-                            _clear_failed_close(symbol)  # ★ v2.99.4
+                            ts.close_fail_count = 0
+                            _clear_failed_close(symbol)
                         elif _res in ("partial", "unknown"):
-                            # ★ v3.9.149: 残玉があるので時計を戻さない（次の巡回で再発動）。
-                            #   完了していないので forced_exits も数えない。
                             ts._last_close_attempt_at = None
                             _clear_failed_close(symbol)
                             log.warning(
@@ -23861,15 +21189,11 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                 f"、次の巡回で残りを決済します"
                             )
                         elif _res in ("owned", "pending"):
-                            # ★ v3.9.141b: 「未約定の決済が残っているので見送った」場合は
-                            #   発注失敗ではない（Codexレビュー指摘）。失敗カウントを
-                            #   進めると、誤って重大通知や強制同期に至る。
                             log.info(
                                 f"{tag} ⏰ 時間切れ決済は見送りました（既存の決済注文の処理待ち）"
                                 f" → 次の巡回で再挑戦します"
                             )
                         else:
-                            # ★ v3.9.31: 連続失敗カウント + 無限リトライ防止
                             # 5/21 利用者T事例: ショートカバーが moomoo に拒否され続け
                             # 時間切れ決済が 11 分間無限ループした。N 回連続失敗で
                             # sync_positions を強制実行し、実態 qty=0 なら諦める。
@@ -23878,7 +21202,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                                 f"{tag} ⏰ 時間切れ決済の発注が全失敗しました "
                                 f"({ts.close_fail_count}回連続) → entry_time を維持し 60秒後に再試行"
                             )
-                            _mark_failed_close(symbol)  # ★ v2.99.4
+                            _mark_failed_close(symbol)
                             if ts.close_fail_count >= _CLOSE_FAIL_GIVEUP_LIMIT:
                                 log.warning(
                                     f"{tag} ⏰ 決済発注が {ts.close_fail_count} 回連続失敗 → "
@@ -23925,19 +21249,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         continue
 
                 # ── ③ リアルタイム株価の取得 ─────────────────────────────────
-                # ★ v3.9.171: await せずに呼ぶとイベントループを塞ぐ。get_quote は
-                #   OpenD への同期RPC（subscribe＋板＋気配）で、生成は
-                #   _make_ctx_bounded で最大 MOOMOO_CTX_BUILD_TIMEOUT_SEC（既定15秒）
-                #   まで待つ。建玉ごとに毎ティック呼ぶこの箇所は、建玉数ぶん直列に
-                #   積み上がり、その間は損切り・トレール・時間切れ・ニュース取得・
-                #   心拍が同時に止まる。v3.9.129 が sync_positions を to_thread に
-                #   逃がしたのと同じ理由・同じ形。
-                #   ★ この per-symbol ループには同種の同期呼び出しが3箇所あり
-                #     （外部保有・約定直後の未反映窓・ここ）、前2つは continue で
-                #     抜けるためここには到達しない。1つだけ直すと夜間持ち越し中や
-                #     エントリー直後は塞がったままなので、3箇所すべてを揃える。
-                #     残る同期は同関数の約60秒ゲート（_status_interval）内の
-                #     状況表示のみ。行番号は書かない（挿入のたびに腐るため）。
                 quote = await get_quote_async(symbol)
                 price = quote_price(quote)
                 if price <= 0:
@@ -23957,7 +21268,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 ts.last_price = price
                 qty = ts.position_qty
 
-                # ★ v3.1.3: avg_cost 未確定の場合は監視をスキップ (約定反映待ち)
                 # 発注直後の数秒間、position_qty は更新されているが avg_cost が未設定の
                 # ままになるケースがある。この間 PnL = (0 - price) * abs(qty) が
                 # 大幅マイナス値となり、強制損切りの誤発動を引き起こす。
@@ -23970,7 +21280,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     )
                     continue
 
-                # ★ v3.9.17: 約定確認待ち中はリスク判定をスキップ
                 # SHORT 発注時 avg_cost は limit_price で仮設定されているため (v3.1.3)、
                 # 実約定価格との乖離で誤った PnL 算出 → 強制損切り誤発動が起きる。
                 # 5/13 22:49 SPY 事例: limit=$732.32 vs 現値$736.05 → 誤算 -0.51% で
@@ -23993,7 +21302,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 else:
                     continue
 
-                # ── ★ v2.95: 保有中最大含み益を更新（GAS送信用）──────────────
                 # 含み益が正値の時だけ更新。含み損は更新しない（最大ドローダウンは別途管理）。
                 # ロング・ショート両対応（qty>0/qty<0 両方で pnl は正なら含み益）
                 if pnl > 0:
@@ -24026,16 +21334,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     else:
                         dfp = (price - ts.peak_price) / ts.peak_price * 100
                         trail_str = f"  trough=${ts.peak_price:.2f} 上昇={dfp:.2f}%"
-                # ★ v3.9.134: 管理対象外の建玉は、その旨を毎回はっきり出す。
-                #   従来は「ポジションなし」の行にだけ注意書きを足していたため、
-                #   建玉があるとき＝まさに知らせたい場面で画面に出ていなかった
-                #   （デモ実機テストで判明）。
                 if _is_other_owner(symbol):
-                    # ★ v3.9.171: OVN と外部建玉を出し分ける。v3.9.140 で1つ目の
-                    #   チェックは直したが、この2つ目には入っていなかった。
-                    #   ここへ来る主因は「待機中に OVN が所有権を取った」場合なので、
-                    #   出し分けないと、OVN が正常に建てた瞬間に「Bot 以外の建玉＝
-                    #   手動介入が必要かも」と出る（v3.9.140 が消した誤解の再現）。
                     if bool(getattr(ts, "ovn_held", False)):
                         _late_note = ("  🌙 夜間持ち越しが管理中です"
                                       "（日中の自動売買は触りません）")
@@ -24048,13 +21347,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         f"{tag} [ポジション] ${price:.2f}  "
                         f"PnL={pnl_colored(pnl)}({pct_colored(unr_pct)}){_late_note}"
                     )
-                    # ★ v3.9.171: ここで打ち切る。株価取得の await 中に OVN が所有権を
-                    #   取る（ovn_held=True）ことがあり、従来はログだけ出して④⑤へ
-                    #   落ちていた。実際の売却は place_close_all の低レベルガードが
-                    #   止めるので誤発注にはならないが、その手前で「強制損切り発動」の
-                    #   通知を送り、決済試行の時刻を刻んで60秒のクールダウンを自分に
-                    #   掛けてしまう（所有権が戻った直後の本物の損切りが遅れる）。
-                    #   ログの文言どおり「決済しません」で揃える。
                     continue
                 else:
                     log.info(
@@ -24065,16 +21357,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 # ── ④ 強制損切り（ポジション評価額の MAX_LOSS_PCT %）──────────
                 position_cost   = ts.avg_cost * abs(qty)
                 # 決算銘柄は EARNINGS_MAX_LOSS_PCT（0なら MAX_LOSS_PCT を流用）
-                # ★ v3.9.63: モメンタム建玉は専用の MOMENTUM_STOP_LOSS_PCT を適用。
-                #   従来は共通 MAX_LOSS_PCT(0.30%) で切られ、6/1 実発注でも QQQ 0.20-0.31%
-                #   で被弾が頻発し 60分タイムアウト前に刈られていた (寄り高値掴みの早期損切り
-                #   連発)。MOMENTUM_STOP_LOSS_PCT は % 単位 (例 0.50) のため /100 で小数化。
-                #   優先順位: 決算 > モメンタム > 通常。0 以下のときは通常値にフォールバック。
-                # ★ v3.9.176c: どの枝が値を決めたかをここで確定させる（外部レビュー指摘）。
-                #   従来は記録側で `_is_earn_sym` だけを見て "earnings" と書いていたが、
-                #   EARNINGS_MAX_LOSS_PCT が 0（既定値・「通常値を流用」の意味）のときは
-                #   この枝を通らないので、決算銘柄なのに通常の値が入る。それを
-                #   「決算の設定でこうなった」と記録すると読み手を誤らせる。
                 if _is_earn_sym and EARNINGS_MAX_LOSS_PCT > 0:
                     _eff_max_loss = EARNINGS_MAX_LOSS_PCT
                     _stop_basis = "earnings"
@@ -24084,48 +21366,24 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 else:
                     _eff_max_loss = MAX_LOSS_PCT
                     _stop_basis = "common"
-                # ★ v3.9.32: 高ボラ銘柄 (NVDA/SMH/TSLA 等) は損切り幅を拡大
                 # (発注時にサイズを縮小済みなのでドル損失額は ETF と同水準に保たれる)
                 # モメンタム専用値を使う場合は二重拡大を避けるため倍率は適用しない。
                 # ※ 案a(高ボラ損切り拡大)は実取引を変えず「シャドー計測」で検証する方針(v3.9.93)。
                 if not (_is_momentum and MOMENTUM_STOP_LOSS_PCT > 0):
                     _eff_max_loss = _effective_max_loss_pct(symbol, _eff_max_loss)
-                # ★ v3.9.133: ここで確定した「実際に適用される損切り%」を建玉に保存する。
-                #   決済記録(_send_trade_result)はこの値をそのまま出力し、後からグローバル値で
-                #   再計算しない（モメンタムは高ボラ倍率をスキップするため、再計算すると
-                #   記録=1.50% / 実際=0.50% のように乖離する。今週の分析で判明）。
                 try:
                     ts.enforced_stop_pct = round(_eff_max_loss * 100.0, 4)
                 except Exception as _es_exc:
-                    # ★ v3.9.178: 隣の enforced_exit と同じ扱い（外部レビュー指摘）。
-                    #   握り潰すと前回の巡回の値が残り、決済記録に古い損切り%が載る。
                     ts.enforced_stop_pct = None
                     log.warning(f"{tag} 損切り%の保存に失敗（記録は設計値で補完されます）: "
                                 f"{type(_es_exc).__name__}: {_es_exc}")
                 max_loss_dollar = position_cost * _eff_max_loss
-                # ★ v3.9.66 (施策B'): 個別株は 1 トレード絶対損失上限 (USD) も併用。
                 # % 損切りが間に合わない急変動でも -STOCK_MAX_LOSS_USD で必ず切る。
                 _is_stock_rm = (symbol in STOCK_TICKERS or symbol in EARNINGS_PRE_TICKERS
                                 or symbol in EARNINGS_AFTER_TICKERS)
                 _usd_cap_hit = (
                     _is_stock_rm and STOCK_MAX_LOSS_USD > 0 and pnl <= -STOCK_MAX_LOSS_USD
                 )
-                # ★ v3.9.85: PAN案（任意・MOMENTUM_TRAIL_FROM_ENTRY=true）。
-                #   モメンタム建玉は固定損切り(建値基準)の代わりに「建玉からのトレール
-                #   (幅=損切り幅 _eff_max_loss)」で損失保護する。peak は毎ループ更新済みで
-                #   建玉時から有利側へ動けば損切り線も切り上がる。下方向(一直線逆行)では
-                #   peak≒建値となり固定損切りと同値=劣らない。trail_active 後は下の狭い
-                #   トレール(_t_drop < _eff_max_loss)が先に発火し2段階トレールになる。
-                # ★ v3.9.86 (レビュー指摘修正):
-                #   (1) peak_price は建玉時に seed されず「最初に観測した市場価格」で
-                #       初期化されるため、建玉直後に逆行(ギャップ/観測遅延)すると
-                #       トレール基準が建値より不利側に置かれ、固定損切りより"緩く"なる
-                #       不具合があった。基準を建値で floor/cap し、固定損切りに決して
-                #       劣らない(弱意味で優位)ことを保証する。
-                #         LONG : ref = max(peak, avg_cost)
-                #         SHORT: ref = min(peak, avg_cost)
-                #   (2) trail_active 到達後は狭いトレール(⑤)に委ね、広い建玉トレール(④)は
-                #       発火させない(急落1tickで利確が損切り計上されA/B分類を汚す問題の解消)。
                 _pan_trail_mode = bool(
                     MOMENTUM_TRAIL_FROM_ENTRY and _is_momentum
                     and ts.peak_price > 0 and ts.avg_cost > 0
@@ -24141,14 +21399,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     _stop_hit = (_drop_from_peak >= _eff_max_loss)
                 else:
                     _stop_hit = (pnl <= -max_loss_dollar)
-                # ★ v3.9.175: 損切りと同じ考えで、タイムアウトとトレールも
-                #   「いま適用した値」をここで1組にして残す。この時点で
-                #   _t_timeout / _t_trigger / _t_drop は決算・モメンタム・通常の
-                #   分岐を通過済みなので、記録側で再計算する必要がなくなる。
-                #   ★ v3.9.175b: 保存を _pan_trail_mode の確定後に移した（外部レビュー
-                #     指摘）。損切りの方式は「設定 × モメンタム」だけでは決まらず、
-                #     利益トレールが発動済み（trail_active）なら固定幅に戻る。
-                #     _pan_trail_mode をそのまま使えば、条件がコード内に2つできない。
                 try:
                     ts.enforced_exit = {
                         "stop_pct":          round(_eff_max_loss * 100.0, 4),
@@ -24167,20 +21417,9 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         "basis":             _stop_basis,
                     }
                 except Exception as _ee_exc:
-                    # ★ v3.9.178: ログを出すだけでは足りない（外部レビュー指摘）。
-                    #   ここで例外が出たまま放置すると ts.enforced_exit は**前回の巡回の
-                    #   断面のまま**残り、決済記録に古い値が「正しい値の顔で」載る。
-                    #   None に落として記録側を空欄にする（推測より空欄、が本版の方針）。
-                    #   log.debug はコンソールにもエラー収集にも乗らないので warning。
                     ts.enforced_exit = None
                     log.warning(f"{tag} 出口条件の保存に失敗（記録は空欄になります）: "
                                 f"{type(_ee_exc).__name__}: {_ee_exc}")
-                # ★ v3.9.101: 約定直後の猶予中は損失保護（建玉トレール/強制損切り）を抑止。
-                #   指値の仮設定→実約定単価の反映までの過渡期に誤発火しない保険。
-                #   利益確定のトレール(⑤)は対象外（損失保護のみ抑止）。
-                # ★ v3.9.105: 猶予はモメンタム建玉のみに限定（v3.9.101 の実装漏れ修正）。
-                #   従来は _is_momentum 条件が抜けており、ニュース/決算建玉の損切りまで
-                #   15秒遅延していた。
                 if (_stop_hit or _usd_cap_hit) and _is_momentum \
                         and MOMENTUM_ENTRY_GRACE_SEC > 0 \
                         and ts.entry_time is not None:
@@ -24194,7 +21433,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         _stop_hit = False
                         _usd_cap_hit = False
                 if _stop_hit or _usd_cap_hit:
-                    # ★ v2.99.2: 発注失敗時の再試行クールダウン (60秒)
                     _last_attempt_lc = getattr(ts, "_last_close_attempt_at", None)
                     if _last_attempt_lc is not None:
                         _elapsed_since_lc = (datetime.datetime.now() - _last_attempt_lc).total_seconds()
@@ -24205,25 +21443,12 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                             continue
 
                     loss_pct = abs(pnl) / position_cost * 100 if position_cost > 0 else 0
-                    # ★ v3.9.102: 表記改善。利益トレール作動後(trail_active=含み益が+発動閾値に
-                    #   達してトレール管理下に入った建玉)の戻り決済を「強制損切り」と表記すると
-                    #   誤解を招くため、トレール表記にする（exit_code は TRAIL）。
-                    #   一度も利益が乗らずライン到達で切れた純粋な損切りのみ「強制損切り」。
                     if _pan_trail_mode:
                         _exit_label = "建玉トレールストップ"
                     elif ts.trail_active:
                         _exit_label = "トレイリングストップ（利益確保後の戻り）"
                     else:
                         _exit_label = "強制損切り"
-                    # ── ★ v3.9.84: 強制損切りA/B計測（シャドー・挙動は一切不変）──────────
-                    #   強制損切りした建玉について「もし損切りせずトレール/+60分保有していたら」
-                    #   の反実仮想を、観察ログの仮想exit列（32=基準PnL%・33=仮想MFEトレールPnL%）で
-                    #   後追い計測する。block_stage="forced_stop_ab"。実現損≒実効損切り%（列43）と
-                    #   比較し、反実仮想が実現損を継続的に上回れば「損切りが早すぎる＝緩める/トレール
-                    #   委任の検証材料」になる。観察ログ既存の +60分 vexit パイプラインに相乗りする
-                    #   ため新規GAS列・新規ロジックは不要（送信1件増のみ・売買は完全に不変）。
-                    #   ※ PAN案(建玉トレール)・利益トレール戻りで決済した分はA/Bの対照群を
-                    #     汚さないため記録しない（純粋な強制損切りのみ計測）。
                     if not _pan_trail_mode and not ts.trail_active:
                         try:
                             _log_observation(
@@ -24262,30 +21487,21 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         f"基準幅: {_eff_max_loss*100:.2f}%（{_cut_reason}）\n"
                         f"株価: ${price:.2f}  取得単価: ${ts.avg_cost:.2f}"
                     ))
-                    # ★ v2.86: 銘柄単位ロックで race 防止
-                    # ★ v2.99.2: 戻り値で発注成否を判定
                     ts._last_close_attempt_at = datetime.datetime.now()
                     async with _get_sym_lock(symbol):
                         _close_ok_lc = place_close_all(symbol, trd_env, f"{_exit_label}: ${pnl:.2f} ({loss_pct:.2f}%)")
                     _res_lc = _take_close_result(symbol)
                     if _res_lc in ("full", "partial", "unknown"):
                         ts._last_close_attempt_at = None
-                        _clear_failed_close(symbol)  # ★ v2.99.4
+                        _clear_failed_close(symbol)
                         if _res_lc == "full":
                             ts.forced_exits += 1
-                            # ★ v3.9.149（案A）: 全量さばけた回だけ時計を返す。
-                            #   時間切れ経路と挙動が揃い、決済後に「時間切れ（建玉なし）」の
-                            #   不要な再照会と通知が出なくなる。
-                            #   "partial" では返さない——残玉の時間切れ監視を落とさないため。
                             ts.entry_time = None
                         else:
                             log.warning(
                                 f"{tag} {_exit_label}は一部のみ決済しました → entry_time を維持します"
                             )
                     elif (_why_lc := _res_lc) in ("owned", "pending"):
-                        # ★ v3.9.148: 見送りは発注失敗ではない（Codexレビュー指摘）。
-                        #   アラート音と連続失敗カウントを進めると、実害が無いのに
-                        #   重大通知や強制同期に至る。理由はそのまま出す。
                         log.info(
                             f"{tag} {_exit_label}は見送りました"
                             f"（{'Bot 以外の建玉' if _why_lc == 'owned' else '既存の決済注文の処理待ち'}）"
@@ -24295,8 +21511,8 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         log.error(
                             f"{tag} ⚠ {_exit_label}の発注が全失敗 → 60秒後に再試行します"
                         )
-                        _play_alert_sound("force_loss_cut_failed")  # ★ v3.9.19: アラート音
-                        _mark_failed_close(symbol)  # ★ v2.99.4
+                        _play_alert_sound("force_loss_cut_failed")
+                        _mark_failed_close(symbol)
                     continue
 
                 # ── ⑤ トレイリングストップ ───────────────────────────────────
@@ -24312,7 +21528,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         peak_pnl = (ts.avg_cost - ts.peak_price) * abs(qty)
                         label_peak = f"trough=${ts.peak_price:.2f}→${price:.2f}  上昇={drop*100:.3f}%"
                     if drop >= _t_drop:
-                        # ★ v2.99.2: 発注失敗時の再試行クールダウン (60秒)
                         _last_attempt_tr = getattr(ts, "_last_close_attempt_at", None)
                         if _last_attempt_tr is not None:
                             _elapsed_since_tr = (datetime.datetime.now() - _last_attempt_tr).total_seconds()
@@ -24335,8 +21550,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                             f"最高利益時: +${peak_pnl:.2f}\n"
                             f"{label_peak}"
                         ))
-                        # ★ v2.86: 銘柄単位ロックで race 防止
-                        # ★ v2.99.2: 戻り値で発注成否を判定
                         ts._last_close_attempt_at = datetime.datetime.now()
                         async with _get_sym_lock(symbol):
                             _close_ok_tr = place_close_all(
@@ -24346,17 +21559,16 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         _res_tr = _take_close_result(symbol)
                         if _res_tr in ("full", "partial", "unknown"):
                             ts._last_close_attempt_at = None
-                            _clear_failed_close(symbol)  # ★ v2.99.4
+                            _clear_failed_close(symbol)
                             if _res_tr == "full":
                                 ts.trail_exits += 1
-                                ts.entry_time = None   # ★ v3.9.149（案A）
+                                ts.entry_time = None
                             else:
                                 log.warning(
                                     f"{tag} ★ トレイリングストップは一部のみ決済しました"
                                     f" → entry_time を維持します"
                                 )
                         elif (_why_tr := _res_tr) in ("owned", "pending"):
-                            # ★ v3.9.148: 損切り経路と同じく、見送りは失敗に数えない。
                             log.info(
                                 f"{tag} ★ トレイリングストップは見送りました"
                                 f"（{'Bot 以外の建玉' if _why_tr == 'owned' else '既存の決済注文の処理待ち'}）"
@@ -24366,7 +21578,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                             log.error(
                                 f"{tag} ★ トレイリングストップの発注が全失敗 → 60秒後に再試行します"
                             )
-                            _mark_failed_close(symbol)  # ★ v2.99.4
+                            _mark_failed_close(symbol)
 
             except Exception as e:
                 log.error(f"[{symbol}] リスク監視エラー: {e}", exc_info=True)
@@ -24375,11 +21587,6 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
 def _startup_block_note(trd_env) -> str:
     """起動時復元で建玉が確認できないときの、末尾の一文。
 
-    ★ v3.9.181: デモ口座にも「実口座の新規発注を止めます」と出ていた
-      （外部レビュー指摘）。実際に止まるのは REAL 限定（:14384 / :14962 の
-      `trd_env == TrdEnv.REAL`）なのに、デモの利用者が「発注が止まっている」と
-      読み、**別の理由で発注に至らなかった件までこれのせいだと判断していた**。
-      認定サポーターの報告に、その誤った因果が実際に載っている。
     """
     return ("（実口座の新規発注を止めます。明細が取得でき次第、自動で再開します）"
             if trd_env == TrdEnv.REAL else
@@ -24389,23 +21596,19 @@ def _startup_block_note(trd_env) -> str:
 async def main(live: bool) -> None:
     global market_open_event, _main_loop, _anthropic_api_lock
     market_open_event = asyncio.Event()
-    # ★ v3.9.7 hotfix: Python 3.10+ で asyncio.get_event_loop() は実行中ループ外で
     # RuntimeError を投げる。本関数は async def main 内なので get_running_loop()
     # が正解。利用者A環境の "no current event loop in thread 'asyncio_N'" 系
     # 報告に対する根本対策 (worker thread 経由で ensure_future が呼ばれる経路で
     # _main_loop を確実に参照できるよう、main コルーチン自身のループを保持)。
     _main_loop = asyncio.get_running_loop()
-    # ★ v3.9.13: Anthropic API 並列呼出シリアライズ用 Semaphore を初期化。
     # Semaphore(1) で同時 1 呼出のみ許可 → 異なる async ループからの並列発火を排除。
     # 5/13 04:44 認定サポーター環境で観測の 529 連発事例への根本対策。
     _anthropic_api_lock = asyncio.Semaphore(1)
 
     trd_env              = TrdEnv.REAL if live else TrdEnv.SIMULATE
-    # ★ v3.9.99: 実取引/デモの判別タグを確定（トレード送信に付与・レポートで分離集計可能に）。
     global _RUN_TRADE_ENV
     _RUN_TRADE_ENV = "REAL" if live else "DEMO"
 
-    # ★ v3.9.115: 当日サマリ集計を再起動後に復元（同一 ET 日付ならマージ）。
     # DATA_COLLECT 非依存で日次サマリを正しく表示するため、ここで1回読み戻す。
     try:
         _n_restored = _load_today_state()
@@ -24414,7 +21617,6 @@ async def main(live: bool) -> None:
     except Exception as _e_lts:
         log.debug(f"[当日サマリ] 復元失敗(黙殺): {_mask_secrets(_e_lts)}")
 
-    # ★ v3.9.134: 建玉台帳を読み込む（起動時ポジション復元より前に必ず実行）
     try:
         _n_led = _ledger_load()
         log.info(f"[建玉台帳] 読込完了: Bot の建玉 {_n_led}銘柄")
@@ -24433,19 +21635,13 @@ async def main(live: bool) -> None:
     except Exception as _e_led0:
         log.warning(f"[建玉台帳] 読込で例外: {_mask_secrets(_e_led0)}")
 
-    # ★ v3.9.163: フラグ復元を先に行う（新規Claudeレビュアーの指摘——後にすると
-    #   OVN 保有中の正常な起動でも毎回「所有権フラグが落ちていたため自己修復」の
-    #   warning が出て、本当の異常時の信号として使えなくなる）。
     try:
         if _ovn_state_owns_position():
             state.get(OVN_SYMBOL).ovn_held = True
     except Exception:
         pass
-    _ledger_repair_ovn_absorption()   # ★ v3.9.162: 誤って取り込まれた OVN 建玉を外す
+    _ledger_repair_ovn_absorption()
 
-    # ★ v3.9.183: 実行時の状態がどこに置かれたかを必ず1行残す（v3.9.160c の教訓——
-    #   `_bot_state_dir()` は書けない場所を黙って避けてフォールバックするので、
-    #   ログに証拠が無いと「配布フォルダの差し替えで消えた」に気づけない）。
     try:
         log.info(
             f"[状態ファイル] 置き場所={OVN_STATE_DIR}"
@@ -24462,13 +21658,11 @@ async def main(live: bool) -> None:
 
     # 起動時の最初の sync_positions より前に OVN 所有権を復元する。
     # 後回しにすると台帳に無い QQQ が外部建玉と誤通知される。
-    # ★ v3.9.159: 判定結果に関わらず永続状態の中身を必ず1行残す（実機の早期決済
-    #   事故では「復元しました」の不在という否定証拠しか無く、原因特定が難航した）。
     try:
-        _ovn_migrate_legacy_dir()   # ★ v3.9.160: 旧フォルダの状態を引き継ぐ
+        _ovn_migrate_legacy_dir()
         _ovn_dbg = _ovn_load()
         _ovn_boot_owns = _ovn_state_owns_position(_ovn_dbg)
-        with _ovn_owns_lock:   # ★ v3.9.159b: 起動判定をキャッシュへプライム（読み直し不要に）
+        with _ovn_owns_lock:
             _ovn_file_owns_cache["v"] = _ovn_boot_owns
             _ovn_file_owns_cache["t"] = time.monotonic()
         log.info(
@@ -24485,10 +21679,8 @@ async def main(live: bool) -> None:
     if _ovn_boot_owns:
         state.get(OVN_SYMBOL).ovn_held = True
 
-    # ★ v3.9.73: PCT 旧表記(小数)を検出していれば起動時に1回まとめて警告
     _emit_pct_unit_warnings()
 
-    # ★ v3.9.90: 建玉トレールの状態を起動時に明示（既定ON＝標準）。
     if MOMENTUM_TRAIL_FROM_ENTRY:
         log.info(
             "[建玉トレール] 有効（標準・既定ON）→ モメンタム建玉は"
@@ -24499,7 +21691,6 @@ async def main(live: bool) -> None:
     else:
         log.info("[建玉トレール] 無効（MOMENTUM_TRAIL_FROM_ENTRY=false）→ 従来の固定の強制損切りで損失保護します。")
 
-    # ★ v3.9.103: 当日トレンド・フィルターの状態
     if MOMENTUM_TREND_FILTER_PCT > 0:
         if MOMENTUM_TREND_FILTER_ENABLED:
             log.info(
@@ -24512,7 +21703,6 @@ async def main(live: bool) -> None:
                 f" 実ブロックは MOMENTUM_TREND_FILTER_ENABLED=true。"
             )
 
-    # ★ v3.9.104: プレマーケット抑制フィルターの状態
     if MOMENTUM_PREMARKET_FILTER_ENABLED:
         log.info("[プレマーケット抑制] 実ブロック有効 → premarket の新規モメンタム実発注を停止。")
     else:
@@ -24521,7 +21711,6 @@ async def main(live: bool) -> None:
             "premarket_filter_ab に記録。実ブロックは MOMENTUM_PREMARKET_FILTER_ENABLED=true。"
         )
 
-    # ★ v3.9.65: デモ・ネッティング空売りの状態を起動時に明示
     if trd_env == TrdEnv.SIMULATE:
         if DEMO_SHORT_ENABLED:
             log.warning(
@@ -24535,7 +21724,6 @@ async def main(live: bool) -> None:
                 " 既定は ON です。実発注化するには .env の DEMO_SHORT_ENABLED 行を true にするか削除してください。"
             )
 
-    # ★ v3.9.69: 実口座の買い専用オプションの状態を起動時に明示
     if trd_env == TrdEnv.REAL:
         if REAL_SHORT_ENABLED:
             log.info("[実口座ショート] REAL_SHORT_ENABLED=true (既定) → 実口座でも空売りを実発注します。")
@@ -24546,14 +21734,13 @@ async def main(live: bool) -> None:
             )
 
     # ─────────────────────────────────────────────────────────────
-    # ★ v2.96 / v3.9.83: OpenD 到達性チェック（起動時・デモ/実の両方）
     # OpenD が起動していないと OpenSecTradeContext / OpenQuoteContext の
     # TCP 接続が無言でハングし、Mac/Windows が固まったように見える。
     # さらにデモ環境でも OpenD 未起動のままだと「ポジション取得失敗+
     # リトライ連発(リトライ嵐)」が起きるため、--live だけでなく
     # デモ起動でも 3 秒タイムアウトで事前チェックして明示エラーを出す。
     # ─────────────────────────────────────────────────────────────
-    if True:   # ★ v3.9.83: 以前は if live: だったがデモにも適用 (大多数の受講生はデモ)
+    if True:
         import socket as _socket
         _conn_err = None
         try:
@@ -24561,14 +21748,7 @@ async def main(live: bool) -> None:
                 pass
         except (OSError, _socket.timeout) as _e_conn:
             _conn_err = _e_conn
-        # ★ v3.9.167: すぐ諦めず、まず OpenD の起動を待つ（認定サポーターの指摘——
-        #   v3.9.157b で入れた最大10分の待機が、この即時終了に阻まれて
-        #   「OpenD 未起動」という本来の想定場面で一度も走っていなかった）。
-        #   自動起動で Bot が先に立ち上がった回は、ここで自己修復する。
         if _conn_err is not None:
-            # ★ v3.9.167b: 待つ前に原因を見せる（レビュー指摘——待機を前に置いた結果、
-            #   OpenD を立て忘れただけの人が10分間ほぼ無言で待たされ、原因の枠が
-            #   出るのは10分後になっていた）。表示してから待ち、直れば続行する。
             log.warning(
                 f"[起動] OpenD に接続できません（{MOOMOO_HOST}:{MOOMOO_PORT}）。"
                 f"OpenD を起動してログインしてください。"
@@ -24595,11 +21775,10 @@ async def main(live: bool) -> None:
             print("  ║    4) .env の MOOMOO_HOST / MOOMOO_PORT が正しい             ║")
             print("  ╚══════════════════════════════════════════════════════════════╝")
             print()
-            _play_alert_sound("opend_connection_failed")  # ★ v3.9.19: アラート音
+            _play_alert_sound("opend_connection_failed")
             sys.exit(1)
         log.info(f"[起動時検証] OpenD 到達性 OK ({MOOMOO_HOST}:{MOOMOO_PORT}・{'実' if live else 'デモ'})")
 
-    # ── ★ v3.5.2: moomoo SDK の TrdSide.BUY_BACK 存在チェック (実口座のみ) ──
     # moomoo サポート (2026-05-08) 確認: 開設は BUY/SELL_SHORT、決済は SELL/BUY_BACK。
     # 旧 SDK は BUY_BACK 不在 → silent fallback で order failure 発生 (受講生環境で
     # moomoo から直接通知)。v3.5.2 以降は明示拒否。推奨: moomoo-api 10.4.6408+。
@@ -24622,7 +21801,7 @@ async def main(live: bool) -> None:
         print("  ║    決済           : SELL / BUY_BACK                          ║")
         print("  ╚══════════════════════════════════════════════════════════════╝")
         print()
-        _play_alert_sound("moomoo_sdk_outdated")  # ★ v3.9.19: アラート音
+        _play_alert_sound("moomoo_sdk_outdated")
         sys.exit(1)
     if live:
         log.info("[起動時検証] moomoo SDK TrdSide.BUY_BACK OK (SHORT 決済対応)")
@@ -24641,7 +21820,6 @@ async def main(live: bool) -> None:
             # ── get_acc_list を1回だけ取得してロジック内で使い回す ──
             _acc_list_df = None
             try:
-                # ★ v2.86: with _trade_ctx() で例外時の close を保証
                 with _trade_ctx() as _verify_ctx:
                     _vret, _vdata = _verify_ctx.get_acc_list()
                 if _vret == RET_OK and _df_has_rows(_vdata):
@@ -24877,7 +22055,6 @@ async def main(live: bool) -> None:
                 print()
                 sys.exit(1)
 
-    # ── ★ v3.9.106: 実口座の購買力と BUDGET_USD の整合チェック（--live のみ）──
     # BUDGET_USD は自己申告値のため、実口座の信用余力を上回っていると
     # 「Insufficient buying power」で発注拒否が発生する（Bot内の残余力チェックは
     # BUDGET_USD 基準なので防げない）。起動時に実際の購買力(power)を取得して警告する。
@@ -24923,7 +22100,6 @@ async def main(live: bool) -> None:
     state.simulation_mode = not live
 
     mode_label     = f"🔴 実口座（acc_id={REAL_ACC_ID}・特定口座・信用）" if live else "🟡 デモ口座（シミュレーション）"
-    # ★ v3.8.9: Discord 送信用は acc_id を含めない (機密情報の漏えい防止)
     # ローカルログは引き続き acc_id 付きで記録 (運営側の監査・トラブル調査用)
     mode_label_safe = "🔴 実口座（特定口座・信用）" if live else "🟡 デモ口座（シミュレーション）"
     discord_status = "有効" if DISCORD_WEBHOOK_URL else "未設定（スキップ）"
@@ -24935,12 +22111,7 @@ async def main(live: bool) -> None:
     exec_syms = sorted({sym for syms in EXECUTION_MAP.values() for sym in syms})
     log.info("=" * 60)
     log.info(f"  moomoo_trade_v1.py  {BOT_VERSION}  {mode_label}")
-    # ★ v3.9.191: 環境差の切り分け用。Python 3.14 では非推奨警告が出る経路があった
-    #   （配布物は 3.13 前提）。版が違うと分かるだけで、原因の当たりがつく。
     log.info(f"  Python {sys.version.split()[0]}  {sys.platform}")
-    # ★ v3.9.192: 読んだ .env の場所と moomoo-api の版（認定サポーターの提案⑧）。
-    #   load_dotenv はスクリプトの位置を基準に探すので、複製フォルダやリンク経由では
-    #   「同じコードが別の設定で走る」ことが無警告で起きる。起動ログで見分けられるようにする。
     try:
         from dotenv import find_dotenv as _find_dotenv
         _env_path = _find_dotenv(usecwd=False) or "(見つからず・既定値で起動)"
@@ -24952,10 +22123,6 @@ async def main(live: bool) -> None:
     if _smh_note:
         log.warning(_smh_note)
     log.info(f"  コンソールの簡易編集モード: {_disable_console_quickedit()}")
-    # ★ v3.9.191: カテゴリ→発注銘柄の対応を最初に出す（認定サポーターの指摘）。
-    #   対応は TRIGGER_TICKERS の**位置**で決まる（先頭=MACRO・2番目=TECH）。
-    #   既定の SPY,QQQ,SMH を前提にした作りなので、QQQ,SMH のような並びでは
-    #   TECH のニュースが SMH に出る。誤りではないが、意図せずそうなる人がいる。
     _map_note = ""
     if _macro_sym != "SPY" or _tech_sym != "QQQ":
         _map_note = "  ⚠️ 既定（SPY,QQQ,SMH）と対応が違います。意図どおりかご確認ください"
@@ -24963,7 +22130,6 @@ async def main(live: bool) -> None:
     log.info(f"  OpenD: {MOOMOO_HOST}:{MOOMOO_PORT}")
     log.info(f"  {_opend_state_line()}")
 
-    # ── ★ v3.9.18: 過去 24 時間のクレジット切れ警告 (起動時) ──────────────────
     # 5/13-5/14 で受講生 10-15 名がクレジット切れに気づかず Bot が中立スキップ状態の
     # まま放置されていた事象への対策。Bot は AI 失敗時に中立判定 (発注スキップ) と
     # なるため「Bot が動いていない」ことに本人が気づきにくい。起動時に明示警告を出す。
@@ -24998,15 +22164,7 @@ async def main(live: bool) -> None:
         log.info(f"  🔴 実口座: 夜間セッションも取引継続（週末のみ {_FRIDAY_CLOSE_TIME.strftime('%H:%M')} ET に全決済）")
         log.info(f"  　　→ moomoo確認済: オーバーナイトも株価取得・発注・ポジション照会すべて対応")
     log.info(f"  戦略: SPY/QQQ ロング（現物買い）/ ショート（空売り）")
-    # ★ v3.9.169: ニュース選抜プロファイルの適用状態を起動時に明示（既定オフ）
     if NEWS_PROFILE_SELECT:
-        # ★ v3.9.173: 適用範囲を明記（認定サポーターの報告）。従来の文言は
-        #   「時間外は新規建てしない」と読めたが、絞るのは ETF ニュース連動
-        #   （process_headlines）だけで、個別株ルート（process_stock_news /
-        #   process_dynamic_stock）は対象外。個別株の採用カテゴリ STOCK は
-        #   選抜対象に含まれないため、同じゲートを掛けると個別株が全停止する
-        #   （＝意図した除外）。実際にプレマーケットで個別株 SHORT が建ち、
-        #   バナーとの食い違いとして報告された。
         log.warning(
             "  🎛 ニュース選抜プロファイル v1 (news_select_v1) が有効です。"
             f" ETFニュース連動の新規建てを {'/'.join(sorted(NEWS_SELECT_V1_CATEGORIES))} × RTH に絞ります"
@@ -25017,9 +22175,6 @@ async def main(live: bool) -> None:
             " 従来どおりに戻すには .env の NEWS_STRATEGY_PROFILE を standard にしてください。"
         )
         if not _is_data_collect_enabled():
-            # ★ v3.9.169b（レビュー指摘）: 見送りの記録は DATA_COLLECT=true ＋
-            #   STUDENT_NAME が前提。片方でも欠けると「発注だけ止まって検証データは
-            #   ゼロ」になるので、その状態を黙って進めない。
             log.warning(
                 "  ⚠️ ただし DATA_COLLECT が無効（または STUDENT_NAME 未設定）のため、"
                 "見送りの記録は残りません。検証に使うなら .env の DATA_COLLECT=true と "
@@ -25039,11 +22194,7 @@ async def main(live: bool) -> None:
     log.info(f"  時間切れ決済: {timeout_str}  トレール発動: +{TRAIL_TRIGGER_PCT*100:.2f}%  トレール幅: {TRAIL_DROP_PCT*100:.2f}%")
     log.info(f"  AIしきい値: confidence>{STRONG_BUY_CONFIDENCE}（ベース）  パニックしきい値: confidence>{PANIC_CONFIDENCE}")
     if any([_CONF_RTH, _CONF_PREMARKET, _CONF_AFTERHOURS, _CONF_OVERNIGHT]):
-        # ★ v3.9.159: 旧表示「OVN=」は夜間持ち越し機能（OVN_ENABLED）と紛らわしい
-        #   （認定サポーターの指摘）。これは moomoo のオーバーナイト・セッション
-        #   （時間帯区分）の AI しきい値。
         log.info(f"  　時間帯別しきい値: RTH={_CONF_RTH or '-'}  Pre={_CONF_PREMARKET or '-'}  After={_CONF_AFTERHOURS or '-'}  Overnight時間帯={_CONF_OVERNIGHT or '-'}")
-    # ★ v3.9.6: 「発注しない」設定セッションの一覧 (CONFIDENCE_*=2.00 sentinel)
     _disabled_sess_list = [
         (name, flag) for name, flag in [
             ("RTH",        _DISABLED_RTH),
@@ -25060,22 +22211,15 @@ async def main(live: bool) -> None:
         )
     else:
         log.info(f"  　発注しない設定: なし (全セッション稼働)")
-    # ★ v3.9.12 / v3.9.16 / v3.9.35: モメンタム設定 (シャドー観察 / Phase 1 実発注)
     if (MOMENTUM_SHADOW_ENABLED or MOMENTUM_LIVE_TRADING) and MOMENTUM_ORDER_SIZE_PCT > 0:
         _level_name = _MOMENTUM_LEVEL_NAMES.get(MOMENTUM_LEVEL, "?")
         if MOMENTUM_LIVE_TRADING:
             _mom_hdr = "モメンタム: ⚡ 実発注モード (Phase 1)"
-            # ★ v3.9.153: select_v1 有効時は「プロファイル絞り込み後」の実効サイドを
-            #   表示する（認定サポーターの指摘）。従来は env の生値を出しており、
-            #   すぐ上の「SPY除外」の行と食い違って見えた。
-            # ★ v3.9.157 (A-2): シャドーループ側と同じヘルパー（口座別ゲート適用後）。
             _eff_sides = _momentum_effective_live_sides(trd_env)
             _prof_note = ("（select_v1 絞り込み後・口座別ゲート適用後）" if MOMENTUM_PROFILE_SELECT
                           else "（select_v2 絞り込み後・口座別ゲート適用後）" if MOMENTUM_PROFILE_SELECT_V2
                           else "（口座別ゲート適用後）")
             _mom_note = f"実発注対象サイド={_eff_sides}{_prof_note} (それ以外はシャドー記録のみ)"
-            # ★ v3.9.155/156: select_v1（SHORTのみ）×デモのSHORT無効 では実発注が
-            #   発生しない（デモ限定・ヘルパーが環境で分岐する）。
             if (MOMENTUM_PROFILE_SELECT and not DEMO_SHORT_ENABLED
                     and trd_env == TrdEnv.SIMULATE):
                 _mom_note += "（※この組み合わせでは実発注は発生しません: SHORT無効のデモ）"
@@ -25095,7 +22239,6 @@ async def main(live: bool) -> None:
             f"最大発注額: {MOMENTUM_ORDER_SIZE_PCT}% (=${_BUDGET_USD * MOMENTUM_ORDER_SIZE_PCT / 100:.0f})"
             f"  ※シグナル強度で 50/75/100% に山型配分"
         )
-        # ── ★ v3.9.61 / v3.9.150b: 実発注対象とリスク監視対象のズレ検証 ──────
         # ここにあった検査は、監視集合に _momentum_live_symbols() を含めたうえで
         # その同じ集合との差を取っていたため、設定の内容に関わらず必ず空集合に
         # なっていた（A - (B ∪ A) = ∅・認定サポーターの指摘 2-2）。
@@ -25103,19 +22246,16 @@ async def main(live: bool) -> None:
         # 起動時復元のあと（口座の実際の建玉が分かる地点）で検査する形に移した。
     else:
         log.info(f"  モメンタム機能: 無効")
-    # ★ v2.99: 発注クールダウン設定の表示
     log.info(
         f"  発注クールダウン: 個別株={COOLDOWN_STOCK_MIN}分（同一銘柄）  "
         f"ETF再エントリー禁止={ETF_REENTRY_LOCKOUT_MIN}分（決済後）"
     )
     log.info(f"  ETF影響ガード: 有効（QQQ/SMH/SPY の victims/beneficiaries は主要構成銘柄登場時のみ通過）")
-    # ★ v3.8.3: ノイズフィルタ (AI 呼出前の早期 score=0 判定で API コスト削減)
     log.info(
         f"  ノイズフィルタ (AI 呼出前 pre-filter): "
         f"{'有効' if NOISE_FILTER_ENABLED else '無効'} "
         f"({len(HEADLINE_NOISE_PATTERNS)} パターン)"
     )
-    # ★ v2.99.4: 新規安全制御 + 可視化機能の状態表示
     log.info(
         f"  決済FAILED時新規BUYブロック: {FAILED_CLOSE_LOCKOUT_MIN}分（既存ポジション解消優先）"
     )
@@ -25126,7 +22266,6 @@ async def main(live: bool) -> None:
         f"/ 構成S(SPY 15分≤{SPY_DOWNTREND_15M_PCT}%/60分≤{SPY_DOWNTREND_60M_PCT}%) "
         f"/ 構成D(個別株 15分≤{STOCK_DOWNTREND_15M_PCT}%/60分≤{STOCK_DOWNTREND_60M_PCT}%)"
     )
-    # ★ v3.8.1 / v3.8.2 / v3.9.5: 上昇トレンドフィルタ (SHORT ブロック)
     log.info(
         f"  上昇トレンドフィルタ (SHORT ブロック): "
         f"構成B'(QQQ 15分≥+{MACRO_UPTREND_15M_PCT}%/60分≥+{MACRO_UPTREND_60M_PCT}%) "
@@ -25202,11 +22341,6 @@ async def main(live: bool) -> None:
 
     client = get_anthropic_client()
 
-    # ── ★ v3.9.157b/167: OpenD より先に Bot が起動した場合は待つ ────────────
-    #   待機の本体は _wait_for_opend()（起動時の到達性チェックからも呼ぶ）。
-    #   そこで既に待って到達済みのはずなので、ここは念のための再確認。
-    # ★ v3.9.167b: ここで再び **待つ** と、設定した上限の2倍まで待ちうる
-    #   （レビュー指摘）。手前の関門で待ち終えているので、ここは素早い再確認だけにする。
     if not _opend_tcp_ok():
         log.error(
             f"[起動] 🔴 OpenD への接続が失われました（{MOOMOO_HOST}:{MOOMOO_PORT}）。"
@@ -25222,7 +22356,6 @@ async def main(live: bool) -> None:
     log.info(f"[接続] moomoo OpenD に接続中: {MOOMOO_HOST}:{MOOMOO_PORT}")
     _test_symbol = TRIGGER_TICKERS[0] if TRIGGER_TICKERS else (ALL_TICKERS[0] if ALL_TICKERS else "SPY")
     try:
-        # ★ v2.86: with _quote_ctx() で例外時の close を保証
         with _quote_ctx() as test_ctx:
             # 全監視対象銘柄を1件ずつ個別にサブスクライブ
             # （バッチだと部分失敗してもRET_OKが返りsubscribeされないケースがある）
@@ -25279,7 +22412,6 @@ async def main(live: bool) -> None:
     if trd_env == TrdEnv.REAL:
         unlock_trade_if_needed(trd_env)
 
-    # ── ★ v2.87: NYSE 休日・早期クローズ日の起動時案内 ─────────────────────
     # 起動時点の ET 日付で判定し、ログにのみ出力（Discord 通知は要件により省略）。
     _today_et_startup = datetime.datetime.now(_ET).date()
     if is_nyse_holiday(_today_et_startup):
@@ -25296,16 +22428,15 @@ async def main(live: bool) -> None:
                 f" NYSE 早期クローズ日（{_ec_startup.strftime('%H:%M')} ET 終了予定）"
             )
 
-    await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+    await asyncio.to_thread(sync_positions, trd_env)
 
-    # ★ v2.98: 起動時 SHORT 自動クリーンアップ廃止 (v2.97 までの設計は誤動作源)。
     # 持越し SHORT は通常ポジションとして維持しリスク監視/通常決済に任せる。
 
     # ── 起動時ポジション復元 (_tracked_position_cost に反映) ────────────────
     # 取得失敗時は最大8回×10秒リトライ (moomoo: refresh_cache=True は30秒10回制限)。
     _MAX_SYNC_RETRY = 8
     for _retry in range(_MAX_SYNC_RETRY):
-        await asyncio.to_thread(sync_positions, trd_env)   # ★ v3.9.129: OpenDハングでイベントループを凍らせない
+        await asyncio.to_thread(sync_positions, trd_env)
         exec_syms_list = sorted({sym for syms in EXECUTION_MAP.values() for sym in syms})
         _any_position = any(
             state.get(sym).position_qty != 0 or state.get(sym).avg_cost > 0
@@ -25315,7 +22446,6 @@ async def main(live: bool) -> None:
             break
         if _retry == 0:
             try:
-                # ★ v2.86: with _trade_ctx() で例外時の close を保証
                 with _trade_ctx() as _ctx_chk:
                     _acc_chk = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
                     _r_chk, _d_chk = _ctx_chk.accinfo_query(
@@ -25324,12 +22454,6 @@ async def main(live: bool) -> None:
                 if _r_chk != RET_OK:
                     log.warning(f"[起動時復元] accinfo_query ret={_r_chk} エラー: {_d_chk}")
                 elif _df_has_rows(_d_chk):
-                    # ★ v3.9.141: ショート建玉の取りこぼしを直す（認定サポーターからの指摘）。
-                    #   デモ口座で実測したところ short_mv は負で返る（1株の空売りで −24.86）。
-                    #   旧実装の `_v > 0` はショートを検知できず、ショートだけの口座で
-                    #   「建玉なし」と誤判定して、確認しないまま新規発注しうる。
-                    #   あわせて、3列すべてを読めたときだけ「確定ゼロ」と見なす。
-                    #   1列でも欠落・非数値なら「確認できなかった」として扱う。
                     _all_zero  = True
                     _read_cols = 0
                     for _f in ("market_val", "long_mv", "short_mv"):
@@ -25351,13 +22475,11 @@ async def main(live: bool) -> None:
                     if _all_zero:
                         log.info(f"[起動時復元] [{_mode}] accinfo $0 → ポジションなし（クリーンスタート）")
                     else:
-                        # ★ v3.8.5: accinfo フォールバックは正常なリカバリパスなので INFO に降格
                         log.info(f"[起動時復元] [{_mode}] accinfo market_val > $0 / position_list_queryが空 → accinfo フォールバックへ")
                     break
             except Exception as _ec:
                 log.debug(f"[起動時復元] accinfo早期確認エラー: {_ec}")
         wait = 10
-        # ★ v3.8.5: 起動時のリトライ過程は INFO に降格 (最終失敗時のみ WARNING)
         log.info(f"[起動時復元] ポジション取得が空 → {_retry + 1}回目リトライ（{wait}秒後）")
         await asyncio.sleep(wait)
 
@@ -25366,14 +22488,13 @@ async def main(live: bool) -> None:
     # v2.77: デモ口座にも適用 (旧版は実口座限定で、デモは毎回80秒待ちが発生)。
     # v2.92: long_mv/short_mv/market_val 全て$0なら「ポジションなし確定」フラグ ON
     #        → 受講生に不要な「⚠️ポジション取得失敗」通知を出さない。
-    global _startup_position_unknown   # ★ v3.9.141: 建玉不明フラグを立てる
+    global _startup_position_unknown
     _no_position_confirmed_by_accinfo = False
     _need_accinfo_check = not any(
         state.get(sym).position_qty != 0 for sym in ALL_TICKERS
     )
     if _need_accinfo_check:
         try:
-            # ★ v2.86: with _trade_ctx() で例外時の close を保証
             with _trade_ctx() as _ctx_acc:
                 _acc_id_c = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
                 _ret_acc, _data_acc = _ctx_acc.accinfo_query(
@@ -25381,9 +22502,6 @@ async def main(live: bool) -> None:
                 )
             # ★ moomoo サポート推奨: ret != RET_OK のとき必ずエラーメッセージを出力
             if _ret_acc != RET_OK:
-                # ★ v3.9.141b: 照会そのものが失敗＝建玉の有無は不明。
-                #   従来はここで警告を出すだけで、どの分岐にも入らずフラグが立たなかった。
-                #   「照会に失敗したとき」こそ止めたい経路だった（Codexレビュー指摘）。
                 _startup_position_unknown = True
                 log.error(
                     f"[起動時復元] 🔴 accinfo_query(最終確認) ret={_ret_acc} エラー: {_data_acc}"
@@ -25399,7 +22517,7 @@ async def main(live: bool) -> None:
             elif _df_has_rows(_data_acc):
                 _mktval     = 0.0
                 _field_used = "（なし）"
-                _read_n     = 0   # ★ v3.9.141: 実際に読めた列数
+                _read_n     = 0
                 for _f, _label in [
                     ("market_val", "market_val"),
                     ("long_mv",    "long_mv（ロング建玉）"),
@@ -25412,7 +22530,6 @@ async def main(live: bool) -> None:
                             else _data_acc[_f][0]
                         )
                         _read_n += 1
-                        # ★ v3.9.141: short_mv は負で返る（実測）。abs で判定する。
                         if abs(_v) > 0:
                             _mktval     = abs(_v)
                             _field_used = _label
@@ -25424,13 +22541,6 @@ async def main(live: bool) -> None:
                     except (KeyError, IndexError, TypeError, ValueError):
                         pass
                 if _mktval > 0:
-                    # ★ v3.9.143: 評価額からの「推定復元」を廃止（認定サポーターと外部
-                    #   レビューが独立に同じ指摘）。推定した建玉には position_id が無く
-                    #   決済すらできないため、推定を続ける利点が無い。何を持っているか
-                    #   分からないまま実口座で新規発注する穴だけが残っていた。
-                    #   建玉不明として新規発注を止める。既存建玉の監視・決済経路は
-                    #   影響を受けず、次の position_list_query が成功すれば
-                    #   sync_positions がフラグを自動解除する（:10861）。
                     _startup_position_unknown = True
                     log.error(
                         f"[起動時復元] 🔴 建玉明細は空だが {_field_used}=${_mktval:,.0f}。"
@@ -25444,13 +22554,8 @@ async def main(live: bool) -> None:
                     # market_val=$0 → 本当にポジションなし（デモ・実口座共通）
                     _mode = "デモ口座" if trd_env == TrdEnv.SIMULATE else "実口座"
                     log.info(f"[起動時復元] [{_mode}] accinfo market_val/long_mv/short_mv すべて$0 → ポジションなし（正常）")
-                    # ★ v2.92: ポジションなし確定 → 後続の警告ブロックをスキップ
                     _no_position_confirmed_by_accinfo = True
                 else:
-                    # ★ v3.9.141: 3列すべてを読めたときだけ「確定ゼロ」と見なす
-                    #   （認定サポーターからの指摘）。列が欠落・非数値のときは
-                    #   「建玉なし」ではなく「確認できなかった」であり、
-                    #   応答が壊れているときほど警告が消える向きになっていた。
                     _startup_position_unknown = True
                     log.error(
                         f"[起動時復元] 🔴 accinfo の3列のうち {_read_n} 列しか読めませんでした。"
@@ -25466,20 +22571,10 @@ async def main(live: bool) -> None:
                             "（既存建玉の損切り・時間切れ決済は通常どおり動きます）"
                         ))
         except Exception as _e:
-            # ★ v3.9.141: 照会そのものが失敗＝建玉の有無は不明。ゼロ扱いにしない。
             _startup_position_unknown = True
-            # ★ v3.9.181: ここが5番目の site だった（外部レビュー指摘・5レーンが独立に指摘）。
-            #   しかも一番広い経路（accinfo の全例外を受ける）なので、
-            #   デモの利用者がいちばん見やすい。
             log.error(f"[起動時復元] 🔴 accinfo確認エラー → 建玉不明 "
                       f"{_startup_block_note(trd_env)}: {_e}")
 
-    # ★ v3.9.149: 復元対象を risk_monitor_loop（:18452 付近）と同じ式で作る。
-    #   従来は EXECUTION_MAP（= TRIGGER_TICKERS）だけを回していたため、
-    #   モメンタムで実発注される SMH のように TRIGGER_TICKERS に無い銘柄は
-    #   entry_time が復元されず、時間切れ決済が永久に発火しなかった
-    #   （時間切れ判定は entry_time is not None を必須にしている）。
-    #   v3.9.61 の原則「実発注銘柄=必ず監視対象」を、この経路にも通す。
     _restore_etf   = {sym for syms in EXECUTION_MAP.values() for sym in syms}
     _restore_earn  = set(dict.fromkeys(EARNINGS_PRE_TICKERS + EARNINGS_AFTER_TICKERS))
     exec_syms_list = sorted(
@@ -25488,21 +22583,13 @@ async def main(live: bool) -> None:
     restored = []
     for sym in exec_syms_list:
         ts = state.get(sym)
-        # ★ v2.86: ショートポジション（position_qty < 0）も復元対象に含める。
         # 旧コード `> 0` ではショート持越し時に _tracked_position_cost が空のまま
         # 直後の sync_positions の冒頭ガード（`<= 0 → position_qty=0`）でショートが
         # state から消されてしまう実害があった。
         if ts.position_qty != 0 and ts.avg_cost > 0:
             # コストは絶対株数 × 平均取得価格（ショートも建玉評価額として計上）
             estimated_cost = abs(ts.position_qty) * ts.avg_cost
-            if sym == OVN_SYMBOL and _ovn_owns_now():   # ★ v3.9.159b: 二重ソース判定
-                # ★ v3.9.146 (A-11): OVN が建てた建玉は日中予算 (BUDGET_USD) に
-                #   計上しない。ovn_held はこのループより前（:18975 付近）で永続
-                #   OVN 状態から復元済み。tracked=0 のままだと直後の sync_positions
-                #   冒頭ガードで日中側の state はリセットされるが、OVN は自前の
-                #   状態ファイルで管理するので問題ない（ovn_held は対象外）。
-                #   後続の position_id 警告・台帳判定・外部フラグ解除（:19928）は
-                #   従来どおり通す（continue しない）。
+            if sym == OVN_SYMBOL and _ovn_owns_now():
                 log.info(
                     f"[起動時復元] 【{sym}】 OVN 保有 → 日中予算に計上しません"
                     f"（OVN_BUDGET_USD の別枠で管理）"
@@ -25510,7 +22597,6 @@ async def main(live: bool) -> None:
             else:
                 _tracked_position_cost[sym] = estimated_cost
             _pos_label = "SHORT" if ts.position_qty < 0 else "LONG"
-            # ★ v2.98: position_id 数を確認 (決済時に必須となる)
             _pid_count = len(ts.position_ids.get(_pos_label, []))
             restored.append(
                 f"{sym}({_pos_label})=${estimated_cost:,.0f}/{_pid_count}建玉"
@@ -25521,19 +22607,6 @@ async def main(live: bool) -> None:
                     f"→ 決済時に position_id 必須エラーが発生する可能性あり。"
                     f" 次サイクルの sync_positions で再取得を期待します。"
                 )
-            # ── ★ v3.9.134: 台帳と突き合わせて「Bot の建玉か」を判定する ────────
-            # ★ v3.9.160c: 状態が読めない OVN 銘柄も初回移行から除外する
-            #   （新規Claudeレビュアーの指摘——事故の経路では台帳も同時に消えるため
-            #   初回移行が走り、QQQ を Bot 建玉として取り込む。すると安全網の
-            #   「台帳に無い」条件が崩れ、v3.9.160 の砦が一度も発動しない）。
-            # ★ v3.9.167b: 同じ判断が sync_positions（:12791）にもあり、そちらだけ
-            #   OVN_ENABLED を足していた（レビュー指摘）。2か所が食い違うと、
-            #   どちらが先に建玉を見たかで「取り込む／凍結する」が変わる。揃える。
-            # ★ v3.9.167c: OVN_ENABLED の掛かる範囲を正した（機械検証で発見——
-            #   `OVN_ENABLED and (owns or not readable)` だと、OVN で建てた建玉を
-            #   持ったまま OVN_ENABLED=false にした人の建玉を取り込んでしまう。
-            #   所有の確認（_ovn_owns_now）は ENABLED に依存させない。
-            #   これで sync_positions 側の実効挙動と全16組み合わせで一致する）。
             if (_ledger_first_run and not _ledger_has(sym, trd_env)
                     and not (sym == OVN_SYMBOL
                              and (_ovn_owns_now()
@@ -25570,11 +22643,6 @@ async def main(live: bool) -> None:
                 # （従来は再起動のたびに現在時刻へリセットされ、時間切れの
                 #   時計が巻き戻っていた）。
                 _ext_set_held(sym, False)
-                # ★ v3.9.150c: 再起動をまたいで決済注文が生きていることがある
-                #   （_pending_orders はプロセスの記憶なので再起動で消える）。
-                #   同期側の自己修復と同じく、生きている注文がある間は時計を
-                #   戻さない（Codexレビュー指摘）。戻すのは注文が片付いてから
-                #   （自己修復が次の同期で拾う）。
                 if ts.entry_time is None and _has_live_broker_order(sym, trd_env):
                     log.info(
                         f"[起動時復元] {sym} に生きている注文があるため、時間切れの"
@@ -25582,9 +22650,6 @@ async def main(live: bool) -> None:
                     )
                 elif ts.entry_time is None:
                     ts.entry_time = _ledger_entry_time(sym, trd_env) or datetime.datetime.now()
-                    # ★ v3.9.149: どの戦略で建てたかも戻す。これが無いと再起動後に
-                    #   モメンタム建玉が通常建玉として扱われ、時間切れが 60分→10分に、
-                    #   損切りが銘柄倍率つきの緩い値に変わる（SMH で設計の約1.8倍）。
                     _cat = _ledger_category(sym, trd_env)
                     if _cat and not ts.entry_ai_category:
                         ts.entry_ai_category = _cat
@@ -25616,29 +22681,18 @@ async def main(live: bool) -> None:
         # このあと利用者が手で建てた建玉まで Bot 建玉として取り込んでしまう。
         # 永続化失敗は上の ERROR/Discord で通知し、次回起動時は安全側に倒す。
         globals()["_ledger_first_run"] = False
-    # ── ★ v3.9.150b: 監視から外れている建玉が口座に無いかを検査する
-    #   （認定サポーターの指摘 2-2）。設定同士を比べる旧検査は必ず成功していた。
-    #   ここでは「直前の同期で口座に実在した銘柄」と「監視対象」を比べる。
-    #   照会は sync_positions が済ませているので、ここで再照会はしない。
     try:
         if not _account_scan_valid:
-            # ★ v3.9.150c: 照会が一度も完走していない＝検査できていない。
-            #   黙って通すと「検査済み」と誤読されるので、明示する（Codexレビュー指摘）。
             log.warning(
                 "  ⚠️ [整合性] 建玉照会が完走していないため、監視対象の検査が"
                 "できていません（照会が回復し次第、次回の起動時に再検査されます）"
             )
         else:
             _mon_syms = set(ALL_TICKERS) | _momentum_live_symbols()
-            # ★ v3.9.156: OVN が所有する建玉は OVN 巡回が監視・決済する。ここで
-            #   「監視されていない→手動決済して」と誤警報すると、案内に従った操作が
-            #   翌朝の OVN 売却と衝突する（5日分レビュー）。
-            if _ovn_owns_now():   # ★ v3.9.159b: 二重ソース判定
+            if _ovn_owns_now():
                 _mon_syms.add(OVN_SYMBOL)
             _orphan_real = sorted(_account_symbols_seen - _mon_syms)
             if _orphan_real:
-                # ★ v3.9.190: 建玉不明フラグを解除するときに照合する（下記参照）。
-                #   中身の入れ替えで済ませる（再代入しないので global 宣言が要らない）。
                 with _STARTUP_UNKNOWN_LOCK:
                     _startup_unmonitored_symbols.clear()
                     _startup_unmonitored_symbols.update(_orphan_real)
@@ -25668,7 +22722,6 @@ async def main(live: bool) -> None:
         log.info(f"[起動時復元] 既存ポジションを検出・復元: {', '.join(restored)}")
         log.info(f"[起動時復元] ポートフォリオ合計=${total:,.0f} → このまま継続します")
     elif _no_position_confirmed_by_accinfo:
-        # ★ v2.92: accinfo で「ポジションなし」が確定している正常ケース
         # → 不要な警告を出さず、INFO ログでクリーンスタートを伝えるのみ
         log.info("[起動時復元] 既存ポジションなし（クリーンスタート）")
     else:
@@ -25684,14 +22737,12 @@ async def main(live: bool) -> None:
                 "実口座にポジションが残っている可能性があります。\n"
                 "moomooアプリで残高・ポジションを手動確認してください。"
             ))
-        # ★ v3.8.5: デモ口座のポジション取得失敗 warning は INFO に降格。
         # デモ環境では position_list_query が頻繁に空を返し、その大半は
         # 実害のないクリーンスタート相当。受講生からの問い合わせ削減のため、
         # 通常の起動メッセージ程度のレベルに統一する。実口座ケースは引き続き warning。
         if trd_env == TrdEnv.SIMULATE:
             log.info("[起動時復元] デモ口座: ポジション取得スキップ → クリーンスタート扱い")
 
-    # ★ v3.9.3: 起動時に直近 60 分の K 線を取得して _INDEX_PRICE_HISTORY をバックフィル。
     # 取引ループ開始前にトレンドフィルタ (構成 B/B'/C/C'/D/D') を即座に稼働状態にする。
     # 失敗してもログを残して通常起動 (60 分かけてリアルタイム蓄積する後方互換動作)。
     try:
@@ -25701,7 +22752,6 @@ async def main(live: bool) -> None:
 
     await asyncio.to_thread(
         send_discord_message,
-        # ★ v3.8.9: mode_label_safe (acc_id 非表示) を使用。acc_id を Discord に
         # 出さないことで万一 Webhook URL が漏えいしても口座が特定されない。
         f"🚀 moomoo 監視を開始しました\n"
         f"モード: {mode_label_safe}\n"
@@ -25745,7 +22795,6 @@ async def main(live: bool) -> None:
                     ))
                     await asyncio.sleep(3)
 
-        # ── ★ v2.97: RSS フィード起動時 DNS 事前チェック ─────────────────────
         # DNS 解決できないフィードを _rss_excluded に追加し、
         # 以降の取得対象から外すことで起動直後のログ汚染を防ぐ。
         _rss_dns_precheck()
@@ -25755,7 +22804,6 @@ async def main(live: bool) -> None:
         _BOT_START_TIME = datetime.datetime.now()
         log.info(f"[起動待機] 最初の {STARTUP_NEWS_IGNORE_SEC} 秒間はニュース発注をスキップします")
 
-        # ── ★ v3.9.131: ハートビート監視スレッドを起動（凍結検知・通知のみ・自動再起動なし）──
         if HEARTBEAT_WATCHDOG_ENABLED:
             global _last_heartbeat_mono
             _last_heartbeat_mono = time.monotonic()
@@ -25773,23 +22821,12 @@ async def main(live: bool) -> None:
             _loop_guard(risk_monitor_loop,      trd_env,         name="リスク監視"),
             _loop_guard(pending_order_watchdog,                  name="注文ウォッチドッグ"),
             _loop_guard(close_order_chaser,                      name="損切りチェイサー"),
-            # ★ v3.5.1: Prompt Cache 利用統計の1時間ごとサマリ出力
             _loop_guard(cache_stats_loop,                        name="Cache統計"),
-            # ★ v3.9.7: 観察ログ Phase 2 — pending observation の +60min 後 PnL 算出
-            #   DATA_COLLECT=true 環境でのみ実体動作 (それ以外は即 return でアイドル)
             _loop_guard(observation_pnl_check_loop,              name="観察PnL"),
-            # ★ v3.9.75: GAS送信の未送信ローカルキューを定期再送 (記録欠落の自動復旧)
             _loop_guard(gas_retry_loop,                          name="GAS再送"),
-            # ★ v3.9.76: 観察ログ/PnL のバッチ送信フラッシュ (30秒間隔・送信直列化)
             _loop_guard(observation_batch_flush_loop,            name="観察バッチ"),
-            # ★ v3.9.12: モメンタム観察 / ★ v3.9.35: Phase 1 実発注対応
-            #   シャドーのみ: MOMENTUM_SHADOW_ENABLED=true + DATA_COLLECT=true
-            #   実発注: MOMENTUM_LIVE_TRADING=true (DATA_COLLECT 不問)
             _loop_guard(momentum_shadow_loop,    trd_env,        name="モメンタム"),
-            # ★ v3.9.28: シャドー SHORT ライフサイクル監視 (デモ環境向け仮想 PnL シミュ)
-            #   SHADOW_SHORT_ENABLED=true + DATA_COLLECT=true 環境でのみ動作
             _loop_guard(shadow_short_exit_loop,                  name="シャドーSHORT"),
-            # ★ v3.9.31: 重大な健全性問題 (Anthropic クレジット / Alpaca 不全) の 5 分警告
             _loop_guard(health_warning_loop,                     name="健全性警告"),
             _loop_guard(ovn_overnight_loop,      trd_env,        name="夜間持ち越し"),
         )
@@ -25800,9 +22837,6 @@ async def main(live: bool) -> None:
     except Exception as e:
         log.error(f"[予期しないエラー] {type(e).__name__}: {e}", exc_info=True)
     finally:
-        # ★ v3.9.81 (P1-2): 終了時の最終フラッシュ＋キュー1回ドレイン（best-effort）。
-        #   クリーン停止時に、メモリ上の観察バッファと未送信キューを可能な限り送り切る。
-        #   （送れない分はローカルに残り、次回起動時に P1-1/P1-3 で回収される）
         if _is_data_collect_enabled():
             try:
                 _flush_obs_entry_buffer()
@@ -25814,7 +22848,6 @@ async def main(live: bool) -> None:
 
         summary = state.total_summary()
         log.info(f"[終了]\n{summary}")
-        # ★ v3.8.6: 当日トレードサマリを端末表示 + Discord 送信 (取引なしならスキップ)
         try:
             _print_daily_summary_to_terminal()
         except Exception:
@@ -25840,9 +22873,6 @@ async def main(live: bool) -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 
 # 送信履歴ファイル（重複送信防止・起動時キャッチアップで参照）
-# ★ v3.9.181: 素の相対パスだった（外部レビュー指摘・(1) とまったく同じ型）。
-#   cwd は launchd 起動と手動起動で変わるため、履歴が空に見えると
-#   起動のたびに最大7日ぶんの再送バーストになる。
 #
 #   保存先は **OVN_STATE_DIR**（＝`_bot_state_dir()`）。台帳・夜間持ち越しの状態と
 #   同じ、v3.9.160 が定めた唯一の置き場所。
@@ -25854,11 +22884,6 @@ async def main(live: bool) -> None:
 #         「ログと同じ場所」は既定構成で成立していなかった
 #       ・_LOG_DIR は環境変数の素の値で、`_bot_state_dir()` が持つ
 #         「書けるか（tmp→os.replace）」の実地確認を通っていない
-#   ★ v3.9.181: REAL と DEMO でファイルを分ける（外部レビュー Codex の指摘）。
-#     OVN の状態は v3.9.145 で分けたのに、送信履歴は1本のままだった。
-#     同じフォルダで併走すると、**DEMO が送った日付を REAL が「送信済み」と
-#     誤判定し、REAL の集計が送られないまま追いかけにも乗らない**。
-#     _RUN_TRADE_ENV は実行時に決まるので、_ovn_state_path と同じく関数にする。
 _DATA_SENT_HISTORY_NAME = ".data_sent_history.json"
 
 
@@ -25892,8 +22917,6 @@ def _sent_history_ready() -> bool:
 
 def _load_sent_dates() -> set:
     """送信済み日付（YYYY-MM-DD文字列）のセットを返す。存在しなければ空集合。"""
-    # ★ v3.9.181: 書き換えと同じ錠を取る（外部レビュー指摘）。
-    #   Windows では読み手がファイルを開いている間の os.replace が失敗する。
     with _SENT_HISTORY_LOCK:
         _sent_history_ready()
         try:
@@ -25901,53 +22924,25 @@ def _load_sent_dates() -> set:
                 data = json.load(f)
                 return set(data.get("sent_dates", []))
         except (OSError, ValueError):
-            # ★ v3.9.182: UnicodeDecodeError を取りこぼしていた（配布前レビュー指摘）。
-            #   ValueError の一種だが json.JSONDecodeError でも OSError でもないので
-            #   呼び手まで抜け、その日の集計が送られないまま終わっていた。
             return set()
 
-# ★ v3.9.181: 送信履歴の書き手が2つになった（外部レビュー指摘）。
-#   v3.9.179 までは run_daily_data_collect の1箇所だけだったが、v3.9.180 で
-#   再送キューの排出（gas_retry_loop の別スレッド）からも呼ぶようにした。
-#   読み出し → 加工 → 書き戻しをロック無しでやると、起動時の追いかけ
-#   （7日ぶんを5秒間隔）と再送ループ（120秒周期）が重なったとき、
-#   **open("w") の途中で読んだ側が JSONDecodeError → 空集合**になり、
-#   履歴が丸ごと消えて最大7日ぶんの再送バーストになる。
-#   ロックと、tmp → os.replace（同ファイル内の _ovn_save と同じ作り）で塞ぐ。
-#   ★ v3.9.181: RLock にして、読み手（_load_sent_dates）も同じ錠で守る。
-#     Windows は「読み手がファイルを開いている間の os.replace」が
-#     PermissionError になる（CPython の open は FILE_SHARE_DELETE を立てない）。
-#     Win365 が対象環境なので、そこで日付が記録されず再送バーストになる。
-#     _mark_date_sent が内部で _load_sent_dates を呼ぶため、再入可能である必要がある。
 _SENT_HISTORY_LOCK = threading.RLock()
 
 
 def _mark_date_sent(date_str: str) -> None:
     """指定日付を送信済みとして記録。90日以上古いエントリは自動削除。"""
-    # ★ v3.9.183: 一時ファイルの作成・fsync・置換・後始末は _atomic_write_text に
-    #   集約した（同じ手順が7箇所に写経され、耐久性が3通りに割れていた）。
-    #   一時ファイル名にスレッドIDを入れる v3.9.181 の教訓もそちらが持つ。
     _dst = _sent_history_path()
     try:
         with _SENT_HISTORY_LOCK:
-            # ★ v3.9.183: 引き継ぎの判定を**読み出しより先**に行う。順番を逆に
-            #   すると、読み出しのあとで引き継ぎが成功した回に、引き継いだ内容を
-            #   直後の書き込みが上書きして消す（検査で検出）。
             _ok = _sent_history_ready()
             sent = _load_sent_dates()
             if not _ok:
-                # ★ v3.9.182: 引き継ぎに失敗している間は保存先を作らない。
-                #   作ると次回の引き継ぎが「保存先が在る」で短絡し、旧履歴が
-                #   永久に孤立する（配布前レビュー10レーンが一致して指摘）。
-                #   記録しそこねた日は、次の起動の追いかけで送り直される。
-                #   ★ v3.9.183: 判定は共通の引き継ぎ機構へ移した。
                 log.warning(
                     f"[データ収集] 送信履歴を引き継げていないため {date_str} の記録は"
                     f"見送ります（旧い履歴を失わないため・次回もう一度引き継ぎます）")
                 return
             sent.add(date_str)
             # 90日以上古い履歴は削除（ファイル肥大化防止）
-            # ★ v2.86: 固定オフセット(-4h)を ZoneInfo に変更（DST 自動対応）。
             from datetime import timedelta as _td
             cutoff = (datetime.datetime.now(ZoneInfo("America/New_York")).date()
                       - _td(days=90)).strftime("%Y-%m-%d")
@@ -25957,7 +22952,6 @@ def _mark_date_sent(date_str: str) -> None:
     except Exception as e:
         log.warning(f"[データ収集] 送信履歴保存エラー: {e}")
 
-# ── ★ v3.9.48: ログ + logbackup/ アーカイブ統合スキャン ──────────────────────
 # 旧版 (v3.9.47 以前) の find_unsent_trading_dates / run_daily_data_collect は
 # 現在のログ (moomoo_trade_v1.log) のみをスキャンしていた。WeeklyLogbackupHandler
 # が月曜 00:00 にログを logbackup/ へローテーションするため、月曜以降の起動で
@@ -25982,7 +22976,7 @@ def _iter_log_lines(log_path: str, cutoff_date):
             log.warning(f"[データ収集] 現在ログ読込エラー ({log_path}): {e}")
 
     # 2) logbackup/ 内のアーカイブ
-    backup_dir = _LOG_BACKUP_DIR   # ★ v3.9.181: 書き手と同じ場所を見る
+    backup_dir = _LOG_BACKUP_DIR
     if not os.path.isdir(backup_dir):
         return
 
@@ -26035,9 +23029,7 @@ def _iter_log_lines(log_path: str, cutoff_date):
 def find_unsent_trading_dates(log_path: str = _LOG_PATH,
                                lookback_days: int = 7) -> list:
     """ログをスキャンして、過去lookback_days日以内でログ記録があり、かつ / まだ送信していないET日付のリストを返す（古い順）。 / 当日は含めない（定時送信で処理）。DATA_COLLECT=false の場合は空を返す。
-    ★ v3.9.48: logbackup/ 内のアーカイブ (.log/.zip) もスキャンするように改修。
-    月曜 00:00 ローテーション後の起動でも前週末のデータが拾えるようになる。"""
-    # ★ v2.86: 固定オフセット(-4h)は EDT 専用。ZoneInfo に変更で DST 自動対応。
+    """
     from datetime import timedelta as _td
 
     if os.environ.get("DATA_COLLECT", "").strip().lower() != "true":
@@ -26054,7 +23046,6 @@ def find_unsent_trading_dates(log_path: str = _LOG_PATH,
     found = set()
     ts_pat = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
-    # ★ v3.9.48: 現在ログ + logbackup/ を統合スキャン
     try:
         for line in _iter_log_lines(log_path, cutoff):
             m = ts_pat.match(line)
@@ -26104,16 +23095,14 @@ async def catchup_data_send_on_startup(log_path: str = _LOG_PATH) -> None:
 # 二重起動の防止
 # =============================================================================
 _SINGLE_INSTANCE_HANDLE = None   # プロセスが生きている間ロックを保持し続ける
-_SINGLE_INSTANCE_EXTRA: list = []   # ★ v3.9.163b: 移行期間の旧位置ロック（同時に保持）
-_SINGLE_INSTANCE_ENV_ERROR: bool = False   # ★ v3.9.163d: 二重起動ではなく環境障害だった
+_SINGLE_INSTANCE_EXTRA: list = []
+_SINGLE_INSTANCE_ENV_ERROR: bool = False
 
 
 _BOT_ENTRY_NAME = "moomoo_trade_v1.py"
 # コマンドラインから「先頭の実行ファイル」と「スクリプトのパス」を取り出す。
 # Windows は空白を含むパスが引用符で囲まれるため、単純な split では割れる。
 _RE_ARGV0 = re.compile(r'^\s*(?:"([^"]*)"|(\S+))')
-# ★ v3.9.166b: 語の切れ目まで見る（新規Claudeレビュアーの指摘——
-#   moomoo_trade_v1.py.bak / .pyc も本体として拾っていた）。
 _RE_ENTRY = re.compile(r'"([^"]*' + _BOT_ENTRY_NAME.replace(".", r"\.") + r')"'
                        r'|(\S*' + _BOT_ENTRY_NAME.replace(".", r"\.") + r')(?=\s|$)',
                        re.IGNORECASE)
@@ -26154,20 +23143,11 @@ def _list_process_rows() -> tuple:
     Bot だけに絞らず **全プロセス** を返す。親子関係をたどるには Bot 以外の
     プロセスも要るため（中継役の間に別のプロセスが挟まることがある）。
 
-    ★ v3.9.165b: Windows 11 / Windows 365 には **wmic が存在しない**（本番環境で実測）。
-    PowerShell の CIM を主経路にし、wmic は古い Windows 向けの控えとして残す。
     """
     _rows = []
-    # ★ v3.9.165b: 「1行も返らない」を "Bot は1つだけ" と読むと、走査が壊れている場合を
-    #   静かに見逃す。PowerShell 経路は必ず目印を出させ、それが返ったときだけ
-    #   「走査できた」と扱う。
     _MARK = "__PANBOT_SCAN_OK__"
     if os.name == "nt":
         _cmds = [
-            # ★ v3.9.166b: 絞り込まずに **全プロセス** を取る（新規Claudeレビュアーの
-            #   指摘——中継役の python.exe が直接の親でない場合、系統をたどれずに
-            #   自分の身内を「別の Bot」と数えて起動を止める）。親子関係は Bot 以外の
-            #   プロセスを挟むことがあるので、系統をたどる材料は全件必要。
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
              "$r = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue); "
              "Write-Output '" + _MARK + "'; "
@@ -26178,16 +23158,10 @@ def _list_process_rows() -> tuple:
         ]
     else:
         _cmds = [["ps", "-eo", "pid=,ppid=,etime=,command="]]
-    # ★ v3.9.166: Windows で pythonw から起動している利用者に、走査のたび黒い窓が
-    #   一瞬出るのを防ぐ（起動時の1回だけとはいえ「何か起きた」と見える）。
     _no_win = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} \
         if os.name == "nt" else {}
     for _cmd in _cmds:
         try:
-            # ★ v3.9.166b: errors="replace" が要る（新規Claudeレビュアーの指摘——
-            #   配布ランチャは PYTHONUTF8=1 を立てるため、日本語のユーザー名を含む
-            #   Windows PowerShell 5.1 の CP932 出力を UTF-8 として読んで
-            #   UnicodeDecodeError になり、走査が丸ごと死んでいた）。
             _res = subprocess.run(_cmd, capture_output=True, text=True,
                                   errors="replace", timeout=25, **_no_win)
         except Exception:
@@ -26195,9 +23169,6 @@ def _list_process_rows() -> tuple:
         _stdout = _res.stdout or ""
         # 一覧そのものが取れたか（Bot が見つかったかとは別）
         if os.name == "nt" and _cmd[0] == "powershell":
-            # ★ v3.9.166: 目印だけでは足りない。CIM が権限やサービス停止で
-            #   黙って空を返すと「走査できた・プロセスは無い」に見えてしまう。
-            #   CIM が働いていれば全プロセスが返るので、1行も無い＝働いていない。
             _scanned = (_MARK in _stdout) and any(
                 _l.split("|", 1)[0].strip().isdigit() for _l in _stdout.splitlines())
         else:
@@ -26229,18 +23200,13 @@ def _list_process_rows() -> tuple:
                     continue
                 _rows.append((int(_f[0]), int(_f[1]) if _f[1].isdigit() else 0,
                               _proc_age_seconds(_f[2]), _f[3]))
-        # ★ v3.9.166d: 1行も解釈できなければ「走査できた」と言ってはいけない
-        #   （新規Claudeレビュアーの指摘——復号を寛容にした結果、wmic の UTF-16 出力や
-        #   CommandLine が読めない環境で「行はあるが全部解釈不能」になり、
-        #   警告も出さずに『別の Bot は居ない』として起動していた）。
-        #   プロセスが実際に0件ということはあり得ないので、空＝解釈失敗と断定できる。
         if _rows:
             return _rows, True
     return [], False
 
 
 def _find_other_bot_processes(tag: str) -> list:
-    """★ v3.9.165: 自分以外の Bot プロセスを OS のプロセス一覧から探す。
+    """
 
     ロックはファイル位置で排他するため、**旧版が別フォルダで稼働中**のときは
     噛み合わない（旧版は自分のフォルダのロックしか見ない・認定サポーターの指摘。
@@ -26254,8 +23220,6 @@ def _find_other_bot_processes(tag: str) -> list:
     try:
         _rows, _scanned = _list_process_rows()
         if not _scanned:
-            # ★ v3.9.165b: 走査できないこと自体を黙って通すと「守られているつもり」に
-            #   なる（本番の Windows で wmic 不在により起きていた）。必ず見える形で残す。
             print("[二重起動防止] ⚠ プロセス一覧を取得できませんでした。"
                   "別フォルダの旧版が動いていないかは確認できていません。")
             return []
@@ -26267,13 +23231,6 @@ def _find_other_bot_processes(tag: str) -> list:
                 return os.path.normcase(_p or "")
 
         def _is_my_file(_p):
-            # ★ v3.9.167c: 同一ファイルかは**実体**で判定する（Codexレビュー指摘）。
-            #   文字列を .lower() で畳むと、大小を区別するボリューム上の
-            #   本当に別のファイル（/Bot/ と /bot/）まで「同じ」と誤認して
-            #   実口座の二重起動を見逃す。逆に畳まないと、大小を区別しない
-            #   ボリュームで大文字パス起動の自分を「別の Bot」と誤検知する
-            #   （v3.9.167b で実測）。os.path.samefile は inode で比べるので
-            #   どちらのボリュームでも正しい。確認できなければ検知側に倒す。
             try:
                 return os.path.samefile(_p, os.path.abspath(__file__))
             except OSError:
@@ -26281,12 +23238,6 @@ def _find_other_bot_processes(tag: str) -> list:
 
 
 
-        # ★ v3.9.165b: Windows の本番では「中継役の python.exe」が同じコマンドラインで
-        #   親として残る（Win365 で実測——親子ペアで見える）。自分の先祖・子孫を
-        #   他人と数えると、正規の起動が毎回止まる。系統を除外する。
-        #   除外するのは **先祖だけ**。子孫まで除外すると、自分から派生したシェル経由で
-        #   起動された別フォルダの Bot を見逃す（テストが検知した）。Bot は自分の複製を
-        #   生成しないので、除外は先祖方向だけで足りる。
         _pp = {_r[0]: _r[1] for _r in _rows}
         _kin = {_me}
         _cur, _hop = _pp.get(_me, 0), 0
@@ -26296,10 +23247,6 @@ def _find_other_bot_processes(tag: str) -> list:
         _my_age = next((_r[2] for _r in _rows if _r[0] == _me), -1.0)
 
         for _pid, _ppid, _age, _cmdline in _rows:
-            # ★ v3.9.167: 大小を区別していたため、_RE_ENTRY の re.IGNORECASE に
-            #   到達していなかった（認定サポーターの指摘・Mac で実測）。Windows も
-            #   macOS も既定でファイル名の大小を区別しないので MOOMOO_TRADE_V1.py でも
-            #   同じ本体が起動する。
             if _pid in _kin or _BOT_ENTRY_NAME.lower() not in _cmdline.lower():
                 continue
             _m0 = _RE_ARGV0.match(_cmdline)
@@ -26309,27 +23256,11 @@ def _find_other_bot_processes(tag: str) -> list:
             _argv0 = _m0.group(1) or _m0.group(2) or ""
             _entry = _me_entry.group(1) or _me_entry.group(2) or ""
             # 「python が実行している」形だけを拾う（エディタ・grep・シェルを除外）。
-            # ★ v3.9.165b: Windows のランチャ py.exe / pythonw.exe も通す（Codex指摘）。
-            #   区切りは自前で割る（他OSのパス表記を解釈する場面があるため、
-            #   os.path.basename では \ を区切りとみなさない環境がある）。
             _exe = re.split(r"[\\/]", _argv0)[-1].strip().lower()
             if not ("python" in _exe or _exe in ("py", "py.exe")):
                 continue
-            # ★ v3.9.165b: 実行ファイルそのものが argv[0] の場合（引数として渡していない）は
-            #   スクリプト実行ではないので対象外。
             if _norm(_entry) == _norm(_argv0):
                 continue
-            # ★ v3.9.165b: `python -m py_compile moomoo_trade_v1.py` のように
-            #   **本体を実行していない** python を Bot と誤認していた（新規Claude
-            #   レビュアーの指摘——tests/run_all.sh が毎回これを走らせるので、
-            #   検査中にデモを起動すると必ず止まる）。
-            # ★ v3.9.166b: ただし「オプションがあれば除外」は行き過ぎだった
-            #   （Codexレビュー指摘——`python -u 本体.py --live` や -O / -X 付きで
-            #   動かしている旧版を丸ごと見逃す）。実行対象を差し替えるのは -m と -c
-            #   だけなので、それだけを見る。
-            # ★ v3.9.166b: あわせて「本体より前に別のスクリプト名がある」形
-            #   （`python3 なにか.py moomoo_trade_v1.py` ＝本体を引数として渡しただけ）も
-            #   除外する（新規Claudeレビュアーの指摘）。値を取るオプションの値は読み飛ばす。
             # トークン分割は引用符を尊重する（Windows のコマンドラインは引用符が残る）。
             # ただし ps は引用符を保持しないので、これだけでは
             # `-X pycache_prefix=/a/Cache Folder` の "Folder" を救えない。
@@ -26346,15 +23277,6 @@ def _find_other_bot_processes(tag: str) -> list:
                     _runs_other_target = True          # 標準入力から実行
                     break
                 if not _a.startswith("-"):
-                    # ★ v3.9.166c: 「オプションでないトークン＝別のスクリプト」は
-                    #   強すぎた（Codexレビュー指摘・実プロセスで再現）。ps は引用符を
-                    #   保持しないため、`-X pycache_prefix=/a/Cache Folder` の "Folder" が
-                    #   別スクリプト扱いになり、旧版を見逃していた。**.py で終わる
-                    #   ものだけ**を実行対象とみなす。
-                    # ★ v3.9.166d: 拡張子の無いコンソールスクリプト
-                    #   （`python3 /venv/bin/pylint 本体.py`）も実行対象とみなす
-                    #   （新規Claudeレビュアーの指摘——これを Bot と誤認して
-                    #   デモの起動が止まっていた）。区切り文字を含めばパス＝実行対象。
                     if (_a.lower().endswith((".py", ".pyw", ".pyc"))
                             or "/" in _a or "\\" in _a):
                         _runs_other_target = True      # 実行対象は別のスクリプト
@@ -26370,35 +23292,16 @@ def _find_other_bot_processes(tag: str) -> list:
                     break
             if _runs_other_target:
                 continue
-            # ★ v3.9.165b: **同じファイル**を動かしているなら、その相手はロックで
-            #   排他できている（同じ OVN_STATE_DIR・同じ旧位置）。この走査が拾うべきは
-            #   「別の場所にある本体」だけ。中継役の python.exe も監視スクリプトも
-            #   自分と同じパスを持つので、ここで落ちる。
-            # ★ v3.9.166b: 相対パスで起動された相手（`python moomoo_trade_v1.py --live`）は
-            #   **相手の作業フォルダが分からない**ので、同じファイルかどうか判定できない
-            #   （Codexレビュー指摘——realpath は自分の作業フォルダを基準に解決するため、
-            #   別フォルダの旧版を「自分と同じ」と誤認して見逃していた）。
-            #   判定できないときは検知する側（＝二重発注を避ける安全側）に倒す。
             if _looks_absolute_path(_entry) and _is_my_file(_entry):
                 continue
             # 同じモード同士だけを衝突とみなす（実口座とデモの併走は正当）
             _tail = _cmdline[_me_entry.end():]
             _targs = [_a.strip('"') for _a in _tail.split()]
-            # ★ v3.9.167: Bot 自身は argparse で受けており、**長いオプションの
-            #   省略形が既定で通る**（--liv / --li / --l はいずれも実口座で起動する）。
-            #   走査側だけ完全一致で見ていたため、その形の実口座の旧版を「デモだから
-            #   別モード」と読み飛ばしていた（認定サポーターの指摘・実測）。
             _is_live_other = ("real" in _targs) or any(
                 _a.startswith("--") and len(_a) > 2 and "--live".startswith(_a)
                 for _a in _targs)
             if (tag == "live") != bool(_is_live_other):
                 continue
-            # ★ v3.9.166b: ここに「後から起動した相手には譲る（先着優先）」を入れていたが、
-            #   **撤回した**（新規Claudeレビュアーの指摘）。走査を持たない旧版が1秒あとに
-            #   立ち上がっただけで、新版が旧版を見逃して両方稼働する——実口座で発注が
-            #   重複する、この機能が防ぐはずだったものそのものになる。
-            #   先着優先が救おうとした「新版どうしが両方中止」は、共有ロックが先に効くので
-            #   ほぼ起きない（起きても損害は「動かない」＝目に見える側）。
             _out.append((_pid, _cmdline[:200], _age))
     except Exception as _e_ps:
         print(f"[二重起動防止] ⚠ プロセス走査に失敗しました（{_e_ps}）。"
@@ -26418,14 +23321,6 @@ def _acquire_single_instance(tag: str = "bot"):
     global _SINGLE_INSTANCE_HANDLE
     import os as _o
 
-    # ★ v3.9.163: 状態（台帳・OVN）を固定フォルダへ集約したのに、二重起動ロックだけ
-    #   本体フォルダのままだった（新規Claudeレビュアーの指摘）。版の更新で本体フォルダを
-    #   差し替える運用では、旧フォルダと新フォルダの2プロセスが別々のロックを取って
-    #   同時に起動でき、同じ台帳・同じ OVN 状態を上書きし合う。排他の範囲を状態の
-    #   共有範囲に合わせる。
-    # ★ v3.9.163b: ロック位置を移すと、旧位置のロックを持ったまま稼働している
-    #   旧版プロセスと**同時に起動できてしまう**（Codexレビュー指摘——実口座で
-    #   発注が重複する）。移行期間は新旧の両方を取る。片方でも取れなければ中止。
     _lock_paths = [_o.path.join(OVN_STATE_DIR, f".{tag}_single.lock")]
     _legacy_lock = _o.path.join(_o.path.dirname(_o.path.abspath(__file__)),
                                 f".{tag}_single.lock")
@@ -26435,10 +23330,6 @@ def _acquire_single_instance(tag: str = "bot"):
     def _try_lock(_path, _required=False):
         """1つのロックを非ブロッキングで取る。(handle, 取得できたか, 保持者)
 
-        ★ v3.9.163c: 共有先（OVN_STATE_DIR）のロックは「唯一プロセス間で共通する
-        排他点」なので、開けないときに通すと排他そのものが無効になる
-        （Codexレビュー指摘——別フォルダの新旧Bot が両方起動して実口座で二重発注）。
-        必須のロックが開けない場合は起動を中止する。
         """
         try:
             _fh = open(_path, "a+")
@@ -26446,7 +23337,7 @@ def _acquire_single_instance(tag: str = "bot"):
             if _required:
                 print(f"[二重起動防止] 共有のロックファイルを開けません（{_e_o}）。"
                       f"二重起動を防げないため、この起動を中止します: {_path}")
-                return None, False, "__ENV_ERROR__"   # ★ v3.9.163d: 環境障害の印
+                return None, False, "__ENV_ERROR__"
             print(f"[二重起動防止] ロックファイルを開けません（{_e_o}）。この位置は無視します。")
             return None, True, ""   # 旧位置は判定に使わない（従来どおり通す）
         try:
@@ -26464,7 +23355,6 @@ def _acquire_single_instance(tag: str = "bot"):
             except Exception:
                 _who = ""
             _fh.close()
-            # ★ v3.9.163d: 競合以外のロックエラーを「既にBotが動いている」と説明しない
             if getattr(_e_lk, "errno", None) not in (
                     getattr(__import__("errno"), "EACCES", 13),
                     getattr(__import__("errno"), "EAGAIN", 11),
@@ -26485,8 +23375,6 @@ def _acquire_single_instance(tag: str = "bot"):
                     pass
             print("=" * 60)
             if _who_l == "__ENV_ERROR__":
-                # ★ v3.9.163d: 環境障害を「二重起動」と説明しない（Codexレビュー指摘——
-                #   監視側が正常な抑止と誤認する）。異常として知らせる。
                 print("[二重起動防止] 🔴 排他のためのロックを扱えませんでした。")
                 print(f"  ロック: {_lp}")
                 print("  権限・空き容量・保存先の状態をご確認ください。")
@@ -26506,12 +23394,6 @@ def _acquire_single_instance(tag: str = "bot"):
         return True   # どの位置も開けなかった＝ロックが使えないだけなので通す
     fh = _held[0]
 
-    # ★ v3.9.165: ロックは取れたが、別フォルダの旧版が動いていないかを確かめる
-    #   （認定サポーターの指摘——版跨ぎ×フォルダ跨ぎではロックが噛み合わない）。
-    #   誤検知で起動できないほうが困る場面のために BOT_SKIP_PROCESS_SCAN=true で無効化可。
-    # ★ v3.9.165b: PID の書き込みより **前** に走査する（新規Claudeレビュアーの指摘——
-    #   走査で中止すると、ロックファイルに起動しなかったプロセスの PID が残り、
-    #   次に本物の二重起動を弾いたとき存在しない PID を「稼働中」と表示する）。
     if (os.environ.get("BOT_SKIP_PROCESS_SCAN", "").strip().lower() != "true"):
         _others = _find_other_bot_processes(tag)
         if _others:
@@ -26578,16 +23460,13 @@ _AI_LABEL_SCORE = {"📈 ポジティブ": 1, "➡️ 中立": 0, "📉 ネガ�
 
 
 def _ai_score_from_match(m) -> int:
-    """★ v3.9.192: 日次集計用。score= があればそれを、無ければラベルから -1/0/1 を返す。"""
+    """"""
     _sc = m.groupdict().get("score")
     if _sc is not None:
         return int(_sc)
     return _AI_LABEL_SCORE[m.group("label")]
 
 
-# ★ v3.9.193: 日次集計が「最大益/最大損」を拾う行の形（`[ポジション] $700.00  PnL=$+1.89(+0.27%)`）。
-#   検査から直接当てられるよう関数の外に置く。ANSI の色指定はファイル側では除去済みだが、
-#   あっても通る形にしておく。
 _DAILY_POSITION_PNL_RE_TAIL = (
     r"\[ポジション\].*?PnL=(?:\x1b\[[0-9;]*m)?(?P<pnl>\$?[+-]?[\d.]+)"
     r"(?:\x1b\[[0-9;]*m)?\((?:\x1b\[[0-9;]*m)?(?P<pct>[+-]?[\d.]+)%"
@@ -26632,7 +23511,6 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
     # ── 対象日付の決定 ───────────────────────────────────────────────
     # 引数で指定があればキャッチアップ送信、無ければ呼び出し時点のET日付。
     # 日付はランダム遅延の「前」に確定させる（遅延で日付が跨いでもOK）。
-    # ★ v2.86: 固定オフセット(-4h)を ZoneInfo に変更（DST 自動対応）。
     _ET_TZ  = ZoneInfo("America/New_York")
     _JST_TZ = ZoneInfo("Asia/Tokyo")
     if target_date is None:
@@ -26643,7 +23521,6 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
         is_catchup = True
     date_str = today.strftime("%Y-%m-%d")
 
-    # ★ v2.87: 休日はトレードログがほぼないため定時送信をスキップ
     # キャッチアップ送信（target_date 指定あり）は手動再送等の用途を妨げないよう
     # 休日でも実行する。
     if not is_catchup and is_nyse_holiday(today):
@@ -26677,7 +23554,6 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
     SESS = {"pre":(240,570),"rth":(570,960),"ath":(960,1200)}
     def _session(ts_str):
         try:
-            # ★ v2.86: JST→ET 変換を ZoneInfo へ。DST 自動対応。
             dt = (datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
                   .replace(tzinfo=_JST_TZ).astimezone(_ET_TZ))
             m  = dt.hour*60+dt.minute
@@ -26689,49 +23565,24 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
 
     TS  = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
     # .env で設定された全銘柄から動的に生成（レバレッジETF固定値は使用しない）
-    # ★ v3.9.150: 夜間持ち越しの確定損益行は OVN_SYMBOL（固定）で出るため、
-    #   TRIGGER_TICKERS に QQQ が無い設定だと拾えなかった（認定サポーターの指摘）。
     _sym_pool = sorted(set(ALL_TICKERS) | ({OVN_SYMBOL} if OVN_ENABLED else set()))
     SYM = r"(" + "|".join(re.escape(t) for t in _sym_pool) + r")"
     pats = {
         "ts":    re.compile(rf"^{TS}"),
-        # ★ v3.9.144: SHORT を追加（認定サポーターの指摘）。発注ログは
-        #   [ORDER] SHORT の形式で、BUY|SELL では拾えず件数から漏れていた。
-        #   一致後の分類は「BUY 以外は売り系」なので SHORT はそのまま売り側に入る。
         "order": re.compile(rf"{TS}.*?【{SYM}】.*?\[ORDER\]\s+(?P<side>BUY|SELL|SHORT).*?qty=(?P<qty>\d+).*?price=(?P<price>[\d.]+)", re.I),
         "fill":  re.compile(rf"{TS}.*?【{SYM}】.*?\[約定確認\].*?status=(?P<status>\S+)", re.I),
-        # ★ v3.9.141: LONG / SHORT / リトライ の全形式を拾う。
-        #   旧実装は「[確定損益] + sell_avg + buy_avg」のLONG形式だけに一致し、
-        #   SHORT の「[確定損益(SC)] + cover_avg + short_avg」が1件も拾えず、
-        #   ショートだけの日は「損益N/A・決済0回」になっていた。
-        #   （認定サポーターからの指摘。実環境で再現を確認）
-        #   決済方向を問わず realized_pnl と qty だけを見る形に統一する。
-        #   実在するタグは4種類:
-        #     [確定損益] [確定損益(SC)] [確定損益(リトライ)] [確定損益(SC・リトライ)]
-        #   括弧の中身は問わず、realized_pnl と qty だけを見る。
         "rpnl":  re.compile(rf"{TS}.*?【{SYM}】.*?\[確定損益(?:\([^\]]*\))?\]"
                             rf".*?realized_pnl=(?P<pnl>[+-]?[\d.]+).*?qty=(?P<qty>\d+)", re.I),
-        # ★ v3.9.193: 最大益/最大損が v3.9.133 以降ずっと 0.00 だった（認定サポーターの指摘）。
-        #   ① `[リスク]` というタグを出す行はどの版にも無く、実際は `[ポジション]`。
-        #   ② 金額は `$+1.89`（$ が符号の前）で、`+$1.89` を期待する形では当たらない。
-        #   片方だけ直しても 0 件のまま（実ログ 64,196 行で 0/0/0/576）。両方直す。
-        #   ANSI の色指定はファイル側では除去済みだが、あっても通る形にしておく。
         "risk":  re.compile(rf"{TS}.*?【{SYM}】.*?" + _DAILY_POSITION_PNL_RE_TAIL, re.I),
         "eod":   re.compile(rf"{TS}.*?(?:強制クローズ発動|EOD|close_all_for_|15:45)", re.I),
         "err":   re.compile(rf"{TS}.*?\[(ERROR|WARN(?:ING)?)\]\s+(?P<msg>.+)", re.I),
-        # ★ v3.9.192: 実際のログは「[AI判定] 📉 ネガティブ  confidence=0.68」で、score= は出ない。
-        #   従来の score= 要求では1行も当たらず、AI信頼度・強気・弱気・中立の4列が
-        #   **構造的に常に空**だった（認定サポーターの指摘）。ラベルでも拾う。
         "ai":    re.compile(rf"{TS}.*?(?:AI判定|\[AI\]).*?(?:score=(?P<score>[+-]?\d)|(?P<label>📈 ポジティブ|➡️ 中立|📉 ネガティブ)).*?confidence=(?P<conf>[\d.]+)", re.I),
-        # ★ v3.9.137: 夜間持ち越しの「記録のみ」結果。実発注の確定損益とは別枠。
         "ovnsh": re.compile(rf"{TS}.*?\[夜間持ち越し\]\[記録のみ\].*?qty=(?P<qty>\d+).*?"
                             rf"shadow_pnl=(?P<pnl>[+-][\d.]+).*?shadow_pct=(?P<pct>[+-][\d.]+)", re.I),
     }
 
     buy_orders=sell_orders=filled=cancelled=trade_count=0
     rpnl_total=0.0
-    # ★ v3.9.193: None から始める。0.0 始まりの max/min だと全敗の日の最大益・
-    #   全勝の日の最大損が 0.00 のままになる。
     best_pnl=worst_pnl=None
     ai_scores,ai_confs,errors=[],[],[]
     sym_orders=defaultdict(int)
@@ -26741,7 +23592,6 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
 
     def is_today(ts_str):
         try:
-            # ★ v2.86: JST→ET 変換を ZoneInfo へ。DST 自動対応。
             dt = (datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
                   .replace(tzinfo=_JST_TZ).astimezone(_ET_TZ))
             return dt.date() == today
@@ -26757,7 +23607,6 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
         for d in (-1, 0, 1)
     }
 
-    # ★ v3.9.48: 現在ログ + logbackup/ アーカイブを統合スキャン。
     # 月曜以降の起動で前週末のデータをバックアップから拾えるようにする。
     try:
         for line in _iter_log_lines(log_path, today):
@@ -26821,20 +23670,15 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
             me=pats["err"].search(line)
             if me:
                 _emsg = me.group("msg").strip()
-                # ★ v3.9.87 (B-1): 情報バナー/状態通知はエラーシートへ送らない
-                #   （端末表示は維持・"エラー"件数の水増しを防ぎ真のエラーを埋もれさせない）
                 if any(_tag in _emsg for _tag in _ERROR_LOG_EXCLUDE_TAGS):
                     continue
-                # ★ v3.9.132: 再試行で回復する一時的エラーの「途中経過」は記録しない。
-                #   再接続/再試行は設計どおりの動作。最終的に失敗した行（"再試行"を含まない
-                #   本エラーや「接続不全」等の集約警告）は従来どおり記録される。
                 if any(_tag in _emsg for _tag in _ERROR_LOG_TRANSIENT_TAGS):
                     continue
                 errors.append({
                     "t":   ts_str[11:19],                # HH:MM:SS
                     "lv":  me.group(2).upper(),          # ERROR / WARNING
                     "msg": _emsg[:150],                  # メッセージ本文
-                    "impact": _classify_error_impact(_emsg),  # ★ v3.9.111: 売買影響区分
+                    "impact": _classify_error_impact(_emsg),
                 })
     except Exception as e:
         log.warning(f"[データ収集] ログ解析エラー: {e}")
@@ -26858,8 +23702,6 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
         "force_close":"Yes" if eod_time else "No","force_close_time":eod_time,
         "error_count":len(errors),
         "errors_summary":" | ".join(e["msg"] for e in errors[:3]),
-        # ★ v3.9.96: GAS送信量とエラーログ詳細シートの肥大を抑えるため 50→25 に削減
-        #   (error_count は全件カウントのまま。詳細は端末ログ/CHANGELOG参照)。
         "error_logs":_json.dumps(errors[:25], ensure_ascii=False),
         # 時間帯別
         "pre_trades":sess_stats["pre"]["trades"],"pre_pnl":_pnl(sess_stats["pre"]),
@@ -26870,7 +23712,6 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
         "ath_wins":sess_stats["ath"]["wins"],"ath_losses":sess_stats["ath"]["losses"],"ath_winrate":_wr(sess_stats["ath"]),
         "ovn_trades":sess_stats["ovn"]["trades"],"ovn_pnl":_pnl(sess_stats["ovn"]),
         "ovn_wins":sess_stats["ovn"]["wins"],"ovn_losses":sess_stats["ovn"]["losses"],"ovn_winrate":_wr(sess_stats["ovn"]),
-        # ★ v3.9.137: 夜間持ち越し「記録のみ」（実発注していない仮想成績）
         "ovnshadow_trades":ovn_shadow["trades"],"ovnshadow_pnl":round(ovn_shadow["pnl"],2),
         "ovnshadow_pct":round(ovn_shadow["pct"],2),
         "ovnshadow_wins":ovn_shadow["wins"],"ovnshadow_losses":ovn_shadow["losses"],
@@ -26884,10 +23725,6 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
             {"token": "algo2026secret", "student_name": cfg_name, "data": summary},
             ensure_ascii=False
         )
-        # ★ v3.9.174: 再送＋キュー退避つきの共通経路で送る（従来ここだけ
-        #   _gas_post 直呼びで、LOCK_BUSY 等の失敗がその場で終わっていた）。
-        #   kind="summary" は再送上限・破棄優先度・クールダウン免除が定義済み。
-        #   ジッターは 0（この関数自身が送信前に 0〜180秒 の分散を済ませている）。
         # timeout は 30秒: 分散遅延の上限180秒 ＋ 再送3回×30秒 ＋ 待機20秒 ＝ 290秒
         #   で、asyncio が executor スレッドの終了を待つ 300秒の予算内に収まる
         #   （60秒だと 385秒になり予算超過＝Ctrl+C 時に退避前へ打ち切られうる）。
@@ -26919,18 +23756,12 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
             )
         return
     except Exception as e:
-        # ★ v3.9.174: 通信エラーはここへ届かなくなった（共通経路が内部で握り、
-        #   分類・マスクつきの WARNING を自前で出す）。ここに来るのは payload の
-        #   組み立て失敗くらいなので、ラベルを実態に合わせる。日付は未送信の
-        #   ままなので、次回起動時の追いかけが再試行する。
         log.warning(f"[データ収集] 送信準備エラー: {_mask_secrets(e)} → 次回起動時に再送")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="moomoo セクター連動型アルゴトレード v1")
     parser.add_argument("--live", action="store_true", help="実口座モード")
-    # ★ v3.9.117: Bot Station.app 互換。アプリは位置引数 demo/real を渡すため受け付ける。
-    #   demo（または省略）＝デモ / real＝実口座。従来の --live も引き続き有効（real と等価）。
     parser.add_argument("mode", nargs="?", choices=["demo", "real"], default=None,
                         help="起動モード: demo=デモ口座 / real=実口座（省略時は --live に従う）")
     args = parser.parse_args()
@@ -26939,9 +23770,6 @@ if __name__ == "__main__":
     # 同じ口座へ二重に発注しないための安全装置。
     # 実口座かデモかで別のロックにし、それぞれ1つだけ動けるようにする。
     if not _acquire_single_instance("live" if _is_live else "demo"):
-        # ★ v3.9.163d: 「既に動いている」（正常な抑止）と「ロックを扱えない」
-        #   （環境障害）を終了コードで区別する（Codexレビュー指摘——同じ 0 だと
-        #   監視側が環境障害を正常な抑止と誤認する）。
         sys.exit(2 if globals().get("_SINGLE_INSTANCE_ENV_ERROR") else 0)
 
     import platform, subprocess

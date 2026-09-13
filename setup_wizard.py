@@ -2,7 +2,7 @@
 setup_wizard.py
 ===============
 moomoo_trade_v1.py 用 .env セットアップウィザード（完全版）
-最新バージョン: v1.48  最終更新日: 2026-09-08
+最新バージョン: v1.50  最終更新日: 2026-09-13
 
 使い方:
   python3 setup_wizard.py   # Mac
@@ -18,6 +18,23 @@ moomoo_trade_v1.py 用 .env セットアップウィザード（完全版）
 # 更新履歴
 # =============================================================================
 #
+# v1.50 2026-09-13  モメンタムの選抜プロファイル v2 を STEP 1 で選べるようにした（PAN 指示・Bot v3.9.194 の select_v2）。
+#   ①STEP 1 に [3] 選抜プロファイル v2（検証中）を追加し、初めて設定する方の既定を v2 にした。v1 は引き続き選べる。
+#   ②v1.49 までは v2 の .env で Enter を押すと黙って v1 に戻っていた。STEP 1 は現在値 select_v2 を [2] と表示し、
+#     STEP 14 は選抜なら常に select_v1 を書き戻していたため。いまの値をそのまま保つ。
+#   ③v2 は買いも実発注の対象にするが、Wizard の既定の発注サイドに QQQ の買いが無く、v2 に切り替えても買いが
+#     届かなかった。v2 の既定は Bot の既定サイドから SMH の買いを外したものにし、既存の設定に QQQ の買いが無いときは
+#     自動で加え、加えたことを画面にはっきり出す（PAN 指示）。
+#   ④確認画面・.env の説明・STEP 4／6 の選抜判定・実発注サイドの表示を v2 に対応。
+# v1.49 2026-09-11  認定サポーターの v1.48 レビュー反映。
+#   ①最重要: (Y/N) の欄が全角の「Ｎ」「Ｙ」を既定値として素通りさせていた。日本語入力のまま Ｎ と打つと
+#     聞き直しにならず既定の側で進むため、「実発注を有効にします」「OVN取引機能の実売買を有効にします」で
+#     止めたつもりが有効のまま保存されうる。NFKC で全角を直し、読めない入力は聞き直す（Enter だけが既定値）。
+#   ②「ひとつ前に戻る: b」で全角の「ｂ」が効かず、そのまま次の STEP へ進んでいた（_is_back で NFKC）。
+#   ③v1.48 の取りこぼし。最大発注比率・モメンタム損切り・夜間ミュート時間帯の3つに validate が無く、
+#     現在値が範囲外だと「Enter=現在値」と出ているのに Enter で進めないループが残っていた。
+#   ④同じ金額の欄なのに、STEP 2 の BUDGET_USD だけ $10000 や全角を弾いていた（STEP 15 は通る）。
+#     OVN 側の正規化（_normalize_amount）に揃えた。
 # v1.48 2026-09-08  認定サポーター4名の v1.47 レビュー反映。
 #   ①最重要: .env の読み取りを Bot（python-dotenv）と同じ規則に揃える（_read_env_value）。値のクォートと
 #     「空白＋#」以降の行末コメントを落とし、export 接頭辞も外す。これを読まずにいたため、手編集の .env で
@@ -457,18 +474,39 @@ def _num_in_range(v, lo, hi, allow_comma=False, integer_only=False, exclude_lo=F
     return (lo < f if exclude_lo else lo <= f) and f <= hi
 
 
+def _int_trunc_in_range(v, lo, hi):
+    """★ v1.49: ask(validate=) 用。小数を切り捨てた整数が範囲内なら True。
+
+    後段の検査（int(float(val)) が lo〜hi）と同じ条件にしてある。緩いと壊れた
+    現在値を既定として出してしまい、厳しいと通るはずの現在値を落とす。"""
+    try:
+        _i = int(float(str(v).strip()))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return lo <= _i <= hi
+
+
 def ask_yn(prompt, default=True):
     # ★ v1.21 (点5b): 日本語「はい/いいえ」も受け付ける。従来は「いいえ」が True(=はい)
     #   扱いになる不具合があった（N/NO 以外は全て True だったため）。
-    hint = "(Y/N)"
-    raw = ask(f"{prompt} {dim(hint)}", default="Y" if default else "N")
-    s = raw.strip().lower()
-    if s in ("n", "no", "いいえ", "no.", "いや", "しない"):
-        return False
-    if s in ("y", "yes", "はい", "する", "ok"):
-        return True
-    # 不明な入力は既定値を採用（誤って True に倒さない）
-    return default
+    # ★ v1.49: 全角の「Ｎ」「Ｙ」が既定値として素通りしていた（認定サポーターの報告）。
+    #   日本語入力のまま Ｎ と打つと、聞き直しにならず既定の側で先へ進む。
+    #   「実発注を有効にします」「OVN取引機能の実売買を有効にします」も同じ入口なので、
+    #   止めたつもりで有効のまま保存されうる。NFKC で全角を直し、読めない入力は聞き直す。
+    #   Enter（空入力）だけが既定値の意味。
+    # ★ v1.49（配布前レビュー Claude 別人格）: default="" を渡すと ask の [現在: Y] が出なくなり、
+    #   「実発注を有効にします」で Enter がどちらに倒れるかが画面から消える。ヒントに入れる。
+    hint = f"(Y/N・Enter={'Y' if default else 'N'})"
+    while True:
+        raw = ask(f"{prompt} {dim(hint)}", default="")
+        s = unicodedata.normalize("NFKC", str(raw or "")).strip().lower()
+        if s == "":
+            return default
+        if s in ("n", "no", "いいえ", "no.", "いや", "しない"):
+            return False
+        if s in ("y", "yes", "はい", "する", "ok"):
+            return True
+        warn(f"Y か N で入力してください（Enter だけなら {'Y' if default else 'N'}）")
 
 def ask_choice(prompt, choices, default="", custom_range=None):
     """選択式入力。custom_range=(min,max) を渡すと『値の直接入力』モードになる。
@@ -649,6 +687,11 @@ _WIZARD_CAN_GO_BACK = False
 _BACK_TOKENS = {"b", "back", "戻る", "もどる"}
 
 
+def _is_back(raw):
+    """★ v1.49: 「戻る」指示かどうか。全角の「ｂ」でも戻れるようにする（認定サポーターの報告）。"""
+    return unicodedata.normalize("NFKC", str(raw or "")).strip().lower() in _BACK_TOKENS
+
+
 def next_step_pause():
     """次のSTEPへ進む前にEnterを待つ。'b' 入力で前のステップへ戻る（v1.26）。"""
     if _WIZARD_CAN_GO_BACK:
@@ -656,11 +699,11 @@ def next_step_pause():
     else:
         prompt = f"  {dim('次の STEP へ進む場合は Enter : ')}"
     try:
-        ans = input(prompt).strip().lower()
+        ans = input(prompt)
     except (KeyboardInterrupt, EOFError):
         print("\n\n  " + yellow("キャンセルしました。"))
         sys.exit(0)
-    if _WIZARD_CAN_GO_BACK and ans in _BACK_TOKENS:
+    if _WIZARD_CAN_GO_BACK and _is_back(ans):
         raise _GoBack()
     print()
 
@@ -721,7 +764,7 @@ TOTAL = 16   # ★ v1.46: 14→16（戦略プロファイルを STEP1 に・OVN�
 
 # 既知ETFリスト（STOCK_TICKERS入力時のバリデーション用）
 # ★ v1.38: 版数は必ずここを更新する（起動バナー・ヘッダ表示で共用。取り残し防止）
-WIZARD_VERSION = "v1.48"
+WIZARD_VERSION = "v1.50"
 
 _KNOWN_ETFS = {
     "SPY", "QQQ", "SMH", "SPXL", "SPXS", "TQQQ", "SQQQ", "SOXL", "SOXS",
@@ -733,6 +776,48 @@ _KNOWN_ETFS = {
 
 # 発注しない設定の sentinel 値（AI confidence は 0.0〜1.0 なので 2.0 は絶対に超えない）
 _DISABLED_CONF = "2.00"
+
+# ★ v1.50: モメンタムの戦略プロファイルの名前と判定を1か所にまとめる（v2 の追加で分岐が6か所に増えたため）。
+_MOM_PROFILE_LABELS = {
+    "standard":  "カスタマイズ設定（今まで通り）",
+    "select_v1": "選抜プロファイル v1（絞り込み運転）",
+    "select_v2": "選抜プロファイル v2（絞り込み運転・検証中）",
+}
+# v2 の既定サイドは Bot の既定（_DEFAULT_ENABLED_SIDES）から SMH の買いだけ外したもの。
+# v2 は実行時に SMH の買いを外すので、入れておいても v2 では発注されないが、あとで [1] カスタマイズ設定に
+# 切り替えたときにこの値が残ると SMH の買いが有効になる（v3.9.192 で標準セットから外した判断と食い違う）。
+_V2_DEFAULT_SIDES = "SPY:SELL_SHORT,QQQ:SELL_SHORT,QQQ:BUY,SMH:SELL_SHORT"
+
+
+def _mom_profile_label(profile):
+    return _MOM_PROFILE_LABELS.get(str(profile or "").strip().lower(), _MOM_PROFILE_LABELS["standard"])
+
+
+def _is_mom_select(profile):
+    return str(profile or "").strip().lower() in ("select_v1", "select_v2")
+
+
+def _effective_select_v2_sides(raw):
+    """★ v1.50: 選抜プロファイル v2 の絞り込み後に残る実発注サイド（Bot の _momentum_effective_live_sides と同じ式:
+    SPY を外し、SMH の買いを外す）。"""
+    pairs = [p.strip().upper() for p in (raw or "").split(",") if ":" in p]
+    return ",".join(p for p in pairs if not p.startswith("SPY:") and p != "SMH:BUY")
+
+
+def _short_gate_note(config, sides_str):
+    """★ v1.50: 口座ごとの空売りの許可を実発注サイドの表示に反映する（Bot の _momentum_effective_live_sides と同じ関門）。
+    配布前レビュー（Claude 別人格）: 表示に空売りが出ていても、許可が false の口座では Bot は空売りを発注しない。"""
+    if ":SELL_SHORT" not in str(sides_str or "").upper():
+        return ""
+    off = []
+    if not _bot_reads_true(config, "DEMO_SHORT_ENABLED"):
+        off.append("デモ口座")
+    if not _bot_reads_true(config, "REAL_SHORT_ENABLED"):
+        off.append("実口座")
+    # 口座を限って書く。「空売りは発注されません」だけだと、もう片方の口座でも出ないように読める。
+    _acc = "・".join(off)
+    return ("（" + _acc + "では空売りを無効にしているため、" + _acc + "では空売りは発注されません）") if off else ""
+
 
 def step_profiles(existing):
     """★ v1.46: 戦略プロファイルを最初に決める。ここで「選抜」を選ぶと、プロファイルが優先する
@@ -747,17 +832,24 @@ def step_profiles(existing):
     print(f"  {dim('過去の全取引データの集計に基づく「絞り込み運転」を選べます。')}")
     # ★ v1.38: 既定は[2]選抜プロファイル。「Enter＝従来どおり」ではない点を正しく表記（Codexレビュー対応）
     print(f"  {dim('[1] カスタマイズ設定 を選ぶと、これまでと同じく STEP 14 で細かく決めます。')}")
-    print(f"  {dim('Enter を押すと ▶ の付いている項目（現在の設定）がそのまま使われます。初回は [2] が既定です。')}")
+    print(f"  {dim('Enter を押すと ▶ の付いている項目（現在の設定）がそのまま使われます。初回は [3] が既定です。')}")
     print()
     # ★ v1.37: 既定を「選抜プロファイル v1」に変更。過去集計で標準より相対的に成績が良好かつ、
-    #   実発注が少なく1トレードのリスクも小さい（より保守的な）運転のため。未設定の新規は select_v1。
+    #   実発注が少なく1トレードのリスクも小さい（より保守的な）運転のため。未設定の新規は select_v1（v1.50 で新規の既定は v2 に変更）。
     #   （注）戦略全体はまだ黒字化していない。あくまで“標準よりマシ・低リスク”の位置づけで、利益は非保証。
-    _cur_profile = str(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).strip().lower()
-    _cur_prof_mode = "1" if _cur_profile == "standard" else "2"
+    # ★ v1.50: 初めて設定する方の既定は v2（PAN 指示）。いまの値が standard / v1 / v2 ならそのまま保つ。
+    #   配布前レビュー（Codex / Gemini）: キーが無い既存の .env は Bot の既定 standard で動いている。
+    #   そこへ v2 を既定として出すと Enter だけで黙って v2 に切り替わるので、ニュース選抜と同じく分ける。
+    _raw_profile = str(existing.get("MOMENTUM_STRATEGY_PROFILE", "")).strip().lower()
+    if _raw_profile in ("standard", "select_v1", "select_v2"):
+        _cur_profile = _raw_profile
+    else:
+        _cur_profile = "select_v2" if not existing else "standard"
+    _cur_prof_mode = {"standard": "1", "select_v1": "2", "select_v2": "3"}[_cur_profile]
     print(f"  {green('▶') if _cur_prof_mode == '1' else ' '} [1] カスタマイズ設定（今まで通り）")
     print( "        プロファイルによる絞り込みなし。STEP 14 の [1]〜[6] で自分で決めた設定がそのまま使われます。")
     print( "        （方向・銘柄・時間帯・金額の絞り込みを自分で決めます）")
-    print(f"  {green('▶') if _cur_prof_mode == '2' else ' '} [2] 選抜プロファイル v1（絞り込み運転）← 既定")
+    print(f"  {green('▶') if _cur_prof_mode == '2' else ' '} [2] 選抜プロファイル v1（絞り込み運転）")
     print( "        約5週間の全取引データ（実発注 4,266件＋シャドー観察のユニークシグナル 4,952件）")
     print( "        を集計し、カスタマイズ設定（絞り込みなし）より相対的に成績が良好だった条件だけに実発注を絞ります。")
     print( "        （＝実発注の候補を条件で絞る運転。1回の損失の大きさは発注額・値動き・損切りで決まり、成績は保証しません）")
@@ -770,28 +862,41 @@ def step_profiles(existing):
     print( "                       利益が伸びたときのトレール利確は今まで通り働きます")
     print( "          ⑤ 安全網  … 1日の損失が上限（リスク許容度・既定なら予算の 0.5%）に達したら、その日の新規発注を自動停止")
     print( "                       （プロファイルは予算の 1.5% の上限も重ねてかけます。先に当たった方で止まります）")
+    print(f"  {green('▶') if _cur_prof_mode == '3' else ' '} [3] 選抜プロファイル v2（絞り込み運転・検証中）← 既定")
+    print( "        8〜9月の観察ログと実取引を集計し直して、v1 の絞り込みを組み直したものです。")
+    print( "        （まだ検証中の仮説です。成績は保証しません）")
+    print( "        v1 との違い（5つ）:")
+    print( "          ① 方向    … 買い（ロング）も実発注の対象にします")
+    print( "          ② 時間帯  … 売りは米国東部時間 9・12時台、買いは 9〜11時台に新規発注")
+    print( "          ③ 強さ    … 5分・15分の変化率が Level 2 の基準に届かないときは実発注しない")
+    print( "                       （変化率の値が取れないときは、この条件を飛ばして判定します。")
+    print( "                        発火頻度 MOMENTUM_LEVEL を Level 2 より厳しくしているときは、そちらが効きます）")
+    print( "          ④ 相場    … 直近60分で QQQ が +0.15% より上げているときは売りを見送り")
+    print( "                       （QQQ の値が取れないときは、見送りません）")
+    print( "          ⑤ 銘柄    … SPY と SMH の買いは実発注から除外（対象は QQQ の売買と SMH の売り）")
+    print( "        固定の損切りライン・1日の損失上限（.env で別の値を指定していなければ予算の 1.5%）は v1 と同じです。")
     print()
     print(f"  {dim('・見送ったシグナルもすべてシャドー記録に残るため、絞り込みの効果は毎週の集計で確認できます。')}")
     print(f"  {dim('・過去データの傾向に基づく設定であり、将来の成績を保証するものではありません。')}")
-    print(f"  {dim('・[2]を選んだ場合、STEP 14 の [2-c]銘柄サイド・[2-d]ロングレンジ・[6]損切り方式よりも、')}")
+    print(f"  {dim('・[2]・[3]を選んだ場合、STEP 14 の [2-c]銘柄サイド・[2-d]ロングレンジ・[6]損切り方式よりも、')}")
     print(f"  {dim('  プロファイルの絞り込みが優先されます（実発注のみ。シャドー記録は全件そのまま）。')}")
     print(f"  {dim('・いつでも Wizard を再実行して [1] カスタマイズ設定に戻せます。')}")
     print()
     profile_choices = [
         ("1", "カスタマイズ設定（今まで通り）"),
-        ("2", "選抜プロファイル v1（絞り込み運転）← 既定"),
+        ("2", "選抜プロファイル v1（絞り込み運転）"),
+        ("3", "選抜プロファイル v2（絞り込み運転・検証中）← 既定"),
     ]
     _prof_sel = ask_choice("番号を選択（Enter=現在値を維持）", profile_choices, default=_cur_prof_mode)
-    strategy_profile = "select_v1" if _prof_sel == "2" else "standard"
-    is_select_profile = (strategy_profile == "select_v1")
-    ok("戦略プロファイル: " + ("選抜プロファイル v1（絞り込み運転）" if is_select_profile else "カスタマイズ設定（今まで通り）"))
+    strategy_profile = {"1": "standard", "2": "select_v1", "3": "select_v2"}.get(_prof_sel, "select_v2")
+    ok("戦略プロファイル: " + _mom_profile_label(strategy_profile))
     print()
 
     # ── [0-b] ニュース選抜プロファイル v1 ★ v1.46 / Bot v3.9.169 ──
     news_profile = _ask_news_profile(existing)
     print()
     ok_box([
-        ("MOMENTUM_STRATEGY_PROFILE", "選抜プロファイル v1" if is_select_profile else "カスタマイズ設定（今まで通り）"),
+        ("MOMENTUM_STRATEGY_PROFILE", _mom_profile_label(strategy_profile)),
         ("NEWS_STRATEGY_PROFILE",     "ニュース選抜 v1（TECH / SEMI_STRONG・RTH のみ新規建て）" if news_profile == "select_v1" else "カスタマイズ設定（今まで通り）"),
     ])
     next_step_pause()
@@ -809,10 +914,12 @@ def step1_budget(existing):
     ])
     cur = existing.get("BUDGET_USD") or "10000"          # ★ v1.48: KEY= の空値でも既定に落とす
     while True:
-        val = ask("BUDGET_USD（ドル）", default=cur,
-                  validate=lambda _v: _num_in_range(_v, 0, 1_000_000_000, allow_comma=True, exclude_lo=True))
+        # ★ v1.49: 同じ金額の欄なのに、STEP 15（OVN）は $800 が通るのにここは $10000 を弾いていた
+        #   （認定サポーターの報告）。$ と全角とカンマの扱いを OVN 側（_normalize_amount）に揃える。
+        val = ask("BUDGET_USD（ドル・$ やカンマ・全角も可）", default=cur,
+                  validate=_ovn_budget_ok)
         try:
-            v = float(val.replace(",", ""))
+            v = float(_normalize_amount(val))
             # ★ v1.38: inf / nan / 極端値ガード（int(inf) の OverflowError でクラッシュしないように）
             if math.isfinite(v) and 0 < v <= 1_000_000_000:
                 result = str(int(v))
@@ -933,7 +1040,7 @@ def _pct_to_percent_str(raw, default_percent_str):
 def step3_trailing(existing):
     header(4, TOTAL, "📈 STEP 4 ── トレイリングストップ")
     print("  利益が出たポジションを守るための自動追跡決済です。\n")
-    if str(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).strip().lower() == "select_v1":
+    if _is_mom_select(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v2")):
         # ★ v1.46: 選抜プロファイルのモメンタム建玉は固定の損切りで、この設定は使われない（ニュース連動の建玉には使われる）
         print(f"  {dim('※ STEP 1 の選抜プロファイルが置き換えるのは損切り側（建玉トレール→固定の損切りライン）だけです。')}")
         print(f"  {dim('   ここで決める利確トレールは、ニュース連動・モメンタムの両方の建玉に効きます。')}\n")
@@ -1068,7 +1175,7 @@ def step5_session(existing, base_conf):
     base = float(base_conf)
     # ★ v1.46: モメンタムとニュースの両方が選抜プロファイルなら、新規建ては RTH だけ（プロファイルが
     #   優先）なので、RTH 以外の時間帯は「発注しない」を自動で書き、この STEP は尋ねない（PAN 指示）。
-    _mom_sel  = str(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).strip().lower() == "select_v1"
+    _mom_sel  = _is_mom_select(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v2"))   # ★ v1.50: v2 も同じ扱い
     _news_sel = str(existing.get("NEWS_STRATEGY_PROFILE", "")).strip().lower() == "select_v1"
     _prev_saved = existing.get("_SESSION_PREV") or {}
     def _sess_val(k):
@@ -1314,17 +1421,29 @@ def _effective_select_sides(raw):
     return ",".join(p for p in pairs if p.endswith(":SELL_SHORT") and not p.startswith("SPY:"))
 
 
+def _bot_reads_true(config, key, default="true"):
+    """Bot と同じ読み方で真偽を返す。Bot は 'true' のときだけ有効とし、0 / no / off / 空欄は無効になる。
+    Wizard が「'false' のときだけ無効」と読むと、Bot がシャドー運転している .env を Enter だけで実発注に変えてしまう。"""
+    return str(config.get(key, default)).strip().lower() == "true"
+
+
 def _fmt_momentum_live(config):
     """★ v1.46: 確認画面の「MOMENTUM実発注」。実発注しない／選抜の絞り込み後／カスタマイズの生値。"""
-    if str(config.get("MOMENTUM_LIVE_TRADING", "true")).strip().lower() == "false":
+    if not _bot_reads_true(config, "MOMENTUM_LIVE_TRADING"):
         return "実発注しない（シャドー観察のみ・記録だけ）"
     raw = config.get("MOMENTUM_ENABLED_SIDES", "")
-    if str(config.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).strip().lower() == "select_v1":
+    _prof = str(config.get("MOMENTUM_STRATEGY_PROFILE", "select_v2")).strip().lower()
+    if _prof == "select_v1":
         eff = _effective_select_sides(raw)
         if not eff:
             return "（選抜の絞り込み後、実発注の対象なし。STEP 14 の設定に QQQ / SMH の空売りがありません）"
-        return _fmt_momentum_sides(eff) + "（選抜プロファイルが空売りだけに絞り込み・買いと SPY は記録のみ）"
-    return _fmt_momentum_sides(raw)
+        return _fmt_momentum_sides(eff) + "（選抜プロファイルが空売りだけに絞り込み・買いと SPY は記録のみ）" + _short_gate_note(config, eff)
+    if _prof == "select_v2":
+        eff = _effective_select_v2_sides(raw)
+        if not eff:
+            return "（選抜 v2 の絞り込み後、実発注の対象なし。QQQ の売買・SMH の売りがどれも設定にありません）"
+        return _fmt_momentum_sides(eff) + "（選抜プロファイル v2 が絞り込み・SPY と SMH の買いは記録のみ）" + _short_gate_note(config, eff)
+    return _fmt_momentum_sides(raw) + _short_gate_note(config, raw)
 
 
 def _fmt_account(config):
@@ -2079,30 +2198,60 @@ def step_momentum(existing, budget):
     print()
 
     # ★ v1.46: 戦略プロファイルは STEP 1 で選ぶ。ここでは選んだ結果を読むだけ。
-    strategy_profile = str(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).strip().lower()
-    if strategy_profile not in ("standard", "select_v1"):
-        strategy_profile = "select_v1"
-    is_select_profile = (strategy_profile == "select_v1")
+    strategy_profile = str(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v2")).strip().lower()
+    if strategy_profile not in ("standard", "select_v1", "select_v2"):
+        strategy_profile = "select_v2"
+    is_select_profile = _is_mom_select(strategy_profile)
     news_profile = str(existing.get("NEWS_STRATEGY_PROFILE", "standard")).strip().lower()
     if news_profile not in ("standard", "select_v1"):
         news_profile = "standard"
-    print(f"  {dim('戦略プロファイル（STEP 1 で選択）: ' + ('選抜プロファイル v1（絞り込み運転）' if is_select_profile else 'カスタマイズ設定（今まで通り）'))}")
+    print(f"  {dim('戦略プロファイル（STEP 1 で選択）: ' + _mom_profile_label(strategy_profile))}")
     print()
 
     # ── ★ v1.36: 選抜プロファイル選択時は詳細設定([1]〜[6])をスキップして次STEPへ ──
     # プロファイルが実発注の絞り込み（SHORTのみ・SPY除外・時間帯・固定損切り・日次1.5%）を
     # 内蔵するため、細かいモメンタム設定は尋ねず、他キーは現在値を維持する（シャドーは全記録）。
     if is_select_profile:
-        _ds_cur     = str(existing.get("DEMO_SHORT_ENABLED", "true")).strip().lower()
-        _demo_short = (_ds_cur != "false")
+        _demo_short = _bot_reads_true(existing, "DEMO_SHORT_ENABLED")
         _mom_stop_keep = _pct_to_percent_str(existing.get("MOMENTUM_STOP_LOSS_PCT", ""), "0.50")
-        print(f"  {green('選抜プロファイル v1 を選択 → 詳細なモメンタム設定はスキップします。')}")
+        print(f"  {green(_mom_profile_label(strategy_profile) + ' を選択 → 詳細なモメンタム設定はスキップします。')}")
         print(f"  {dim('プロファイルが以下を自動適用します（実発注のみ・シャドー記録は全件そのまま）:')}")
-        print(f"  {dim('  ・空売り(SHORT)のみ実発注（買いは記録のみ）')}")
-        print(f"  {dim('  ・SPYは対象外（QQQ / SMH を実発注）')}")
-        print(f"  {dim('  ・米国東部時間 9・10・12・13時台のみ新規発注')}")
+        if strategy_profile == "select_v2":
+            print(f"  {dim('  ・買いは QQQ だけ（米国東部時間 9〜11時台）、売りは QQQ / SMH（9・12時台）')}")
+            print(f"  {dim('  ・SPY と SMH の買いは対象外')}")
+            print(f"  {dim('  ・5分・15分の変化率が Level 2 の基準に届かないときは実発注しない（値が取れないときは飛ばす）')}")
+            print(f"  {dim('    発火頻度の設定が Level 2 より厳しいときは、そちらが効きます')}")
+            print(f"  {dim('  ・直近60分で QQQ が +0.15% より上げているときは売りを見送り（値が取れないときは見送らない）')}")
+        else:
+            print(f"  {dim('  ・空売り(SHORT)のみ実発注（買いは記録のみ）')}")
+            print(f"  {dim('  ・SPYは対象外（QQQ / SMH を実発注）')}")
+            print(f"  {dim('  ・米国東部時間 9・10・12・13時台のみ新規発注')}")
         print(f"  {dim('  ・固定の損切りライン（建玉トレールは使わない）')}")
         print(f"  {dim('  ・1日の損失が上限（リスク許容度・既定なら予算の 0.5%）に達したら自動停止')}")
+        # ★ v1.50: 発注サイド。v1 は従来の既定のまま。v2 は買いが肝なので、既定は Bot の既定サイドから
+        #   SMH の買いを外したもの（_V2_DEFAULT_SIDES）にし、既存の設定に QQQ の買いが無ければ自動で加えて、そう表示する。
+        _sides_default = (_V2_DEFAULT_SIDES if strategy_profile == "select_v2"
+                          else "SPY:SELL_SHORT,QQQ:SELL_SHORT,SMH:SELL_SHORT")
+        _sides_keep = existing.get("MOMENTUM_ENABLED_SIDES", _sides_default)
+        if strategy_profile == "select_v2":
+            _pairs_now = {p.strip().upper() for p in str(_sides_keep or "").split(",") if ":" in p}
+            # 発注サイドを「なし」（観察のみ）にしている人には、本人が選んだものなので QQQ の買いを足さない。
+            # 「なし」は空欄だけではない。Bot は「:」を含む組だけを拾うので、none や ,,, も発注サイドなしになり、
+            # IWM だけのような値も SPY / QQQ / SMH の実発注は無い。キーがあってこの3銘柄の組が1つも無ければ「なし」とみなす。
+            _sides_chosen_empty = ("MOMENTUM_ENABLED_SIDES" in existing
+                                   and not any(p.split(":", 1)[0] in ("SPY", "QQQ", "SMH") for p in _pairs_now))
+            if _sides_chosen_empty:
+                print()
+                print(f"  {dim('  発注サイドが「なし」（観察のみ）の設定なので、QQQ の買いは加えません。')}")
+                print(f"  {dim('  v2 の買いを実発注するには、STEP 1 でカスタマイズ設定を選び、発注サイドを選び直してください。')}")
+            elif "QQQ:BUY" not in _pairs_now:
+                # PAN 指示（2026-09-13）: v2 は買いが肝なので、QQQ の買いは尋ねずに加え、加えたことをはっきり出す。
+                _sides_keep = ",".join([p.strip() for p in str(_sides_keep or "").split(",") if p.strip()] + ["QQQ:BUY"])
+                print()
+                print(f"  {yellow('選抜プロファイル v2 は買いも実発注の対象にするため、発注サイドに QQQ の買いを加えました。')}")
+                print(f"  {dim('  実発注を行う設定なら、QQQ の買いの注文も出るようになります（v2 をやめれば外せます）。')}")
+            _eff_now = _effective_select_v2_sides(_sides_keep)
+            print(f"  {dim('  ・いまの設定で実発注されるサイド: ' + (_fmt_momentum_sides(_eff_now) if _eff_now else 'なし') + _short_gate_note(existing, _eff_now))}")
         # ★ v1.46（配布前レビュー）: プロファイルが決めない数字は実発注に効くので、金額つきで見せる
         _lv_keep   = str(existing.get("MOMENTUM_LEVEL", "3"))
         _rk_keep   = str(existing.get("MOMENTUM_RISK_LEVEL", "3"))
@@ -2122,8 +2271,7 @@ def step_momentum(existing, budget):
         #   従来はスキップで既定 true のまま通過し、実発注の明示確認が行われなかった。
         print(f"  {bold('実発注の確認（重要）')}")
         print(f"  {dim('選抜プロファイルでも「実際に注文するか」はここで決まります。')}")
-        _live_cur = str(existing.get("MOMENTUM_LIVE_TRADING", "true")).strip().lower()
-        _live_mode_cur = "1" if _live_cur == "false" else "2"
+        _live_mode_cur = "2" if _bot_reads_true(existing, "MOMENTUM_LIVE_TRADING") else "1"
         _live_choices = [
             ("1", "シャドー観察のみ   実発注なし・「もし注文していたら」を記録のみ"),
             ("2", "実発注も行う      実際に注文する（デモ口座→デモ発注 / 実口座→実発注）← 既定"),
@@ -2138,11 +2286,11 @@ def step_momentum(existing, budget):
                 print()
                 info("シャドー観察（記録のみ）に切り替えました。実発注は行いません。")
         print()
-        ok("モメンタム設定: 選抜プロファイル v1（詳細設定はスキップ）/ "
+        ok("モメンタム設定: " + _mom_profile_label(strategy_profile) + "（詳細設定はスキップ）/ "
            + ("実発注も行う" if _is_live else "シャドー観察のみ"))
         next_step_pause()
         return {
-            "MOMENTUM_STRATEGY_PROFILE": "select_v1",
+            "MOMENTUM_STRATEGY_PROFILE": strategy_profile,       # ★ v1.50: v2 を v1 に書き戻さない
             "NEWS_STRATEGY_PROFILE":  news_profile,           # ★ v1.46
             "MOMENTUM_LEVEL":         existing.get("MOMENTUM_LEVEL", "3"),
             "MOMENTUM_RISK_LEVEL":    existing.get("MOMENTUM_RISK_LEVEL", "3"),
@@ -2155,8 +2303,7 @@ def step_momentum(existing, budget):
             "MOMENTUM_SHADOW_ENABLED": "true",
             "MOMENTUM_LIVE_TRADING":   "true" if _is_live else "false",
             "DEMO_SHORT_ENABLED":      "true" if _demo_short else "false",
-            "MOMENTUM_ENABLED_SIDES":  existing.get(
-                "MOMENTUM_ENABLED_SIDES", "SPY:SELL_SHORT,QQQ:SELL_SHORT,SMH:SELL_SHORT"),
+            "MOMENTUM_ENABLED_SIDES":  _sides_keep,
         }
 
     # ── [1] 発火頻度 ─────────────────────────────────────────────
@@ -2185,8 +2332,7 @@ def step_momentum(existing, budget):
     ]
     # 既存設定から現在モードを推定 (MOMENTUM_LIVE_TRADING=true なら 2)
     # ★ v3.9.68: 既定を 2(実発注) に変更 (記載が無ければ実発注)
-    cur_live = existing.get("MOMENTUM_LIVE_TRADING", "true").strip().lower()
-    cur_mode = "1" if cur_live == "false" else "2"
+    cur_mode = "2" if _bot_reads_true(existing, "MOMENTUM_LIVE_TRADING") else "1"
     mode = ask_choice("番号を選択（Enter=現在値を維持）", mode_choices, default=cur_mode)
     is_live = (mode == "2")
     if is_live:
@@ -2210,8 +2356,7 @@ def step_momentum(existing, budget):
         ("1", "ON   デモでもショートを実発注する ← 既定"),
         ("2", "OFF  デモのショートは記録のみ（シャドー）"),
     ]
-    cur_ds = existing.get("DEMO_SHORT_ENABLED", "true").strip().lower()
-    cur_ds_mode = "2" if cur_ds == "false" else "1"
+    cur_ds_mode = "1" if _bot_reads_true(existing, "DEMO_SHORT_ENABLED") else "2"
     ds_mode = ask_choice("番号を選択（Enter=現在値を維持）", demo_short_choices, default=cur_ds_mode)
     demo_short = (ds_mode == "1")
     print()
@@ -2230,6 +2375,9 @@ def step_momentum(existing, budget):
     # 既存 env からの現在値推定
     cur_sides_set = set(s.strip().upper() for s in
                         existing.get("MOMENTUM_ENABLED_SIDES", "").split(",") if ":" in s)
+    # キーがあるのに組が1つも無い（空欄・none・,,, など）＝本人が「なし」を選んだ。Bot も発注サイドなしと読む。
+    # 以前はこれを「未設定」と同じに扱い、Enter で標準セット（5サイド）が書かれて実発注が始まっていた。
+    _sides_chosen_none = ("MOMENTUM_ENABLED_SIDES" in existing) and not cur_sides_set
 
     def _cur_mode_for(sym):
         has_buy = f"{sym}:BUY" in cur_sides_set
@@ -2237,7 +2385,8 @@ def step_momentum(existing, budget):
         if has_buy and has_sht: return "1"
         if has_buy:             return "2"
         if has_sht:             return "3"
-        if cur_sides_set:       return "4"   # env明示済みで当該銘柄なし＝なし
+        if cur_sides_set or _sides_chosen_none:
+            return "4"                        # env明示済みで当該銘柄なし＝なし
         return _std[sym]                      # env未設定＝既定（両方）
 
     # ★ v1.21 (点3): まず「標準セット一括 / 個別選択」で分岐。大半は1画面で抜けられる。
@@ -2247,7 +2396,7 @@ def step_momentum(existing, budget):
     ]
     # ★ v1.42: 既存が標準セット以外のカスタムなら既定を[2]個別選択にし、Enterで上書きしない
     _std_sides_set = {f"{s}:{d}" for s in _SIDE_SYMS for d in ("BUY", "SELL_SHORT")} - {"SMH:BUY"}
-    _setup_default = "2" if (cur_sides_set and cur_sides_set != _std_sides_set) else "1"
+    _setup_default = "2" if (_sides_chosen_none or (cur_sides_set and cur_sides_set != _std_sides_set)) else "1"
     _sm_hint = "現在の個別設定を維持" if _setup_default == "2" else "標準セット"
     setup_mode = ask_choice(f"番号を選択（Enter={_sm_hint}）", setup_choices, default=_setup_default)
     print()
@@ -2277,8 +2426,11 @@ def step_momentum(existing, budget):
                     ("3", "売りのみ（SHORT）"),
                     ("4", "なし（観察のみ・発注しない）"),
                 ]
-                if _d in ("1", "2"):
+                # 買い+売りなら売りだけを残す。買いだけの人は、Enter で売りを増やさず「なし」にする。
+                if _d == "1":
                     _d = "3"
+                elif _d == "2":
+                    _d = "4"
                 print(f"  {bold(sym)}  {dim('※ SMH の買いはモメンタム経由では実発注されないため、選択肢にありません')}")
             else:
                 print(f"  {bold(sym)}")
@@ -2375,7 +2527,10 @@ def step_momentum(existing, budget):
     print()
     cur_max = existing.get("MOMENTUM_MAX_PCT", "80")
     while True:
-        val = ask("最大発注比率 %（50〜100 の整数 / Enter=現在値）", default=cur_max)
+        # ★ v1.49: 現在値が 50〜100 でないとき、Enter が通らないのに「Enter=現在値」と
+        #   出していた（認定サポーターの報告・v1.48 の取りこぼし）。validate で既定を落とす。
+        val = ask("最大発注比率 %（50〜100 の整数 / Enter=現在値）", default=cur_max,
+                  validate=lambda _v: _int_trunc_in_range(_v, 50, 100))
         try:
             v = int(float(val))
             if 50 <= v <= 100:
@@ -2405,7 +2560,9 @@ def step_momentum(existing, budget):
     print()
     cur_stop = existing.get("MOMENTUM_STOP_LOSS_PCT", "0.50")
     while True:
-        val = ask("モメンタム損切り %（0.10〜5.0 / Enter=現在値）", default=cur_stop)
+        # ★ v1.49: 上と同じ（現在値が範囲外だと Enter で進めないループになる）。
+        val = ask("モメンタム損切り %（0.10〜5.0 / Enter=現在値）", default=cur_stop,
+                  validate=lambda _v: _num_in_range(_v, 0.10, 5.0))
         try:
             v = float(val)
             if 0.10 <= v <= 5.0:
@@ -2621,8 +2778,10 @@ def step_ovn(existing, budget):
     print()
 
     # ★ v1.46: 既定は「使う」（PAN 指示）。既存 .env で false と書いてある人だけ「使わない」が既定
-    _cur_enabled = str(existing.get("OVN_ENABLED", "true")).strip().lower() != "false"
-    _cur_mode    = str(existing.get("OVN_MODE", "live")).strip().lower() or "live"
+    # 書いてある値は Bot と同じく「true のときだけ使う」と読む（0 / no / 空欄の人を Enter で使う側にしない）。
+    # キーが無い人の既定「使う」は PAN 指示のまま。OVN_MODE も Bot と同じく live のときだけ実売買で、空欄は記録のみ。
+    _cur_enabled = ("OVN_ENABLED" not in existing) or _bot_reads_true(existing, "OVN_ENABLED")
+    _cur_mode    = str(existing.get("OVN_MODE", "live")).strip().lower()
     _cur_vix     = str(existing.get("OVN_VIX_LEVEL", "normal")).strip().lower() or "normal"
     _cur_budget  = str(existing.get("OVN_BUDGET_USD", "")).strip()
     _cur_hol     = str(existing.get("OVN_SKIP_LONG_HOLIDAY", "true")).strip().lower() != "false"
@@ -2642,7 +2801,7 @@ def step_ovn(existing, budget):
             "OVN_ENABLED":           "false",
             "OVN_SET_BY":            _ovn_set_by(False),
             # 以前の設定は残す（再び有効にしたときに引き継ぐ）
-            "OVN_MODE":              _cur_mode if _cur_mode in ("live", "shadow") else "live",
+            "OVN_MODE":              _cur_mode if _cur_mode in ("live", "shadow") else "shadow",
             "OVN_VIX_LEVEL":         _cur_vix if _cur_vix in ("loose", "normal", "strict") else "normal",
             "OVN_BUDGET_USD":        (_cur_budget if _ovn_budget_ok(_cur_budget) else "0"),
             "OVN_SKIP_LONG_HOLIDAY": "true" if _cur_hol else "false",
@@ -2682,7 +2841,7 @@ def step_ovn(existing, budget):
     while True:
         raw = ask("金額を入力（例: 800 ／ b で Q1 の「使わない」に戻る）", default=_default_budget,
                   validate=_ovn_budget_ok)
-        if str(raw).strip().lower() in ("b", "back", "戻る"):
+        if _is_back(raw):   # ★ v1.49: 全角の「ｂ」でも戻れる
             # 配布前レビュー（Claude 別人格）: 必須入力のループに出口が無かった（Ctrl+C しかない）
             info("OVN取引機能を「使わない」にします。")
             ok_box([("OVN_ENABLED", "false（使わない）"), ("OVN_SET_BY", _ovn_set_by(False))])
@@ -2833,8 +2992,15 @@ def step_alert_sound(existing):
     print(f"  {dim('例: 23:00-06:00  （日本の夜11時〜朝6時は音を鳴らさない。未入力で常時有効）')}")
     # ★ v1.38: HH:MM-HH:MM 形式を検証（不正形式は Bot 側で黙って「ミュートなし」扱いになるため）
     _QH_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d-([01]?\d|2[0-3]):[0-5]\d$")
+    # ★ v1.49（配布前レビュー Claude 別人格）: この欄は空が「ミュートなし」を意味するので、
+    #   壊れた現在値を既定から落とすと、Enter が「設定を黙って消す」になる。先に断っておく。
+    if cur_quiet_hours and not _QH_RE.match(cur_quiet_hours):
+        warn(f"いまの値「{cur_quiet_hours}」は HH:MM-HH:MM の形ではありません。")
+        info("このまま Enter だけ押すと「ミュートなし（常時有効）」になります。")
     while True:
-        quiet_hours = ask("夜間ミュート時間帯", default=cur_quiet_hours).strip()
+        # ★ v1.49: 現在値が HH:MM-HH:MM でないと Enter で進めないループになっていた。
+        quiet_hours = ask("夜間ミュート時間帯（未入力=常時有効）", default=cur_quiet_hours,
+                          validate=lambda _v: bool(_QH_RE.match(str(_v).strip()))).strip()
         if not quiet_hours or _QH_RE.match(quiet_hours):
             break
         warn("HH:MM-HH:MM 形式で入力してください（例: 23:00-06:00 / 未入力=常時有効）")
@@ -2882,7 +3048,7 @@ def _fmt_ovn(config):
     """★ v1.46: 確認画面用の夜間持ち越しの1行"""
     if str(config.get("OVN_ENABLED", "false")).strip().lower() != "true":
         return "使わない"
-    _mode = "実際に売買" if str(config.get("OVN_MODE", "live")).strip().lower() != "shadow" else "記録のみ"
+    _mode = "実際に売買" if str(config.get("OVN_MODE", "live")).strip().lower() == "live" else "記録のみ"
     try:
         _b = float(config.get("OVN_BUDGET_USD", "0") or 0)
     except (ValueError, TypeError):
@@ -3500,7 +3666,7 @@ def step_confirm(config):
         ("ORDER_CANCEL_MINUTES",  f"{config.get('ORDER_CANCEL_MINUTES','1')}分",     "未約定キャンセル"),
         ("発注サイズ",            "AI の確信度に応じて発注額を自動配分（山型）",           ""),
         ("── 戦略プロファイル・夜間持ち越し ────────────", None, None),
-        ("MOMENTUM_STRATEGY_PROFILE", ("選抜プロファイル v1" if str(config.get("MOMENTUM_STRATEGY_PROFILE", "select_v1")).lower() == "select_v1" else "カスタマイズ設定（今まで通り）"), "モメンタム"),
+        ("MOMENTUM_STRATEGY_PROFILE", _mom_profile_label(config.get("MOMENTUM_STRATEGY_PROFILE", "select_v2")), "モメンタム"),
         ("NEWS_STRATEGY_PROFILE",     ("ニュース選抜 v1（TECH/SEMI_STRONG・RTH）" if str(config.get("NEWS_STRATEGY_PROFILE", "select_v1")).lower() == "select_v1" else "カスタマイズ設定（今まで通り）"), "ニュース連動"),
         ("OVN_ENABLED",               _fmt_ovn(config), "OVN取引機能（夜間持ち越し）"),
         ("── APIキー ─────────────────────────────────", None, None),
@@ -3632,7 +3798,10 @@ def _build_env_lines_merged(config):
             result.append(line)
 
     # 既存ファイルになかったWizardキーを末尾に追記
-    missing = [k for k in _WIZARD_MANAGED_KEYS if k not in written_keys and _get_wizard_value(k, config)]
+    # 空の値は書かないが、MOMENTUM_ENABLED_SIDES の空は「発注サイドなし」という選択なので書く。
+    # 書かないと Bot は既定の5サイドで実発注する（Bot は「キーが無い」と「空」を別に読む）。
+    missing = [k for k in _WIZARD_MANAGED_KEYS if k not in written_keys
+               and (_get_wizard_value(k, config) or (k == "MOMENTUM_ENABLED_SIDES" and k in config))]
     if missing:
         result.append("")
         result.append("# ── Wizardによる追加設定 ──────────────────────────────")
@@ -3738,10 +3907,12 @@ def _build_env_lines(config):
         "#                            記載した銘柄:方向のみ実発注。DRAM は観察のみ(非実発注)。",
         "#   MOMENTUM_TRAIL_FROM_ENTRY  損切りの方式 (true=建玉トレール[標準・既定 v1.23〜] /",
         "#                              false=従来の固定損切り・Wizard [6] で選択)",
-        "#   MOMENTUM_STRATEGY_PROFILE  戦略プロファイル (select_v1=選抜プロファイル v1[既定 v1.37〜] /",
-        "#                              standard=今まで通り・Wizard STEP1 で選択。",
-        "#                              select_v1: SHORTのみ/SPY除外/ET 9・10・12・13時台のみ",
-        "#                              実発注/固定損切り/日次損失1.5%停止。シャドー記録は全件継続)",
+        "#   MOMENTUM_STRATEGY_PROFILE  戦略プロファイル (select_v2=選抜プロファイル v2[既定 v1.50〜・検証中] /",
+        "#                              select_v1=選抜プロファイル v1 / standard=今まで通り・Wizard STEP1 で選択。",
+        "#                              select_v1: SHORTのみ/SPY除外/ET 9・10・12・13時台のみ実発注",
+        "#                              select_v2: 売り ET 9・12時台/買い ET 9〜11時台/Level 2 以上/直近60分で",
+        "#                              QQQ が +0.15% 超なら売り見送り/SPY と SMH の買いは除外",
+        "#                              どちらも固定損切り/日次損失1.5%停止。シャドー記録は全件継続)",
         "#   MOMENTUM_STOP_LOSS_PCT     モメンタム建玉の強制損切りライン (% ・Wizard [5] で設定)",
         "#   MOMENTUM_STOP_PROFILE      損切り幅プロファイル (モメンタム実発注には効かない・Wizard [5b])",
         "#   MOMENTUM_LONG_MIN/MAX_SIGNAL_PCT  ロング発注の5分モメンタムレンジ (Wizard [2-d] で選択)",
@@ -3758,7 +3929,7 @@ def _build_env_lines(config):
         f"MOMENTUM_LONG_MAX_SIGNAL_PCT={config.get('MOMENTUM_LONG_MAX_SIGNAL_PCT', '0.80')}",
         f"MOMENTUM_TRAIL_FROM_ENTRY={config.get('MOMENTUM_TRAIL_FROM_ENTRY', 'true')}",
         # ★ v1.38: フォールバックも Wizard 既定の select_v1 に統一（経路による既定の食い違い解消）
-        f"MOMENTUM_STRATEGY_PROFILE={config.get('MOMENTUM_STRATEGY_PROFILE', 'select_v1')}",
+        f"MOMENTUM_STRATEGY_PROFILE={config.get('MOMENTUM_STRATEGY_PROFILE', 'select_v2')}",
         "#   NEWS_STRATEGY_PROFILE  ニュース選抜プロファイル (select_v1=TECH/SEMI_STRONG かつ RTH のみ新規建て /",
         "#                          standard=今まで通り・Wizard STEP1 で選択。決済は止めない・見送りは全件記録)",
         f"NEWS_STRATEGY_PROFILE={config.get('NEWS_STRATEGY_PROFILE', 'select_v1')}",
