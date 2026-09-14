@@ -2,7 +2,7 @@
 setup_wizard.py
 ===============
 moomoo_trade_v1.py 用 .env セットアップウィザード（完全版）
-最新バージョン: v1.50  最終更新日: 2026-09-13
+最新バージョン: v1.51  最終更新日: 2026-09-14
 
 使い方:
   python3 setup_wizard.py   # Mac
@@ -18,6 +18,17 @@ moomoo_trade_v1.py 用 .env セットアップウィザード（完全版）
 # 更新履歴
 # =============================================================================
 #
+# v1.51 2026-09-14  選抜を選んだ人向けの案内を出し分けた（認定サポーターの隔離確認の報告・売買条件と保存値は変えない）。
+#   ①STEP 7: ニュース選抜が有効なら、ここで選ぶのはそのニュース取引に使う ETF 構成で、選び直しても選抜は解除されないと書く。
+#     個別株の欄では、個別株ニュースによる発注はニュース選抜の絞り込みの対象外だと再掲する。
+#   ②STEP 7 と STEP 14 の冒頭が、選抜のときも「[2-c] で選ぶ」と案内していた（選抜では [2-c] を尋ねない）。選抜のときは
+#     STEP 1 のプロファイルが絞り込むこと、細かく変えるなら STEP 1 でカスタマイズ設定を選ぶことを書く。
+#   ③v2 の途中表示「いまの設定で実発注されるサイド」は実発注の確認より前に出るため、実発注オフでも出ていた。
+#     「実発注する場合の対象サイド」とし、いまが実発注オフならそう添える。
+#   ④v2 の1日の損失上限を「予算の 1.5%」とだけ書いていた。v1 と同じく、リスク許容度の上限（既定 0.5%）と
+#     プロファイルの上限（1.5%）を重ねてかけ、先に当たった方で止まると書く（.env の説明も同じ）。
+#   ⑤v2 の説明は、変化率の値が取れないときは強さの条件を省いて判定する、と Bot の動きと逆に書いていた。Bot は
+#     5分・15分の変化率が取れない銘柄をその回は判定せず見送る（詳細レビューの指摘）。
 # v1.50 2026-09-13  モメンタムの選抜プロファイル v2 を STEP 1 で選べるようにした（PAN 指示・Bot v3.9.194 の select_v2）。
 #   ①STEP 1 に [3] 選抜プロファイル v2（検証中）を追加し、初めて設定する方の既定を v2 にした。v1 は引き続き選べる。
 #   ②v1.49 までは v2 の .env で Enter を押すと黙って v1 に戻っていた。STEP 1 は現在値 select_v2 を [2] と表示し、
@@ -764,7 +775,7 @@ TOTAL = 16   # ★ v1.46: 14→16（戦略プロファイルを STEP1 に・OVN�
 
 # 既知ETFリスト（STOCK_TICKERS入力時のバリデーション用）
 # ★ v1.38: 版数は必ずここを更新する（起動バナー・ヘッダ表示で共用。取り残し防止）
-WIZARD_VERSION = "v1.50"
+WIZARD_VERSION = "v1.51"
 
 _KNOWN_ETFS = {
     "SPY", "QQQ", "SMH", "SPXL", "SPXS", "TQQQ", "SQQQ", "SOXL", "SOXS",
@@ -869,12 +880,13 @@ def step_profiles(existing):
     print( "          ① 方向    … 買い（ロング）も実発注の対象にします")
     print( "          ② 時間帯  … 売りは米国東部時間 9・12時台、買いは 9〜11時台に新規発注")
     print( "          ③ 強さ    … 5分・15分の変化率が Level 2 の基準に届かないときは実発注しない")
-    print( "                       （変化率の値が取れないときは、この条件を飛ばして判定します。")
+    print( "                       （変化率の値が取れない銘柄は、その回は判定せずに見送ります。")
     print( "                        発火頻度 MOMENTUM_LEVEL を Level 2 より厳しくしているときは、そちらが効きます）")
     print( "          ④ 相場    … 直近60分で QQQ が +0.15% より上げているときは売りを見送り")
     print( "                       （QQQ の値が取れないときは、見送りません）")
     print( "          ⑤ 銘柄    … SPY と SMH の買いは実発注から除外（対象は QQQ の売買と SMH の売り）")
-    print( "        固定の損切りライン・1日の損失上限（.env で別の値を指定していなければ予算の 1.5%）は v1 と同じです。")
+    print( "        固定の損切りラインと1日の損失上限は v1 と同じです。損失上限は、リスク許容度の上限（既定なら予算の 0.5%）と")
+    print( "        プロファイルの上限（.env で別の値を指定していなければ予算の 1.5%）を重ねてかけ、先に当たった方で止まります。")
     print()
     print(f"  {dim('・見送ったシグナルもすべてシャドー記録に残るため、絞り込みの効果は毎週の集計で確認できます。')}")
     print(f"  {dim('・過去データの傾向に基づく設定であり、将来の成績を保証するものではありません。')}")
@@ -1476,8 +1488,20 @@ def _fmt_momentum_sides(raw):
 def step6_symbols(existing):
     header(7, TOTAL, "📊 STEP 7 ── 売買銘柄の選択（ニュース駆動）")
     print("  ここで選ぶのは【ニュース駆動（AIニュース）】の対象ETFです。買い・空売りの両方に対応します。")
-    print(f"  {dim('※ モメンタム戦略の実発注銘柄は STEP 14「モメンタム発注設定」の[2-c]で別に選びます（別系統）。')}")
+    if _is_mom_select(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v2")):
+        # 選抜では STEP 14 の [2-c] を尋ねない。無い入力欄へ案内しない（認定サポーターの報告）。
+        print(f"  {dim('※ モメンタム戦略の実発注は、STEP 1 で選んだ選抜プロファイルが絞り込みます（ここで選ぶ銘柄とは別系統）。')}")
+        print(f"  {dim('  銘柄・方向を細かく変えたいときは、STEP 1 でカスタマイズ設定を選んでください。')}")
+    else:
+        print(f"  {dim('※ モメンタム戦略の実発注銘柄は STEP 14「モメンタム発注設定」の[2-c]で別に選びます（別系統）。')}")
     print(f"  {dim('  現在のモメンタム実発注: ' + (_fmt_momentum_live(existing) if existing.get('MOMENTUM_ENABLED_SIDES') else '（STEP 14 で決めます）'))}\n")
+
+    _news_sel = str(existing.get("NEWS_STRATEGY_PROFILE", "standard")).strip().lower() == "select_v1"
+    if _news_sel:
+        # 選抜を決めた後も銘柄を選ぶ理由を書く（認定サポーターの報告）。ニュース選抜が絞るのはカテゴリと時間帯で、
+        # 銘柄構成はここで決める。STEP 7 はニュース選抜の値を書き換えない。
+        print(f"  {green('ニュース選抜 v1 が有効です。')}{dim('新規の取引は、テック系・半導体系のニュースと通常取引時間に絞られます。')}")
+        print(f"  {dim('  ここでは、そのニュース取引に使う ETF の構成を選びます。選び直しても、ニュース選抜は解除されません。')}\n")
 
     # ── プリセット選択 ────────────────────────────────────────────────────
     presets = [
@@ -1547,6 +1571,8 @@ def step6_symbols(existing):
     print(f"  {dim('Finnhubのその銘柄固有ニュースを30秒間隔で取得してAI判定・直接売買します。')}")
     print(f"  {dim('例: NVDA → NVIDIAの決算・自社ニュースが出たときだけ発注')}\n")
     print(f"  {red('⚠  ETFティッカーは設定できません（例: SPXL, SOXL など）')}\n")
+    if _news_sel:
+        print(f"  {yellow('※ 個別株のニュース（決算・自社ニュース）による発注は、ニュース選抜 v1 の絞り込みの対象外です。')}\n")
 
     cur_stock = existing.get("STOCK_TICKERS", "")
     if cur_stock:
@@ -2191,7 +2217,11 @@ def step_momentum(existing, budget):
     print(f"  {dim('ニュースが流れていなくても、価格の急変動（勢い）だけを根拠に売買')}")
     print(f"  {dim('タイミングを判定する機能です。')}")
     print()
-    print(f"  {bold('発注対象（実発注は下の [2-c] で銘柄ごと・方向ごとに選べます）')}")
+    if _is_mom_select(existing.get("MOMENTUM_STRATEGY_PROFILE", "select_v2")):
+        # 選抜では [2-c] を尋ねない。無い入力欄へ案内しない（認定サポーターの報告）。
+        print(f"  {bold('発注対象（選抜プロファイルでは、STEP 1 で選んだプロファイルが実発注の対象を絞り込みます）')}")
+    else:
+        print(f"  {bold('発注対象（実発注は下の [2-c] で銘柄ごと・方向ごとに選べます）')}")
     print(f"  {dim('・SPY / QQQ / SMH … 実発注の対象。買い(ロング)・空売り(ショート)の両方に対応。')}")
     print(f"  {dim('  （デモ口座でもネッティング方式で空売りに対応します）')}")
     print(f"  {dim('・IWM / DRAM … シャドー観察のみ（実発注対象外。検証データを収集中）。')}")
@@ -2219,7 +2249,7 @@ def step_momentum(existing, budget):
         if strategy_profile == "select_v2":
             print(f"  {dim('  ・買いは QQQ だけ（米国東部時間 9〜11時台）、売りは QQQ / SMH（9・12時台）')}")
             print(f"  {dim('  ・SPY と SMH の買いは対象外')}")
-            print(f"  {dim('  ・5分・15分の変化率が Level 2 の基準に届かないときは実発注しない（値が取れないときは飛ばす）')}")
+            print(f"  {dim('  ・5分・15分の変化率が Level 2 の基準に届かないときは実発注しない（値が取れない銘柄はその回は見送る）')}")
             print(f"  {dim('    発火頻度の設定が Level 2 より厳しいときは、そちらが効きます')}")
             print(f"  {dim('  ・直近60分で QQQ が +0.15% より上げているときは売りを見送り（値が取れないときは見送らない）')}")
         else:
@@ -2228,6 +2258,7 @@ def step_momentum(existing, budget):
             print(f"  {dim('  ・米国東部時間 9・10・12・13時台のみ新規発注')}")
         print(f"  {dim('  ・固定の損切りライン（建玉トレールは使わない）')}")
         print(f"  {dim('  ・1日の損失が上限（リスク許容度・既定なら予算の 0.5%）に達したら自動停止')}")
+        print(f"  {dim('    プロファイルの上限（既定なら予算の 1.5%）も重ねてかけ、先に当たった方で止まります')}")
         # ★ v1.50: 発注サイド。v1 は従来の既定のまま。v2 は買いが肝なので、既定は Bot の既定サイドから
         #   SMH の買いを外したもの（_V2_DEFAULT_SIDES）にし、既存の設定に QQQ の買いが無ければ自動で加えて、そう表示する。
         _sides_default = (_V2_DEFAULT_SIDES if strategy_profile == "select_v2"
@@ -2251,7 +2282,9 @@ def step_momentum(existing, budget):
                 print(f"  {yellow('選抜プロファイル v2 は買いも実発注の対象にするため、発注サイドに QQQ の買いを加えました。')}")
                 print(f"  {dim('  実発注を行う設定なら、QQQ の買いの注文も出るようになります（v2 をやめれば外せます）。')}")
             _eff_now = _effective_select_v2_sides(_sides_keep)
-            print(f"  {dim('  ・いまの設定で実発注されるサイド: ' + (_fmt_momentum_sides(_eff_now) if _eff_now else 'なし') + _short_gate_note(existing, _eff_now))}")
+            # 実発注するかは、この後の「実発注の確認」で決まる。オフの人に「実発注される」と言い切らない。
+            _live_note = "" if _bot_reads_true(existing, "MOMENTUM_LIVE_TRADING") else "（いまは実発注オフ・記録のみ。下で変えられます）"
+            print(f"  {dim('  ・実発注する場合の対象サイド: ' + (_fmt_momentum_sides(_eff_now) if _eff_now else 'なし') + _short_gate_note(existing, _eff_now) + _live_note)}")
         # ★ v1.46（配布前レビュー）: プロファイルが決めない数字は実発注に効くので、金額つきで見せる
         _lv_keep   = str(existing.get("MOMENTUM_LEVEL", "3"))
         _rk_keep   = str(existing.get("MOMENTUM_RISK_LEVEL", "3"))
@@ -3912,7 +3945,8 @@ def _build_env_lines(config):
         "#                              select_v1: SHORTのみ/SPY除外/ET 9・10・12・13時台のみ実発注",
         "#                              select_v2: 売り ET 9・12時台/買い ET 9〜11時台/Level 2 以上/直近60分で",
         "#                              QQQ が +0.15% 超なら売り見送り/SPY と SMH の買いは除外",
-        "#                              どちらも固定損切り/日次損失1.5%停止。シャドー記録は全件継続)",
+        "#                              どちらも固定損切り/日次損失はリスク許容度の上限と1.5%を重ね、先に当たった方で停止。",
+        "#                              シャドー記録は全件継続)",
         "#   MOMENTUM_STOP_LOSS_PCT     モメンタム建玉の強制損切りライン (% ・Wizard [5] で設定)",
         "#   MOMENTUM_STOP_PROFILE      損切り幅プロファイル (モメンタム実発注には効かない・Wizard [5b])",
         "#   MOMENTUM_LONG_MIN/MAX_SIGNAL_PCT  ロング発注の5分モメンタムレンジ (Wizard [2-d] で選択)",
