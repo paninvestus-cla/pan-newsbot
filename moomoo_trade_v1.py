@@ -13834,7 +13834,7 @@ def place_buy(
             f"先にショートを買い戻します。次のシグナルでロングを試みます。"
         ))
         place_close_all(symbol, trd_env, "ロング前ショート強制決済")
-        _mark_order_fail(symbol, "ショートを先に買い戻し中")
+        _mark_order_fail(symbol, "ショートを保有中のため、先に買い戻しを試みる（ロングは次のシグナルで）")
         return False
 
     # 直前の place_close_all が全 position_id 失敗で True を返さなかった銘柄は、
@@ -17449,6 +17449,8 @@ async def process_headlines(
                     block_reason=f"{_elapsed:.1f}分前に決済済・あと{_remaining:.1f}分",
                     price_at_decision=_last_recorded_price(sym), skip_quote=True,
                 )
+                # 回の頭で古い印を消した後なので、この回のまとめ行に理由が載る（配布前レビュー Claude 別人格）
+                _mark_order_fail(sym, f"ETF の再エントリー禁止中（決済から{_elapsed:.0f}分・あと{_remaining:.0f}分）")
                 continue
         async with _get_sym_lock(sym):
             # 既存ショートがあれば先に買い戻し
@@ -19727,7 +19729,7 @@ async def ovn_overnight_loop(trd_env) -> None:
                 if not (trend_ok and vix_ok) or holiday or weekend_skip:
                     _reason = ("連休の前" if holiday else
                                "週末の前（OVN_SKIP_WEEKEND=true の設定により見送り）" if weekend_skip else
-                               f"条件不成立（200日線 {'○' if trend_ok else '×'} / VIXY {vchg:+.2%} {'○' if vix_ok else '×'}）")
+                               f"条件不成立（200日線 {'○' if trend_ok else '×'} / VIXY {vchg:+.2%}（前営業日の終値ベース） {'○' if vix_ok else '×'}）")
                     _ovn_say(f"本日は見送ります。{_reason}")
                     st["phase"] = "IDLE"; _ovn_save(st); continue
 
@@ -19755,7 +19757,7 @@ async def ovn_overnight_loop(trd_env) -> None:
                               shadow_entry=round(entry_price, 4),
                               shadow_date=today)
                     _ovn_say(f"（記録のみ）買う条件がそろいました。QQQ {entry_price:.2f} × {qty}株 相当"
-                             f"\n200日線 {sma:.2f} / VIXY {vchg:+.2%}　翌朝の寄り付き値と比べて記録します。")
+                             f"\n200日線 {sma:.2f} / VIXY {vchg:+.2%}（前営業日の終値ベース）　翌朝の寄り付き値と比べて記録します。")
                     _ovn_save(st); continue
 
                 # 注文応答前クラッシュでも口座から回収できるよう、意図を先に永続化する。
