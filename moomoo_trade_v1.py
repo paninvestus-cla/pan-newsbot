@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.197"
+BOT_VERSION = "v3.9.198"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -2192,6 +2192,8 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
         + ("上限なし" if MOMENTUM_LONG_MAX_SIGNAL_PCT <= 0
            else f"{MOMENTUM_LONG_MAX_SIGNAL_PCT:.2f}%")
         + ("（select_v1 のため LONG は実発注しません）" if MOMENTUM_PROFILE_SELECT else "")
+        + ("（select_v2 ではこのレンジは使いません。買いは Level 2 の基準と時間帯で判定します）"
+           if MOMENTUM_PROFILE_SELECT_V2 else "")
     )
 
     while True:
@@ -2356,7 +2358,9 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                         _will_live_order = False
 
                 if _will_live_order:
-                    _order_note = "⚡ 実発注 (Phase 1)"
+                    # この後に高値掴みガードと place 側のガードがある。ここで「実発注」と言い切ると、直後に見送った回が
+                    # 発注済みに読める（利用者の報告）。最終結果は後続の「発注試行」「見送り」の行で出る。
+                    _order_note = "⚡ 実発注の候補 (Phase 1・発注前のガードで見送る場合あり)"
                 elif _trend_blocked:
                     _order_note = (
                         f"実発注なし・当日トレンド逆行"
@@ -12865,7 +12869,7 @@ def sync_positions(trd_env: TrdEnv) -> None:
                         log.info(
                             f"[sync_positions] 【{_sym_chk}】"
                             f" {_GHOST_MISS_THRESHOLD}回連続でAPIにポジション不在"
-                            f" → tracked_cost をクリア（手動決済または外部決済の可能性）"
+                            f" → tracked_cost をクリア（Bot 自身の決済が反映された場合と、手動・外部で決済された場合に出ます）"
                         )
                 # v3.9.20: ポジション解消で entry_count を 0 にリセット (新規エントリー判定用)。
                 # 【重要】_tracked_position_cost > 0 なら API 一時 qty=0 とみなし誤リセット回避。
@@ -13779,18 +13783,22 @@ def place_buy(
     session, _ = get_session_info()
 
     if _skip_if_externally_held(symbol, "新規ロング"):
+        _mark_order_fail(symbol, "口座に Bot 以外の同じ銘柄の建玉あり")
         return False
 
     if session == SESSION_WEEKEND:
         log.info(f"{tag} 週末セッション: BUY をスキップ")
+        _mark_order_fail(symbol, "週末")
         return False
 
     if session == SESSION_HOLIDAY:
         log.info(f"{tag} 休場日セッション: BUY をスキップ")
+        _mark_order_fail(symbol, "休場日")
         return False
 
     if session == SESSION_OVERNIGHT and trd_env == TrdEnv.SIMULATE:
         log.info(f"{tag} オーバーナイトセッション: BUY をスキップ（デモ口座・ポジション管理不可）")
+        _mark_order_fail(symbol, "夜間セッション（デモ口座）")
         return False
 
     # ── 起動時ポジション不明フラグチェック ────────────────────────────────────
@@ -13799,6 +13807,7 @@ def place_buy(
             f"{tag} 🚫 発注ブロック: 起動時のポジション確認が取れていません。"
             f" moomooアプリでポジションを確認してからbotを再起動してください。"
         )
+        _mark_order_fail(symbol, "起動時のポジション確認が取れていない")
         return False
 
     # SHORT 保有中の新規 BUY は moomoo が買戻と区別できず両建てになる可能性。
@@ -13812,6 +13821,7 @@ def place_buy(
                 f"{tag} [BUY前チェック] ショート {_abs_short}株 保有中 → "
                 f"転換せず新規LONGを見送り（MOMENTUM_REVERSE_EXIT=false・既存SHORTは損切り/トレールに委ねる）"
             )
+            _mark_order_fail(symbol, "ショート保有中（転換しない設定）")
             return False
         log.info(
             f"{tag} [BUY前チェック] ショートポジション {_abs_short}株 が残存 "
@@ -13824,6 +13834,7 @@ def place_buy(
             f"先にショートを買い戻します。次のシグナルでロングを試みます。"
         ))
         place_close_all(symbol, trd_env, "ロング前ショート強制決済")
+        _mark_order_fail(symbol, "ショートを先に買い戻し中")
         return False
 
     # 直前の place_close_all が全 position_id 失敗で True を返さなかった銘柄は、
@@ -13835,6 +13846,7 @@ def place_buy(
             f"{tag} 🚫 [決済FAILED中] 既存ポジションの決済が失敗中 ({_fc_elapsed:.1f}分前) "
             f"→ 新規BUYをスキップ (既存ポジション解消を優先)"
         )
+        _mark_order_fail(symbol, "既存ポジションの決済が失敗中")
         return False
 
     # 5/12 ログ分析でデモ日次決済 (15:45 ET) 直前 1 分間に 22 件の新規 BUY が
@@ -13851,6 +13863,7 @@ def place_buy(
                          beneficiaries=beneficiaries, victims=victims,
                          outcome="blocked", block_stage="late_session",
                          block_reason=f"強制決済まで残り {_mins_to_close:.1f}分")
+        _mark_order_fail(symbol, "終盤エントリーブロック")
         return False
 
     # 構成 A: 急落直後の同一銘柄ブロック (直近 NEW_LONG_BLOCK_SEC 秒)
@@ -13868,6 +13881,7 @@ def place_buy(
                          beneficiaries=beneficiaries, victims=victims,
                          outcome="blocked", block_stage="risk_event_a",
                          block_reason=f"直近 {int(_elapsed_a)}秒前にリスクイベント発動")
+        _mark_order_fail(symbol, "リスクイベント直後の新規ロング停止")
         return False
     # 構成 B: マクロ下落トレンド検知 (全銘柄) — QQQ の直近騰落率から判定
     # v2.92 で導入した _INDEX_PRICE_HISTORY を活用し、相場全体が下落中の
@@ -13883,6 +13897,7 @@ def place_buy(
                          beneficiaries=beneficiaries, victims=victims,
                          outcome="blocked", block_stage="macro_downtrend",
                          block_reason=_dt_reason)
+        _mark_order_fail(symbol, "マクロ下落トレンドで新規ロング停止")
         return False
 
     # 5/5 SMH 終日下落事案で、QQQ は横ばい (構成 B が発火しない) でも SMH だけが
@@ -13902,6 +13917,7 @@ def place_buy(
                              beneficiaries=beneficiaries, victims=victims,
                              outcome="blocked", block_stage="smh_strict",
                              block_reason=f"SMH conf={confidence:.3f} < {SMH_CONFIDENCE_THRESHOLD}")
+            _mark_order_fail(symbol, "SMH 専用の confidence の関門に未達")
             return False
         # 修正項目 4: SMH 下落トレンド検知ブロック
         # SMH 自体の直近騰落率で下落トレンドを判定（QQQ ベースの構成 B とは独立）。
@@ -13916,6 +13932,7 @@ def place_buy(
                              beneficiaries=beneficiaries, victims=victims,
                              outcome="blocked", block_stage="smh_downtrend",
                              block_reason=_smh_dt_reason)
+            _mark_order_fail(symbol, "SMH の下落トレンド")
             return False
 
     # SPY は QQQ より約 40% 低ボラのため、QQQ ベースの構成 B (-0.30%/-0.70%) では
@@ -13932,6 +13949,7 @@ def place_buy(
                              beneficiaries=beneficiaries, victims=victims,
                              outcome="blocked", block_stage="spy_downtrend",
                              block_reason=_spy_dt_reason)
+            _mark_order_fail(symbol, "SPY の下落トレンド")
             return False
 
     # STOCK_TICKERS に含まれる銘柄のみ判定対象。QQQ/SMH 系の構成 B/C では
@@ -13948,6 +13966,7 @@ def place_buy(
                              beneficiaries=beneficiaries, victims=victims,
                              outcome="blocked", block_stage="stock_downtrend",
                              block_reason=_stock_dt_reason)
+            _mark_order_fail(symbol, "個別株の下落トレンド")
             return False
 
     # ── リアルタイム価格の取得（Quote Right 対応・推定値は使わない）──────────────
@@ -13960,10 +13979,12 @@ def place_buy(
                          beneficiaries=beneficiaries, victims=victims,
                          outcome="blocked", block_stage="quote_sanity",
                          block_reason=_qreason, quote_sanity=0)
+        _mark_order_fail(symbol, "気配の異常（異常クォートガード）")
         return False
     limit_price = calc_limit_price(quote, "BUY", symbol)
     if limit_price <= 0:
         log.warning(f"{tag} リアルタイム価格取得失敗: BUY をスキップ（ask={quote['ask']}, last={quote['last']}）")
+        _mark_order_fail(symbol, "価格取得失敗")
         return False
 
     # 旧 v3.9.19 までは「同方向に複数回追加 (PYRAMID_MAX_ENTRIES)」を許可していたが、
@@ -13977,6 +13998,7 @@ def place_buy(
         log.info(
             f"{tag} 既存 LONG ポジション保有中 (qty={ts_check.position_qty}株) → 新規発注スキップ"
         )
+        _mark_order_fail(symbol, "既存ロング保有中")
         return False
 
     if qty is None:
@@ -14033,6 +14055,7 @@ def place_buy(
                          outcome="blocked", block_stage="portfolio_cap",
                          block_reason=f"合計${portfolio_total:,.0f} ≥ 上限${_BUDGET_USD:,.0f}",
                          price_at_decision=quote_price(quote))
+        _mark_order_fail(symbol, "ポートフォリオ上限到達")
         return False
 
     # ② 残余力を計算（BUDGET_USD - 自前管理の合計コスト）
@@ -14051,6 +14074,7 @@ def place_buy(
                              outcome="blocked", block_stage="insufficient_budget",
                              block_reason=f"残余力${remaining_budget:,.0f} < 1株${limit_price:.2f}",
                          price_at_decision=quote_price(quote))
+            _mark_order_fail(symbol, "余力不足（1株に届かない）")
             return False
         log.info(
             f"{tag} 余力調整: ${order_size:,.0f}"
@@ -14069,6 +14093,7 @@ def place_buy(
                 f"{tag} 個別株上限到達: {symbol}=${_sym_cost:,.0f}"
                 f" ≥ STOCK_MAX=${STOCK_MAX_USD:,.0f} → 発注スキップ"
             )
+            _mark_order_fail(symbol, "個別株の1銘柄上限に到達")
             return False
         _stock_remaining = STOCK_MAX_USD - _sym_cost
         if order_size > _stock_remaining:
@@ -14079,6 +14104,7 @@ def place_buy(
             order_size = _stock_remaining
             if order_size < limit_price:
                 log.info(f"{tag} 個別株上限後に残余力不足 → 発注スキップ")
+                _mark_order_fail(symbol, "個別株の上限調整後に余力不足")
                 return False
 
     if qty is None:
@@ -14094,6 +14120,7 @@ def place_buy(
                     f"{tag} 残余力 ${_rb_calc:,.0f} が1株の値段 ${limit_price:.2f} に"
                     f"届きません → 発注スキップ（予算超過の防止）"
                 )
+                _mark_order_fail(symbol, "余力不足（1株に届かない）")
                 return False
             log.info(f"{tag} 残余力に合わせて数量を調整: {qty} → {_qty_fit}株")
             qty = _qty_fit
@@ -14114,6 +14141,7 @@ def place_buy(
                                  outcome="blocked", block_stage="insufficient_budget",
                                  block_reason=f"残余力${_rb_buy:,.0f} < 1株${limit_price:.2f}（数量指定）",
                                  price_at_decision=quote_price(quote))
+                _mark_order_fail(symbol, "余力不足（1株に届かない）")
                 return False
             if qty > _max_qty_budget:
                 log.info(
@@ -19751,7 +19779,7 @@ async def ovn_overnight_loop(trd_env) -> None:
                           entry_price=round(entry_price, 4),
                           entry_at=datetime.datetime.now().isoformat(timespec="seconds"))
                 _ovn_say(f"買い注文を受け付けました。QQQ {qty}株"
-                         f"（前日終値 {last:.2f} / 200日線 {sma:.2f} / VIXY {vchg:+.2%}"
+                         f"（前日終値 {last:.2f} / 200日線 {sma:.2f} / VIXY {vchg:+.2%}（前営業日の終値ベース）"
                          f"／発注直前の気配 {entry_price:.2f}）"
                          f"\n翌営業日の寄り付きで売ります。（orderId={oid}）")
                 if not _ovn_save(st):
