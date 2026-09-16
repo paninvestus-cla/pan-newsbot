@@ -1191,6 +1191,7 @@ def _log_observation(
     pct_15m: Optional[float] = None,       # モメンタム 15 分変化率%
     quote_sanity: Optional[int] = None,    # 1=健全 / 0=異常クォートで遮断 / None=未チェック
     skip_quote: bool = False,
+    decision_time: Optional[datetime.datetime] = None,  # 判定した時点（省略時は現在時刻）
 ) -> None:
     """観察イベントを GAS に送信し Phase 2 用に pending 登録する。
 
@@ -1226,8 +1227,16 @@ def _log_observation(
                 price_at_decision = 0.0
 
         obs_id = _new_observation_id()
-        now_local = datetime.datetime.now()
-        now_et = datetime.datetime.now(_ET).replace(tzinfo=None)
+        # ★ v3.9.199: 判定した時点を呼び出し側から渡せるようにした。モメンタムは
+        #   発注の可否が決まってから送るので（D 案）、ここで現在時刻を打つと、
+        #   発注を試した回だけ place_* の所要時間ぶん時刻が後ろへずれる。価格は
+        #   シグナル時点のままなので、価格と時刻の基準が食い違う。時間帯で選抜を
+        #   評価する tools/eval_select_v2.py の振り分けも境目で変わる。
+        _now_here = datetime.datetime.now()
+        now_local = decision_time or _now_here
+        # ET も同じだけ巻き戻す（時差の計算を二重に書かないための引き算）。
+        now_et = (datetime.datetime.now(_ET).replace(tzinfo=None)
+                  - (_now_here - now_local))
         session, _ = get_session_info()
         headline_first = (headlines[0] if headlines else "")[:200]
 
@@ -2399,6 +2408,7 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                 #   時刻と価格はシグナルの時点の値をそのまま使い、どの経路を通っても finally で必ず1回だけ送る。
                 #   block_stage は "momentum_shadow" のまま（レポート・集計の読み手4つがこの値で行を拾う）。
                 _obs_final = _order_note if not _will_live_order else "実発注の候補（判定中）"
+                _obs_at = datetime.datetime.now()   # シグナルの時点（送るのは後でも、時刻はここ）
                 try:
 
                     if _against_trend:
@@ -2520,6 +2530,13 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                                     f"[モメンタム実発注] {symbol} {side} 発注見送り "
                                     f"(place 側ガードによりスキップ)"
                                 )
+                        except asyncio.CancelledError:
+                            # 停止や再起動で発注の待ちが取り消された回。別スレッドの
+                            # place_* は走り続けるので結果は分からない。「判定中」の
+                            # まま残すと、確定したように見えて後から直せない
+                            # （配布前レビュー指摘・v3.9.199）。
+                            _obs_final = "不明（発注の待ちが取り消された・Bot 停止など）"
+                            raise
                         except Exception as _e_mom:
                             _obs_final = "見送り（発注時のエラー）"
                             log.warning(
@@ -2536,13 +2553,15 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                         headlines=[f"[MOMENTUM SHADOW] {reason}"],
                         outcome="blocked",
                         block_stage="momentum_shadow",
-                    block_reason=f"{reason[:250]} ｜ 最終: {_obs_final}"[:300],
+                        # 末尾の「最終」は削らない（あふれたら理由のほうを詰める）。
+                        block_reason=_clip_block_reason(reason, f" ｜ 最終: {_obs_final}"),
                         price_at_decision=price,
                         live_allowed=_live_eligible,
                         size_pct=effective_size_pct,
                         eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
                         pct_5m=pct_5,
                         pct_15m=pct_15,
+                        decision_time=_obs_at,
                     )
         except asyncio.CancelledError:
             log.debug("[モメンタムシャドー] ループキャンセル受信 → 終了")
@@ -13116,7 +13135,8 @@ async def _check_order_filled(
                 avg_price = f"  約定均価: ${float(ap):.2f}"
             except (ValueError, TypeError):
                 avg_price = f"  約定均価: {ap}"
-        log.info(f"{tag} [約定確認] orderId={order_id}  status={status}  約定数={filled}{avg_price}")
+        log.info(f"{tag} [約定確認] orderId={order_id}  status={status}  約定数={filled}{avg_price}"
+                 f"  env={_env_tag()}")
         try:
             global _SEEN_ORDER_STATUSES
             if status not in _SEEN_ORDER_STATUSES:
@@ -13758,7 +13778,8 @@ async def _check_order_filled(
 
             if not _retried:
                 # 3回リトライしても未約定 → 指値待ちとして扱う + Discord通知
-                log.info(f"{tag} [約定確認] 未約定: status={status} （指値待ち・リトライ3回とも未約定）")
+                log.info(f"{tag} [約定確認] 未約定: status={status} （指値待ち・リトライ3回とも未約定）"
+                         f"  env={_env_tag()}")
                 _threadsafe_future(asyncio.to_thread(
                     send_discord_message,
                     f"[Bot] {tag} ⚠️ 約定確認 SUBMITTED のまま {mode}\n"
@@ -14035,8 +14056,11 @@ def place_buy(
                 f"{tag} 発注額計算: confidence={confidence:.4f}  [{_size_label}]"
                 f"  → 高ボラ銘柄サイズ調整 ${_order_size_before:,.0f} ÷ {_hv_mult:.1f}"
                 f" = ${_order_size_before / _hv_mult:,.0f}"
-                # 下限で切り上げた回に「÷N = 同額」と出て計算が合わなかった（利用者の報告）
-                f"{f' → 下限 ${ORDER_SIZE_MIN_USD:,.0f} を適用 = ${order_size:,.0f}' if order_size > _order_size_before / _hv_mult else ''}"
+                # 下限で切り上げた回に「÷N = 同額」と出て計算が合わなかった（利用者の報告）。
+                # 比べるのは表示と同じ「ドル単位に丸めた値」。丸める前で比べると、
+                # 999.6 と 1,000 のような差でも「= $1,000 → 下限 $1,000 を適用 = $1,000」
+                # とやはり同額に見える（配布前レビュー指摘）。
+                f"{f' → 下限 ${ORDER_SIZE_MIN_USD:,.0f} を適用 = ${order_size:,.0f}' if round(order_size) > round(_order_size_before / _hv_mult) else ''}"
                 f"  (損切り幅 {MAX_LOSS_PCT*100:.2f}%→{MAX_LOSS_PCT*_hv_mult*100:.2f}% / "
                 f"想定最大損失額は ETF と同水準)"
             )
@@ -14208,7 +14232,8 @@ def place_buy(
                 _warn_trade_locked()
             return False
         order_id = str(data["order_id"][0])
-        log.info(f"{tag} [ORDER] BUY  orderId={order_id}  qty={qty}  price={limit_price}")
+        log.info(f"{tag} [ORDER] BUY  orderId={order_id}  qty={qty}  price={limit_price}"
+                 f"  env={_env_tag()}")
     except Exception as e:
         log.error(f"{tag} [ORDER] BUY API例外: {e}", exc_info=True)
         _mark_order_fail(symbol, f"発注APIの例外: {e}")
@@ -14345,7 +14370,8 @@ def place_short(
             )
         except Exception as _e:
             log.debug(f"{tag} [シャドーSHORT] open エラー (黙殺): {_mask_secrets(_e)}")
-        _mark_order_fail(symbol, "空売りが無効な口座（シャドー記録のみ）", side="SHORT")
+        _mark_order_fail(symbol, "設定で空売りを止めています（実口座は買い専用・シャドー記録のみ）",
+                         side="SHORT")
         return False
 
     if trd_env == TrdEnv.SIMULATE and not DEMO_SHORT_ENABLED:
@@ -14364,7 +14390,8 @@ def place_short(
             )
         except Exception as _e:
             log.debug(f"{tag} [シャドーSHORT] open エラー (黙殺): {_mask_secrets(_e)}")
-        _mark_order_fail(symbol, "空売りが無効な口座（シャドー記録のみ）", side="SHORT")
+        _mark_order_fail(symbol, "デモ口座は空売りに対応していません（シャドー記録のみ）",
+                         side="SHORT")
         return False
 
     # ── 起動時ポジション不明フラグチェック ────────────────────────────────────
@@ -14516,7 +14543,7 @@ def place_short(
     limit_price = calc_limit_price(quote, "SELL", symbol)
     if limit_price <= 0:
         log.warning(f"{tag} 価格取得失敗: SHORT をスキップ")
-        _mark_order_fail(symbol, "気配の異常（異常クォートガード）", side="SHORT")
+        _mark_order_fail(symbol, "価格取得失敗", side="SHORT")
         return False
 
     ts_check = state.get(symbol)
@@ -14562,8 +14589,11 @@ def place_short(
                 f"{tag} [空売り発注額] confidence={confidence:.4f} [{_size_label}]"
                 f" → 高ボラ銘柄サイズ調整 ${_order_size_before:,.0f} ÷ {_hv_mult:.1f}"
                 f" = ${_order_size_before / _hv_mult:,.0f}"
-                # 下限で切り上げた回に「÷N = 同額」と出て計算が合わなかった（利用者の報告）
-                f"{f' → 下限 ${ORDER_SIZE_MIN_USD:,.0f} を適用 = ${order_size:,.0f}' if order_size > _order_size_before / _hv_mult else ''}"
+                # 下限で切り上げた回に「÷N = 同額」と出て計算が合わなかった（利用者の報告）。
+                # 比べるのは表示と同じ「ドル単位に丸めた値」。丸める前で比べると、
+                # 999.6 と 1,000 のような差でも「= $1,000 → 下限 $1,000 を適用 = $1,000」
+                # とやはり同額に見える（配布前レビュー指摘）。
+                f"{f' → 下限 ${ORDER_SIZE_MIN_USD:,.0f} を適用 = ${order_size:,.0f}' if round(order_size) > round(_order_size_before / _hv_mult) else ''}"
                 f" (損切り幅 {MAX_LOSS_PCT*100:.2f}%→{MAX_LOSS_PCT*_hv_mult*100:.2f}%)"
             )
         else:
@@ -14615,7 +14645,7 @@ def place_short(
                     f"{tag} 残余力 ${remaining_budget:,.0f} が1株の値段 ${limit_price:.2f} に"
                     f"届きません → 空売りスキップ（予算超過の防止）"
                 )
-                _mark_order_fail(symbol, "個別株の上限調整後に余力不足", side="SHORT")
+                _mark_order_fail(symbol, "余力不足（1株に届かない）", side="SHORT")
                 return False
             log.info(f"{tag} 残余力に合わせて数量を調整: {qty} → {_qty_fit_s}株")
             qty = _qty_fit_s
@@ -14722,7 +14752,8 @@ def place_short(
             _mark_order_fail(symbol, f"moomoo が発注を拒否: {data}", side="SHORT")
             return False
         order_id = str(data["order_id"][0])
-        log.info(f"{tag} [ORDER] SHORT orderId={order_id}  qty={qty}  price={limit_price}")
+        log.info(f"{tag} [ORDER] SHORT orderId={order_id}  qty={qty}  price={limit_price}"
+                 f"  env={_env_tag()}")
         _clear_trade_lock("新規ショート")
     except Exception as e:
         log.error(f"{tag} [ORDER] SHORT API例外: {e}", exc_info=True)
@@ -17148,6 +17179,7 @@ async def process_headlines(
     score_label = {1: "📈 ポジティブ", 0: "➡️ 中立", -1: "📉 ネガティブ"}.get(score, "?")
     log.info(
         f"[AI判定] {score_label}  confidence={confidence:.4f}"
+        f"  env={_env_tag()}"
         f"  horizon={horizon}  category={category}  reason={reason}"
         f"  beneficiaries={beneficiaries}  victims={victims}"
     )
@@ -17879,6 +17911,7 @@ async def process_stock_news(
     score_label = {1: "📈 ポジティブ", 0: "➡️ 中立", -1: "📉 ネガティブ"}.get(score, "?")
     log.info(
         f"{tag} [個別株AI判定] {score_label}  confidence={confidence:.4f}"
+        f"  env={_env_tag()}"
         f"  horizon={horizon}  reason={reason}"
     )
 
@@ -19892,6 +19925,7 @@ async def ovn_overnight_loop(trd_env) -> None:
                     f"【{OVN_SYMBOL}】[夜間持ち越し][記録のみ] mode=shadow qty={qty_s} "
                     f"buy={entry:.4f} sell={exit_price:.4f} "
                     f"shadow_pnl={pnl:+.2f} shadow_pct={pct:+.2f}"
+                    f"  env={_env_tag()}"
                 )
                 _ovn_say(f"（記録のみ）買っていた場合の結果: {entry:.2f} → {exit_price:.2f}"
                          f"　{pnl:+.2f} ドル（{pct:+.2f}%）")
@@ -20955,7 +20989,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         _own_log(
                             f"{tag} [ポジション] ${_ext_price:.2f}  "
                             f"PnL={pnl_colored(_ext_pnl)}({pct_colored(_ext_pct)})"
-                            f"{_own_note}"
+                            f"  env={_env_tag()}{_own_note}"
                         )
                     else:
                         _own_log(f"{tag} [ポジション]{_own_note}")
@@ -21417,12 +21451,14 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         _late_log = log.warning
                     _late_log(
                         f"{tag} [ポジション] ${price:.2f}  "
-                        f"PnL={pnl_colored(pnl)}({pct_colored(unr_pct)}){_late_note}"
+                        f"PnL={pnl_colored(pnl)}({pct_colored(unr_pct)})"
+                        f"  env={_env_tag()}{_late_note}"
                     )
                     continue
                 else:
                     log.info(
                         f"{tag} [ポジション] ${price:.2f}  PnL={pnl_colored(pnl)}({pct_colored(unr_pct)})"
+                        f"  env={_env_tag()}"
                         f"  trail={'ON' if ts.trail_active else 'off'}{trail_str}"
                     )
 
@@ -23544,6 +23580,12 @@ _DAILY_POSITION_PNL_RE_TAIL = (
     r"(?:\x1b\[[0-9;]*m)?\((?:\x1b\[[0-9;]*m)?(?P<pct>[+-]?[\d.]+)%"
 )
 
+# ★ v3.9.199: ログ行に付いた口座の印（env=REAL / env=DEMO）。
+#   実口座とデモを同じ機械で動かすと1本のログに両方が並ぶため、集計する側は
+#   これで自分の口座の行だけを拾う。印が付くのは集計の対象になる行だけで、
+#   印の無い行（古い版・集計に使わない行）は、これまでどおり対象にする。
+_ENV_IN_LINE = re.compile(r"\senv=(REAL|DEMO)(?![A-Za-z0-9_])")
+
 
 def run_daily_data_collect(log_path: str = _LOG_PATH,
                            target_date=None) -> None:
@@ -23646,8 +23688,9 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
         # env= は v3.9.199 から。実口座とデモを同じ機械で同時に動かすと、
         # 1本のログに両方の決済が並び、集計が合算になっていた（利用者の報告）。
         # 印の無い古い行は、これまでどおり対象にする（1口座だけの人は影響を受けない）。
+        # 拾うのは下の _ENV_IN_LINE で行ごとにまとめて行う（項目ごとに書くと、
+        # 決済だけ自分の口座・発注回数は両方、という矛盾した1行になる）。
         "rpnl":  re.compile(rf"{TS}.*?【{SYM}】.*?\[確定損益(?:\([^\]]*\))?\]"
-                            rf"(?:\s+env=(?P<env>REAL|DEMO))?"
                             rf".*?realized_pnl=(?P<pnl>[+-]?[\d.]+).*?qty=(?P<qty>\d+)", re.I),
         "risk":  re.compile(rf"{TS}.*?【{SYM}】.*?" + _DAILY_POSITION_PNL_RE_TAIL, re.I),
         "eod":   re.compile(rf"{TS}.*?(?:強制クローズ発動|EOD|close_all_for_|15:45)", re.I),
@@ -23691,6 +23734,14 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
                 continue
             mt=pats["ts"].match(line)
             if not mt or not is_today(mt.group(1)): continue
+            # 実口座とデモを同じ機械で動かすと1本のログに両方が並ぶ。
+            # 自分の口座の行だけ数える。ここで1回だけ落とすのは、項目ごとに
+            # 書くと「決済回数は自分の口座・発注回数は両方」という、1行の中で
+            # 基準が混ざった集計になるため（配布前レビュー指摘・v3.9.199）。
+            # 印の無い古い行は、これまでどおり対象にする（1口座だけの人は
+            # 影響を受けない。印は v3.9.199 から付く）。
+            _me=_ENV_IN_LINE.search(line)
+            if _me and _me.group(1).upper()!=_env_tag(): continue
             ts_str=mt.group(1)
             if not settings_line:
                 ms=re.search(r"moomoo_trade_v1\.py\s+(v[\d.]+)",line)
@@ -23709,11 +23760,6 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
                 continue
             mr=pats["rpnl"].search(line)
             if mr:
-                # 実口座とデモを同じ機械で動かすと1本のログに両方の決済が並ぶ。
-                # 自分の口座の行だけ数える（印の無い古い行は従来どおり数える）。
-                _row_env = (mr.groupdict().get("env") or "").upper()
-                if _row_env and _row_env != _env_tag():
-                    continue
                 try:
                     pv=float(mr.group("pnl"))
                     rpnl_total+=pv; trade_count+=1
