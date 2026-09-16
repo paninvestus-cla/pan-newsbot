@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.198"
+BOT_VERSION = "v3.9.199"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -2395,148 +2395,155 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     f"({_order_note}・次回 {MOMENTUM_COOLDOWN_MIN}分後まで同方向ロック)"
                 )
 
-                # 観察ログに記録 (既存の _log_observation を流用)
-                # block_stage="momentum_shadow" で集計時に識別可能
-                _log_observation(
-                    symbol=symbol,
-                    side=side,
-                    confidence=0.70,  # シャドー固定値 (集計時のフィルタ用)
-                    score=score,
-                    category="MOMENTUM",
-                    headlines=[f"[MOMENTUM SHADOW] {reason}"],
-                    outcome="blocked",
-                    block_stage="momentum_shadow",
-                    block_reason=reason[:300],
-                    price_at_decision=price,
-                    live_allowed=_live_eligible,
-                    size_pct=effective_size_pct,
-                    eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
-                    pct_5m=pct_5,
-                    pct_15m=pct_15,
-                )
-
-                if _against_trend:
-                    try:
-                        _log_observation(
-                            symbol=symbol,
-                            side=side,
-                            confidence=0.70,
-                            score=score,
-                            category="MOMENTUM",
-                            headlines=[
-                                f"[TREND FILTER] SPY{MOMENTUM_TREND_LOOKBACK_MIN}m "
-                                f"{_trend_pct:+.2f}% vs {'SHORT' if score < 0 else 'LONG'}"
-                            ],
-                            outcome="blocked",
-                            block_stage="trend_filter_ab",
-                            block_reason=(
-                                f"against_trend side={'SHORT' if score < 0 else 'LONG'} "
-                                f"trend={_trend_pct:+.2f}% thr={MOMENTUM_TREND_FILTER_PCT:.2f}% "
-                                f"enforced={MOMENTUM_TREND_FILTER_ENABLED} "
-                                f"would_live={_will_live_order or _trend_blocked}"
-                            )[:300],
-                            price_at_decision=price,
-                            live_allowed=_live_eligible,
-                            size_pct=effective_size_pct,
-                            eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
-                            pct_5m=pct_5,
-                            pct_15m=pct_15,
-                        )
-                    except Exception:
-                        pass
-
-                if _is_premarket and (_will_live_order or _premarket_blocked):
-                    try:
-                        _log_observation(
-                            symbol=symbol,
-                            side=side,
-                            confidence=0.70,
-                            score=score,
-                            category="MOMENTUM",
-                            headlines=[
-                                f"[PREMARKET FILTER] premarket {'SHORT' if score < 0 else 'LONG'} "
-                                f"5m {pct_5:+.2f}%"
-                            ],
-                            outcome="blocked",
-                            block_stage="premarket_filter_ab",
-                            block_reason=(
-                                f"premarket_entry side={'SHORT' if score < 0 else 'LONG'} "
-                                f"enforced={MOMENTUM_PREMARKET_FILTER_ENABLED} "
-                                f"would_live={_will_live_order or _premarket_blocked}"
-                            )[:300],
-                            price_at_decision=price,
-                            live_allowed=_live_eligible,
-                            size_pct=effective_size_pct,
-                            eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
-                            pct_5m=pct_5,
-                            pct_15m=pct_15,
-                        )
-                    except Exception:
-                        pass
-
+                # ★ v3.9.199: 観察ログは「発注したか見送ったか」が決まってから送る（利用者の提案・PAN 指示）。
+                #   時刻と価格はシグナルの時点の値をそのまま使い、どの経路を通っても finally で必ず1回だけ送る。
+                #   block_stage は "momentum_shadow" のまま（レポート・集計の読み手4つがこの値で行を拾う）。
+                _obs_final = _order_note if not _will_live_order else "実発注の候補（判定中）"
                 try:
-                    _record_today_shadow_momentum({
-                        "symbol":         symbol,
-                        "direction":      direction,        # LONG / SHORT
-                        "side":           side,             # BUY / SELL_SHORT
-                        "pct_5":          pct_5,
-                        "pct_15":         pct_15,
-                        "price":          price,
-                        "size_pct":       effective_size_pct,
-                        "strength_label": strength_label,
-                        "strength_mult":  strength_multiplier,
-                        "live_eligible":  _live_eligible,
-                    })
-                except Exception:
-                    pass
 
-                # MOMENTUM_LIVE_TRADING=true かつ live-eligible サイドのみ。
-                # place_buy / place_short を再利用するため、発注後のポジションは
-                # risk_monitor_loop が損切り/トレール/時間切れで自動管理する。
-                # qty を明示指定して calc_order_size を回避し、モメンタム算出の
-                # サイズ (BUDGET × MAX_PCT × 強度係数) で発注する。
-                # (シャドー観察ログは上で記録済み)。
-                if _will_live_order and _momentum_high_chase_block(symbol, side, price):
-                    log.info(
-                        f"[モメンタム実発注] {symbol} {side} 見送り (高値掴みガード): "
-                        f"現値 ${price:.2f} が直近{MOMENTUM_HIGH_CHASE_LOOKBACK_MIN}分高値の "
-                        f"{MOMENTUM_HIGH_CHASE_GUARD_PCT:.2f}%以内 → シャドー記録のみ"
-                    )
-                    _will_live_order = False
-                if _will_live_order:
-                    _mom_qty = max(1, int(hypothetical_order_usd / price))
-                    log.warning(
-                        f"[モメンタム実発注] {symbol} {side} {_mom_qty}株 "
-                        f"(想定 ${hypothetical_order_usd:,.0f}) → 発注試行"
-                    )
-                    try:
-                        _place_fn = place_buy if side == "BUY" else place_short
-                        async with _get_sym_lock(symbol):
-                            _mom_ok = await asyncio.to_thread(
-                                _place_fn, symbol, trd_env,
+                    if _against_trend:
+                        try:
+                            _log_observation(
+                                symbol=symbol,
+                                side=side,
                                 confidence=0.70,
-                                trigger=symbol,
-                                reason=f"[モメンタム] {reason}",
-                                qty=_mom_qty,
+                                score=score,
                                 category="MOMENTUM",
-                                news_source="MOMENTUM",
-                                headlines=[f"[MOMENTUM] {reason}"],
-                                entry_pct_5m=pct_5,
-                                entry_pct_15m=pct_15,
+                                headlines=[
+                                    f"[TREND FILTER] SPY{MOMENTUM_TREND_LOOKBACK_MIN}m "
+                                    f"{_trend_pct:+.2f}% vs {'SHORT' if score < 0 else 'LONG'}"
+                                ],
+                                outcome="blocked",
+                                block_stage="trend_filter_ab",
+                                block_reason=(
+                                    f"against_trend side={'SHORT' if score < 0 else 'LONG'} "
+                                    f"trend={_trend_pct:+.2f}% thr={MOMENTUM_TREND_FILTER_PCT:.2f}% "
+                                    f"enforced={MOMENTUM_TREND_FILTER_ENABLED} "
+                                    f"would_live={_will_live_order or _trend_blocked}"
+                                )[:300],
+                                price_at_decision=price,
+                                live_allowed=_live_eligible,
+                                size_pct=effective_size_pct,
+                                eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
+                                pct_5m=pct_5,
+                                pct_15m=pct_15,
                             )
-                        if _mom_ok:
-                            log.info(f"[モメンタム実発注] {symbol} {side} 発注成功")
-                        else:
-                            log.info(
-                                f"[モメンタム実発注] {symbol} {side} 発注見送り "
-                                f"(place 側ガードによりスキップ)"
-                            )
-                    except Exception as _e_mom:
-                        log.warning(
-                            f"[モメンタム実発注] {symbol} {side} エラー (継続): "
-                            f"{_mask_secrets(_e_mom)}"
-                        )
+                        except Exception:
+                            pass
 
+                    if _is_premarket and (_will_live_order or _premarket_blocked):
+                        try:
+                            _log_observation(
+                                symbol=symbol,
+                                side=side,
+                                confidence=0.70,
+                                score=score,
+                                category="MOMENTUM",
+                                headlines=[
+                                    f"[PREMARKET FILTER] premarket {'SHORT' if score < 0 else 'LONG'} "
+                                    f"5m {pct_5:+.2f}%"
+                                ],
+                                outcome="blocked",
+                                block_stage="premarket_filter_ab",
+                                block_reason=(
+                                    f"premarket_entry side={'SHORT' if score < 0 else 'LONG'} "
+                                    f"enforced={MOMENTUM_PREMARKET_FILTER_ENABLED} "
+                                    f"would_live={_will_live_order or _premarket_blocked}"
+                                )[:300],
+                                price_at_decision=price,
+                                live_allowed=_live_eligible,
+                                size_pct=effective_size_pct,
+                                eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
+                                pct_5m=pct_5,
+                                pct_15m=pct_15,
+                            )
+                        except Exception:
+                            pass
+
+                    try:
+                        _record_today_shadow_momentum({
+                            "symbol":         symbol,
+                            "direction":      direction,        # LONG / SHORT
+                            "side":           side,             # BUY / SELL_SHORT
+                            "pct_5":          pct_5,
+                            "pct_15":         pct_15,
+                            "price":          price,
+                            "size_pct":       effective_size_pct,
+                            "strength_label": strength_label,
+                            "strength_mult":  strength_multiplier,
+                            "live_eligible":  _live_eligible,
+                        })
+                    except Exception:
+                        pass
+
+                    # MOMENTUM_LIVE_TRADING=true かつ live-eligible サイドのみ。
+                    # place_buy / place_short を再利用するため、発注後のポジションは
+                    # risk_monitor_loop が損切り/トレール/時間切れで自動管理する。
+                    # qty を明示指定して calc_order_size を回避し、モメンタム算出の
+                    # サイズ (BUDGET × MAX_PCT × 強度係数) で発注する。
+                    # (シャドー観察ログは上で記録済み)。
+                    if _will_live_order and _momentum_high_chase_block(symbol, side, price):
+                        log.info(
+                            f"[モメンタム実発注] {symbol} {side} 見送り (高値掴みガード): "
+                            f"現値 ${price:.2f} が直近{MOMENTUM_HIGH_CHASE_LOOKBACK_MIN}分高値の "
+                            f"{MOMENTUM_HIGH_CHASE_GUARD_PCT:.2f}%以内 → シャドー記録のみ"
+                        )
+                        _will_live_order = False
+                        _obs_final = "見送り（高値掴みガード）"
+                    if _will_live_order:
+                        _mom_qty = max(1, int(hypothetical_order_usd / price))
+                        log.warning(
+                            f"[モメンタム実発注] {symbol} {side} {_mom_qty}株 "
+                            f"(想定 ${hypothetical_order_usd:,.0f}) → 発注試行"
+                        )
+                        try:
+                            _place_fn = place_buy if side == "BUY" else place_short
+                            async with _get_sym_lock(symbol):
+                                _mom_ok = await asyncio.to_thread(
+                                    _place_fn, symbol, trd_env,
+                                    confidence=0.70,
+                                    trigger=symbol,
+                                    reason=f"[モメンタム] {reason}",
+                                    qty=_mom_qty,
+                                    category="MOMENTUM",
+                                    news_source="MOMENTUM",
+                                    headlines=[f"[MOMENTUM] {reason}"],
+                                    entry_pct_5m=pct_5,
+                                    entry_pct_15m=pct_15,
+                                )
+                            if _mom_ok:
+                                _obs_final = "実発注（注文を出した）"
+                                log.info(f"[モメンタム実発注] {symbol} {side} 発注成功")
+                            else:
+                                _obs_final = "見送り（place 側のガード・理由は直前のログ）"
+                                log.info(
+                                    f"[モメンタム実発注] {symbol} {side} 発注見送り "
+                                    f"(place 側ガードによりスキップ)"
+                                )
+                        except Exception as _e_mom:
+                            _obs_final = "見送り（発注時のエラー）"
+                            log.warning(
+                                f"[モメンタム実発注] {symbol} {side} エラー (継続): "
+                                f"{_mask_secrets(_e_mom)}"
+                            )
+                finally:
+                    _log_observation(
+                        symbol=symbol,
+                        side=side,
+                        confidence=0.70,  # シャドー固定値 (集計時のフィルタ用)
+                        score=score,
+                        category="MOMENTUM",
+                        headlines=[f"[MOMENTUM SHADOW] {reason}"],
+                        outcome="blocked",
+                        block_stage="momentum_shadow",
+                    block_reason=f"{reason[:250]} ｜ 最終: {_obs_final}"[:300],
+                        price_at_decision=price,
+                        live_allowed=_live_eligible,
+                        size_pct=effective_size_pct,
+                        eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
+                        pct_5m=pct_5,
+                        pct_15m=pct_15,
+                    )
         except asyncio.CancelledError:
             log.debug("[モメンタムシャドー] ループキャンセル受信 → 終了")
             raise
@@ -2597,7 +2604,8 @@ def _send_trade_result(symbol: str, entry_price: float, exit_price: float,
     try:
         _record_today_trade({
             'symbol':      symbol,
-            'pnl':         realized_pnl,
+            # 集計の丸めをそろえる: 個別を2桁に丸めてから合算する（日次サマリとデータ収集で1セントずれていた・利用者の報告）
+            'pnl':         round(realized_pnl, 2),
             'qty':         qty,
             'entry_price': entry_price,
             'exit_price':  exit_price,
@@ -13190,6 +13198,7 @@ async def _check_order_filled(
                                     f"  │  {int(filled_qty)}株"
                                     f"  │  買 ${prev_avg:.2f} → 売 ${filled_price:.2f}"
                                     f"  │  [確定損益]"
+                                    f"  env={_env_tag(trd_env)}"
                                     f"  realized_pnl={realized:+.2f}"
                                     f"  sell_avg={filled_price:.2f}"
                                     f"  buy_avg={prev_avg:.2f}"
@@ -13303,6 +13312,7 @@ async def _check_order_filled(
                                     f"  │  {int(filled_qty)}株"
                                     f"  │  売 ${prev_avg_sc:.2f} → 買 ${filled_price:.2f}"
                                     f"  │  [確定損益(SC)]"
+                                    f"  env={_env_tag(trd_env)}"
                                     f"  realized_pnl={realized_sc:+.2f}"
                                     f"  cover_avg={filled_price:.2f}"
                                     f"  short_avg={prev_avg_sc:.2f}"
@@ -13535,6 +13545,7 @@ async def _check_order_filled(
                                                 f"  │  {int(filled_qty2)}株"
                                                 f"  │  買 ${prev_avg2:.2f} → 売 ${filled_price2:.2f}"
                                                 f"  │  [確定損益(リトライ)]"
+                                                f"  env={_env_tag(trd_env)}"
                                                 f"  realized_pnl={realized2:+.2f}"
                                                 f"  sell_avg={filled_price2:.2f}"
                                                 f"  buy_avg={prev_avg2:.2f}"
@@ -13617,6 +13628,7 @@ async def _check_order_filled(
                                                 f"  │  {int(filled_qty2)}株"
                                                 f"  │  売 ${prev_avg_sc2:.2f} → 買 ${filled_price2:.2f}"
                                                 f"  │  [確定損益(SC・リトライ)]"
+                                                f"  env={_env_tag(trd_env)}"
                                                 f"  realized_pnl={realized_sc2:+.2f}"
                                                 f"  cover_avg={filled_price2:.2f}"
                                                 f"  short_avg={prev_avg_sc2:.2f}"
@@ -13819,7 +13831,7 @@ def place_buy(
         if not MOMENTUM_REVERSE_EXIT:
             log.info(
                 f"{tag} [BUY前チェック] ショート {_abs_short}株 保有中 → "
-                f"転換せず新規LONGを見送り（MOMENTUM_REVERSE_EXIT=false・既存SHORTは損切り/トレールに委ねる）"
+                f"転換せず新規LONGを見送り（MOMENTUM_REVERSE_EXIT=false・既存SHORTは、決済注文が出ていればその決済で、無ければ損切り/トレールで閉じます）"
             )
             _mark_order_fail(symbol, "ショート保有中（転換しない設定）")
             return False
@@ -14022,7 +14034,9 @@ def place_buy(
             log.info(
                 f"{tag} 発注額計算: confidence={confidence:.4f}  [{_size_label}]"
                 f"  → 高ボラ銘柄サイズ調整 ${_order_size_before:,.0f} ÷ {_hv_mult:.1f}"
-                f" = ${order_size:,.0f}"
+                f" = ${_order_size_before / _hv_mult:,.0f}"
+                # 下限で切り上げた回に「÷N = 同額」と出て計算が合わなかった（利用者の報告）
+                f"{f' → 下限 ${ORDER_SIZE_MIN_USD:,.0f} を適用 = ${order_size:,.0f}' if order_size > _order_size_before / _hv_mult else ''}"
                 f"  (損切り幅 {MAX_LOSS_PCT*100:.2f}%→{MAX_LOSS_PCT*_hv_mult*100:.2f}% / "
                 f"想定最大損失額は ETF と同水準)"
             )
@@ -14110,7 +14124,8 @@ def place_buy(
     if qty is None:
         qty = max(1, math.floor(order_size / limit_price))
         _rb_calc = _BUDGET_USD - portfolio_total
-        if symbol in STOCK_TICKERS:
+        # STOCK_MAX_PCT=0 は「1銘柄の上限なし」。0 を上限として扱うと個別株の買いが全部止まる（利用者の報告）。
+        if symbol in STOCK_TICKERS and STOCK_MAX_USD > 0:
             _rb_calc = min(_rb_calc,
                            STOCK_MAX_USD - (_tracked_position_cost.get(symbol, 0.0) or 0))
         if qty * limit_price > _rb_calc:
@@ -14301,14 +14316,17 @@ def place_short(
     session, _ = get_session_info()
 
     if _skip_if_externally_held(symbol, "新規ショート"):
+        _mark_order_fail(symbol, "口座に Bot 以外の同じ銘柄の建玉あり", side="SHORT")
         return False
 
     if session == SESSION_WEEKEND:
         log.info(f"{tag} 週末セッション: SHORT をスキップ")
+        _mark_order_fail(symbol, "週末", side="SHORT")
         return False
 
     if session == SESSION_HOLIDAY:
         log.info(f"{tag} 休場日セッション: SHORT をスキップ")
+        _mark_order_fail(symbol, "休場日", side="SHORT")
         return False
 
     # ★ テスト結果確認済み（2026-05-01）: デモ口座は SELL_SHORT（信用空売り）非対応
@@ -14327,6 +14345,7 @@ def place_short(
             )
         except Exception as _e:
             log.debug(f"{tag} [シャドーSHORT] open エラー (黙殺): {_mask_secrets(_e)}")
+        _mark_order_fail(symbol, "空売りが無効な口座（シャドー記録のみ）", side="SHORT")
         return False
 
     if trd_env == TrdEnv.SIMULATE and not DEMO_SHORT_ENABLED:
@@ -14345,6 +14364,7 @@ def place_short(
             )
         except Exception as _e:
             log.debug(f"{tag} [シャドーSHORT] open エラー (黙殺): {_mask_secrets(_e)}")
+        _mark_order_fail(symbol, "空売りが無効な口座（シャドー記録のみ）", side="SHORT")
         return False
 
     # ── 起動時ポジション不明フラグチェック ────────────────────────────────────
@@ -14353,6 +14373,7 @@ def place_short(
             f"{tag} 🚫 発注ブロック（SHORT）: 起動時のポジション確認が取れていません。"
             f" moomooアプリでポジションを確認してからbotを再起動してください。"
         )
+        _mark_order_fail(symbol, "起動時のポジション確認が取れていない", side="SHORT")
         return False
 
     _is_fc_locked_s, _fc_elapsed_s = _is_failed_close_locked(symbol)
@@ -14361,6 +14382,7 @@ def place_short(
             f"{tag} 🚫 [決済FAILED中] 既存ポジションの決済が失敗中 ({_fc_elapsed_s:.1f}分前) "
             f"→ 新規SHORTをスキップ (既存ポジション解消を優先)"
         )
+        _mark_order_fail(symbol, "既存ポジションの決済が失敗中", side="SHORT")
         return False
 
     # SHORT 側にも対称ガードを適用 (LONG と同じく終盤の新規エントリーは即決済リスク)。
@@ -14375,6 +14397,7 @@ def place_short(
                          beneficiaries=beneficiaries, victims=victims,
                          outcome="blocked", block_stage="late_session",
                          block_reason=f"強制決済まで残り {_mins_to_close_s:.1f}分")
+        _mark_order_fail(symbol, "終盤エントリーブロック", side="SHORT")
         return False
 
     # place_buy の is_macro_downtrend() に対応する SHORT 側の対称ガード。
@@ -14395,6 +14418,7 @@ def place_short(
                              beneficiaries=beneficiaries, victims=victims,
                              outcome="blocked", block_stage="macro_uptrend",
                              block_reason=_ut_reason)
+            _mark_order_fail(symbol, "マクロ上昇トレンドで新規空売り停止", side="SHORT")
             return False
         # SPY は QQQ より約 40% 低ボラのため、QQQ ベース (+0.10%/+0.25%) では
         # SPY 単独上昇の検知精度が低い。SPY 専用閾値 (+0.07%/+0.15%) で補完。
@@ -14410,6 +14434,7 @@ def place_short(
                                  beneficiaries=beneficiaries, victims=victims,
                                  outcome="blocked", block_stage="spy_uptrend",
                                  block_reason=_spy_ut_reason)
+                _mark_order_fail(symbol, "SPY の上昇トレンド", side="SHORT")
                 return False
     elif symbol == "SMH":
         _is_up, _ut_reason = is_smh_uptrend()
@@ -14423,6 +14448,7 @@ def place_short(
                              beneficiaries=beneficiaries, victims=victims,
                              outcome="blocked", block_stage="smh_uptrend",
                              block_reason=_ut_reason)
+            _mark_order_fail(symbol, "SMH の上昇トレンド", side="SHORT")
             return False
 
     # place_buy の is_stock_downtrend() に対応する SHORT 側の対称ガード。
@@ -14442,6 +14468,7 @@ def place_short(
                              beneficiaries=beneficiaries, victims=victims,
                              outcome="blocked", block_stage="stock_uptrend",
                              block_reason=_stock_ut_reason)
+            _mark_order_fail(symbol, "個別株の上昇トレンド", side="SHORT")
             return False
 
     # ── ロングポジション残存チェック ─────────────────────────────────────────
@@ -14454,8 +14481,9 @@ def place_short(
         if not MOMENTUM_REVERSE_EXIT:
             log.info(
                 f"{tag} [SHORT前チェック] ロング {ts_pre.position_qty}株 保有中 → "
-                f"転換せず新規SHORTを見送り（MOMENTUM_REVERSE_EXIT=false・既存LONGは損切り/トレールに委ねる）"
+                f"転換せず新規SHORTを見送り（MOMENTUM_REVERSE_EXIT=false・既存LONGは、決済注文が出ていればその決済で、無ければ損切り/トレールで閉じます）"
             )
+            _mark_order_fail(symbol, "ロング保有中（転換しない設定）", side="SHORT")
             return False
         log.info(
             f"{tag} [SHORT前チェック] ロングポジション {ts_pre.position_qty}株 が残存 "
@@ -14468,6 +14496,7 @@ def place_short(
             f"先にロングを決済します。次のシグナルでショートを試みます。"
         ))
         place_close_all(symbol, trd_env, "ショート前ロング強制決済")
+        _mark_order_fail(symbol, "ロングを保有中のため、先に決済を試みる（空売りは次のシグナルで）", side="SHORT")
         return False
 
     # ※ 貸株在庫の事前確認はmoomoo APIに専用エンドポイントが存在しないため行わない。
@@ -14482,10 +14511,12 @@ def place_short(
                          beneficiaries=beneficiaries, victims=victims,
                          outcome="blocked", block_stage="quote_sanity",
                          block_reason=_qreason, quote_sanity=0)
+        _mark_order_fail(symbol, "気配の異常（異常クォートガード）", side="SHORT")
         return False
     limit_price = calc_limit_price(quote, "SELL", symbol)
     if limit_price <= 0:
         log.warning(f"{tag} 価格取得失敗: SHORT をスキップ")
+        _mark_order_fail(symbol, "気配の異常（異常クォートガード）", side="SHORT")
         return False
 
     ts_check = state.get(symbol)
@@ -14493,6 +14524,7 @@ def place_short(
         log.info(
             f"{tag} 既存 SHORT ポジション保有中 (qty={ts_check.position_qty}株) → 新規空売りスキップ"
         )
+        _mark_order_fail(symbol, "既存ショート保有中", side="SHORT")
         return False
 
     # ── ポートフォリオ上限チェック ────────────────────────────────────────────
@@ -14506,6 +14538,7 @@ def place_short(
                          outcome="blocked", block_stage="portfolio_cap",
                          block_reason=f"合計${portfolio_total:,.0f} ≥ 上限${_BUDGET_USD:,.0f}",
                          price_at_decision=quote_price(quote))
+        _mark_order_fail(symbol, "ポートフォリオ上限到達", side="SHORT")
         return False
 
     remaining_budget = _BUDGET_USD - portfolio_total
@@ -14528,7 +14561,9 @@ def place_short(
             log.info(
                 f"{tag} [空売り発注額] confidence={confidence:.4f} [{_size_label}]"
                 f" → 高ボラ銘柄サイズ調整 ${_order_size_before:,.0f} ÷ {_hv_mult:.1f}"
-                f" = ${order_size:,.0f}"
+                f" = ${_order_size_before / _hv_mult:,.0f}"
+                # 下限で切り上げた回に「÷N = 同額」と出て計算が合わなかった（利用者の報告）
+                f"{f' → 下限 ${ORDER_SIZE_MIN_USD:,.0f} を適用 = ${order_size:,.0f}' if order_size > _order_size_before / _hv_mult else ''}"
                 f" (損切り幅 {MAX_LOSS_PCT*100:.2f}%→{MAX_LOSS_PCT*_hv_mult*100:.2f}%)"
             )
         else:
@@ -14545,6 +14580,7 @@ def place_short(
                                  outcome="blocked", block_stage="insufficient_budget",
                                  block_reason=f"残余力${remaining_budget:,.0f} < 1株${limit_price:.2f}",
                          price_at_decision=quote_price(quote))
+                _mark_order_fail(symbol, "余力不足（1株に届かない）", side="SHORT")
                 return False
             order_size = remaining_budget
         _is_stock_sym_s = (symbol in STOCK_TICKERS
@@ -14557,6 +14593,7 @@ def place_short(
                     f"{tag} 個別株上限到達: {symbol}=${_sym_cost_s:,.0f}"
                     f" ≥ STOCK_MAX=${STOCK_MAX_USD:,.0f} → 空売りスキップ"
                 )
+                _mark_order_fail(symbol, "個別株の1銘柄上限に到達", side="SHORT")
                 return False
             _stock_remaining_s = STOCK_MAX_USD - _sym_cost_s
             if order_size > _stock_remaining_s:
@@ -14568,6 +14605,7 @@ def place_short(
                 order_size = _stock_remaining_s
                 if order_size < limit_price:
                     log.info(f"{tag} 個別株上限後に残余力不足 → 空売りスキップ")
+                    _mark_order_fail(symbol, "個別株の上限調整後に余力不足", side="SHORT")
                     return False
         qty = max(1, math.floor(order_size / limit_price))
         if qty * limit_price > remaining_budget:
@@ -14577,6 +14615,7 @@ def place_short(
                     f"{tag} 残余力 ${remaining_budget:,.0f} が1株の値段 ${limit_price:.2f} に"
                     f"届きません → 空売りスキップ（予算超過の防止）"
                 )
+                _mark_order_fail(symbol, "個別株の上限調整後に余力不足", side="SHORT")
                 return False
             log.info(f"{tag} 残余力に合わせて数量を調整: {qty} → {_qty_fit_s}株")
             qty = _qty_fit_s
@@ -14594,6 +14633,7 @@ def place_short(
                              outcome="blocked", block_stage="insufficient_budget",
                              block_reason=f"残余力${remaining_budget:,.0f} < 1株${limit_price:.2f}（数量指定）",
                              price_at_decision=quote_price(quote))
+            _mark_order_fail(symbol, "余力不足（1株に届かない）", side="SHORT")
             return False
         if qty > _max_qty_budget:
             log.info(
@@ -14653,6 +14693,7 @@ def place_short(
                     f"既存建玉との合計が口座の信用余力を超えたため、moomooが発注を拒否しました。\n"
                     f"BUDGET_USD を実際の信用余力の範囲内に設定してください（複数銘柄の同時保有を考慮）。"
                 ))
+                _mark_order_fail(symbol, "信用余力の不足で moomoo が発注を拒否", side="SHORT")
                 return False
             _borrow_keywords = (
                 "insufficient", "borrow", "short sell", "short position",
@@ -18958,6 +18999,7 @@ def _ovn_report_trade(st: dict, exit_price: float, exit_reason: str) -> None:
         )
         log.info(
             f"【{OVN_SYMBOL}】 [夜間持ち越し] [確定損益]"
+            f"  env={_env_tag()}"
             f"  realized_pnl={realized:+.2f}"
             f"  sell_avg={exit_price:.2f}"
             f"  buy_avg={entry:.2f}"
@@ -23601,7 +23643,11 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
         "ts":    re.compile(rf"^{TS}"),
         "order": re.compile(rf"{TS}.*?【{SYM}】.*?\[ORDER\]\s+(?P<side>BUY|SELL|SHORT).*?qty=(?P<qty>\d+).*?price=(?P<price>[\d.]+)", re.I),
         "fill":  re.compile(rf"{TS}.*?【{SYM}】.*?\[約定確認\].*?status=(?P<status>\S+)", re.I),
+        # env= は v3.9.199 から。実口座とデモを同じ機械で同時に動かすと、
+        # 1本のログに両方の決済が並び、集計が合算になっていた（利用者の報告）。
+        # 印の無い古い行は、これまでどおり対象にする（1口座だけの人は影響を受けない）。
         "rpnl":  re.compile(rf"{TS}.*?【{SYM}】.*?\[確定損益(?:\([^\]]*\))?\]"
+                            rf"(?:\s+env=(?P<env>REAL|DEMO))?"
                             rf".*?realized_pnl=(?P<pnl>[+-]?[\d.]+).*?qty=(?P<qty>\d+)", re.I),
         "risk":  re.compile(rf"{TS}.*?【{SYM}】.*?" + _DAILY_POSITION_PNL_RE_TAIL, re.I),
         "eod":   re.compile(rf"{TS}.*?(?:強制クローズ発動|EOD|close_all_for_|15:45)", re.I),
@@ -23663,6 +23709,11 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
                 continue
             mr=pats["rpnl"].search(line)
             if mr:
+                # 実口座とデモを同じ機械で動かすと1本のログに両方の決済が並ぶ。
+                # 自分の口座の行だけ数える（印の無い古い行は従来どおり数える）。
+                _row_env = (mr.groupdict().get("env") or "").upper()
+                if _row_env and _row_env != _env_tag():
+                    continue
                 try:
                     pv=float(mr.group("pnl"))
                     rpnl_total+=pv; trade_count+=1
