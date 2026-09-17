@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.200"
+BOT_VERSION = "v3.9.201"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -2409,6 +2409,15 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                 #   block_stage は "momentum_shadow" のまま（レポート・集計の読み手4つがこの値で行を拾う）。
                 _obs_final = _order_note if not _will_live_order else "実発注の候補（判定中）"
                 _obs_at = datetime.datetime.now()   # シグナルの時点（送るのは後でも、時刻はここ）
+                # ★ 2026-09-17: 注文を出した回は "ordered"。理由は2つ（利用者の確認依頼）。
+                #   ・結果の列だけを見たとき、モメンタムだけ「一度も発注していない」ように見えていた
+                #     （ニュース経路は前から ordered / blocked を使い分けている）。
+                #   ・当番制の間引き（既定20%・_momentum_shadow_is_reporter）は
+                #     「結果が ordered でなければ間引く」条件なので、当番でない環境が
+                #     実発注した回の観察ログが送られずに消えていた。いちばん貴重な1件が
+                #     いちばん残りにくい状態だった。
+                #   ブロック段階は "momentum_shadow" のまま（読み手4つはこの値で行を拾う）。
+                _obs_outcome = "blocked"
                 try:
 
                     if _against_trend:
@@ -2535,6 +2544,7 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                                 )
                             if _mom_ok:
                                 _obs_final = "実発注（注文を出した）"
+                                _obs_outcome = "ordered"
                                 log.info(f"[モメンタム実発注] {symbol} {side} 発注成功")
                             else:
                                 _obs_final = (f"見送り（place 側のガード: {_mom_why}）"
@@ -2565,7 +2575,7 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                         score=score,
                         category="MOMENTUM",
                         headlines=[f"[MOMENTUM SHADOW] {reason}"],
-                        outcome="blocked",
+                        outcome=_obs_outcome,
                         block_stage="momentum_shadow",
                         # 末尾の「最終」は削らない（あふれたら理由のほうを詰める）。
                         block_reason=_clip_block_reason(reason, f" ｜ 最終: {_obs_final}"),
