@@ -2306,7 +2306,10 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                 hypothetical_order_usd = _BUDGET_USD * (effective_size_pct / 100.0)
                 hypothetical_qty = round(hypothetical_order_usd / price, 2) if price > 0 else 0
 
-                _elig_tag = "live可" if _live_eligible else "シャドー専用"
+                # 2026-09-17（配布前レビュー）: 「シャドー専用」は銘柄そのものが実発注
+                #   できないと読める語で、同じ行の見送り理由（設定で外した/観察専用を
+                #   出し分ける）と食い違っていた。理由の詳細は _order_note 側にある。
+                _elig_tag = "live可" if _live_eligible else "実発注対象外"
                 reason = (
                     f"{symbol} 5m {pct_5:+.2f}% / 15m {pct_15:+.2f}%  "
                     f"強度={strength_label}  "
@@ -2517,21 +2520,9 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                         )
                         try:
                             _place_fn = place_buy if side == "BUY" else place_short
-                            # 2026-09-17: place 側で止まった回の理由を観察ログにも残す。
-                            #   place_* が置く印（_mark_order_fail）はスレッドごとの入れ物に
-                            #   入るため、別スレッドの finally からは読めない。呼んだその場
-                            #   （同じワーカースレッド）で取り出して返す。
-                            #   読み手のいない印を掃除することにもなる。
-                            _mark_side = "BUY" if side == "BUY" else "SHORT"
-                            def _place_and_take(_fn=_place_fn, _sym=symbol, _ms=_mark_side, **_kw):
-                                _r = _fn(_sym, trd_env, **_kw)
-                                try:
-                                    return _r, _take_order_fails([_sym], side=_ms)
-                                except Exception:
-                                    return _r, ""
                             async with _get_sym_lock(symbol):
                                 _mom_ok, _mom_why = await asyncio.to_thread(
-                                    _place_and_take,
+                                    _place_with_reason, _place_fn, symbol, side, trd_env,
                                     confidence=0.70,
                                     trigger=symbol,
                                     reason=f"[モメンタム] {reason}",
@@ -2547,8 +2538,11 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                                 _obs_outcome = "ordered"
                                 log.info(f"[モメンタム実発注] {symbol} {side} 発注成功")
                             else:
-                                _obs_final = (f"見送り（place 側のガード: {_mom_why}）"
-                                              if _mom_why else
+                                # 理由は "SPY: 余力不足…" の形で返る。1銘柄なので銘柄は落とす
+                                _why_txt = (_mom_why.split(": ", 1)[1]
+                                            if _mom_why.startswith(f"{symbol}: ") else _mom_why)
+                                _obs_final = (f"見送り（place 側のガード: {_why_txt}）"
+                                              if _why_txt else
                                               "見送り（place 側のガード・理由は直前のログ）")
                                 log.info(
                                     f"[モメンタム実発注] {symbol} {side} 発注見送り "
@@ -3715,10 +3709,43 @@ def _momentum_not_live_note(symbol: str) -> str:
     if _sym_on:
         return ("実発注なし・この方向は設定で実発注の対象外"
                 f"（{symbol} で有効なのは {' / '.join(_sym_on)}）")
-    if symbol in _MOMENTUM_LIVE_CAPABLE:
-        return (f"実発注なし・{symbol} を設定で実発注の対象にしていません"
-                "（Wizard の STEP 14 で選べます）")
-    return f"実発注なし・{symbol} は観察専用の銘柄（実発注には選べません）"
+    if symbol not in _MOMENTUM_LIVE_CAPABLE:
+        return f"実発注なし・{symbol} は観察専用の銘柄（実発注には選べません）"
+    # ここから先は「設定すれば実発注できる銘柄なのに、設定に入っていない」回。
+    # 入口の案内は運転の状態で変える（配布前レビュー: 無い入力欄へ案内しない）。
+    if not MOMENTUM_LIVE_TRADING:
+        return (f"実発注なし・{symbol} は実発注の対象外"
+                "（いまは記録のみの運転・実発注は設定で有効にします）")
+    if MOMENTUM_PROFILE_SELECT or MOMENTUM_PROFILE_SELECT_V2:
+        # 選抜のときは Wizard が STEP 14 [2-c] を尋ねない。そこへ案内すると迷わせる。
+        return (f"実発注なし・{symbol} は実発注の対象外"
+                "（選抜プロファイルが銘柄と方向を決めます）")
+    return (f"実発注なし・{symbol} を設定で実発注の対象にしていません"
+            "（Wizard の STEP 14 で選べます）")
+
+
+def _place_with_reason(place_fn, symbol: str, side: str, trd_env, **kw) -> tuple:
+    """発注を呼び、止まったときの理由も一緒に返す。戻りは (結果, 理由)。
+
+    place_* が置く理由の印（_mark_order_fail）はスレッドごとの入れ物に入るので、
+    asyncio.to_thread の外側（呼び出し元の finally）からは読めない。呼んだその場＝
+    同じワーカースレッドで取り出す必要がある。この関数ごと to_thread に渡すことで、
+    発注と取り出しが必ず同じスレッドに乗る。読み手のいない印の掃除にもなる。
+
+    印の鍵は売買の別（"BUY" / "SHORT"）で、シグナルの向き（"SELL_SHORT"）とは別の語。
+    取り違えると理由は常に空になり、総称の文言に戻る（気づきにくい）。
+    """
+    _mark_side = "BUY" if side == "BUY" else "SHORT"
+    try:
+        _r = place_fn(symbol, trd_env, **kw)
+    finally:
+        # 発注が例外で抜けた回も、印はここで落とす。残すと同じ銘柄・同じ向きの
+        # 次の回（30秒の寿命の内側）で前回の理由を今回の理由として出しうる。
+        try:
+            _why = _take_order_fails([symbol], side=_mark_side)
+        except Exception:
+            _why = ""
+    return _r, _why
 
 # 上級者向け個別オーバーライド (env 設定があれば LEVEL プリセットより優先)
 _MOMENTUM_QQQ_5M_OVERRIDE  = os.environ.get("MOMENTUM_QQQ_5M_PCT",  "").strip()
@@ -3785,8 +3812,11 @@ MOMENTUM_PREMARKET_FILTER_ENABLED: bool = (
 )
 # 対象銘柄 (env で絞り込み可、デフォルトは QQQ/SPY/SMH/IWM/DRAM)
 # 実発注に選べる銘柄（Wizard の STEP 14 が尋ねる範囲）。
-# ここに無い銘柄（IWM / DRAM）は観察専用で、設定しても実発注はしない。
-# 見送り理由の文言を「設定で外した」と「そもそも選べない」で分けるために使う。
+# 使うのは見送り理由の文言を「設定で外した」と「そもそも選べない」で分けるためだけ。
+# 発注の可否そのものは MOMENTUM_ENABLED_SIDES が決める（_momentum_side_allowed）。
+# ここに無い IWM / DRAM も、.env に手で書けば実発注の対象になる。この表は
+# 「Wizard では選べない」を表すのであって、Bot が発注を禁止しているのではない
+# （配布前レビューの指摘・この2つを混ぜて書くと、表を消せば発注が止まると読める）。
 _MOMENTUM_LIVE_CAPABLE: frozenset = frozenset({"SPY", "QQQ", "SMH"})
 
 _mom_syms_raw = os.environ.get("MOMENTUM_SYMBOLS", "QQQ,SPY,SMH,IWM,DRAM").strip()
@@ -5051,6 +5081,13 @@ SESSION_WEEKEND_CLOSED = "weekend_closed"
 # ── Ctrl+C 停止メッセージ ────────────────────────────────────────────────────
 # asyncio.run() がCtrl+Cを処理する前にSIGINTをキャッチして確実に表示する。
 _stop_message_shown = False
+
+# 停止が始まったかどうか。別スレッドで眠っている待ちがこれを見て切り上げる
+# （使い方と経緯は _sleep_unless_stopping の説明）。
+# ★ 定義はハンドラの登録（下の signal.signal）より前に置く。後ろに置くと、
+#   読み込みの途中で Ctrl+C が来たとき、ハンドラが立てた印をこの代入が消す
+#   （配布前レビューの指摘）。
+_shutting_down: bool = False
 
 def _sigint_handler(sig, frame):
     global _stop_message_shown, _shutting_down
@@ -7361,15 +7398,16 @@ def _sweep_session_begin() -> None:
 _SWEEP_VERIFY_ATTEMPTS: int = 3
 _SWEEP_VERIFY_RETRY_SEC: int = 20
 
-# ★ 2026-09-17: 停止中であることを、別スレッドの待ちに伝えるための印。
+# ★ 2026-09-17: 停止中（_shutting_down・定義は Ctrl+C のハンドラの手前）に、
+#   別スレッドで眠っている待ちを切り上げるための関数。
 #   Ctrl+C を1回押すと「[完了] 終了しました」はすぐ出るのに、プロセスが数十秒〜
 #   100秒以上残ることがあった（利用者の実測: 6.7秒／11.4秒／約104秒）。
-#   日次・週末の決済の裏取りが asyncio.to_thread のワーカースレッドで走り、
-#   ここで最大 10+20+20 秒眠る。main() を抜けたあと asyncio.run() が
-#   そのワーカーの終了を待つ（Python 3.9 の shutdown_default_executor には
-#   期限が無い）ため、眠り終わるまでプロセスが消えない。
-#   停止中は「待つ意味が無い」（結果を使う先がもう無い）ので、待ちを切り上げる。
-_shutting_down: bool = False
+#   決済の裏取り（最大 10+20+20 秒）とデータ収集の分散待ち（最大180秒）が
+#   asyncio.to_thread のワーカースレッドで眠り、main() を抜けたあと
+#   asyncio.run() がそのワーカーの終了を待つ（Python 3.9 の
+#   shutdown_default_executor には期限が無い）ため、眠り終わるまで消えない。
+#   停止の合図は Ctrl+C（SIGINT）のみ。タスクスケジューラや launchd からの
+#   停止（SIGTERM）では立たないので、そちらの終了は従来どおり。
 
 
 def _sleep_unless_stopping(sec: float) -> bool:
@@ -23737,12 +23775,15 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
     else:
         _delay_sec = _random.uniform(0, 180)   # 最大3分（asyncio 300秒制限の範囲内）
         log.info(f"[データ収集] 対象日={date_str}  {_delay_sec/60:.1f}分後に送信（分散処理）")
-    # 5秒刻みのループで待機（Ctrl+C 時にスレッドが即解放されるよう短く分割）
-    _waited = 0.0
-    while _waited < _delay_sec:
-        _chunk = min(5.0, _delay_sec - _waited)
-        _time.sleep(_chunk)
-        _waited += _chunk
+    # ★ 2026-09-17（配布前レビュー）: この待ちは Ctrl+C の終了を最大3分延ばしていた。
+    #   ここは週末決済・日次決済・セッション移行の直後にワーカースレッドで走るので、
+    #   停止の操作と重なりやすい。main() を抜けたあと asyncio.run() はワーカーの終了を
+    #   期限なしで待つため、眠っているぶんがそのまま終了の遅れになる。
+    #   （5秒刻みに割ってあったが、刻んでもスレッドは解放されない。旧コメントは誤り。）
+    #   停止中は待たずに送る。遅延は多人数の同時送信をばらけさせるためのもので、
+    #   止めようとしている1台が先に送っても困らない。送信そのものは飛ばさない。
+    if not _sleep_unless_stopping(_delay_sec):
+        log.info("[データ収集] 停止中のため分散待ちを切り上げて送信します")
 
     # セッション判定（ET基準）
     SESS = {"pre":(240,570),"rth":(570,960),"ath":(960,1200)}
