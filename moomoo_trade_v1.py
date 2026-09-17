@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.199"
+BOT_VERSION = "v3.9.200"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -2386,7 +2386,7 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                 elif _profile_block_reason:
                     _order_note = f"実発注なし・選抜プロファイル: {_profile_block_reason} → シャドーのみ"
                 elif not _live_eligible:
-                    _order_note = "実発注なし・シャドー専用銘柄 (Phase 1 でも発注対象外)"
+                    _order_note = _momentum_not_live_note(symbol)
                 elif not _long_range_ok:
                     _order_note = (
                         f"実発注なし・LONGレンジ外 "
@@ -2508,9 +2508,21 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                         )
                         try:
                             _place_fn = place_buy if side == "BUY" else place_short
+                            # 2026-09-17: place 側で止まった回の理由を観察ログにも残す。
+                            #   place_* が置く印（_mark_order_fail）はスレッドごとの入れ物に
+                            #   入るため、別スレッドの finally からは読めない。呼んだその場
+                            #   （同じワーカースレッド）で取り出して返す。
+                            #   読み手のいない印を掃除することにもなる。
+                            _mark_side = "BUY" if side == "BUY" else "SHORT"
+                            def _place_and_take(_fn=_place_fn, _sym=symbol, _ms=_mark_side, **_kw):
+                                _r = _fn(_sym, trd_env, **_kw)
+                                try:
+                                    return _r, _take_order_fails([_sym], side=_ms)
+                                except Exception:
+                                    return _r, ""
                             async with _get_sym_lock(symbol):
-                                _mom_ok = await asyncio.to_thread(
-                                    _place_fn, symbol, trd_env,
+                                _mom_ok, _mom_why = await asyncio.to_thread(
+                                    _place_and_take,
                                     confidence=0.70,
                                     trigger=symbol,
                                     reason=f"[モメンタム] {reason}",
@@ -2525,7 +2537,9 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                                 _obs_final = "実発注（注文を出した）"
                                 log.info(f"[モメンタム実発注] {symbol} {side} 発注成功")
                             else:
-                                _obs_final = "見送り（place 側のガード・理由は直前のログ）"
+                                _obs_final = (f"見送り（place 側のガード: {_mom_why}）"
+                                              if _mom_why else
+                                              "見送り（place 側のガード・理由は直前のログ）")
                                 log.info(
                                     f"[モメンタム実発注] {symbol} {side} 発注見送り "
                                     f"(place 側ガードによりスキップ)"
@@ -3677,6 +3691,25 @@ def _momentum_side_allowed(symbol: str, side: str) -> bool:
     key = f"{symbol}:{side}".upper()
     return key in MOMENTUM_ENABLED_SIDES
 
+
+def _momentum_not_live_note(symbol: str) -> str:
+    """実発注の対象でない理由。2026-09-17 まで一律「シャドー専用銘柄」だった。
+
+    「設定で外した銘柄」と「もともと観察専用の銘柄（IWM / DRAM）」が同じ文言だと、
+    SMH のように設定すれば実発注できる銘柄まで「発注対象外」に読める（利用者の報告。
+    同じ日の同じ SMH が、別の環境では [live可] と出ていた）。
+    この文言は観察ログの最終結果にもそのまま入るため、シート側の分析でも区別できなかった。
+    """
+    _sym_on = sorted(str(_s) for _s in MOMENTUM_ENABLED_SIDES
+                     if str(_s).upper().startswith(f"{symbol}:"))
+    if _sym_on:
+        return ("実発注なし・この方向は設定で実発注の対象外"
+                f"（{symbol} で有効なのは {' / '.join(_sym_on)}）")
+    if symbol in _MOMENTUM_LIVE_CAPABLE:
+        return (f"実発注なし・{symbol} を設定で実発注の対象にしていません"
+                "（Wizard の STEP 14 で選べます）")
+    return f"実発注なし・{symbol} は観察専用の銘柄（実発注には選べません）"
+
 # 上級者向け個別オーバーライド (env 設定があれば LEVEL プリセットより優先)
 _MOMENTUM_QQQ_5M_OVERRIDE  = os.environ.get("MOMENTUM_QQQ_5M_PCT",  "").strip()
 _MOMENTUM_QQQ_15M_OVERRIDE = os.environ.get("MOMENTUM_QQQ_15M_PCT", "").strip()
@@ -3741,6 +3774,11 @@ MOMENTUM_PREMARKET_FILTER_ENABLED: bool = (
     os.environ.get("MOMENTUM_PREMARKET_FILTER_ENABLED", "false").strip().lower() == "true"
 )
 # 対象銘柄 (env で絞り込み可、デフォルトは QQQ/SPY/SMH/IWM/DRAM)
+# 実発注に選べる銘柄（Wizard の STEP 14 が尋ねる範囲）。
+# ここに無い銘柄（IWM / DRAM）は観察専用で、設定しても実発注はしない。
+# 見送り理由の文言を「設定で外した」と「そもそも選べない」で分けるために使う。
+_MOMENTUM_LIVE_CAPABLE: frozenset = frozenset({"SPY", "QQQ", "SMH"})
+
 _mom_syms_raw = os.environ.get("MOMENTUM_SYMBOLS", "QQQ,SPY,SMH,IWM,DRAM").strip()
 MOMENTUM_SYMBOLS: tuple = tuple(s.strip().upper() for s in _mom_syms_raw.split(",") if s.strip())
 
@@ -5005,7 +5043,10 @@ SESSION_WEEKEND_CLOSED = "weekend_closed"
 _stop_message_shown = False
 
 def _sigint_handler(sig, frame):
-    global _stop_message_shown
+    global _stop_message_shown, _shutting_down
+    # 停止が始まったことを、別スレッドで眠っている待ちにも伝える
+    # （終了の待ち時間がここで決まる。詳細は _sleep_unless_stopping）。
+    _shutting_down = True
     if _stop_message_shown:
         # 2 回目の Ctrl+C: シャットダウン処理 (集計表示・Discord 送信) が
         # 固まっている場合に備え、ここで強制終了する。
@@ -7310,6 +7351,31 @@ def _sweep_session_begin() -> None:
 _SWEEP_VERIFY_ATTEMPTS: int = 3
 _SWEEP_VERIFY_RETRY_SEC: int = 20
 
+# ★ 2026-09-17: 停止中であることを、別スレッドの待ちに伝えるための印。
+#   Ctrl+C を1回押すと「[完了] 終了しました」はすぐ出るのに、プロセスが数十秒〜
+#   100秒以上残ることがあった（利用者の実測: 6.7秒／11.4秒／約104秒）。
+#   日次・週末の決済の裏取りが asyncio.to_thread のワーカースレッドで走り、
+#   ここで最大 10+20+20 秒眠る。main() を抜けたあと asyncio.run() が
+#   そのワーカーの終了を待つ（Python 3.9 の shutdown_default_executor には
+#   期限が無い）ため、眠り終わるまでプロセスが消えない。
+#   停止中は「待つ意味が無い」（結果を使う先がもう無い）ので、待ちを切り上げる。
+_shutting_down: bool = False
+
+
+def _sleep_unless_stopping(sec: float) -> bool:
+    """停止が始まったら途中で戻る待ち。最後まで待てたら True。
+
+    細かく刻んで印を見る。刻みを粗くすると、その粒度がそのまま終了の遅れになる。
+    """
+    _left = float(sec)
+    while _left > 0:
+        if _shutting_down:
+            return False
+        _step = 0.5 if _left > 0.5 else _left
+        time.sleep(_step)
+        _left -= _step
+    return not _shutting_down
+
 
 def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> bool:
     """
@@ -7321,7 +7387,11 @@ def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> 
     確認できないときは False（＝呼び出し側の再試行・監視継続に戻す）。
     """
     for _v_try in range(_SWEEP_VERIFY_ATTEMPTS):
-        time.sleep(_SWEEP_VERIFY_WAIT_SEC if _v_try == 0 else _SWEEP_VERIFY_RETRY_SEC)
+        if not _sleep_unless_stopping(
+                _SWEEP_VERIFY_WAIT_SEC if _v_try == 0 else _SWEEP_VERIFY_RETRY_SEC):
+            log.warning(f"[{log_prefix}] 停止中のため決済後の確認を打ち切ります"
+                        f"（{_v_try + 1}回目の待機中）。決済注文そのものは発注済みです")
+            return False
         _seq_before = _account_scan_seq
         try:
             sync_positions(trd_env)
