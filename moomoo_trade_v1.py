@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.201"
+BOT_VERSION = "v3.9.202"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -1185,6 +1185,8 @@ def _log_observation(
     block_reason: str = "",                # 詳細メッセージ
     price_at_decision: float = 0.0,
     live_allowed: Optional[bool] = None,   # この銘柄サイドが実発注対象か (実発注可否)
+    profile_allowed: Optional[bool] = None,  # 選抜と口座のゲートまで通した実発注可否
+    live_attempted: bool = False,          # 実発注を試した回か（当番制の間引きから外す）
     size_pct: Optional[float] = None,      # 実効投入サイズ%（budget 比）
     eff_stop_loss_pct: Optional[float] = None,  # 実効損切り%（この判定で使われる損切り幅）
     pct_5m: Optional[float] = None,        # モメンタム 5 分変化率%
@@ -1211,8 +1213,14 @@ def _log_observation(
         except Exception:
             pass
 
+    # ★ 2026-09-18（利用者のレビュー）: 停止で発注の待ちが取り消された回は、
+    #   注文は出ているのに outcome が "blocked" のままで、当番でない環境（既定8割）
+    #   では間引きで消えていた。発注を試した回は、当番かどうかに関係なく残す。
+    #   間引きは「同じ相場の同じ結果を全員が送る」ムダを減らすためのもので、
+    #   実際に注文を試した回はその環境にしか無い記録なので対象外にする。
     if (block_stage == "momentum_shadow"
             and outcome != "ordered"
+            and not live_attempted
             and not _momentum_shadow_is_reporter()):
         log.debug(f"[観察ログ] momentum_shadow 非当番のため送信スキップ ({symbol})")
         return
@@ -1314,6 +1322,13 @@ def _log_observation(
 
         if live_allowed is not None:
             payload_data["live_allowed"] = 1 if live_allowed else 0
+        # ★ 2026-09-18（利用者のレビュー）: live_allowed は MOMENTUM_ENABLED_SIDES に
+        #   在るかどうかだけで、選抜プロファイルと口座のゲートを見ていない。選抜 v2 が
+        #   外している SPY:BUY なども「実発注可否=1」で載るため、シートで絞って数えると
+        #   混ざる。意味の違う値を同じ列に混ぜないよう、置き換えではなく項目を足す
+        #   （シート側の列は GAS v9.34 以降。古い GAS では黙って捨てられる）。
+        if profile_allowed is not None:
+            payload_data["profile_allowed"] = 1 if profile_allowed else 0
         if size_pct is not None:
             payload_data["size_pct"] = round(float(size_pct), 3)
         if eff_stop_loss_pct is not None:
@@ -2266,6 +2281,10 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                 # MOMENTUM_ENABLED_SIDES のみ」に変更。SMH は ENABLED_SIDES に
                 # 含めないことで「シャドー専用 (観察のみ・実発注なし)」となる。
                 _live_eligible = _momentum_side_allowed(symbol, side)
+                # 選抜プロファイルと口座のゲートまで通した可否（観察ログ用）
+                _profile_live_ok = (f"{symbol}:{side}".upper()
+                                    in {str(_s).upper()
+                                        for _s in _momentum_effective_live_sides(trd_env)})
 
                 # クールダウン (同方向シグナル)
                 cooldown_key = f"{symbol}_{direction}"
@@ -2388,8 +2407,13 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     )
                 elif _profile_block_reason:
                     _order_note = f"実発注なし・選抜プロファイル: {_profile_block_reason} → シャドーのみ"
+                elif not MOMENTUM_LIVE_TRADING:
+                    # 記録のみの運転では、有効にした銘柄とそうでない銘柄で説明が
+                    # 分かれ、厚いほうが「有効にしていない銘柄」に出ていた
+                    # （利用者のレビュー）。同じ状態は同じ文言にする。
+                    _order_note = _momentum_not_live_note(symbol, trd_env)
                 elif not _live_eligible:
-                    _order_note = _momentum_not_live_note(symbol)
+                    _order_note = _momentum_not_live_note(symbol, trd_env)
                 elif not _long_range_ok:
                     _order_note = (
                         f"実発注なし・LONGレンジ外 "
@@ -2398,10 +2422,9 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     )
                 elif strength_multiplier <= 0:
                     _order_note = "実発注なし・強シグナルのためデータ収集のみ (発注対象外)"
-                elif MOMENTUM_LIVE_TRADING:
-                    _order_note = "実発注なし・実発注モードだが価格取得失敗等で見送り"
                 else:
-                    _order_note = "実発注なし・観察ログのみ (シャドーモード)"
+                    # ここに来るのは実発注モードのときだけ（記録のみは上で決着する）
+                    _order_note = "実発注なし・実発注モードだが価格取得失敗等で見送り"
                 log.info(
                     f"[モメンタム] 🎯 {direction} シグナル検出: {reason}  "
                     f"({_order_note}・次回 {MOMENTUM_COOLDOWN_MIN}分後まで同方向ロック)"
@@ -2421,6 +2444,7 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                 #     いちばん残りにくい状態だった。
                 #   ブロック段階は "momentum_shadow" のまま（読み手4つはこの値で行を拾う）。
                 _obs_outcome = "blocked"
+                _obs_attempted = False
                 try:
 
                     if _against_trend:
@@ -2445,6 +2469,7 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                                 )[:300],
                                 price_at_decision=price,
                                 live_allowed=_live_eligible,
+                                profile_allowed=_profile_live_ok,
                                 size_pct=effective_size_pct,
                                 eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
                                 pct_5m=pct_5,
@@ -2474,6 +2499,7 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                                 )[:300],
                                 price_at_decision=price,
                                 live_allowed=_live_eligible,
+                                profile_allowed=_profile_live_ok,
                                 size_pct=effective_size_pct,
                                 eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
                                 pct_5m=pct_5,
@@ -2513,6 +2539,7 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                         _will_live_order = False
                         _obs_final = "見送り（高値掴みガード）"
                     if _will_live_order:
+                        _obs_attempted = True   # 以降は当番制の間引きから外す
                         _mom_qty = max(1, int(hypothetical_order_usd / price))
                         log.warning(
                             f"[モメンタム実発注] {symbol} {side} {_mom_qty}株 "
@@ -2570,11 +2597,13 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                         category="MOMENTUM",
                         headlines=[f"[MOMENTUM SHADOW] {reason}"],
                         outcome=_obs_outcome,
+                        live_attempted=_obs_attempted,
                         block_stage="momentum_shadow",
                         # 末尾の「最終」は削らない（あふれたら理由のほうを詰める）。
                         block_reason=_clip_block_reason(reason, f" ｜ 最終: {_obs_final}"),
                         price_at_decision=price,
                         live_allowed=_live_eligible,
+                        profile_allowed=_profile_live_ok,
                         size_pct=effective_size_pct,
                         eff_stop_loss_pct=MOMENTUM_STOP_LOSS_PCT,
                         pct_5m=pct_5,
@@ -3696,23 +3725,27 @@ def _momentum_side_allowed(symbol: str, side: str) -> bool:
     return key in MOMENTUM_ENABLED_SIDES
 
 
-def _momentum_not_live_note(symbol: str) -> str:
+_MOMENTUM_SIDE_WORDS = ("BUY", "SELL_SHORT")
+
+
+def _momentum_not_live_note(symbol: str, trd_env=None) -> str:
     """実発注の対象でない理由。2026-09-17 まで一律「シャドー専用銘柄」だった。
 
     「設定で外した銘柄」と「もともと観察専用の銘柄（IWM / DRAM）」が同じ文言だと、
     SMH のように設定すれば実発注できる銘柄まで「発注対象外」に読める（利用者の報告。
     同じ日の同じ SMH が、別の環境では [live可] と出ていた）。
     この文言は観察ログの最終結果にもそのまま入るため、シート側の分析でも区別できなかった。
+
+    ★ 2026-09-18（利用者のレビュー）:
+      ・運転の状態（記録のみ・選抜プロファイル）は銘柄にも方向にもよらず効くので、
+        銘柄で決着する枝より先に見る。後ろに置いていたため、既定の設定では
+        この2つの説明に到達しなかった（銘柄を絞った環境でだけ読めていた）。
+      ・「有効なのは…」は設定の生の値ではなく、選抜と口座のゲートを通した後
+        （_momentum_effective_live_sides）を出す。通す前の値だと、選抜が外している
+        方向まで「有効」と書いてしまう。
+      ・`.env` の綴り違い（`SPY: BUY` や `SPY:SHORT`）は、判定では無効なのに
+        一覧には出ていた。表示は Bot が実際に受け付ける綴りだけにする。
     """
-    _sym_on = sorted(str(_s) for _s in MOMENTUM_ENABLED_SIDES
-                     if str(_s).upper().startswith(f"{symbol}:"))
-    if _sym_on:
-        return ("実発注なし・この方向は設定で実発注の対象外"
-                f"（{symbol} で有効なのは {' / '.join(_sym_on)}）")
-    if symbol not in _MOMENTUM_LIVE_CAPABLE:
-        return f"実発注なし・{symbol} は観察専用の銘柄（実発注には選べません）"
-    # ここから先は「設定すれば実発注できる銘柄なのに、設定に入っていない」回。
-    # 入口の案内は運転の状態で変える（配布前レビュー: 無い入力欄へ案内しない）。
     if not MOMENTUM_LIVE_TRADING:
         return (f"実発注なし・{symbol} は実発注の対象外"
                 "（いまは記録のみの運転・実発注は設定で有効にします）")
@@ -3720,8 +3753,19 @@ def _momentum_not_live_note(symbol: str) -> str:
         # 選抜のときは Wizard が STEP 14 [2-c] を尋ねない。そこへ案内すると迷わせる。
         return (f"実発注なし・{symbol} は実発注の対象外"
                 "（選抜プロファイルが銘柄と方向を決めます）")
-    return (f"実発注なし・{symbol} を設定で実発注の対象にしていません"
-            "（Wizard の STEP 14 で選べます）")
+    _sides = (_momentum_effective_live_sides(trd_env) if trd_env is not None
+              else sorted(MOMENTUM_ENABLED_SIDES))
+    _sym_on = sorted(str(_s) for _s in _sides
+                     if str(_s).upper().split(":", 1)[0] == symbol.upper()
+                     and str(_s).upper().split(":", 1)[-1] in _MOMENTUM_SIDE_WORDS)
+    if _sym_on:
+        return ("実発注なし・この方向は設定で実発注の対象外"
+                f"（{symbol} で有効なのは {' / '.join(_sym_on)}）")
+    if symbol in _MOMENTUM_LIVE_CAPABLE:
+        return (f"実発注なし・{symbol} を設定で実発注の対象にしていません"
+                "（Wizard の STEP 14 で選べます）")
+    return (f"実発注なし・{symbol} は観察専用の銘柄"
+            "（Wizard では実発注に選べません）")
 
 
 def _place_with_reason(place_fn, symbol: str, side: str, trd_env, **kw) -> tuple:
@@ -7437,8 +7481,17 @@ def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> 
     for _v_try in range(_SWEEP_VERIFY_ATTEMPTS):
         if not _sleep_unless_stopping(
                 _SWEEP_VERIFY_WAIT_SEC if _v_try == 0 else _SWEEP_VERIFY_RETRY_SEC):
-            log.warning(f"[{log_prefix}] 停止中のため決済後の確認を打ち切ります"
-                        f"（{_v_try + 1}回目の待機中）。決済注文そのものは発注済みです")
+            # ★ 2026-09-18（利用者のレビュー）: 決済対象が0件の回（注文を1件も
+            #   出していない）でも「発注済みです」と出ていた。台帳を見て書き分ける。
+            #   打ち切ると未約定の検出も飛ぶので、「確認していない」と明記する。
+            _today_orders = [e for e in _last_sweep_close_orders
+                             if e.get("day") == _sweep_today_et()]
+            log.warning(
+                f"[{log_prefix}] 停止中のため決済後の確認を打ち切ります"
+                f"（{_v_try + 1}回目の待機中）。"
+                + (f"決済注文は{len(_today_orders)}件出していますが、約定したかは確認していません"
+                   if _today_orders else
+                   "この回は決済の注文を出していません（対象の建玉なし）"))
             return False
         _seq_before = _account_scan_seq
         try:
@@ -8631,6 +8684,12 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
             for _wk_retry in range(4):
                 if _wk_ok:
                     break
+                if _shutting_down:
+                    # ★ 2026-09-18（利用者のレビュー）: 停止中は裏取りが即座に
+                    #   打ち切られるので、再試行しても空振りが並ぶだけで
+                    #   「決済しきれませんでした」という誤解を招く ERROR が出る。
+                    log.warning("[週末決済] 停止中のため再試行はしません（決済の状態は次回の起動時に確認します）")
+                    break
                 log.error(f"[週末決済] 決済しきれませんでした → 60秒後に再試行（{_wk_retry + 1}/4）")
                 await asyncio.sleep(60)
                 _wk_ok = await asyncio.to_thread(
@@ -8684,6 +8743,10 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 _dd_ok = await asyncio.to_thread(_sweep_close_verified, trd_env, "デモ日次決済")
             for _dd_retry in range(4):
                 if _dd_ok:
+                    break
+                if _shutting_down:
+                    # 週末決済と同じ理由（停止中は裏取りが即座に打ち切られる）
+                    log.warning("[デモ日次決済] 停止中のため再試行はしません（決済の状態は次回の起動時に確認します）")
                     break
                 log.error(f"[デモ日次決済] 決済しきれませんでした → 60秒後に再試行（{_dd_retry + 1}/4）")
                 await asyncio.sleep(60)
@@ -23783,7 +23846,12 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
     #   停止中は待たずに送る。遅延は多人数の同時送信をばらけさせるためのもので、
     #   止めようとしている1台が先に送っても困らない。送信そのものは飛ばさない。
     if not _sleep_unless_stopping(_delay_sec):
-        log.info("[データ収集] 停止中のため分散待ちを切り上げて送信します")
+        # ★ 2026-09-18（利用者のレビュー）: 待ちをゼロにすると、複数の環境が
+        #   同じ瞬間に止められたとき（タスクスケジューラ等）全部が同時に送る。
+        #   終了の速さはほぼ保ったまま、短い散らしだけ残す。
+        _short = _random.uniform(0, 3)
+        log.info(f"[データ収集] 停止中のため分散待ちを切り上げます（{_short:.1f}秒だけ散らして送信）")
+        _time.sleep(_short)
 
     # セッション判定（ET基準）
     SESS = {"pre":(240,570),"rth":(570,960),"ath":(960,1200)}
