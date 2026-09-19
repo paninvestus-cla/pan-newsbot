@@ -777,7 +777,7 @@ TOTAL = 16   # ★ v1.46: 14→16（戦略プロファイルを STEP1 に・OVN�
 
 # 既知ETFリスト（STOCK_TICKERS入力時のバリデーション用）
 # ★ v1.38: 版数は必ずここを更新する（起動バナー・ヘッダ表示で共用。取り残し防止）
-WIZARD_VERSION = "v1.52"
+WIZARD_VERSION = "v1.53"
 
 _KNOWN_ETFS = {
     "SPY", "QQQ", "SMH", "SPXL", "SPXS", "TQQQ", "SQQQ", "SOXL", "SOXS",
@@ -810,10 +810,29 @@ def _is_mom_select(profile):
     return str(profile or "").strip().lower() in ("select_v1", "select_v2")
 
 
+_MOM_SIDE_WORDS = ("BUY", "SELL_SHORT")
+
+
+def _mom_side_pairs(raw):
+    """★ v1.53: Bot が受け付ける綴りだけを取り出す（Bot の判定は完全一致）。
+
+    `SPY: BUY` や `SPY:SHORT` は Bot では実発注の対象にならないのに、Wizard の
+    確認画面は実発注のサイドとして出していた（Bot v3.9.203 の配布前レビュー）。
+    とくに `SPY: SELL_SHORT`（コロンの後に空白）は空売りの注記の判定にも当たらず、
+    空売りを止めている口座で「実発注される」と読める表示になっていた。
+    """
+    out = []
+    for p in (raw or "").split(","):
+        p = p.strip().upper()
+        if ":" in p and p.split(":", 1)[-1] in _MOM_SIDE_WORDS:
+            out.append(p)
+    return out
+
+
 def _effective_select_v2_sides(raw):
     """★ v1.50: 選抜プロファイル v2 の絞り込み後に残る実発注サイド（Bot の _momentum_effective_live_sides と同じ式:
     SPY を外し、SMH の買いを外す）。"""
-    pairs = [p.strip().upper() for p in (raw or "").split(",") if ":" in p]
+    pairs = _mom_side_pairs(raw)
     return ",".join(p for p in pairs if not p.startswith("SPY:") and p != "SMH:BUY")
 
 
@@ -1431,7 +1450,7 @@ def step5_session(existing, base_conf):
 def _effective_select_sides(raw):
     """★ v1.46: 選抜プロファイルが絞り込んだ後に残る実発注サイド（Bot の _momentum_effective_live_sides と同じ式:
     空売りだけ・SPY は外す）。"""
-    pairs = [p.strip().upper() for p in (raw or "").split(",") if ":" in p]
+    pairs = _mom_side_pairs(raw)
     return ",".join(p for p in pairs if p.endswith(":SELL_SHORT") and not p.startswith("SPY:"))
 
 
@@ -1457,7 +1476,10 @@ def _fmt_momentum_live(config):
         if not eff:
             return "（選抜 v2 の絞り込み後、実発注の対象なし。QQQ の売買・SMH の売りがどれも設定にありません）"
         return _fmt_momentum_sides(eff) + "（選抜プロファイル v2 が絞り込み・SPY と SMH の買いは記録のみ）" + _short_gate_note(config, eff)
-    return _fmt_momentum_sides(raw) + _short_gate_note(config, raw)
+    # ★ v1.53: 空売りの注記も、Bot が受け付ける綴りだけを見る（`SPY: SELL_SHORT` は
+    #   Bot では空売りとして扱われないので、注記の対象にもしない）。
+    _raw_eff = ",".join(_mom_side_pairs(raw))
+    return _fmt_momentum_sides(_raw_eff) + _short_gate_note(config, _raw_eff)
 
 
 def _fmt_account(config):
@@ -1470,7 +1492,7 @@ def _fmt_account(config):
 
 def _fmt_momentum_sides(raw):
     """MOMENTUM_ENABLED_SIDES を『SPY-売 / QQQ-売買 / IWM-売』形式に整形して返す。"""
-    pairs = [p.strip().upper() for p in (raw or "").split(",") if ":" in p]
+    pairs = _mom_side_pairs(raw)   # ★ v1.53: Bot が受け付けない綴りは出さない
     bysym = {}
     for p in pairs:
         sym, side = p.split(":", 1)

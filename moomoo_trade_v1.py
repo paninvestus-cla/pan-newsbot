@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.202"
+BOT_VERSION = "v3.9.203"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -1329,10 +1329,12 @@ def _log_observation(
         #   （シート側の列は GAS v9.34 以降。古い GAS では黙って捨てられる）。
         if profile_side_allowed is not None:
             payload_data["profile_side_allowed"] = 1 if profile_side_allowed else 0
-        # 運転の状態（実発注モードか、記録のみか）。サイドが対象でも、記録のみの
-        # 運転なら実発注はされない。シートで「実発注され得た回」を絞るには
-        # この2つが要る（配布前レビュー）。
-        if block_stage == "momentum_shadow":
+            # 運転の状態（実発注モードか、記録のみか）。サイドが対象でも、記録のみの
+            # 運転なら実発注はされない。シートで「実発注され得た回」を絞るには
+            # この2つが要る（配布前レビュー）ので、片方だけの行を作らない。
+            # ★ 2026-09-19（利用者のレビュー）: momentum_shadow だけに付けていたため、
+            #   同じ絞り込みが trend_filter_ab / premarket_filter_ab の段でできなかった。
+            #   キーが無い行（旧版）と 0 の行は、シート側で同じに扱わないこと。
             payload_data["live_trading"] = 1 if MOMENTUM_LIVE_TRADING else 0
         if size_pct is not None:
             payload_data["size_pct"] = round(float(size_pct), 3)
@@ -2017,11 +2019,33 @@ def _select_profile_block_reason(symbol: str, side: str, now_et_hour: int,
     return None
 
 
-def _momentum_effective_live_sides(trd_env: TrdEnv) -> list:
+# Bot が発注の可否を決めるときの方向の語（判定は完全一致・_momentum_side_allowed）。
+# ★ 2026-09-19（利用者のレビュー）: 定義が _momentum_effective_live_sides より後ろに
+#   あった。呼び出し時に解決されるので動いてはいたが、読み込みの途中で呼ぶ経路が
+#   増えると NameError になるため前へ出す。
+_MOMENTUM_SIDE_WORDS = ("BUY", "SELL_SHORT")
+
+
+def _momentum_effective_live_sides(trd_env: TrdEnv, apply_account_gate: bool = True) -> list:
     """口座別ゲートまで適用した「実際に実発注され得るサイド」の一覧（表示用の正）。
 
+    apply_account_gate=False にすると、口座のゲート（空売りを止める設定）を当てる
+    手前の一覧が返る。見送り理由で「選抜プロファイルが外した」のか「口座の設定で
+    外れた」のかを分けるために使う（利用者のレビュー・v3.9.203）。既定は True
+    なので、既存の呼び出しの挙動は変わらない。
     """
-    sides = sorted(MOMENTUM_ENABLED_SIDES)
+    # ★ 2026-09-19（利用者のレビュー）: Bot が受け付ける綴りだけを「実発注され得る
+    #   サイド」と呼ぶ。判定は完全一致なので、`SPY: BUY` や `SPY:SHORT` は発注され得ない。
+    #   v3.9.202 は見送り理由の文言の中だけで落としていたため、起動バナーの
+    #   live-eligible・起動サマリの実発注対象サイド・「うち実発注可」には残っていた。
+    #   さらに `SPY: SELL_SHORT`（コロンの後に空白）は口座のゲート（endswith）にも
+    #   当たらず、空売りを止めていても「実発注可」に居座り、_momentum_demo_short_note の
+    #   「この組み合わせでは実発注は発生しません」という安全側の注記を黙って消していた。
+    #   MOMENTUM_ENABLED_SIDES 自体は直さない（_momentum_live_symbols がここから
+    #   監視対象の銘柄を取り出しているので、落とすと監視ごと消える）。
+    sides = sorted(sd for sd in MOMENTUM_ENABLED_SIDES
+                   if ":" in str(sd)
+                   and str(sd).upper().split(":", 1)[-1] in _MOMENTUM_SIDE_WORDS)
     if MOMENTUM_PROFILE_SELECT:
         sides = [sd for sd in sides
                  if sd.endswith(":SELL_SHORT")
@@ -2030,10 +2054,11 @@ def _momentum_effective_live_sides(trd_env: TrdEnv) -> list:
         sides = [sd for sd in sides
                  if sd.split(":", 1)[0] not in _SELECT_V2_EXCLUDED_SYMBOLS
                  and sd not in _SELECT_V2_EXCLUDED_SIDES]
-    if trd_env == TrdEnv.REAL and not REAL_SHORT_ENABLED:
-        sides = [sd for sd in sides if not sd.endswith(":SELL_SHORT")]
-    if trd_env == TrdEnv.SIMULATE and not DEMO_SHORT_ENABLED:
-        sides = [sd for sd in sides if not sd.endswith(":SELL_SHORT")]
+    if apply_account_gate:
+        if trd_env == TrdEnv.REAL and not REAL_SHORT_ENABLED:
+            sides = [sd for sd in sides if not sd.endswith(":SELL_SHORT")]
+        if trd_env == TrdEnv.SIMULATE and not DEMO_SHORT_ENABLED:
+            sides = [sd for sd in sides if not sd.endswith(":SELL_SHORT")]
     return sides
 
 
@@ -2162,6 +2187,20 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
         f"クールダウン={MOMENTUM_COOLDOWN_MIN}分, "
         f"最大発注額={MOMENTUM_ORDER_SIZE_PCT}% of BUDGET)"
     )
+    # ★ 2026-09-19（配布前レビュー）: 綴り違いは表示から落としたが、黙って落とすと
+    #   「設定したのに一覧に出ない」だけになる。起動時に名指しで警告する。
+    #   MOMENTUM_ENABLED_SIDES 自体は直さない（監視対象の銘柄がここから出るため、
+    #   落とすと綴り違いしか書いていない銘柄が監視ごと消える）。
+    _mom_typo = sorted(str(_sd) for _sd in MOMENTUM_ENABLED_SIDES
+                       if ":" not in str(_sd)
+                       or str(_sd).upper().split(":", 1)[-1] not in _MOMENTUM_SIDE_WORDS)
+    if _mom_typo:
+        log.warning(
+            f"[モメンタム] ⚠ MOMENTUM_ENABLED_SIDES に Bot が受け付けない綴りがあります: "
+            f"{_mom_typo} → この指定では実発注されません"
+            f"（受け付ける綴りは SPY:BUY / SPY:SELL_SHORT の形。コロンの前後に空白を入れない）。"
+            f" 銘柄の監視には入れてあります。"
+        )
     if MOMENTUM_LIVE_TRADING:
         _demo_short_note = _momentum_demo_short_note(trd_env)
         _live_sides_disp = _momentum_effective_live_sides(trd_env)
@@ -2417,9 +2456,9 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     # 記録のみの運転では、有効にした銘柄とそうでない銘柄で説明が
                     # 分かれ、厚いほうが「有効にしていない銘柄」に出ていた
                     # （利用者のレビュー）。同じ状態は同じ文言にする。
-                    _order_note = _momentum_not_live_note(symbol, trd_env)
+                    _order_note = _momentum_not_live_note(symbol, trd_env, side=side)
                 elif not _live_eligible:
-                    _order_note = _momentum_not_live_note(symbol, trd_env)
+                    _order_note = _momentum_not_live_note(symbol, trd_env, side=side)
                 elif not _long_range_ok:
                     _order_note = (
                         f"実発注なし・LONGレンジ外 "
@@ -2553,6 +2592,13 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                         try:
                             _place_fn = place_buy if side == "BUY" else place_short
                             async with _get_sym_lock(symbol):
+                                # ★ 2026-09-19（利用者のレビュー）: 印は発注を呼ぶ
+                                #   直前に立て、どの抜け方でも下ろさない。CancelledError の
+                                #   枝だけで立てると、発注中の例外で抜けた回（注文が
+                                #   出ているかもしれない）が当番でない環境で消え、逆に
+                                #   銘柄ロックの待ちで取り消された回（まだ1件も発注して
+                                #   いない）が免除されていた。
+                                _obs_attempted = True
                                 _mom_ok, _mom_why = await asyncio.to_thread(
                                     _place_with_reason, _place_fn, symbol, side, trd_env,
                                     confidence=0.70,
@@ -2565,6 +2611,14 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                                     entry_pct_5m=pct_5,
                                     entry_pct_15m=pct_15,
                                 )
+                                # ★ 2026-09-19（配布前レビュー）: 戻ってきた＝注文が
+                                #   出たか出なかったかが分かった回。印は「分からない回」
+                                #   だけの免除なので、ここで下ろす。下ろさないと、place
+                                #   側のゲートで毎回止まる構成（実口座で空売りを止めて
+                                #   いる等）が全シグナルを送り、間引きの意味が薄れる。
+                                #   発注できた回は outcome が ordered なので、印が
+                                #   無くても間引かれない。
+                                _obs_attempted = False
                             if _mom_ok:
                                 _obs_final = "実発注（注文を出した）"
                                 _obs_outcome = "ordered"
@@ -2586,11 +2640,10 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                             # まま残すと、確定したように見えて後から直せない
                             # （配布前レビュー指摘・v3.9.199）。
                             _obs_final = "不明（発注の待ちが取り消された・Bot 停止など）"
-                            # ★ 2026-09-18（配布前レビュー）: 当番制の間引きから外すのは
-                            #   この回だけにする。発注を呼ぶ前から立てると、place 側の
-                            #   ゲートで毎回止まる構成（実口座で空売りを止めている等）が
-                            #   全シグナルを送るようになり、間引きの意味が薄れる。
-                            _obs_attempted = True
+                            # 当番制の間引きを外す印（_obs_attempted）は発注の直前で
+                            # 立ててある。シグナルの段階から立てると、place 側のゲートで
+                            # 毎回止まる構成（実口座で空売りを止めている等）が全シグナルを
+                            # 送るようになり、間引きの意味が薄れる（配布前レビュー）。
                             raise
                         except Exception as _e_mom:
                             _obs_final = "見送り（発注時のエラー）"
@@ -3735,10 +3788,7 @@ def _momentum_side_allowed(symbol: str, side: str) -> bool:
     return key in MOMENTUM_ENABLED_SIDES
 
 
-_MOMENTUM_SIDE_WORDS = ("BUY", "SELL_SHORT")
-
-
-def _momentum_not_live_note(symbol: str, trd_env=None) -> str:
+def _momentum_not_live_note(symbol: str, trd_env=None, side: str = "") -> str:
     """実発注の対象でない理由。2026-09-17 まで一律「シャドー専用銘柄」だった。
 
     「設定で外した銘柄」と「もともと観察専用の銘柄（IWM / DRAM）」が同じ文言だと、
@@ -3755,6 +3805,18 @@ def _momentum_not_live_note(symbol: str, trd_env=None) -> str:
         「設定していません」と言わない。直す場所を間違えるため。
       ・`.env` の綴り違い（`SPY: BUY` / `SPY:SHORT`）は判定では効かないので一覧に出さない。
       ・trd_env が無いときは「有効なのは…」を出さない（生の設定値に黙って戻らない）。
+
+    2026-09-19（利用者のレビュー）:
+      ・原因を1文の中で2つ名指ししない。ゲート通過後が空のとき、選抜プロファイルが
+        外したのか口座の設定で外れたのかを、口座のゲートを当てる前の一覧と比べて分ける。
+      ・方向を受け取り、本当にその方向が対象外のときだけ「（この方向は対象外）」と書く。
+        記録のみの運転では有効にしてある方向でもここへ来るので、一覧に当の方向が
+        載っているのに対象外と書く矛盾が出ていた。
+      ・選抜プロファイルのときは Wizard の STEP 14 へ案内しない（v3.9.201 と同じ理由。
+        202 の新しい文言で戻ってしまっていた）。
+      ・`.env` に手で書いて実発注の対象にしている銘柄を「観察専用の銘柄」と言わない。
+        _MOMENTUM_LIVE_CAPABLE は「Wizard では選べない」を表すだけで、発注の可否は
+        MOMENTUM_ENABLED_SIDES が決めるため。
     """
     _sym_u = symbol.upper()
 
@@ -3763,24 +3825,65 @@ def _momentum_not_live_note(symbol: str, trd_env=None) -> str:
                       if str(_s).upper().split(":", 1)[0] == _sym_u
                       and str(_s).upper().split(":", 1)[-1] in _MOMENTUM_SIDE_WORDS)
 
-    if symbol not in _MOMENTUM_LIVE_CAPABLE:
+    def _has(_list):
+        """この回の方向がその一覧に在るか。
+
+        ★ 2026-09-19（配布前レビュー）: 銘柄単位で見ると、別の方向が原因判定に
+          混ざる。Wizard の既定（SPY は空売りだけ）で空売りを止めている環境の
+          「SPY の買いの見送り」に「空売りを止める設定をご確認ください」と出ていた。
+          SPY:BUY はそもそも設定していないので、空売りを有効にしても買いは出ない。
+          方向が分かるときはその方向だけを見る（分からないときは銘柄単位のまま）。
+        """
+        if not side:
+            return bool(_list)
+        return f"{symbol}:{side}".upper() in {str(_s).upper() for _s in _list}
+
+    _cfg_on = _sides_of(MOMENTUM_ENABLED_SIDES)
+    _on = _sides_of(_momentum_effective_live_sides(trd_env)) if trd_env is not None else []
+    _gate_off = (_sides_of(_momentum_effective_live_sides(trd_env, apply_account_gate=False))
+                 if trd_env is not None else [])
+    # 方向が分かっていて、その銘柄に別の設定がある回は、銘柄ではなく方向の話として書く。
+    _side_ja = {"BUY": "買い", "SELL_SHORT": "空売り"}.get(str(side).upper(), "")
+    _subject = f"{symbol} の{_side_ja}" if (_side_ja and _cfg_on) else symbol
+    if symbol not in _MOMENTUM_LIVE_CAPABLE and not _cfg_on:
         _stand = f"{symbol} は観察専用の銘柄（Wizard では実発注に選べません）"
     elif trd_env is None:
         _stand = f"{symbol} はこの回の実発注の対象外"
-    else:
-        _on = _sides_of(_momentum_effective_live_sides(trd_env))
-        if _on:
-            _stand = f"{symbol} で有効なのは {' / '.join(_on)}（この方向は対象外）"
-        elif _sides_of(MOMENTUM_ENABLED_SIDES):
-            _stand = (f"{symbol} は設定していますが、いまの口座の設定では実発注しません"
-                      "（空売りを止める設定などをご確認ください）")
+    elif _on:
+        # 有効な方向が残っているとき。この方向が落ちた理由も、分かるなら名指しする
+        #（配布前レビュー: 設定したはずの空売りが消えた理由が出ていなかった）。
+        if not side:
+            # 方向が分からないときは、従来どおり「対象外」とだけ書く（原因は名指しできない）
+            _why_this = "（この方向は対象外）"
+        elif f"{symbol}:{side}".upper() in {str(_s).upper() for _s in _on}:
+            _why_this = ""
+        elif _has(_gate_off):
+            _why_this = "（この方向は、いまの口座の設定では実発注しません）"
+        elif _has(_cfg_on):
+            _why_this = "（この方向は、いまの選抜プロファイルでは対象外）"
         else:
-            _stand = f"{symbol} を設定で実発注の対象にしていません（Wizard の STEP 14 で選べます）"
+            _why_this = "（この方向は対象外）"
+        _stand = f"{symbol} で有効なのは {' / '.join(_on)}" + _why_this
+    elif _has(_gate_off):
+        _stand = (f"{_subject} は設定していますが、いまの口座の設定では実発注しません"
+                  "（空売りを止める設定などをご確認ください）")
+    elif _has(_cfg_on):
+        # 選抜が外した回。選抜を使っていなければ _gate_off と同じ集合になるので
+        # ここへは来ないが、文が断定にならないよう、そのときの語も用意しておく。
+        _why_off = ("いまの選抜プロファイルでは"
+                    if (MOMENTUM_PROFILE_SELECT or MOMENTUM_PROFILE_SELECT_V2)
+                    else "いまの設定では")
+        _stand = f"{_subject} は設定していますが、{_why_off}実発注の対象外です"
+    elif MOMENTUM_PROFILE_SELECT or MOMENTUM_PROFILE_SELECT_V2:
+        # 選抜のときは Wizard が STEP 14 [2-c] を尋ねないので、そこへ案内しない。
+        # 「選抜が外した」とも書かない（設定に無いものを外したのは選抜ではない）。
+        _stand = f"{_subject} は実発注の対象に入っていません"
+    else:
+        _stand = f"{_subject} を設定で実発注の対象にしていません（Wizard の STEP 14 で選べます）"
 
     if not MOMENTUM_LIVE_TRADING:
         return f"実発注なし・いまは記録のみの運転（{_stand}）"
     if MOMENTUM_PROFILE_SELECT or MOMENTUM_PROFILE_SELECT_V2:
-        # 選抜のときは Wizard が STEP 14 [2-c] を尋ねない。そこへ案内すると迷わせる。
         return f"実発注なし・実発注の銘柄と方向は選抜プロファイルが決めます（{_stand}）"
     return f"実発注なし・{_stand}"
 
@@ -7513,7 +7616,8 @@ def _sweep_close_verified(trd_env: TrdEnv, log_prefix: str = "週末決済") -> 
                 f"（{_v_try + 1}回目の待機中）。"
                 + (f"決済注文は{len(_today_orders)}件出していますが、約定したかは確認していません"
                    if _today_orders else
-                   "この回は決済の注文を出していません（対象の建玉なし）"))
+                   "この回は決済の注文を出していません"
+                   "（決済対象がなかったか、対象外として見送った建玉のみです）"))
             return False
         _seq_before = _account_scan_seq
         try:
@@ -8703,14 +8807,17 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
             _wk_ok = await asyncio.to_thread(close_all_for_weekend, trd_env, close_reason)
             if _wk_ok:
                 _wk_ok = await asyncio.to_thread(_sweep_close_verified, trd_env, "週末決済")
+            # ★ 2026-09-19（利用者のレビュー）: ここに「停止中は再試行しない」分岐を
+            #   置いていたが、Ctrl+C では到達しない。asyncio.run の後始末が全タスクを
+            #   取り消すため、このコルーチンは停止時点で待っていた await
+            #   （to_thread や sleep）で CancelledError を受けて抜け、以降の行へ戻らない。
+            #   実ログでも裏が取れている（停止した回に「決済しきれませんでした」は
+            #   利用者の33本・こちらの保存ログのいずれにも0件）。到達しない分岐は
+            #   「停止中は再試行に入らない」という事実でない説明を残すので戻した。
+            #   到達させるには停止の設計そのもの（SIGTERM ハンドラ・CancelledError の
+            #   扱い）を変えることになり、停止中に決済注文が出る／出ないも変わる。
             for _wk_retry in range(4):
                 if _wk_ok:
-                    break
-                if _shutting_down:
-                    # ★ 2026-09-18（利用者のレビュー）: 停止中は裏取りが即座に
-                    #   打ち切られるので、再試行しても空振りが並ぶだけで
-                    #   「決済しきれませんでした」という誤解を招く ERROR が出る。
-                    log.warning("[週末決済] 停止中のため再試行はしません（決済の状態は次回の起動時に確認します）")
                     break
                 log.error(f"[週末決済] 決済しきれませんでした → 60秒後に再試行（{_wk_retry + 1}/4）")
                 await asyncio.sleep(60)
@@ -8718,12 +8825,7 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                     close_all_for_weekend, trd_env, f"{close_reason}（再試行{_wk_retry + 1}）")
                 if _wk_ok:
                     _wk_ok = await asyncio.to_thread(_sweep_close_verified, trd_env, "週末決済")
-            if not _wk_ok and _shutting_down:
-                # ★ 2026-09-18（配布前レビュー）: 停止で確認を打ち切った回は、
-                #   「再試行しても決済しきれません」でも「監視は続行します」でもない。
-                #   この2つを混ぜると、停止のたびに赤い行が出て本物の失敗が埋もれる。
-                log.warning("[週末決済] 停止中のため確認を終えていません（決済の状態は次回の起動時に確認します）")
-            elif not _wk_ok:
+            if not _wk_ok:
                 # 決済しきれないまま週末停止に入ると建玉が無監視で残る。
                 # 監視は止めず、通常運転のまま次のループへ（損切り・時間切れは動き続ける）。
                 log.error(
@@ -8768,12 +8870,9 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 f"デモ日次決済（{close_trigger_time.strftime('%H:%M')} ET）")
             if _dd_ok:
                 _dd_ok = await asyncio.to_thread(_sweep_close_verified, trd_env, "デモ日次決済")
+            # 週末決済と同じ理由で v3.9.201 の形へ戻した（上のコメント参照）。
             for _dd_retry in range(4):
                 if _dd_ok:
-                    break
-                if _shutting_down:
-                    # 週末決済と同じ理由（停止中は裏取りが即座に打ち切られる）
-                    log.warning("[デモ日次決済] 停止中のため再試行はしません（決済の状態は次回の起動時に確認します）")
                     break
                 log.error(f"[デモ日次決済] 決済しきれませんでした → 60秒後に再試行（{_dd_retry + 1}/4）")
                 await asyncio.sleep(60)
@@ -8782,10 +8881,7 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                     f"デモ日次決済（再試行{_dd_retry + 1}）")
                 if _dd_ok:
                     _dd_ok = await asyncio.to_thread(_sweep_close_verified, trd_env, "デモ日次決済")
-            if not _dd_ok and _shutting_down:
-                # 週末決済と同じ理由（停止の打ち切りと、再試行を尽くした失敗は別物）
-                log.warning("[デモ日次決済] 停止中のため確認を終えていません（決済の状態は次回の起動時に確認します）")
-            elif not _dd_ok:
+            if not _dd_ok:
                 log.error(
                     "[デモ日次決済] 🔴 再試行しても決済しきれません → 監視は止めずに続行します"
                 )
@@ -23876,9 +23972,11 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
     #   停止中は待たずに送る。遅延は多人数の同時送信をばらけさせるためのもので、
     #   止めようとしている1台が先に送っても困らない。送信そのものは飛ばさない。
     if not _sleep_unless_stopping(_delay_sec):
-        # ★ 2026-09-18（利用者のレビュー）: 待ちをゼロにすると、複数の環境が
-        #   同じ瞬間に止められたとき（タスクスケジューラ等）全部が同時に送る。
+        # ★ 2026-09-18（利用者のレビュー）: 待ちをゼロにすると、複数の環境へ
+        #   同時に Ctrl+C を送ったとき全部が同時に送る。
         #   終了の速さはほぼ保ったまま、短い散らしだけ残す。
+        #   （2026-09-19: この印が立つのは Ctrl+C だけ。SIGTERM や強制終了では
+        #     立たないので対象外。タスクスケジューラが CTRL_C_EVENT を送る構成なら届く。）
         _short = _random.uniform(0, 3)
         log.info(f"[データ収集] 停止中のため分散待ちを切り上げます（{_short:.1f}秒だけ散らして送信）")
         _time.sleep(_short)
