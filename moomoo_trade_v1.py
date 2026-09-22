@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.205"
+BOT_VERSION = "v3.9.206"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -2442,10 +2442,31 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     if _profile_block_reason:
                         _will_live_order = False
 
-                if _will_live_order:
+                # ★ 2026-09-22（配布前の3者レビュー）: 並びを変えた。選抜と口座のゲートで
+                #   外れた方向は、ほかのガードより先に、その理由で決着させる。
+                #   ・選抜の判定（_profile_block_reason）は LONG レンジを通った回にしか走らない。
+                #     レンジで落ちた回と通った回で同じ状態が別の文言になり、シートで
+                #     「最終」の文字列ごとに数えると割れていた。
+                #   ・トレンド逆行・プレマーケット・同時保有上限も、選抜が外した方向に
+                #     先に出ていた。「そのガードを外せば買える」と読めるが、外しても買わない。
+                #   ・口座のゲート（空売りを止める設定）は _will_live_order に入っていない
+                #     （place_* 側で止まる）。v3.9.204 でタグを [実発注対象外] にしたため、
+                #     同じ行の「⚡ 実発注の候補」と食い違っていた。
+                #   表示だけの変更で、発注の可否（_will_live_order）とガードの順序は変えていない。
+                if _will_live_order and _profile_side_ok:
                     # この後に高値掴みガードと place 側のガードがある。ここで「実発注」と言い切ると、直後に見送った回が
                     # 発注済みに読める（利用者の報告）。最終結果は後続の「発注試行」「見送り」の行で出る。
                     _order_note = "⚡ 実発注の候補 (Phase 1・発注前のガードで見送る場合あり)"
+                elif not MOMENTUM_LIVE_TRADING:
+                    # 記録のみの運転では、有効にした銘柄とそうでない銘柄で説明が
+                    # 分かれ、厚いほうが「有効にしていない銘柄」に出ていた
+                    # （利用者のレビュー）。同じ状態は同じ文言にする。
+                    _order_note = _momentum_not_live_note(symbol, trd_env, side=side)
+                elif not _profile_side_ok:
+                    # ★ 2026-09-22（利用者の実ログ・選抜 v1）: 設定の生の値（_live_eligible）で
+                    #   見ていたため、選抜が外した方向が「LONGレンジ外」で決着していた。
+                    #   選抜と口座のゲートを通した後の値で見る（タグ・52列目と同じ基準）。
+                    _order_note = _momentum_not_live_note(symbol, trd_env, side=side)
                 elif _trend_blocked:
                     _order_note = (
                         f"実発注なし・当日トレンド逆行"
@@ -2461,21 +2482,6 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     )
                 elif _profile_block_reason:
                     _order_note = f"実発注なし・選抜プロファイル: {_profile_block_reason} → シャドーのみ"
-                elif not MOMENTUM_LIVE_TRADING:
-                    # 記録のみの運転では、有効にした銘柄とそうでない銘柄で説明が
-                    # 分かれ、厚いほうが「有効にしていない銘柄」に出ていた
-                    # （利用者のレビュー）。同じ状態は同じ文言にする。
-                    _order_note = _momentum_not_live_note(symbol, trd_env, side=side)
-                elif not _profile_side_ok:
-                    # ★ 2026-09-22（利用者の実ログ・選抜 v1）: ここは設定の生の値
-                    #   （_live_eligible）で見ていた。選抜が外した方向でも生の設定には
-                    #   在るので素通りし、下の「LONGレンジ外」で決着していた。しかも
-                    #   選抜の判定（_profile_block_reason）は LONG レンジを通った回に
-                    #   しか走らないので、レンジで先に落ちると選抜に一度も触れない。
-                    #   「レンジを変えれば買える」と読めるが、選抜 v1 は買いを実発注しない。
-                    #   選抜と口座のゲートを通した後の値で見る（タグ・52列目と同じ基準）。
-                    #   表示だけの変更で、発注の可否（_will_live_order）は変えていない。
-                    _order_note = _momentum_not_live_note(symbol, trd_env, side=side)
                 elif not _long_range_ok:
                     _order_note = (
                         f"実発注なし・LONGレンジ外 "
@@ -2605,6 +2611,8 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                         log.warning(
                             f"[モメンタム実発注] {symbol} {side} {_mom_qty}株 "
                             f"(想定 ${hypothetical_order_usd:,.0f}) → 発注試行"
+                            + ("（口座の設定で止まる見込み・発注前のガードで見送ります）"
+                               if not _profile_side_ok else "")
                         )
                         try:
                             _place_fn = place_buy if side == "BUY" else place_short
