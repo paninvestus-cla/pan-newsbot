@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.204"
+BOT_VERSION = "v3.9.205"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -2466,7 +2466,15 @@ async def momentum_shadow_loop(trd_env: TrdEnv) -> None:
                     # 分かれ、厚いほうが「有効にしていない銘柄」に出ていた
                     # （利用者のレビュー）。同じ状態は同じ文言にする。
                     _order_note = _momentum_not_live_note(symbol, trd_env, side=side)
-                elif not _live_eligible:
+                elif not _profile_side_ok:
+                    # ★ 2026-09-22（利用者の実ログ・選抜 v1）: ここは設定の生の値
+                    #   （_live_eligible）で見ていた。選抜が外した方向でも生の設定には
+                    #   在るので素通りし、下の「LONGレンジ外」で決着していた。しかも
+                    #   選抜の判定（_profile_block_reason）は LONG レンジを通った回に
+                    #   しか走らないので、レンジで先に落ちると選抜に一度も触れない。
+                    #   「レンジを変えれば買える」と読めるが、選抜 v1 は買いを実発注しない。
+                    #   選抜と口座のゲートを通した後の値で見る（タグ・52列目と同じ基準）。
+                    #   表示だけの変更で、発注の可否（_will_live_order）は変えていない。
                     _order_note = _momentum_not_live_note(symbol, trd_env, side=side)
                 elif not _long_range_ok:
                     _order_note = (
