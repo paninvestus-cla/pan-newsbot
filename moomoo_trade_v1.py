@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.206"
+BOT_VERSION = "v3.9.207"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -8336,6 +8336,25 @@ def _ext_blocked_symbols() -> list:
                 if getattr(state.get(s), "externally_held", False)]
     except Exception:
         return []
+
+
+def _sync_stale_suffix() -> str:
+    """[状況] 行に足す注意書き。同期が落ちていなければ空文字。
+
+    ★ 2026-09-23（利用者2名の実ログ）: OpenD の応答不良が8時間続いた回に、
+      この行はその間ずっと「ポジションなし」と出ていた。中で持っているのは
+      最後に同期できたときの写しなので、現在の口座を見た結果ではない。
+      しきい値は連続失敗の警告と同じ3回にそろえる（1〜2回の瞬断で騒がない）。
+    """
+    try:
+        if int(_sync_health.get("consecutive_fail", 0)) < 3:
+            return ""
+        _ok_at = _sync_health.get("last_success_at")
+        _ago = (f"{(datetime.datetime.now() - _ok_at).total_seconds() / 60:.0f}分前"
+                if _ok_at is not None else "起動後成功なし")
+        return f"  ⚠️ 口座の同期が連続失敗中（最終同期 {_ago}・現在の建玉は未確認）"
+    except Exception:
+        return ""
 
 
 def _ext_status_suffix() -> str:
@@ -16716,15 +16735,23 @@ def _sync_stall_notice(nfail, stale_s: str, serr: str, held) -> tuple:
             "いまは損切りも時間切れも働きません。\n" + _common + "（本通知は10分おき）",
             600,
         )
+    # ★ 2026-09-23（利用者2名の実ログ・OpenD の応答不良の最中）: ここは
+    #   「いまは建玉なし」と書いていた。同期が落ちている間は現在の口座を見られない
+    #   ので、言えるのは「最後に確かめたときは無かった」まで。最終同期のあとに
+    #   注文が約定していれば、建玉があるのに「なし」と読める（いちばん危ない向き）。
     return (
-        f"[sync_positions] 🚨 ポジション取得が連続失敗中 ({nfail}回): "
+        f"[sync_positions] 🚨 ポジション取得が連続失敗中 ({nfail}回・"
+        f"最終確認時は建玉なし／現在は未確認): "
         f"最終成功 {stale_s} / 直近: {serr}\n"
         f"  → OpenD の起動/接続(Connected)とネットワークを確認してください "
-        f"(本警告は5分ごと・復旧で自動解除・いまは建玉なし)",
+        f"(本警告は5分ごと・復旧で自動解除)",
         "🚨 【継続中】 ポジション取得が連続失敗\n"
         f"連続失敗 {nfail}回 / 最終成功 {stale_s}。\n"
+        "最終確認時は建玉なし。現在の建玉は未確認です。\n"
+        "最終同期のあとに約定していれば、建玉があっても分かりません。\n"
         "OpenD の起動・接続(Connected)とネットワークをご確認ください。\n"
-        "（いまは建玉なし・建玉があると決済判断が効きません・本通知は30分おき）",
+        "必要に応じて moomoo アプリで建玉・未約定注文をご確認ください。\n"
+        "（建玉があると決済判断が効きません・本通知は30分おき）",
         1800,
     )
 
@@ -21191,7 +21218,8 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 price_str = "  ".join(_prices) if _prices else "価格取得失敗"
                 log.info(
                     f"[状況] ポジションなし  セッション:{session_now.upper()}"
-                    f"  {price_str}" + _ext_status_suffix() + _lock_status_suffix()
+                    f"  {price_str}" + _sync_stale_suffix()
+                    + _ext_status_suffix() + _lock_status_suffix()
                 )
             elif _startup_position_unknown and not _has_any_pos:
                 # long_mv>0 で検出済みだが position_list_query では確認できていない状態
