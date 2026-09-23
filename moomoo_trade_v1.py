@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.207"
+BOT_VERSION = "v3.9.208"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -7756,10 +7756,19 @@ def close_all_for_weekend(trd_env: TrdEnv,
         ("週末前強制決済", "早期クローズ前強制決済", "連休前強制決済"))
     if log_prefix is None:
         log_prefix = "週末決済" if is_weekly else "デモ日次決済"
+    # ★ 2026-09-23（配布前レビュー）: 例外しか拾っていなかった。OpenD が ret!=RET_OK を
+    #   返す型では sync_positions は静かに戻るので、照会できていないのに「すでに建玉ゼロ」と
+    #   Discord へ送っていた。裏取り（_sweep_close_verified）と同じやり方で、走査が
+    #   完走したかを番号の前後で見る。売買の流れは変えない（通知の書き分けだけ）。
+    _seq_before_sweep = _account_scan_seq
     try:
         sync_positions(trd_env)
     except Exception as _e_sync_sweep:
         log.warning(f"[{log_prefix}] 事前同期に失敗（内部state基準で続行）: {_mask_secrets(_e_sync_sweep)}")
+    _scan_ok_sweep = _account_scan_seq > _seq_before_sweep
+    if not _scan_ok_sweep:
+        log.warning(f"[{log_prefix}] 事前の建玉照会が完走していません（内部state基準で続行・"
+                    f"建玉の有無は未確認）")
     exec_syms = (
         {sym for syms in EXECUTION_MAP.values() for sym in syms}
         | set(STOCK_TICKERS)
@@ -7787,7 +7796,8 @@ def close_all_for_weekend(trd_env: TrdEnv,
         #   決済注文（取消済みかもしれない）の証拠を捨てると、裏取りが照合対象を
         #   失って「決済完了」に反転する。前日の記録の掃除（v3.9.157b の目的）は
         #   _sweep_session_begin（シーケンス開始時のクリア）が担う。
-        log.info(f"[{log_prefix}] 決済対象ポジションなし → スキップ")
+        log.info(f"[{log_prefix}] 決済対象ポジションなし → スキップ"
+                 + ("" if _scan_ok_sweep else "（建玉照会が完走していないため未確認）"))
         if is_weekly:
             _kept = ("、".join(_skipped_owned) if _skipped_owned else "")
             log.warning(
@@ -7799,7 +7809,12 @@ def close_all_for_weekend(trd_env: TrdEnv,
                     + ("決済の対象になる建玉はありませんでした\n"
                        f"（夜間持ち越し・Bot 以外の建玉 {_kept} はそのまま保有します）\n"
                        if _kept else
-                       "決済対象の建玉はありませんでした（すでに建玉ゼロ）\n")
+                       ("決済対象の建玉はありませんでした（すでに建玉ゼロ）\n"
+                        if _scan_ok_sweep else
+                        "決済の対象は見つかりませんでした。ただし建玉の照会が完走して"
+                        "いないため、いま建玉が無いことは確認できていません\n"
+                        "（OpenD の接続をご確認のうえ、必要なら moomoo アプリで"
+                        "建玉・未約定注文をご確認ください）\n"))
                     + "ニュース取得・発注を停止し、次のプリマーケットまで待機します\n"
                     "（プリマーケットを「発注しない」設定にしている場合は次の 09:30 ET まで）"
                 )
@@ -12787,7 +12802,26 @@ _sync_health: dict = {
     "last_success_at":  None,
     "last_error":       "",
     "last_discord_at":  None,
+    # ★ 2026-09-23（配布前レビュー）: 最後に同期できたときの建玉の写し。
+    #   通知の「最終確認時は建玉なし」はこれを根拠にする。通知の時点の state を
+    #   見てはいけない。sync_positions は問い合わせの前に手元の数量をいったん 0 に
+    #   するので（冒頭ガード）、そのあと通信が失敗すると「0 にした直後の姿」を
+    #   最後に確認した結果として読んでしまう。None＝一度も同期できていない。
+    "last_success_held": None,
 }
+
+
+def _mark_sync_success() -> None:
+    """同期が最後まで終わったときだけ「成功」を記録する。建玉の写しも一緒に残す。"""
+    _sync_health["consecutive_fail"] = 0
+    _sync_health["last_success_at"] = datetime.datetime.now()
+    try:
+        _sync_health["last_success_held"] = sorted({
+            _s for _s in list(state.tickers.keys())
+            if state.get(_s).position_qty != 0
+        })
+    except Exception:
+        _sync_health["last_success_held"] = None
 
 
 _account_symbols_seen: set = set()
@@ -12948,8 +12982,11 @@ def sync_positions(trd_env: TrdEnv) -> None:
             else:
                 log.debug(f"[sync_positions] ポジション取得失敗 (間引き中): ret={ret}")
             return
-        _sync_health["consecutive_fail"] = 0
-        _sync_health["last_success_at"] = datetime.datetime.now()
+        # ★ 2026-09-23（配布前レビュー）: ここで「成功」を記録していたが、この先の
+        #   取り込みが毎回例外になる型（数量が数値に直せない等）では、成功の記録で
+        #   0 に戻してから except で 1 に足すだけになり、連続失敗が 3 に届かない。
+        #   連続失敗の警告も「現在は未確認」の注記も永久に出なかった。
+        #   成功の記録は、取り込みが最後まで終わってから（_mark_sync_success）。
         if not _df_has_rows(data):
             # 空応答でも後段のゴースト判定と台帳更新まで進める。
             # ここで return すると、実際に建玉が消えても externally_held と
@@ -13342,6 +13379,7 @@ def sync_positions(trd_env: TrdEnv) -> None:
                     )
             except Exception:
                 pass
+        _mark_sync_success()
         _ext_remind_if_due()
     except Exception as e:
         try:
@@ -16741,13 +16779,14 @@ def _sync_stall_notice(nfail, stale_s: str, serr: str, held) -> tuple:
     #   注文が約定していれば、建玉があるのに「なし」と読める（いちばん危ない向き）。
     return (
         f"[sync_positions] 🚨 ポジション取得が連続失敗中 ({nfail}回・"
-        f"最終確認時は建玉なし／現在は未確認): "
+        f"{stale_s}の同期では建玉なし／現在は未確認): "
         f"最終成功 {stale_s} / 直近: {serr}\n"
-        f"  → OpenD の起動/接続(Connected)とネットワークを確認してください "
+        f"  → OpenD の起動/接続(Connected)とネットワークを確認し、直らなければ "
+        f"moomoo アプリ側で建玉・未約定注文をご確認ください "
         f"(本警告は5分ごと・復旧で自動解除)",
         "🚨 【継続中】 ポジション取得が連続失敗\n"
         f"連続失敗 {nfail}回 / 最終成功 {stale_s}。\n"
-        "最終確認時は建玉なし。現在の建玉は未確認です。\n"
+        f"{stale_s}の同期では建玉なし。現在の建玉は未確認です。\n"
         "最終同期のあとに約定していれば、建玉があっても分かりません。\n"
         "OpenD の起動・接続(Connected)とネットワークをご確認ください。\n"
         "必要に応じて moomoo アプリで建玉・未約定注文をご確認ください。\n"
@@ -20671,13 +20710,11 @@ async def health_warning_loop() -> None:
                 #   建玉の有無を知らない。空だからといって「いまは建玉なし」と言うと、
                 #   前夜の持ち越しがある翌朝にいちばん危ない文言が出る。None＝不明にして
                 #   安全側（強い文言・10分おき）に倒す。走査で例外が出た回も同じ扱い。
-                try:
-                    _held_sync = None if _last_ok_s is None else sorted({
-                        _s_h for _s_h in list(state.tickers.keys())
-                        if state.get(_s_h).position_qty != 0
-                    })
-                except Exception:
-                    _held_sync = None
+                # ★ 2026-09-23（配布前レビュー）: ここは通知の時点の state を見ていた。
+                #   同期が落ちている間の state は「問い合わせの前に 0 にした直後の姿」に
+                #   なりうるので、最後に確認した結果ではない。成功した同期の写しを使う。
+                _held_sync = (None if _last_ok_s is None
+                              else _sync_health.get("last_success_held"))
                 _term_s, _disc_s, _disc_gap_s = _sync_stall_notice(_nfail, _stale_s, _serr, _held_sync)
                 log.error(f"{_RED}{_BOLD}{_term_s}{_RESET}")
                 _last_disc_s = _sync_health.get("last_discord_at")
@@ -21216,8 +21253,13 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         if s in _INDEX_PRICE_HISTORY and _px_rec > 0:
                             record_index_price(s, _px_rec)
                 price_str = "  ".join(_prices) if _prices else "価格取得失敗"
+                # ★ 2026-09-23（配布前レビュー）: 注記は価格の並びの後ろに付くので、
+                #   銘柄が多い環境では折り返しの向こうになり、いちばん強い語（先頭の
+                #   「ポジションなし」）は断定のまま残る。見出しの側を切り替える。
+                _head_pos = ("ポジションなし" if not _sync_stale_suffix()
+                             else "建玉は未確認（同期が連続失敗中）")
                 log.info(
-                    f"[状況] ポジションなし  セッション:{session_now.upper()}"
+                    f"[状況] {_head_pos}  セッション:{session_now.upper()}"
                     f"  {price_str}" + _sync_stale_suffix()
                     + _ext_status_suffix() + _lock_status_suffix()
                 )
@@ -21276,6 +21318,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         log.info(
                             f"[状況] 【{s}】 📋 注文中（約定待ち・未ポジション）"
                             f"  発注額:${tracked:,.0f}  現在値:${price_now:.2f}{_elapsed_str}"
+                            + _sync_stale_suffix()
                         )
                     elif qty > 0 and price_now <= 0:
                         log.info(
@@ -21492,7 +21535,20 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                         elapsed = (datetime.datetime.now() - ts.entry_time).total_seconds() / 60
                         if elapsed >= _t_timeout:
                             # 時間切れ前にもう一度sync_positionsで再確認
+                            # ★ 2026-09-23（配布前レビュー）: 再同期が失敗しても
+                            #   ts.position_qty は 0 のままなので、この先は必ず
+                            #   「建玉なし」側へ倒れていた。しかも entry_time を
+                            #   捨てるため、確かめられていない読みで内部状態を
+                            #   書き換えていた。照会が完走したかを番号で見る。
+                            _seq_before_to = _account_scan_seq
                             await asyncio.to_thread(sync_positions, trd_env)
+                            if _account_scan_seq <= _seq_before_to:
+                                log.warning(
+                                    f"{tag} ⏰ 時間切れの確認: 建玉照会が完走しません"
+                                    f"でした → 時刻管理はそのままにして次回に持ち越します"
+                                    f"（エントリから {elapsed:.1f}分経過・建玉の有無は未確認）"
+                                )
+                                continue
                             if ts.position_qty != 0:
                                 # ポジション確認できた → 通常の時間切れ決済へ
                                 log.warning(
