@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.211"
+BOT_VERSION = "v3.9.212"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -4332,6 +4332,9 @@ _CLOSE_FAIL_GIVEUP_LIMIT: int = 3
 # (二重決済レース / 既決済 pid)。失敗ではなく「解決済み」を表す内部 ret コード。
 # 5/25-6/1 ログで QQQ 20 件・SPY 12 件の「Not enough positions」ERROR を確認。
 _RET_ALREADY_CLOSED: int = -2
+# v3.9.212: 注文を送ったあとで結果が分からなくなった回。通常の失敗（-1）と分けて、
+# 呼び出し側が「同じ建玉に続けて出さない」判断をできるようにする（二重決済の防止）。
+_RET_SENT_UNKNOWN: int = -4
 
 # 個別株の発注時刻記録: {symbol: datetime}
 _stock_order_history: Dict[str, datetime.datetime] = {}
@@ -6616,6 +6619,10 @@ _AI_FIX_SKIP_PATTERNS = [
     r"read timed out|timeout.*finnhub",   # Finnhubタイムアウトは頻発するためスキップ
     r"discord.*webhook|discord.*post",    # Discord通知失敗もスキップ
     r"\[データ収集\]",                      # データ収集失敗もスキップ
+    # v3.9.212: OpenD の状態を伝える警告は AI に聞かない。対処は「OpenD を見る」で
+    # 固定なのに、経過秒が文言に入るためキャッシュが効かず、障害中ずっと課金対象の
+    # 問い合わせが続く（配布前レビューで指摘・請求の出どころとして既知の型）。
+    r"\[opend\]",
 ]
 
 # AI判定結果キャッシュ {エラーメッセージ先頭80文字: (datetime, 対処法文字列)}
@@ -8413,6 +8420,22 @@ def _sync_stale_suffix() -> str:
         return ""
 
 
+def _holding_note(quote: Optional[dict] = None) -> str:
+    """保有中の [ポジション] 行に足す注記（v3.9.211 / 置き場所の統一は v3.9.212）。
+
+    ★ 実口座の報告: OpenD の応答不良が続いても価格だけは Alpaca で取れるため、
+      この行は普段どおりの含み損を出し続けていた。数量と建値は最後に同期できた
+      ときの写しなので、いま口座にある建玉とは一致しないことがある（手で決済した
+      場合も同じ）。価格が動くことは「口座が見えている」証拠ではない。
+    """
+    _stale = _sync_stale_suffix()
+    _src = (quote or {}).get("source") or ""
+    _src_note = f"  価格={_src}" if _src and _src != "OpenD" else ""
+    if _stale:
+        return f"{_stale}{_src_note}  ※数量・建値は最終同期時点の参考値"
+    return _src_note
+
+
 def _ext_status_suffix() -> str:
     """[状況] 行に足す注意書き。管理対象外が無ければ空文字。"""
     _b = _ext_blocked_symbols()
@@ -8550,10 +8573,12 @@ def _record_today_trade(rec: dict) -> None:
 
 
 def _record_today_entry(symbol: str, side: str, qty: int, trd_env: "TrdEnv") -> None:
-    """新規の発注が通った時点で「その日の新規」として数える（v3.9.211）。
+    """新規の発注が受け付けられた時点で「その日の新規」として数える（v3.9.211）。
 
     決済まで記録できたかどうかとは別に持つ。決済結果を回収できない日に
     「取引なし・損益ゼロ」と読めてしまうのを防ぐための控え。
+    ★ v3.9.212: ここは約定ではなく「発注の受付」。約定確認の前に記録するので、
+      刺さらずに取消された注文も1件として数える。表示もそう書く（配布前レビュー）。
     """
     try:
         _maybe_reset_today_trades()
@@ -8667,11 +8692,12 @@ def _format_daily_summary() -> Optional[str]:
                 f" {_e.get('qty',0)}株" for _e in _today_entries[:5])
             header.append(
                 f"Bot が記録できた本日の決済はありません"
-                f"（本日の新規約定 {len(_today_entries)}件・決済の記録 0件）"
+                f"（本日の新規発注 {len(_today_entries)}件・決済の記録 0件）"
             )
             header.append(f"　新規: {_ent_lines}" + ("  ほか" if len(_today_entries) > 5 else ""))
             header.append(
-                "　⚠️ 損益ゼロではありません。建玉と決済の結果は"
+                "　⚠️ 損益ゼロとは限りません。上は発注が受け付けられた件数で、"
+                "約定は別途の確認が必要です。建玉と決済の結果は"
                 "moomoo の取引履歴で照合してください"
                 "（同期障害中・手で決済した場合は Bot に記録が残りません）"
             )
@@ -8742,7 +8768,7 @@ def _format_daily_summary() -> Optional[str]:
     # v3.9.211: 決済の記録と本日の新規を分けて出す（同じ数とは限らない。
     # 前日からの持ち越しを決済した回も、まだ持っている回もあるため）。
     if _today_entries:
-        lines.append(f"（本日の新規約定 {len(_today_entries)}件 / 決済の記録 {n_total}件）")
+        lines.append(f"（本日の新規発注 {len(_today_entries)}件 / 決済の記録 {n_total}件）")
     lines.append(f"損益  {total_pnl:+.2f}   平均勝ち {avg_w:+.2f} / 平均負け {avg_l:+.2f}")
     lines.append("")
     # v3.9.23: 該当トレードがあるときのみ表示 (全件勝ち/全件負けで片方欠落するケース対応)
@@ -12122,43 +12148,81 @@ _CTX_BUILD_BACKOFF_SEC: float = 20.0
 #   3件たまると、生成の枠が埋まったままになり、そのあとの損切りの決済も同じ
 #   上限で拒否され続けた（実口座で損切りの発注が3回失敗し、利用者が手で決済）。
 #   件数だけを持っていたので「いつから・何が」戻っていないのかも読めなかった。
-#   ここでは1件ごとに用途と開始時刻を持ち、
+#   1件ごとに用途・開始時刻・スレッドを持ち、
 #     ・一定時間を過ぎた生成は「戻ってこない」ものとして枠の計算から外す
-#     ・ただし戻らないスレッドが増え続けないよう、別の天井で必ず止める
-#     ・決済（urgent）には枠を1つ余分に許し、直前のタイムアウトの待機も待たない
+#     ・生きているスレッドの総数には必ず天井を置く（増え続けさせない）
+#     ・決済（urgent）には枠を1つ余分に許し、待機も短くする
 #   の3点で、監視を殺さずに決済の道を残す。
 #   カウンタを黙って0に戻す・上限を上げ続ける・注文を無条件に再送する、は行わない。
-_ctx_build_active: dict = {}      # 連番 -> {"what": 用途, "at": 開始時刻(monotonic)}
+# ★ v3.9.212（配布前の3者レビュー）:
+#     ・スレッドの起動に失敗した回で台帳から消し漏れていた（枠が恒久的に減る）。
+#       台帳にスレッドを持たせ、死んでいる行は数えるときに捨てる（自己修復）。
+#     ・天井は「戻らない件数」ではなく「生きているスレッドの総数」でも掛ける。
+#       戻らない原因が接続の枯渇だったときに、接続を増やす方向へ働かせない。
+#     ・urgent が待機を完全に無視すると、1パスで銘柄ごとに TCP 3秒＋生成15秒を
+#       払い、イベントループが70秒近く止まる。urgent 専用の短い待機を置く。
+#     ・ロックを持ったままログを出していた。警告のハンドラは同期で走るので、
+#       決済も含む全部の生成がその処理を待つ。文言を作るだけにして外で出す。
+_ctx_build_active: dict = {}      # 連番 -> {"what": 用途, "at": 開始時刻, "th": スレッド}
 _ctx_build_seq: int = 0
-try:
-    _CTX_BUILD_STUCK_SEC: float = float(os.environ.get("MOOMOO_CTX_STUCK_SEC", "90") or 90)
-except (TypeError, ValueError):
-    _CTX_BUILD_STUCK_SEC = 90.0
-_CTX_BUILD_STUCK_SEC = min(max(_CTX_BUILD_STUCK_SEC, 30.0), 900.0)
-try:
-    _CTX_BUILD_MAX_STUCK: int = int(os.environ.get("MOOMOO_CTX_MAX_STUCK", "6") or 6)
-except (TypeError, ValueError):
-    _CTX_BUILD_MAX_STUCK = 6
-_CTX_BUILD_MAX_STUCK = min(max(_CTX_BUILD_MAX_STUCK, 1), 20)
+_ctx_build_stuck_note_mono: float = 0.0   # 滞留の警告の間引き用
+
+
+def _ctx_env_float(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        _v = float(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        _v = default
+    return min(max(_v, lo), hi)
+
+
+def _ctx_env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        _v = int(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        _v = default
+    return min(max(_v, lo), hi)
+
+
+_CTX_BUILD_STUCK_SEC: float = _ctx_env_float("MOOMOO_CTX_STUCK_SEC", 90.0, 30.0, 900.0)
+_CTX_BUILD_MAX_STUCK: int = _ctx_env_int("MOOMOO_CTX_MAX_STUCK", 6, 1, 20)
+# 生きているスレッドの総数の天井（urgent でも超えない）。
+_CTX_BUILD_MAX_TOTAL: int = _ctx_env_int(
+    "MOOMOO_CTX_MAX_TOTAL", _CTX_BUILD_MAX_STUCK + 2, _CTX_BUILD_MAX_INFLIGHT + 1, 24)
+# urgent（決済）の待機。0 にはしない——同じパスで銘柄ごとに生成の期限を払うと、
+# イベントループが数十秒止まる。
+_CTX_BUILD_URGENT_BACKOFF_SEC: float = _ctx_env_float(
+    "MOOMOO_CTX_URGENT_BACKOFF_SEC", 3.0, 0.5, _CTX_BUILD_BACKOFF_SEC)
 
 
 def _ctx_build_inflight_count() -> int:
     """生成中（生きているスレッド）の件数。数える場所を1つにする。"""
     with _ctx_build_lock:
-        return len(_ctx_build_active)
+        _n, _, _, _ = _ctx_build_state(time.monotonic())
+        return _n
 
 
 def _ctx_build_state(now_mono: float) -> tuple:
-    """生成中の内訳を返す: (進行中の件数, 戻らない件数, 読める説明)。ロック内で呼ぶ。"""
-    _fresh, _stuck, _parts = 0, 0, []
-    for _info in _ctx_build_active.values():
+    """生成中の内訳を返す: (総数, 進行中, 戻らない件数, 読める説明)。ロック内で呼ぶ。
+
+    v3.9.212: 死んでいるスレッドの行はここで捨てる。スレッドを起こす前に
+    例外が出た回や、解放の記録が漏れた回を自己修復するため。
+    """
+    _fresh, _stuck, _parts, _dead = 0, 0, [], []
+    for _id, _info in _ctx_build_active.items():
+        _th = _info.get("th")
+        if _th is not None and not _th.is_alive():
+            _dead.append(_id)
+            continue
         _el = now_mono - _info["at"]
         if _el > _CTX_BUILD_STUCK_SEC:
             _stuck += 1
         else:
             _fresh += 1
         _parts.append(f"{_info['what']}:{_el:.0f}秒{'(戻らず)' if _el > _CTX_BUILD_STUCK_SEC else ''}")
-    return _fresh, _stuck, " / ".join(_parts)
+    for _id in _dead:
+        _ctx_build_active.pop(_id, None)
+    return _fresh + _stuck, _fresh, _stuck, " / ".join(_parts)
 
 
 class OpenDUnavailableError(RuntimeError):
@@ -12243,33 +12307,60 @@ def _make_ctx_bounded(factory, what: str, urgent: bool = False):
     """SDK のコンテキストを作る。作れないときは OpenDUnavailableError。
 
     urgent=True は決済の経路。相場取得や定期照会が枠を埋めていても通せるよう、
-    枠を1つ余分に許し、直前のタイムアウトの待機（バックオフ）も待たない。
-    TCP の当たりは urgent でも必ず取るので、OpenD が落ちていれば速く失敗する。
+    枠を1つ余分に許し、直前のタイムアウトの待機も短い専用の待機にする。
+    TCP の当たりは（受け付けた試行では）urgent でも必ず取るので、OpenD が
+    落ちていれば速く失敗する。生きているスレッドの総数の天井は urgent でも超えない。
     """
-    global _ctx_build_backoff_until, _ctx_build_seq
+    global _ctx_build_backoff_until, _ctx_build_seq, _ctx_build_stuck_note_mono
     _urg = "・決済優先" if urgent else ""
+    _warn: Optional[str] = None
+    _hard: Optional[str] = None
     with _ctx_build_lock:
         _now = time.monotonic()
-        _fresh, _stuck, _detail = _ctx_build_state(_now)
-        if _stuck >= _CTX_BUILD_MAX_STUCK:
-            # 戻らないスレッドが増え続けないための天井。ここは urgent でも通さない。
-            raise OpenDUnavailableError(
-                f"OpenD 応答なし（戻らない生成が {_stuck}件で上限・{what}{_urg}／{_detail}）")
-        if not urgent and _now < _ctx_build_backoff_until:
-            raise OpenDUnavailableError(f"OpenD 応答なし（直前のタイムアウトから待機中・{what}）")
-        _limit = _CTX_BUILD_MAX_INFLIGHT + (1 if urgent else 0)
-        if _fresh >= _limit:
-            raise OpenDUnavailableError(
-                f"OpenD 応答なし（生成が滞留中 {_fresh}件・{what}{_urg}／{_detail}）")
-        if _stuck:
-            log.warning(
-                f"[OpenD] 戻ってこない生成が {_stuck}件あります"
-                f"（{_CTX_BUILD_STUCK_SEC:.0f}秒超・枠の計算から外して {what}{_urg} を進めます）"
-                f"／{_detail}"
-            )
-        _ctx_build_seq += 1
-        _my_id = _ctx_build_seq
-        _ctx_build_active[_my_id] = {"what": what, "at": _now}
+        _total, _fresh, _stuck, _detail = _ctx_build_state(_now)
+        _reject = None
+        if _total >= _CTX_BUILD_MAX_TOTAL:
+            # 生きているスレッドの総数の天井。ここは urgent でも通さない。
+            # この状態は相場取得・同期・決済のすべてが拒否される唯一の状態なので、
+            # ログだけでなく名指しの通知も出す（Bot の再起動が必要）。
+            _reject = (f"OpenD 応答なし（生成スレッドが {_total}件で上限"
+                       f"・{what}{_urg}／{_detail}）")
+            _hard = (f"生成中のスレッドが {_total}件（うち戻らない {_stuck}件）で上限に達し、"
+                     f"決済を含むすべての接続を作れません。Bot の再起動が必要です")
+        elif _stuck >= _CTX_BUILD_MAX_STUCK and not urgent:
+            # 戻らない生成がここまで溜まったら、通常の用途は増やさない。
+            # 決済だけは総数の天井まで余地を使える。
+            _reject = (f"OpenD 応答なし（戻らない生成が {_stuck}件で上限"
+                       f"・{what}／{_detail}）")
+        elif not urgent and _now < _ctx_build_backoff_until:
+            _reject = f"OpenD 応答なし（直前のタイムアウトから待機中・{what}）"
+        elif urgent and _now < _ctx_build_backoff_until - (
+                _CTX_BUILD_BACKOFF_SEC - _CTX_BUILD_URGENT_BACKOFF_SEC):
+            # 決済にも最小限の間隔は置く（同じパスで銘柄ごとに期限を払うと
+            # イベントループが数十秒止まる）
+            _reject = (f"OpenD 応答なし（直前のタイムアウトから"
+                       f"{_CTX_BUILD_URGENT_BACKOFF_SEC:.0f}秒は待つ・{what}{_urg}）")
+        else:
+            _limit = _CTX_BUILD_MAX_INFLIGHT + (1 if urgent else 0)
+            if _fresh >= _limit:
+                _reject = (f"OpenD 応答なし（生成が滞留中 {_fresh}件"
+                           f"・{what}{_urg}／{_detail}）")
+        if _reject is None:
+            if _stuck and _now - _ctx_build_stuck_note_mono >= 120:
+                _ctx_build_stuck_note_mono = _now
+                _warn = (f"[OpenD] 戻ってこない生成が {_stuck}件あります"
+                         f"（{_CTX_BUILD_STUCK_SEC:.0f}秒超・枠の計算から外して"
+                         f" {what}{_urg} を進めます）／{_detail}")
+            _ctx_build_seq += 1
+            _my_id = _ctx_build_seq
+            _ctx_build_active[_my_id] = {"what": what, "at": _now, "th": None}
+    # ロックの外で出す（警告のハンドラは同期で走るため、ロック内だと決済も待たされる）
+    if _warn:
+        log.warning(_warn)
+    if _hard:
+        _note_opend_down(what, _hard)
+    if _reject is not None:
+        raise OpenDUnavailableError(_reject)
     if not _opend_tcp_ok():
         with _ctx_build_lock:
             _ctx_build_active.pop(_my_id, None)   # スレッドを起こさないので予約を返す
@@ -12311,7 +12402,19 @@ def _make_ctx_bounded(factory, what: str, urgent: bool = False):
                         f" → 枠を解放しました"
                     )
     _th = threading.Thread(target=_build, daemon=True, name=f"ctx-build-{what}")
-    _th.start()
+    with _ctx_build_lock:
+        _info_me = _ctx_build_active.get(_my_id)
+        if _info_me is not None:
+            _info_me["th"] = _th
+    try:
+        _th.start()
+    except Exception as _e_start:
+        # v3.9.212: 起こせなかった回で台帳に残すと、枠が恒久的に1つ減る
+        #（戻らないスレッドが溜まっている局面ほど起こりやすい）。
+        with _ctx_build_lock:
+            _ctx_build_active.pop(_my_id, None)
+        raise OpenDUnavailableError(
+            f"生成スレッドを起こせません（{what}・{type(_e_start).__name__}）")
     _th.join(MOOMOO_CTX_BUILD_TIMEOUT_SEC)
     with _ctx_build_lock:
         if not _done.is_set():
@@ -14847,7 +14950,7 @@ def place_buy(
     ts_state.entry_reason      = reason
     # 自前ポジション管理に発注コストと株数を記録（確保は計上と同時に解放）
     track_position_add(symbol, order_cost, qty=qty, reserve_token=_budget_token)
-    _record_today_entry(symbol, "BUY", qty, trd_env)   # v3.9.211: 本日の新規として数える
+    _record_today_entry(symbol, "BUY", qty, trd_env)   # v3.9.211: 本日の新規（発注）として数える
     _headlines_str = (
         "\n─── トリガーニュース ───\n" + "\n".join(f"・{h}" for h in headlines[:3])
         if headlines else ""
@@ -16270,11 +16373,17 @@ except ValueError:
 # が判明したため撤去。発注金額は calc_order_size() の「山型サイズ配分」で決定。
 # .env の PYRAMID_* 設定が残っていても無視される (削除推奨だが副作用なし)。
 
-def _cancel_order(order_id: str, symbol: str, trd_env: TrdEnv, reason: str = "") -> bool:
-    """指定した注文IDをキャンセルする。成功したら True を返す。"""
+def _cancel_order(order_id: str, symbol: str, trd_env: TrdEnv, reason: str = "",
+                  urgent: bool = False) -> bool:
+    """指定した注文IDをキャンセルする。成功したら True を返す。
+
+    urgent=True は決済の前段で呼ぶ場合（v3.9.212）。決済は必ず「未約定の決済注文を
+    取り消してから」出すので、ここが枠で弾かれると urgent の決済に一切入れない。
+    配布前レビューで、v3.9.211 の優先枠がこの前段で素通りされると指摘された。
+    """
     tag = f"【{symbol}】"
     try:
-        with _trade_ctx() as ctx:
+        with _trade_ctx(urgent=urgent) as ctx:
             _acc_id_cancel = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
             ret, data = ctx.modify_order(
                 modify_order_op = ModifyOrderOp.CANCEL,
@@ -16374,7 +16483,8 @@ async def pending_order_watchdog() -> None:
             reason   = f"{elapsed:.0f}分経過（タイムアウト）{'[ショートカバー]' if is_cover else ''}"
             log.warning(f"【{sym}】 ⏱ 未約定タイムアウト orderId={order_id}  {reason}")
 
-            ok = _cancel_order(order_id, sym, trd_env, reason)
+            # v3.9.212: 決済注文の取消は優先枠（この取消が通らないと再決済に進めない）
+            ok = _cancel_order(order_id, sym, trd_env, reason, urgent=is_close)
             if ok:
                 _pending_orders.pop(order_id, None)
             else:
@@ -16634,6 +16744,7 @@ def _close_one_position_id(
         )
         return -1, f"invalid position_id value: {_pos_id_int}"
 
+    _sent = False
     try:
         # v3.9.211: 決済は生成の枠を1つ余分に使える（相場取得や定期照会に埋められない）
         with _trade_ctx(urgent=True) as ctx:
@@ -16670,6 +16781,9 @@ def _close_one_position_id(
                     )
                     return -1, f"trd_side mismatch for LONG close: {trd_side}"
 
+            # v3.9.212: 送信したかどうかを型ではなく事実で判定する。
+            #   例外の型だけで見ると、SDK の生成が例外を投げた回（明らかに送信前）まで
+            #   「送信済みの可能性あり」と言ってしまう。
             _kwargs = dict(
                 price            = 0.0 if use_market else limit_price,
                 qty              = qty,
@@ -16685,6 +16799,7 @@ def _close_one_position_id(
                 # SHORT 建玉決済は JP_TOKUTEI_SHORT 区分必須
                 **_tokutei_kwargs(trd_env, is_short=is_cover),
             )
+            _sent = True          # ここから先は「送信した」側として扱う
             ret, data = ctx.place_order(**_kwargs)
         if ret == RET_OK:
             order_id = str(data["order_id"][0])
@@ -16716,24 +16831,59 @@ def _close_one_position_id(
                 f"is_cover={is_cover}  msg={data}"
             )
             return ret, str(data)
-    except OpenDUnavailableError as e:
+    except Exception as e:
         # ★ v3.9.211: 送信前に失敗した回と、送信後に結果が分からない回を分ける。
         #   以前はどちらも「place_order 例外」と出ていたため、実ログを読んだ利用者に
         #   「証券会社が注文を3件拒否した」と読めていた（実際は接続の準備で止まっていた）。
         #   送信前だと分かっている回だけ、同じ注文をそのまま出し直して差し支えない。
-        log.error(
-            f"{tag} [{log_label}] 🔴 発注前に失敗（注文は送信していません）"
-            f" pid={_pos_id_str[:12]}...: {e}"
-        )
-        return -1, f"not_sent: {e}"
-    except Exception as e:
+        # ★ v3.9.212: 判定を例外の型から「送信したか」の事実に変えた。
+        #   結果が不明な回は専用の戻り値を返し、呼び出し側が続けて出さないようにする。
+        if not _sent:
+            log.error(
+                f"{tag} [{log_label}] 🔴 発注前に失敗（注文は送信していません）"
+                f" pid={_pos_id_str[:12]}...: {e}"
+            )
+            return -1, f"not_sent: {e}"
         log.error(
             f"{tag} [{log_label}] 🔴 発注後の結果が不明です（送信済みの可能性あり・"
             f"二重決済を避けるため建玉と注文の確認が必要）"
             f" pid={_pos_id_str[:12]}...: {e}",
             exc_info=True,
         )
-        return -1, f"result_unknown: {e}"
+        return _RET_SENT_UNKNOWN, f"result_unknown: {e}"
+
+
+# v3.9.212: 「送ったが結果が分からない決済」が出た銘柄の印。
+# 次にその銘柄へ決済を出す前に、証券会社側の注文照会を必ず通す（照会できなければ出さない）。
+# これが無いと、同じ建玉にもう1本出して二重決済になる（5/27 の +8 → -8 反転と同じ入口）。
+_close_sent_unknown: dict = {}      # symbol -> 記録した時刻
+
+
+def _mark_sent_unknown(symbol: str) -> None:
+    _close_sent_unknown[symbol] = datetime.datetime.now()
+
+
+def _sent_unknown_blocks_close(symbol: str, trd_env) -> bool:
+    """結果不明の決済が残っている間は、照会で裏を取れるまで新しい決済を出さない。
+
+    戻り値 True = 今回は出さない。照会できなかったときも True（安全側）。
+    """
+    if symbol not in _close_sent_unknown:
+        return False
+    _at = _close_sent_unknown.get(symbol)
+    _ago = ((datetime.datetime.now() - _at).total_seconds() / 60) if _at else 0.0
+    if _has_live_broker_order(symbol, trd_env):
+        log.warning(
+            f"【{symbol}】[二重決済防止] 結果の分からない決済（{_ago:.1f}分前）があり、"
+            f"証券会社側にまだ生きている注文があります → 今回は決済を見送ります"
+        )
+        return True
+    _close_sent_unknown.pop(symbol, None)
+    log.info(
+        f"【{symbol}】[二重決済防止] 結果の分からない決済（{_ago:.1f}分前）は"
+        f"証券会社側に残っていないことを確認 → 決済を続けます"
+    )
+    return False
 
 
 _close_fail_notify_at: dict = {}
@@ -16837,6 +16987,8 @@ def place_close_partial(
         )
         return False
 
+    if _sent_unknown_blocks_close(symbol, trd_env):
+        return False
     long_pids = _get_position_ids_for_close(symbol, "LONG")
     if not long_pids:
         _notify_close_failed_no_pid(symbol, "LONG", f"部分決済要求 qty={qty} ({reason})")
@@ -16894,6 +17046,15 @@ def place_close_partial(
                 "side":        "LONG",
             }
             remaining -= order_qty
+        elif ret == _RET_SENT_UNKNOWN:
+            # v3.9.212: 送信済みの可能性がある株数を「出していない」扱いで別の建玉へ
+            # 振り替えると、売り過ぎになる。ここで打ち切って照会に回す。
+            _mark_sent_unknown(symbol)
+            log.error(
+                f"{tag} [部分決済] pid={pid[:12]}... 結果が分からないため打ち切ります"
+                f"（送信済みの可能性あり・次の巡回で注文照会から）: {oid_or_msg}"
+            )
+            break
         else:
             log.error(f"{tag} [部分決済] pid={pid[:12]}... 失敗: {oid_or_msg}")
             # 残り建玉でリトライを試みる (continue)
@@ -17089,7 +17250,9 @@ def _cancel_pending_closes_for_symbol(symbol: str, trd_env: TrdEnv, reason: str 
     for oid in targets:
         _ok = False
         try:
-            _ok = _cancel_order(oid, symbol, trd_env, reason=(f"二重決済回避(再決済前): {reason}")[:60])
+            _ok = _cancel_order(oid, symbol, trd_env,
+                                reason=(f"二重決済回避(再決済前): {reason}")[:60],
+                                urgent=True)   # v3.9.212: 決済の前段は優先枠
         except Exception as _e:
             log.debug(f"【{symbol}】[決済前キャンセル] orderId={oid} 例外: {_mask_secrets(_e)}")
             _ok = False
@@ -17212,6 +17375,11 @@ def place_close_all(
     # 新たな決済を出す前に、同銘柄に出ている未約定の決済注文を必ずキャンセルする。
     # これにより「時間切れ決済」と「デモ日次決済」等が同一建玉に 2 本の決済を出し、
     # 時間外指値の遅延約定で売り過ぎ → ショート反転する事故を防ぐ (常に決済 1 本)。
+    # v3.9.212: 前回「送ったが結果が分からない」で終わった決済があるなら、
+    # 証券会社側の注文照会で裏を取れるまで新しい決済を出さない（二重決済の防止）。
+    if _sent_unknown_blocks_close(symbol, trd_env):
+        _mark_close_deferred(symbol, "pending")
+        return False
     _cancelled_n = _cancel_pending_closes_for_symbol(symbol, trd_env, reason)
     _still_open = [oid for oid, info in list(_pending_orders.items())
                    if info.get("symbol") == symbol and info.get("is_close")]
@@ -17334,6 +17502,8 @@ def place_close_all(
     # ── 各 position_id に対して個別 place_order ──────────────────────────────
     placed_orders: list[tuple[str, int]] = []   # (order_id, qty)
     failed_count = 0
+    not_sent_count = 0        # v3.9.212: 送信前に失敗（同じ注文を出し直して差し支えない）
+    sent_unknown_count = 0    # v3.9.212: 送信済みの可能性あり（照会が要る）
     already_closed_count = 0
     owned_skip_count = 0
     remaining = _req_qty
@@ -17406,8 +17576,21 @@ def place_close_all(
         elif ret == _RET_ALREADY_CLOSED:
             already_closed_count += 1
             remaining -= order_qty
+        elif ret == _RET_SENT_UNKNOWN:
+            # v3.9.212: 送信済みの可能性がある。ここで次の建玉に出すと二重決済になる。
+            # このパスは打ち切り、印を付けて次の巡回で照会から始める。
+            failed_count += 1
+            sent_unknown_count += 1
+            _mark_sent_unknown(symbol)
+            log.error(
+                f"{tag} [{side_label}] pid={pid[:12]}... 結果が分からないため"
+                f"、この銘柄の決済はいったん打ち切ります（次の巡回で注文照会から）: {oid_or_msg}"
+            )
+            break
         else:
             failed_count += 1
+            if isinstance(oid_or_msg, str) and oid_or_msg.startswith("not_sent:"):
+                not_sent_count += 1
             log.error(f"{tag} [{side_label}] pid={pid[:12]}... 発注失敗: {oid_or_msg}")
 
     # ── state 更新 (発注成功した分だけ反映) ──────────────────────────────────
@@ -17508,12 +17691,22 @@ def place_close_all(
         log.error(f"{tag} [{side_label}] 決済の発注ができませんでした{_skip_note}")
         if side == "SHORT":
             _play_alert_sound("short_cover_all_failed")
+        # v3.9.212: 利用者が最初に見るのは Discord。送信前に失敗したのか、
+        # 送ったが結果が分からないのかを通知にも出す（対処が変わるため）。
+        _kind_note = ""
+        if sent_unknown_count:
+            _kind_note = (f"\n⚠️ うち {sent_unknown_count} 件は送信済みの可能性があります"
+                          f"（結果が分かりません）。二重決済を避けるため、この銘柄の決済は"
+                          f"いったん打ち切りました。moomoo アプリで注文と建玉をご確認ください。")
+        elif not_sent_count == failed_count and failed_count:
+            _kind_note = ("\n（いずれも送信前の失敗です。注文は証券会社へ届いていません。"
+                          "次の巡回で出し直します）")
         _threadsafe_future(asyncio.to_thread(
             send_discord_message,
             f"❌ {tag} {side_label} 決済の発注ができませんでした\n"
             f"対象 {len(pids)} 建玉のうち、発注失敗 {failed_count} 件"
             f"／対象外 {owned_skip_count} 件／既に決済済み {already_closed_count} 件\n"
-            f"理由: {reason}\n"
+            f"理由: {reason}{_kind_note}\n"
             f"moomoo アプリで手動確認してください。"
         ))
         _mark_close_result(symbol, "failed")
@@ -19881,6 +20074,8 @@ def _ovn_order(trd_env, side, qty: int, price: float, *, reserve: bool = False,
                position_id=None):
     """OVN の発注。戻り値 (order_id or None, 説明)。
 
+    v3.9.212: 手仕舞い（売り）は決済なので優先枠を使う（配布前レビュー）。
+
     reserve=True は「引け後に出して翌営業日の寄り付きで約定させる」予約。
     実口座では session=RTH の成行注文が翌寄りまで生き残ることを実機で確認済み
     （2026-08-07 引け後に発注 → 2026-08-10 09:30 に約定）。
@@ -19888,6 +20083,8 @@ def _ovn_order(trd_env, side, qty: int, price: float, *, reserve: bool = False,
     """
     try:
         use_market = (price <= 0)
+        # 夜間持ち越しの手仕舞いは決済にあたるので、生成の枠は優先側を使う。
+        _ovn_urgent = (side != TrdSide.BUY)
         kw = dict(
             price=price if price > 0 else 0,
             qty=qty, code=to_moomoo_code(OVN_SYMBOL), trd_side=side,
@@ -19908,10 +20105,14 @@ def _ovn_order(trd_env, side, qty: int, price: float, *, reserve: bool = False,
         else:
             # moomoo は成行注文と fill_outside_rth=True の併用を拒否する。
             kw["fill_outside_rth"] = (not use_market)
-        with _trade_ctx() as ctx:
+        with _trade_ctx(urgent=_ovn_urgent) as ctx:
             ret, data = ctx.place_order(**kw)
         if ret != RET_OK:
             return None, str(data)
+        if side == TrdSide.BUY:
+            # v3.9.212: OVN の新規も「本日の新規」に数える（配布前レビュー）。
+            # これが無いと OVN しか動かなかった日のサマリが「実トレードなし」になる。
+            _record_today_entry(OVN_SYMBOL, "BUY(OVN)", qty, trd_env)
         return str(data["order_id"][0]), "OK"
     except Exception as e:
         return None, f"{type(e).__name__}: {_mask_secrets(e)}"
@@ -21226,7 +21427,9 @@ async def close_order_chaser() -> None:
                     f" → 新指値=${new_price:.2f}"
                 )
                 # キャンセル
-                ok = _cancel_order(order_id, sym, trd_env, f"チェイス（旧${old_price:.2f}→新${new_price:.2f}）")
+                ok = _cancel_order(order_id, sym, trd_env,
+                                   f"チェイス（旧${old_price:.2f}→新${new_price:.2f}）",
+                                   urgent=True)   # v3.9.212: 決済の追いかけも優先枠
                 if not ok:
                     _st_chk, _dealt_chk, _detail_chk = _order_status_snapshot(order_id, sym, trd_env)
                     if _is_terminal_order_status(_st_chk):
@@ -22142,6 +22345,8 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     else:
                         dfp = (price - ts.peak_price) / ts.peak_price * 100
                         trail_str = f"  trough=${ts.peak_price:.2f} 上昇={dfp:.2f}%"
+                # v3.9.212: 管理対象外・夜間持ち越しの行にも同じ注記を付ける
+                # （「口座が見えているように読める」問題は同じ・配布前レビュー）。
                 if _is_other_owner(symbol):
                     if bool(getattr(ts, "ovn_held", False)):
                         _late_note = ("  🌙 夜間持ち越しが管理中です"
@@ -22154,22 +22359,11 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     _late_log(
                         f"{tag} [ポジション] ${price:.2f}  "
                         f"PnL={pnl_colored(pnl)}({pct_colored(unr_pct)})"
-                        f"  env={_env_tag()}{_late_note}"
+                        f"  env={_env_tag()}{_late_note}{_holding_note(quote)}"
                     )
                     continue
                 else:
-                    # ★ v3.9.211（実口座の報告）: OpenD の応答不良が続いても価格だけは
-                    #   Alpaca で取れるため、この行は普段どおりの含み損を出し続けていた。
-                    #   数量と建値は最後に同期できたときの写しなので、いま口座にある建玉とは
-                    #   一致しないことがある（手で決済した場合も同じ）。参考値だと分かる形にする。
-                    _pos_stale = _sync_stale_suffix()
-                    _src = (quote or {}).get("source") or ""
-                    _src_note = f"  価格={_src}" if _src and _src != "OpenD" else ""
-                    if _pos_stale:
-                        _pos_stale = (f"{_pos_stale}{_src_note}"
-                                      f"  ※数量・建値は最終同期時点の参考値")
-                    else:
-                        _pos_stale = _src_note
+                    _pos_stale = _holding_note(quote)
                     log.info(
                         f"{tag} [ポジション] ${price:.2f}  PnL={pnl_colored(pnl)}({pct_colored(unr_pct)})"
                         f"  env={_env_tag()}"
