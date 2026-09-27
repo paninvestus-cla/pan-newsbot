@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.208"
+BOT_VERSION = "v3.9.210"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -1661,7 +1661,12 @@ _SHADOW_SHORT_LOCK = threading.Lock()
 
 
 def _shadow_short_order_usd(symbol: str, confidence: float) -> Tuple[float, str]:
-    """
+    """シャドー SHORT の発注額を実発注と同じ物差しで決める。
+
+    山型のサイズ配分と個別株の 1 銘柄上限までは place_short と揃える。
+    ポートフォリオ合計の余力（BUDGET_USD − 建玉コスト）はあえて見ない。
+    シャドーは「その売りシグナルが当たっていたか」を測るのが目的で、
+    余力が埋まっている日に 0 ドルへ落とすと測れなくなるため。
     """
     usd = calc_order_size(confidence)
     notes = []
@@ -1670,8 +1675,9 @@ def _shadow_short_order_usd(symbol: str, confidence: float) -> Tuple[float, str]
     except Exception:
         _mult = 1.0
     if _mult > 1.0:
-        usd = max(ORDER_SIZE_MIN_USD, usd / _mult)
-        notes.append(f"÷{_mult:.1f}")
+        # ★ 2026-09-27: 実際の発注と同じく、高ボラ銘柄でも発注額は縮めない。
+        #   ここだけ縮めると、観察の物差しが実際の売買とずれる。
+        notes.append(f"高ボラ（損切り×{_mult:.1f}・発注額はそのまま）")
     _is_stock = (symbol in STOCK_TICKERS
                  or symbol in EARNINGS_PRE_TICKERS
                  or symbol in EARNINGS_AFTER_TICKERS)
@@ -1803,8 +1809,9 @@ def _shadow_short_check_exit(pos: Dict[str, Any]) -> Optional[Tuple[str, float]]
 
     LONG ルールの SHORT 対称版:
       ・損切り: 価格が entry × (1 + MAX_LOSS_PCT) 以上に上昇
-      ・トレール作動: peak (安値) が entry × (1 - TRAIL_TRIGGER_PCT) 以下に到達
-      ・トレール決済: 価格が peak × (1 + TRAIL_DROP_PCT) 以上に戻り
+      ・トレール作動: peak (安値) が entry × (1 - 実効トレール発動幅) 以下に到達
+      ・トレール決済: 価格が peak × (1 + 実効トレール幅) 以上に戻り
+        （実効値 = _effective_trail_pcts。損切りと同じ倍率で広がる）
       ・タイムアウト: 経過時間 > TIMEOUT_EXIT_MINUTES (0 設定で無効)
     """
     try:
@@ -1829,17 +1836,20 @@ def _shadow_short_check_exit(pos: Dict[str, Any]) -> Optional[Tuple[str, float]]
             return ("強制損切り", cur)
 
         # ── ② トレール作動チェック ──
+        # v3.9.210: 損切りが倍率で広がる銘柄は利確トレールも同じ倍率で広げる
+        # （実発注と同じ関数を使う。ここだけ素の値だと観察の物差しがずれる）。
+        _sh_trigger, _sh_drop = _effective_trail_pcts(symbol)
         if not pos["trail_triggered"]:
-            if pos["peak_price"] <= entry * (1 - TRAIL_TRIGGER_PCT):
+            if pos["peak_price"] <= entry * (1 - _sh_trigger):
                 pos["trail_triggered"] = True
                 log.info(
                     f"[シャドーSHORT-TRAIL] {symbol} トレール作動 "
                     f"peak=${pos['peak_price']:.2f} entry=${entry:.2f} "
-                    f"(-{TRAIL_TRIGGER_PCT*100:.2f}% 到達)"
+                    f"(-{_sh_trigger*100:.2f}% 到達)"
                 )
-        # ── ③ トレール決済 (peak から TRAIL_DROP_PCT 戻り) ──
+        # ── ③ トレール決済 (peak から _sh_drop 戻り) ──
         if pos["trail_triggered"]:
-            if cur >= pos["peak_price"] * (1 + TRAIL_DROP_PCT):
+            if cur >= pos["peak_price"] * (1 + _sh_drop):
                 return ("トレール停止", cur)
 
         # ── ④ タイムアウト ──
@@ -4811,14 +4821,15 @@ except ValueError:
     sys.exit(1)
 
 # 5/21 NVDA 利用者I -$41.80 事例: NVDA $223 の 0.5% = $1.12 は日中ノイズ範囲で、
-# 損切りが誤発動していた。高ボラ銘柄は損切り幅を拡げる必要があるが、幅を拡げる
-# だけだと 1 トレードあたりの損失額が増える。そこで「損切り幅 × N 倍」と同時に
-# 「ポジションサイズ ÷ N 倍」を行い、1 トレードの想定最大損失額 (ドル) を ETF と
-# 同水準に保つ (リスクパリティ設計)。
+# 損切りが誤発動していた。値動きの荒い銘柄は損切り幅を拡げる必要がある。
+# 2026-09-27（PAN 指示・戦略の明確化）: 荒い銘柄は「大きく狙う代わりに大きな損失も
+# 受け入れる」。損切り幅・利確トレール幅の両方を倍率で広げ、発注額は縮めない。
+# したがって 1 トレードの想定最大損失額（ドル）も倍率ぶん大きくなる。
 #   例: MAX_LOSS_PCT=0.50% / 倍率 2.5 のとき
 #     ETF  : 損切り 0.50% / サイズ 100% → 最大損失 = サイズ × 0.50%
-#     NVDA : 損切り 1.25% / サイズ  40% → 最大損失 = (サイズ×0.4) × 1.25%
-#            = サイズ × 0.50%  ← ETF と同じドル損失
+#     NVDA : 損切り 1.25% / サイズ 100% → 最大損失 = サイズ × 1.25%（2.5 倍）
+# 旧版（v3.9.208 まで）はサイズを 1/N に縮めて損失額を ETF と同水準に保っていた
+# （リスクパリティ設計）。狙いの大きさまで一緒に縮むため v3.9.209 で廃止。
 # STOCK_HIGHVOL_LOSS_MULT=0 で機能無効化 (全銘柄一律 MAX_LOSS_PCT)。
 _HIGHVOL_SYMBOLS: set = {
     "NVDA", "TSLA", "AMD", "MU", "AVGO", "SMH", "MRVL", "ARM",
@@ -4872,6 +4883,28 @@ def _symbol_loss_mult(symbol: str) -> float:
 def _effective_max_loss_pct(symbol: str, base_pct: float) -> float:
     """"""
     return base_pct * _symbol_loss_mult(symbol)
+
+
+def _effective_trail_pcts(symbol: str, is_earn: bool = False,
+                          is_momentum: bool = False) -> Tuple[float, float]:
+    """利確トレールの実効値（発動幅, 戻り幅）を小数で返す。
+
+    v3.9.210: 倍率を掛けるのは「損切り幅に倍率が掛かるとき」だけに揃える
+    （risk_monitor_loop の ④ と同じ条件）。損切りだけ広げて利確を据え置くと、
+    値動きの荒い銘柄ほど「損は大きく、利は小さい」になり戦略と逆を向く。
+      ・決算銘柄: 損切りは EARNINGS_MAX_LOSS_PCT × 倍率 → 利確も同じ倍率
+      ・モメンタム: 損切りは MOMENTUM_STOP_LOSS_PCT（倍率なし）→ 利確も倍率なし
+    倍率 1 未満（値動きの小さい銘柄）では掛けない。設定した利確幅より狭めるのは
+    戦略の狙いではなく、入力の下限（0.1%）も割ってしまうため。
+    上限は入力と同じ 50% で止める（倍率の設定次第で到達不能な幅になりうる）。
+    """
+    _trigger = EARNINGS_TRAIL_TRIGGER_PCT if is_earn else TRAIL_TRIGGER_PCT
+    _drop    = EARNINGS_TRAIL_DROP_PCT    if is_earn else TRAIL_DROP_PCT
+    if not (is_momentum and MOMENTUM_STOP_LOSS_PCT > 0):
+        _mult   = max(1.0, _symbol_loss_mult(symbol))
+        _trigger = min(0.5, _trigger * _mult)
+        _drop    = min(0.5, _drop * _mult)
+    return _trigger, _drop
 
 # 「発注しない設定」セッションや OVERNIGHT へ切り替わる CLOSE_BEFORE_INACTIVE_MIN 分前に
 # 保有ポジションを全決済する。true なら境界の N 分前に決済、false なら保持のまま。
@@ -14435,23 +14468,19 @@ def place_buy(
             _size_label = "★スイートスポット 100%"
         else:
             _size_label = "超強気帯 40%"
-        # 損切り幅を N 倍に拡げる代わりにサイズを 1/N に縮小し、1 トレードの
-        # 想定最大損失額 (ドル) を ETF と同水準に保つ (リスクパリティ)。
+        # ★ 2026-09-27（PAN 指示・戦略の明確化）: 値動きの荒い銘柄は「大きく狙う代わりに
+        #   大きな損失も受け入れる」。ここで発注額を倍率で割ると、狙いの大きさまで
+        #   一緒に縮んでしまう。損切り幅だけを広げ、発注額はそのままにする。
+        #   （旧: 1トレードの想定最大損失額を ETF と同水準に保つ＝リスクパリティ。
+        #     戦略と逆向きだったうえ、弱シグナル帯と超強気帯では発注の下限に当たって
+        #     割った分が打ち消され、帯ごとに 1.0〜3.0 倍とばらついていた・利用者の報告）
         _hv_mult = _symbol_loss_mult(symbol)
         if _hv_mult > 1.0:
-            _order_size_before = order_size
-            order_size = max(ORDER_SIZE_MIN_USD, order_size / _hv_mult)
             log.info(
                 f"{tag} 発注額計算: confidence={confidence:.4f}  [{_size_label}]"
-                f"  → 高ボラ銘柄サイズ調整 ${_order_size_before:,.0f} ÷ {_hv_mult:.1f}"
-                f" = ${_order_size_before / _hv_mult:,.0f}"
-                # 下限で切り上げた回に「÷N = 同額」と出て計算が合わなかった（利用者の報告）。
-                # 比べるのは表示と同じ「ドル単位に丸めた値」。丸める前で比べると、
-                # 999.6 と 1,000 のような差でも「= $1,000 → 下限 $1,000 を適用 = $1,000」
-                # とやはり同額に見える（配布前レビュー指摘）。
-                f"{f' → 下限 ${ORDER_SIZE_MIN_USD:,.0f} を適用 = ${order_size:,.0f}' if round(order_size) > round(_order_size_before / _hv_mult) else ''}"
+                f"  → ${order_size:,.0f}（高ボラ銘柄・発注額は縮めません）"
                 f"  (損切り幅 {MAX_LOSS_PCT*100:.2f}%→{MAX_LOSS_PCT*_hv_mult*100:.2f}% / "
-                f"想定最大損失額は ETF と同水準)"
+                f"想定最大損失額も約{_hv_mult:.1f}倍)"
             )
         else:
             log.info(
@@ -14579,6 +14608,22 @@ def place_buy(
                 qty = _max_qty_budget
     order_cost = qty * limit_price
 
+    # 発注額を先に確保する（同時に走る別銘柄の発注と合計が上限を超えないように）
+    _budget_token = budget_reserve(symbol, order_cost)
+    if _budget_token is None:
+        log.info(
+            f"{tag} 別銘柄の同時発注で余力が埋まりました"
+            f"（発注額=${order_cost:,.0f} / 上限=${_BUDGET_USD:,.0f}）→ 発注スキップ"
+        )
+        _log_observation(symbol=symbol, side="BUY", confidence=confidence, score=1,
+                         category=category, headlines=headlines,
+                         beneficiaries=beneficiaries, victims=victims,
+                         outcome="blocked", block_stage="portfolio_cap",
+                         block_reason=f"同時発注で余力が埋まった（発注額${order_cost:,.0f}）",
+                         price_at_decision=quote_price(quote))
+        _mark_order_fail(symbol, "別銘柄の同時発注で余力が埋まった")
+        return False
+
     # 時間外取引フラグ（RTH 以外は outside_rth=True）
     outside_rth = session != SESSION_RTH
 
@@ -14619,6 +14664,7 @@ def place_buy(
                 _trade_lock_last_warned = None  # 即時表示させる
                 _trade_lock_last_probe = None
                 _warn_trade_locked()
+            budget_release(_budget_token)
             return False
         order_id = str(data["order_id"][0])
         log.info(f"{tag} [ORDER] BUY  orderId={order_id}  qty={qty}  price={limit_price}"
@@ -14626,6 +14672,7 @@ def place_buy(
     except Exception as e:
         log.error(f"{tag} [ORDER] BUY API例外: {e}", exc_info=True)
         _mark_order_fail(symbol, f"発注APIの例外: {e}")
+        budget_release(_budget_token)
         return False
 
     # ── ここから API 送信成功確定 ─────────────────────────────────────────────
@@ -14671,8 +14718,8 @@ def place_buy(
     ts_state.entry_ai_category = category
     ts_state.entry_news_source = news_source
     ts_state.entry_reason      = reason
-    # 自前ポジション管理に発注コストと株数を記録
-    track_position_add(symbol, order_cost, qty=qty)
+    # 自前ポジション管理に発注コストと株数を記録（確保は計上と同時に解放）
+    track_position_add(symbol, order_cost, qty=qty, reserve_token=_budget_token)
     _headlines_str = (
         "\n─── トリガーニュース ───\n" + "\n".join(f"・{h}" for h in headlines[:3])
         if headlines else ""
@@ -14970,20 +15017,19 @@ def place_short(
             _size_label = "★スイートスポット 100%"
         else:
             _size_label = "超強気帯 40%"
+        # ★ 2026-09-27（PAN 指示・戦略の明確化）: 値動きの荒い銘柄は「大きく狙う代わりに
+        #   大きな損失も受け入れる」。ここで発注額を倍率で割ると、狙いの大きさまで
+        #   一緒に縮んでしまう。損切り幅だけを広げ、発注額はそのままにする。
+        #   （旧: 1トレードの想定最大損失額を ETF と同水準に保つ＝リスクパリティ。
+        #     戦略と逆向きだったうえ、弱シグナル帯と超強気帯では発注の下限に当たって
+        #     割った分が打ち消され、帯ごとに 1.0〜3.0 倍とばらついていた・利用者の報告）
         _hv_mult = _symbol_loss_mult(symbol)
         if _hv_mult > 1.0:
-            _order_size_before = order_size
-            order_size = max(ORDER_SIZE_MIN_USD, order_size / _hv_mult)
             log.info(
                 f"{tag} [空売り発注額] confidence={confidence:.4f} [{_size_label}]"
-                f" → 高ボラ銘柄サイズ調整 ${_order_size_before:,.0f} ÷ {_hv_mult:.1f}"
-                f" = ${_order_size_before / _hv_mult:,.0f}"
-                # 下限で切り上げた回に「÷N = 同額」と出て計算が合わなかった（利用者の報告）。
-                # 比べるのは表示と同じ「ドル単位に丸めた値」。丸める前で比べると、
-                # 999.6 と 1,000 のような差でも「= $1,000 → 下限 $1,000 を適用 = $1,000」
-                # とやはり同額に見える（配布前レビュー指摘）。
-                f"{f' → 下限 ${ORDER_SIZE_MIN_USD:,.0f} を適用 = ${order_size:,.0f}' if round(order_size) > round(_order_size_before / _hv_mult) else ''}"
-                f" (損切り幅 {MAX_LOSS_PCT*100:.2f}%→{MAX_LOSS_PCT*_hv_mult*100:.2f}%)"
+                f" → ${order_size:,.0f}（高ボラ銘柄・発注額は縮めません）"
+                f" (損切り幅 {MAX_LOSS_PCT*100:.2f}%→{MAX_LOSS_PCT*_hv_mult*100:.2f}% / "
+                f"想定最大損失額も約{_hv_mult:.1f}倍)"
             )
         else:
             log.info(
@@ -15062,6 +15108,22 @@ def place_short(
             qty = _max_qty_budget
     order_cost = qty * limit_price
 
+    # 発注額を先に確保する（同時に走る別銘柄の発注と合計が上限を超えないように）
+    _budget_token = budget_reserve(symbol, order_cost)
+    if _budget_token is None:
+        log.info(
+            f"{tag} 別銘柄の同時発注で余力が埋まりました"
+            f"（発注額=${order_cost:,.0f} / 上限=${_BUDGET_USD:,.0f}）→ 空売りスキップ"
+        )
+        _log_observation(symbol=symbol, side="SELL_SHORT", confidence=confidence, score=-1,
+                         category=category, headlines=headlines,
+                         beneficiaries=beneficiaries, victims=victims,
+                         outcome="blocked", block_stage="portfolio_cap",
+                         block_reason=f"同時発注で余力が埋まった（発注額${order_cost:,.0f}）",
+                         price_at_decision=quote_price(quote))
+        _mark_order_fail(symbol, "別銘柄の同時発注で余力が埋まった", side="SHORT")
+        return False
+
     # RTH 以外は空売り注文が通らないケースがあるため確認
     outside_rth = session != SESSION_RTH
 
@@ -15113,6 +15175,7 @@ def place_short(
                     f"BUDGET_USD を実際の信用余力の範囲内に設定してください（複数銘柄の同時保有を考慮）。"
                 ))
                 _mark_order_fail(symbol, "信用余力の不足で moomoo が発注を拒否", side="SHORT")
+                budget_release(_budget_token)
                 return False
             _borrow_keywords = (
                 "insufficient", "borrow", "short sell", "short position",
@@ -15139,6 +15202,7 @@ def place_short(
             else:
                 log.error(f"{tag} [ORDER] SHORT 失敗: {data}")
             _mark_order_fail(symbol, f"moomoo が発注を拒否: {data}", side="SHORT")
+            budget_release(_budget_token)
             return False
         order_id = str(data["order_id"][0])
         log.info(f"{tag} [ORDER] SHORT orderId={order_id}  qty={qty}  price={limit_price}"
@@ -15147,6 +15211,7 @@ def place_short(
     except Exception as e:
         log.error(f"{tag} [ORDER] SHORT API例外: {e}", exc_info=True)
         _mark_order_fail(symbol, f"発注APIの例外: {e}", side="SHORT")
+        budget_release(_budget_token)
         return False
 
     # ── ここから API 送信成功確定 ─────────────────────────────────────────────
@@ -15196,7 +15261,7 @@ def place_short(
     ts_state.entry_ai_conf     = confidence
     ts_state.entry_ai_category = category
     ts_state.entry_news_source = news_source
-    track_position_add(symbol, order_cost, qty=qty)
+    track_position_add(symbol, order_cost, qty=qty, reserve_token=_budget_token)
     _headlines_str = (
         "\n─── トリガーニュース ───\n" + "\n".join(f"・{h}" for h in headlines[:3])
         if headlines else ""
@@ -15965,17 +16030,79 @@ def log_market_state() -> None:
     log.info(f"  データ蓄積: " + " ".join(_data_status))
 
 
-def get_tracked_portfolio_total() -> float:
-    """自前管理のポジションコスト合計を返す"""
-    return sum(_tracked_position_cost.values())
+# ── 予算の一時確保（v3.9.210）────────────────────────────────────────────────
+# 上限チェックから track_position_add までの間に発注 API の送信が入る。別銘柄の
+# 発注が同時に走ると、どちらも「余力あり」と判定して合計が BUDGET_USD を超えられる
+# （銘柄ごとのロックしかないため）。発注直前に金額を確保し、追跡コストへ計上できた
+# 時点か、発注が失敗した時点で解放する。
+# 解放漏れで余力が永久に埋まると発注が止まるので、古い確保は自動で失効させる。
+_budget_reserve_lock = threading.Lock()
+_budget_reserved: dict[int, tuple[float, float, str]] = {}   # token -> (金額, 確保時刻, 銘柄)
+_budget_reserve_seq = 0
+BUDGET_RESERVE_TTL_SEC = 300.0
 
-def track_position_add(symbol: str, order_cost: float, qty: int = 0) -> None:
-    """発注成功時にポジションコストと株数を加算"""
+
+def get_budget_reserved_total() -> float:
+    """発注中で確保済みの金額。TTL を超えた確保は解放漏れとみなして捨てる。"""
+    _now = time.time()
+    with _budget_reserve_lock:
+        _stale = [t for t, (_a, _at, _s) in _budget_reserved.items()
+                  if _now - _at > BUDGET_RESERVE_TTL_SEC]
+        for t in _stale:
+            _amt, _at, _sym = _budget_reserved.pop(t)
+            log.warning(
+                f"[予算確保] {_sym} の確保 ${_amt:,.0f} が "
+                f"{BUDGET_RESERVE_TTL_SEC:.0f}秒 解放されなかったため失効させました"
+            )
+        return sum(_a for _a, _at, _s in _budget_reserved.values())
+
+
+def budget_reserve(symbol: str, amount: float) -> Optional[int]:
+    """余力の範囲なら amount を確保してトークンを返す。足りなければ None。"""
+    global _budget_reserve_seq
+    if amount <= 0:
+        return None
+    _reserved = get_budget_reserved_total()   # 先に失効処理を通す
+    with _budget_reserve_lock:
+        _used = sum(_tracked_position_cost.values()) + _reserved
+        if _used + amount > _BUDGET_USD + 1e-6:
+            log.info(
+                f"[予算確保] {symbol} ${amount:,.0f} を確保できません"
+                f"（確定=${sum(_tracked_position_cost.values()):,.0f}"
+                f" + 発注中=${_reserved:,.0f} / 上限=${_BUDGET_USD:,.0f}）"
+            )
+            return None
+        _budget_reserve_seq += 1
+        _token = _budget_reserve_seq
+        _budget_reserved[_token] = (float(amount), time.time(), symbol)
+    return _token
+
+
+def budget_release(token: Optional[int]) -> None:
+    """確保した金額を解放する（計上済み・発注失敗のどちらでも呼ぶ）。"""
+    if token is None:
+        return
+    with _budget_reserve_lock:
+        _budget_reserved.pop(token, None)
+
+
+def get_tracked_portfolio_total() -> float:
+    """自前管理のポジションコスト合計を返す（発注中の確保ぶんを含む）"""
+    return sum(_tracked_position_cost.values()) + get_budget_reserved_total()
+
+def track_position_add(symbol: str, order_cost: float, qty: int = 0,
+                       reserve_token: Optional[int] = None) -> None:
+    """発注成功時にポジションコストと株数を加算
+
+    reserve_token を渡すと、計上と同時に予算の一時確保を解放する。
+    別々に呼ぶと、その間だけ確保ぶんと計上ぶんが二重に数えられる。
+    """
     _ledger_mark(symbol, None, getattr(state.get(symbol), "entry_time", None),
                  category=getattr(state.get(symbol), "entry_ai_category", None))
     _tracked_position_cost[symbol] = _tracked_position_cost.get(symbol, 0.0) + order_cost
     if qty > 0:
         _tracked_qty[symbol] = _tracked_qty.get(symbol, 0) + qty
+    budget_release(reserve_token)
     log.info(
         f"[ポジション管理] {symbol} +${order_cost:,.0f}"
         f"  追跡株数={_tracked_qty.get(symbol, 0)}株"
@@ -21159,6 +21286,21 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
         f"トレール幅: {TRAIL_DROP_PCT*100:.2f}%"
         + (f" / 時間切れ決済: {TIMEOUT_EXIT_MINUTES}分" if TIMEOUT_EXIT_MINUTES > 0 else "")
     )
+    # v3.9.210: 倍率が掛かる銘柄は上の表示と実効値が違うので、銘柄ごとに1行出す
+    # （画面の数字と実際の動きが違って見える、を残さない）。
+    _hv_lines = []
+    for _s in exec_syms:
+        _m_hv = _symbol_loss_mult(_s)
+        if _m_hv == 1.0:
+            continue
+        _tg_hv, _dr_hv = _effective_trail_pcts(_s)
+        _hv_lines.append(
+            f"{_s}(×{_m_hv:.1f}): 損切り -{MAX_LOSS_PCT*_m_hv*100:.2f}% / "
+            f"トレール発動 +{_tg_hv*100:.2f}% / 幅 {_dr_hv*100:.2f}%"
+        )
+    if _hv_lines:
+        log.info("  　値動きの荒い銘柄の実効値: " + " ｜ ".join(_hv_lines))
+        log.info("  　（モメンタム建玉は専用の損切り幅を使うため倍率は掛かりません）")
     if _all_earnings_set:
         log.info(
             f"  　決算銘柄専用: トレール発動 +{EARNINGS_TRAIL_TRIGGER_PCT*100:.2f}% / "
@@ -21334,11 +21476,13 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
 
                 # ── 決算銘柄か通常銘柄かでトレール・タイムアウトを切り替え（アイデアC）──
                 _is_earn_sym = symbol in _all_earnings_set
-                _t_trigger   = EARNINGS_TRAIL_TRIGGER_PCT   if _is_earn_sym else TRAIL_TRIGGER_PCT
-                _t_drop      = EARNINGS_TRAIL_DROP_PCT       if _is_earn_sym else TRAIL_DROP_PCT
                 # を適用 (ニュースの鮮度ベースではなく、トレンド継続時間ベース)。
                 # entry_ai_category == "MOMENTUM" で識別。優先順位: 決算 > モメンタム > 通常。
                 _is_momentum = (ts.entry_ai_category == "MOMENTUM")
+                # ★ 2026-09-27（PAN 指示・戦略の明確化）: 損切り幅だけを倍率で広げて
+                #   利確トレールを据え置くと、荒い銘柄ほど「損は大きく、利は小さい」に
+                #   なる。倍率の有無は下の ④（損切り）と同じ条件で決める。
+                _t_trigger, _t_drop = _effective_trail_pcts(symbol, _is_earn_sym, _is_momentum)
                 if _is_earn_sym:
                     _t_timeout = EARNINGS_TIMEOUT_EXIT_MINUTES
                 elif _is_momentum:
@@ -21890,7 +22034,7 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                 else:
                     _eff_max_loss = MAX_LOSS_PCT
                     _stop_basis = "common"
-                # (発注時にサイズを縮小済みなのでドル損失額は ETF と同水準に保たれる)
+                # (v3.9.209: 発注額は縮めない。ドル損失額は倍率ぶん大きくなる＝戦略どおり)
                 # モメンタム専用値を使う場合は二重拡大を避けるため倍率は適用しない。
                 # ※ 案a(高ボラ損切り拡大)は実取引を変えず「シャドー計測」で検証する方針(v3.9.93)。
                 if not (_is_momentum and MOMENTUM_STOP_LOSS_PCT > 0):
