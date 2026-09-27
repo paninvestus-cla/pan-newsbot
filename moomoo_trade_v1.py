@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.210"
+BOT_VERSION = "v3.9.211"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -7939,6 +7939,11 @@ def close_all_for_weekend(trd_env: TrdEnv,
 # 追加。同じ整形関数を Discord メッセージ (毎日 ET 15:50) と Ctrl+C 終了時の
 # 端末出力で共通化することで保守箇所を 1 つに集約。
 _today_trades: list[dict] = []
+# ★ v3.9.211（実口座の報告）: _today_trades は「決済まで記録できたトレード」だけ。
+#   同期障害で決済結果を回収できないと、その日に新規約定があっても集計は空になり、
+#   終了サマリが「本日の実トレードはありません」と出ていた（実際は QQQ 8株を保有）。
+#   新規の約定を別に数えて、決済の記録が無いことと取引が無かったことを分ける。
+_today_entries: list[dict] = []
 _today_trades_date: Optional["datetime.date"] = None
 _daily_summary_sent_date: Optional["datetime.date"] = None
 def _daily_summary_send_time(trd_env: "TrdEnv", today_et_date: "datetime.date") -> datetime.time:
@@ -8005,6 +8010,7 @@ def _save_today_state() -> None:
         state = {
             "date":            _today_trades_date.isoformat() if _today_trades_date else None,
             "trades":          _today_trades,
+            "entries":         _today_entries,
             "shadow_short":    _today_shadow_short,
             "shadow_momentum": _today_shadow_momentum,
         }
@@ -8017,7 +8023,7 @@ def _save_today_state() -> None:
 
 def _load_today_state() -> int:
     """起動時に当日サマリを読み戻す (保存日付が当日 ET のときのみ)。戻り値=復元トレード件数。"""
-    global _today_trades, _today_trades_date
+    global _today_trades, _today_trades_date, _today_entries
     global _today_shadow_short, _today_shadow_momentum
     try:
         _today_state_ready()
@@ -8032,6 +8038,8 @@ def _load_today_state() -> int:
         if not saved or datetime.date.fromisoformat(saved) != today_et:
             return 0  # 別日の残骸は無視 (次の記録/リセットで上書きされる)
         _today_trades         = list(state.get("trades") or [])
+        # v3.9.211 で足した控え。古い保存ファイルには無いので既定は空。
+        _today_entries        = list(state.get("entries") or [])
         _today_shadow_short   = list(state.get("shadow_short") or [])
         _today_shadow_momentum= list(state.get("shadow_momentum") or [])
         _today_trades_date    = today_et
@@ -8521,11 +8529,12 @@ def _record_today_shadow_momentum(rec: dict) -> None:
 
 def _maybe_reset_today_trades() -> None:
     """ET 日付が変わっていれば当日バッファをリセットする。"""
-    global _today_trades, _today_trades_date
+    global _today_trades, _today_trades_date, _today_entries
     global _today_shadow_short, _today_shadow_momentum, _today_shadow_ovn
     today_et = datetime.datetime.now(_ET).date()
     if _today_trades_date != today_et:
         _today_trades = []
+        _today_entries = []
         _today_shadow_short = []
         _today_shadow_momentum = []
         _today_shadow_ovn = []
@@ -8538,6 +8547,24 @@ def _record_today_trade(rec: dict) -> None:
     _maybe_reset_today_trades()
     _today_trades.append(rec)
     _save_today_state()
+
+
+def _record_today_entry(symbol: str, side: str, qty: int, trd_env: "TrdEnv") -> None:
+    """新規の発注が通った時点で「その日の新規」として数える（v3.9.211）。
+
+    決済まで記録できたかどうかとは別に持つ。決済結果を回収できない日に
+    「取引なし・損益ゼロ」と読めてしまうのを防ぐための控え。
+    """
+    try:
+        _maybe_reset_today_trades()
+        _today_entries.append({
+            "symbol": symbol, "side": side, "qty": int(qty),
+            "env": "REAL" if trd_env == TrdEnv.REAL else "DEMO",
+            "at": datetime.datetime.now(_ET).strftime("%H:%M:%S"),
+        })
+        _save_today_state()
+    except Exception as _e:
+        log.debug(f"[当日サマリ] 新規の記録に失敗(黙殺): {_mask_secrets(_e)}")
 
 
 def _format_shadow_summary_block() -> Optional[str]:
@@ -8621,7 +8648,8 @@ def _format_daily_summary() -> Optional[str]:
     """
     _maybe_reset_today_trades()
     # 実トレードもシャドーも完全ゼロなら None
-    if (not _today_trades and not _today_shadow_short
+    # v3.9.211: 新規の約定だけあって決済の記録が無い日も出す（黙って消さない）
+    if (not _today_trades and not _today_entries and not _today_shadow_short
             and not _today_shadow_momentum and not _today_shadow_ovn):
         return None
     # ── 実トレードゼロでシャドーだけある場合の簡易ヘッダ ──────────────
@@ -8631,7 +8659,24 @@ def _format_daily_summary() -> Optional[str]:
         header.append(f"📊 本日のトレード集計 {'🔴 実口座' if _RUN_TRADE_ENV == 'REAL' else '🟡 デモ口座'}  {today_et.strftime('%Y-%m-%d (%a) %H:%M ET')}")
         header.append('=' * 56)
         header.append(f"🎛 戦略プロファイル: {_PROFILE_DISPLAY}")
-        header.append("本日の実トレードはありません")
+        # ★ v3.9.211: 「取引が無かった」と「決済結果を記録できなかった」を分ける。
+        #   同期障害の日に新規約定があっても、以前はここが「実トレードはありません」だった。
+        if _today_entries:
+            _ent_lines = " / ".join(
+                f"{_e.get('at','')} {_e.get('symbol','')} {_e.get('side','')}"
+                f" {_e.get('qty',0)}株" for _e in _today_entries[:5])
+            header.append(
+                f"Bot が記録できた本日の決済はありません"
+                f"（本日の新規約定 {len(_today_entries)}件・決済の記録 0件）"
+            )
+            header.append(f"　新規: {_ent_lines}" + ("  ほか" if len(_today_entries) > 5 else ""))
+            header.append(
+                "　⚠️ 損益ゼロではありません。建玉と決済の結果は"
+                "moomoo の取引履歴で照合してください"
+                "（同期障害中・手で決済した場合は Bot に記録が残りません）"
+            )
+        else:
+            header.append("本日の実トレードはありません")
         shadow = _format_shadow_summary_block()
         if shadow:
             header.append(shadow)
@@ -8694,6 +8739,10 @@ def _format_daily_summary() -> Optional[str]:
     lines.append('=' * 56)
     lines.append(f"🎛 戦略プロファイル: {_PROFILE_DISPLAY}")
     lines.append(f"合計 {n_total}件   勝率 {win_rate:.0f}% ({n_w}勝 {n_l}敗)")
+    # v3.9.211: 決済の記録と本日の新規を分けて出す（同じ数とは限らない。
+    # 前日からの持ち越しを決済した回も、まだ持っている回もあるため）。
+    if _today_entries:
+        lines.append(f"（本日の新規約定 {len(_today_entries)}件 / 決済の記録 {n_total}件）")
     lines.append(f"損益  {total_pnl:+.2f}   平均勝ち {avg_w:+.2f} / 平均負け {avg_l:+.2f}")
     lines.append("")
     # v3.9.23: 該当トレードがあるときのみ表示 (全件勝ち/全件負けで片方欠落するケース対応)
@@ -12066,10 +12115,50 @@ except (TypeError, ValueError):
 #   まさに起きる窓）は通知が間引かれてしまう。None=未送信で管理する。
 _opend_down_last_note_mono = None
 _ctx_build_lock = threading.Lock()
-_ctx_build_inflight: int = 0
 _CTX_BUILD_MAX_INFLIGHT: int = 3
 _ctx_build_backoff_until: float = 0.0
 _CTX_BUILD_BACKOFF_SEC: float = 20.0
+# ★ v3.9.211（実口座の報告・優先度最高）: SDK のコンストラクタが戻らないまま
+#   3件たまると、生成の枠が埋まったままになり、そのあとの損切りの決済も同じ
+#   上限で拒否され続けた（実口座で損切りの発注が3回失敗し、利用者が手で決済）。
+#   件数だけを持っていたので「いつから・何が」戻っていないのかも読めなかった。
+#   ここでは1件ごとに用途と開始時刻を持ち、
+#     ・一定時間を過ぎた生成は「戻ってこない」ものとして枠の計算から外す
+#     ・ただし戻らないスレッドが増え続けないよう、別の天井で必ず止める
+#     ・決済（urgent）には枠を1つ余分に許し、直前のタイムアウトの待機も待たない
+#   の3点で、監視を殺さずに決済の道を残す。
+#   カウンタを黙って0に戻す・上限を上げ続ける・注文を無条件に再送する、は行わない。
+_ctx_build_active: dict = {}      # 連番 -> {"what": 用途, "at": 開始時刻(monotonic)}
+_ctx_build_seq: int = 0
+try:
+    _CTX_BUILD_STUCK_SEC: float = float(os.environ.get("MOOMOO_CTX_STUCK_SEC", "90") or 90)
+except (TypeError, ValueError):
+    _CTX_BUILD_STUCK_SEC = 90.0
+_CTX_BUILD_STUCK_SEC = min(max(_CTX_BUILD_STUCK_SEC, 30.0), 900.0)
+try:
+    _CTX_BUILD_MAX_STUCK: int = int(os.environ.get("MOOMOO_CTX_MAX_STUCK", "6") or 6)
+except (TypeError, ValueError):
+    _CTX_BUILD_MAX_STUCK = 6
+_CTX_BUILD_MAX_STUCK = min(max(_CTX_BUILD_MAX_STUCK, 1), 20)
+
+
+def _ctx_build_inflight_count() -> int:
+    """生成中（生きているスレッド）の件数。数える場所を1つにする。"""
+    with _ctx_build_lock:
+        return len(_ctx_build_active)
+
+
+def _ctx_build_state(now_mono: float) -> tuple:
+    """生成中の内訳を返す: (進行中の件数, 戻らない件数, 読める説明)。ロック内で呼ぶ。"""
+    _fresh, _stuck, _parts = 0, 0, []
+    for _info in _ctx_build_active.values():
+        _el = now_mono - _info["at"]
+        if _el > _CTX_BUILD_STUCK_SEC:
+            _stuck += 1
+        else:
+            _fresh += 1
+        _parts.append(f"{_info['what']}:{_el:.0f}秒{'(戻らず)' if _el > _CTX_BUILD_STUCK_SEC else ''}")
+    return _fresh, _stuck, " / ".join(_parts)
 
 
 class OpenDUnavailableError(RuntimeError):
@@ -12150,26 +12239,46 @@ def _note_opend_down(what: str, detail: str) -> None:
         pass
 
 
-def _make_ctx_bounded(factory, what: str):
+def _make_ctx_bounded(factory, what: str, urgent: bool = False):
+    """SDK のコンテキストを作る。作れないときは OpenDUnavailableError。
+
+    urgent=True は決済の経路。相場取得や定期照会が枠を埋めていても通せるよう、
+    枠を1つ余分に許し、直前のタイムアウトの待機（バックオフ）も待たない。
+    TCP の当たりは urgent でも必ず取るので、OpenD が落ちていれば速く失敗する。
     """
-    """
-    global _ctx_build_inflight, _ctx_build_backoff_until
+    global _ctx_build_backoff_until, _ctx_build_seq
+    _urg = "・決済優先" if urgent else ""
     with _ctx_build_lock:
-        if time.monotonic() < _ctx_build_backoff_until:
+        _now = time.monotonic()
+        _fresh, _stuck, _detail = _ctx_build_state(_now)
+        if _stuck >= _CTX_BUILD_MAX_STUCK:
+            # 戻らないスレッドが増え続けないための天井。ここは urgent でも通さない。
+            raise OpenDUnavailableError(
+                f"OpenD 応答なし（戻らない生成が {_stuck}件で上限・{what}{_urg}／{_detail}）")
+        if not urgent and _now < _ctx_build_backoff_until:
             raise OpenDUnavailableError(f"OpenD 応答なし（直前のタイムアウトから待機中・{what}）")
-        if _ctx_build_inflight >= _CTX_BUILD_MAX_INFLIGHT:
-            raise OpenDUnavailableError(f"OpenD 応答なし（生成が滞留中 {_ctx_build_inflight}件・{what}）")
-        _ctx_build_inflight += 1
+        _limit = _CTX_BUILD_MAX_INFLIGHT + (1 if urgent else 0)
+        if _fresh >= _limit:
+            raise OpenDUnavailableError(
+                f"OpenD 応答なし（生成が滞留中 {_fresh}件・{what}{_urg}／{_detail}）")
+        if _stuck:
+            log.warning(
+                f"[OpenD] 戻ってこない生成が {_stuck}件あります"
+                f"（{_CTX_BUILD_STUCK_SEC:.0f}秒超・枠の計算から外して {what}{_urg} を進めます）"
+                f"／{_detail}"
+            )
+        _ctx_build_seq += 1
+        _my_id = _ctx_build_seq
+        _ctx_build_active[_my_id] = {"what": what, "at": _now}
     if not _opend_tcp_ok():
         with _ctx_build_lock:
-            _ctx_build_inflight -= 1   # スレッドを起こさないので予約を返す
+            _ctx_build_active.pop(_my_id, None)   # スレッドを起こさないので予約を返す
         _note_opend_down(what, "TCP接続不可")
         raise OpenDUnavailableError(f"OpenD 接続不可 ({MOOMOO_HOST}:{MOOMOO_PORT})")
     _res: dict = {}
     _done = threading.Event()
     _late = threading.Event()
     def _build():
-        global _ctx_build_inflight
         _ctx = None
         try:
             try:
@@ -12193,7 +12302,14 @@ def _make_ctx_bounded(factory, what: str):
                     pass
         finally:
             with _ctx_build_lock:
-                _ctx_build_inflight -= 1
+                _info = _ctx_build_active.pop(_my_id, None)
+            if _info is not None:
+                _el = time.monotonic() - _info["at"]
+                if _el > _CTX_BUILD_STUCK_SEC:
+                    log.warning(
+                        f"[OpenD] 生成が {_el:.0f}秒かかって戻りました（{what}）"
+                        f" → 枠を解放しました"
+                    )
     _th = threading.Thread(target=_build, daemon=True, name=f"ctx-build-{what}")
     _th.start()
     _th.join(MOOMOO_CTX_BUILD_TIMEOUT_SEC)
@@ -12236,8 +12352,12 @@ def _make_quote_ctx() -> OpenQuoteContext:
         lambda: OpenQuoteContext(host=MOOMOO_HOST, port=MOOMOO_PORT), "quote"))
 
 
-def _make_trade_ctx() -> OpenSecTradeContext:
-    """moomoo日本（FUTUJP）実口座用。OpenSecTradeContext + SecurityFirm.FUTUJP が必須。"""
+def _make_trade_ctx(urgent: bool = False) -> OpenSecTradeContext:
+    """moomoo日本（FUTUJP）実口座用。OpenSecTradeContext + SecurityFirm.FUTUJP が必須。
+
+    urgent=True は決済の経路（v3.9.211）。相場取得や定期照会が生成の枠を
+    埋めていても、決済だけは通せるようにする。
+    """
     base_kwargs = dict(host=MOOMOO_HOST, port=MOOMOO_PORT)
     if MOOMOO_RSA_KEY and isinstance(MOOMOO_RSA_KEY, str) and os.path.isfile(MOOMOO_RSA_KEY):
         base_kwargs["security_data_path"] = MOOMOO_RSA_KEY
@@ -12245,7 +12365,7 @@ def _make_trade_ctx() -> OpenSecTradeContext:
         filter_trdmarket=TrdMarket.US,
         security_firm=SecurityFirm.FUTUJP,
         **base_kwargs,
-    ), "trade"))
+    ), "trade", urgent=urgent))
 
 
 # `_make_trade_ctx()` 直呼びは API 例外時に close() されず OpenD 接続が滞留する問題あり。
@@ -12290,10 +12410,13 @@ def _ensure_thread_event_loop() -> None:
 
 
 @_contextlib.contextmanager
-def _trade_ctx():
-    """使用例: / with _trade_ctx() as ctx: / ret, data = ctx.place_order(...) / # この時点で ctx は閉じられている（例外が出ても）"""
+def _trade_ctx(urgent: bool = False):
+    """使用例: / with _trade_ctx() as ctx: / ret, data = ctx.place_order(...) / # この時点で ctx は閉じられている（例外が出ても）
+
+    urgent=True は決済の経路（v3.9.211）。生成の枠を1つ余分に使える。
+    """
     _ensure_thread_event_loop()
-    ctx = _make_trade_ctx()
+    ctx = _make_trade_ctx(urgent=urgent)
     try:
         yield ctx
     finally:
@@ -12569,7 +12692,10 @@ def get_quote(symbol: str) -> dict:
       4. get_order_book が失敗した場合は get_stock_quote の cur_price/last_price で代替
 
     戻り値: {"ask": float, "bid": float, "last": float,
-             "from_book": bool, "two_sided": bool}
+             "from_book": bool, "two_sided": bool, "source": str}
+      - source:     価格の取得先（"OpenD" / "Alpaca" / "Finnhub"・取得失敗は ""）。
+                    v3.9.211: OpenD が応答しない間も代替で価格だけは動くため、
+                    表示に取得先を出して「口座が見えている」と読めないようにする。
       - from_book:  ask/bid が板（ORDER_BOOK）由来なら True（ログ・集計用）
       - two_sided:  ask と bid が独立に観測された実在の両側気配なら True。
                     片側でも last で埋めた合成値なら False（スプレッド検査の軸）。
@@ -12721,7 +12847,8 @@ def get_quote(symbol: str) -> dict:
             else:
                 log.debug(f"[get_quote] {symbol}: 板なし→LV1/last代替 ask=${ask:.2f} bid=${bid:.2f} → ${last:.2f}")
             return {"ask": ask, "bid": bid, "last": last,
-                    "from_book": _quote_from_book, "two_sided": _quote_two_sided}
+                    "from_book": _quote_from_book, "two_sided": _quote_two_sided,
+                    "source": "OpenD"}
 
 
         # ── Alpaca にフォールバック ───────────────────────────────────────────
@@ -12732,7 +12859,7 @@ def get_quote(symbol: str) -> dict:
                 _quote_from_book = False
                 log.debug(f"[get_quote] {symbol}: OpenD取得失敗 → Alpaca ${last:.2f}")
                 return {"ask": _alp["ask"], "bid": _alp["bid"], "last": last,
-                        "from_book": False, "two_sided": True}
+                        "from_book": False, "two_sided": True, "source": "Alpaca"}
 
         # ── 最終フォールバック: Finnhub ──────────────────────────────────────
         if FINNHUB_API_KEY:
@@ -12740,16 +12867,16 @@ def get_quote(symbol: str) -> dict:
             if finn_price > 0:
                 log.debug(f"[get_quote] {symbol}: OpenD/Alpaca失敗 → Finnhub ${finn_price:.2f}")
                 return {"ask": finn_price, "bid": finn_price, "last": finn_price,
-                        "from_book": False, "two_sided": False}
+                        "from_book": False, "two_sided": False, "source": "Finnhub"}
 
         return {"ask": ask, "bid": bid, "last": last,
-                "from_book": False, "two_sided": False}
+                "from_book": False, "two_sided": False, "source": ""}
 
     except Exception as e:
         # 旧コードにあった「except 内での明示的な ctx.close()」は不要になった。
         log.warning(f"[価格取得] {symbol}: {e}")
         return {"ask": 0.0, "bid": 0.0, "last": 0.0,
-                "from_book": False, "two_sided": False}
+                "from_book": False, "two_sided": False, "source": ""}
 
 
 
@@ -12818,7 +12945,7 @@ async def get_quote_async(symbol: str) -> dict:
                 f"損切り・トレールの判定が止まっている可能性があります",
             )
         return {"ask": 0.0, "bid": 0.0, "last": 0.0,
-                "from_book": False, "two_sided": False}
+                "from_book": False, "two_sided": False, "source": ""}
 
 
 def unlock_trade_if_needed(trd_env: TrdEnv) -> bool:
@@ -14720,6 +14847,7 @@ def place_buy(
     ts_state.entry_reason      = reason
     # 自前ポジション管理に発注コストと株数を記録（確保は計上と同時に解放）
     track_position_add(symbol, order_cost, qty=qty, reserve_token=_budget_token)
+    _record_today_entry(symbol, "BUY", qty, trd_env)   # v3.9.211: 本日の新規として数える
     _headlines_str = (
         "\n─── トリガーニュース ───\n" + "\n".join(f"・{h}" for h in headlines[:3])
         if headlines else ""
@@ -15262,6 +15390,7 @@ def place_short(
     ts_state.entry_ai_category = category
     ts_state.entry_news_source = news_source
     track_position_add(symbol, order_cost, qty=qty, reserve_token=_budget_token)
+    _record_today_entry(symbol, "SHORT", qty, trd_env)   # v3.9.211: 本日の新規として数える
     _headlines_str = (
         "\n─── トリガーニュース ───\n" + "\n".join(f"・{h}" for h in headlines[:3])
         if headlines else ""
@@ -16506,7 +16635,8 @@ def _close_one_position_id(
         return -1, f"invalid position_id value: {_pos_id_int}"
 
     try:
-        with _trade_ctx() as ctx:
+        # v3.9.211: 決済は生成の枠を1つ余分に使える（相場取得や定期照会に埋められない）
+        with _trade_ctx(urgent=True) as ctx:
             _acc_id_close = REAL_ACC_ID if trd_env == TrdEnv.REAL else 0
             # FUTUJP 実口座の正規仕様 (moomoo サポート 2026-05-08 確認):
             #   新規 LONG  : TrdSide.BUY        + jp_acc_type=JP_TOKUTEI
@@ -16586,12 +16716,24 @@ def _close_one_position_id(
                 f"is_cover={is_cover}  msg={data}"
             )
             return ret, str(data)
+    except OpenDUnavailableError as e:
+        # ★ v3.9.211: 送信前に失敗した回と、送信後に結果が分からない回を分ける。
+        #   以前はどちらも「place_order 例外」と出ていたため、実ログを読んだ利用者に
+        #   「証券会社が注文を3件拒否した」と読めていた（実際は接続の準備で止まっていた）。
+        #   送信前だと分かっている回だけ、同じ注文をそのまま出し直して差し支えない。
+        log.error(
+            f"{tag} [{log_label}] 🔴 発注前に失敗（注文は送信していません）"
+            f" pid={_pos_id_str[:12]}...: {e}"
+        )
+        return -1, f"not_sent: {e}"
     except Exception as e:
         log.error(
-            f"{tag} [{log_label}] place_order 例外 pid={_pos_id_str[:12]}...: {e}",
+            f"{tag} [{log_label}] 🔴 発注後の結果が不明です（送信済みの可能性あり・"
+            f"二重決済を避けるため建玉と注文の確認が必要）"
+            f" pid={_pos_id_str[:12]}...: {e}",
             exc_info=True,
         )
-        return -1, f"exception: {e}"
+        return -1, f"result_unknown: {e}"
 
 
 _close_fail_notify_at: dict = {}
@@ -22016,10 +22158,22 @@ async def risk_monitor_loop(trd_env: TrdEnv) -> None:
                     )
                     continue
                 else:
+                    # ★ v3.9.211（実口座の報告）: OpenD の応答不良が続いても価格だけは
+                    #   Alpaca で取れるため、この行は普段どおりの含み損を出し続けていた。
+                    #   数量と建値は最後に同期できたときの写しなので、いま口座にある建玉とは
+                    #   一致しないことがある（手で決済した場合も同じ）。参考値だと分かる形にする。
+                    _pos_stale = _sync_stale_suffix()
+                    _src = (quote or {}).get("source") or ""
+                    _src_note = f"  価格={_src}" if _src and _src != "OpenD" else ""
+                    if _pos_stale:
+                        _pos_stale = (f"{_pos_stale}{_src_note}"
+                                      f"  ※数量・建値は最終同期時点の参考値")
+                    else:
+                        _pos_stale = _src_note
                     log.info(
                         f"{tag} [ポジション] ${price:.2f}  PnL={pnl_colored(pnl)}({pct_colored(unr_pct)})"
                         f"  env={_env_tag()}"
-                        f"  trail={'ON' if ts.trail_active else 'off'}{trail_str}"
+                        f"  trail={'ON' if ts.trail_active else 'off'}{trail_str}{_pos_stale}"
                     )
 
                 # ── ④ 強制損切り（ポジション評価額の MAX_LOSS_PCT %）──────────
