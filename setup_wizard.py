@@ -18,6 +18,13 @@ moomoo_trade_v1.py 用 .env セットアップウィザード（完全版）
 # 更新履歴
 # =============================================================================
 #
+# v1.56 2026-09-29  v1.55 の配布前の3者レビューの反映。
+#   ①倍率を Bot と同じ順番（個別指定 MOMENTUM_STOP_MULT_<銘柄> → 一律 → 倍率表 → 荒い銘柄リスト）で出す。
+#     個別指定は一律（flat）でも残ることを案内する。
+#   ②SOXX は ETF だが倍率表には無く、荒い銘柄リスト（STOCK_HIGHVOL_LOSS_MULT）側で動く。表記を分けた。
+#   ③倍率 1 未満は損切りだけ狭まり利確トレールは狭めないこと、モメンタムの建玉には掛からないことを書いた。
+#   ④全部止める方法は STEP 14 [5b] の「4 一律」を先に案内する。ETF の行は80桁で折り返さないよう2行に。
+#   ⑤.env の範囲外・不正値（-1 / nan / inf 等）は Bot と同じく 2.5 として表示する（総当たりで Bot と照合）。
 # v1.55 2026-09-29  STEP 2 の倍率の説明を銘柄の種類ごとに分けた（利用者2名の指摘）。
 #   旧: 「2.5 倍」「無効化は STOCK_HIGHVOL_LOSS_MULT=0」と一律に案内。実際は ETF（SMH / QQQ /
 #   SPY / DRAM / IWM）はモメンタムの倍率表（標準で SMH 3.0・QQQ 2.0・SPY 1.3）が先に効き、
@@ -788,7 +795,59 @@ TOTAL = 16   # ★ v1.46: 14→16（戦略プロファイルを STEP1 に・OVN�
 
 # 既知ETFリスト（STOCK_TICKERS入力時のバリデーション用）
 # ★ v1.38: 版数は必ずここを更新する（起動バナー・ヘッダ表示で共用。取り残し防止）
-WIZARD_VERSION = "v1.55"
+WIZARD_VERSION = "v1.56"
+
+_ETF_TABLE_SYMBOLS = ("SMH", "QQQ", "SPY", "DRAM", "IWM")
+
+
+def _loss_mult_view(existing):
+    """.env の値から、銘柄ごとにかかる損切り倍率を Bot と同じ順番で決める（v1.55）。
+
+    Bot（moomoo_trade_v1._symbol_loss_mult）の優先順位:
+      1. MOMENTUM_STOP_MULT_<銘柄>（0 < 値 <= 6）… 個別指定が最優先
+      2. MOMENTUM_STOP_PROFILE=flat          … 全銘柄 1.0
+      3. 倍率表（narrow / standard / wide）  … ETF
+      4. STOCK_HIGHVOL_LOSS_MULT（0〜5・範囲外は 2.5）… 荒い個別株
+    戻り値: {銘柄: (倍率, 出どころ), "_stock": (倍率, 出どころ), "_profile": 名前,
+             "_overrides": {銘柄: 倍率}}
+    """
+    _ex = existing or {}
+    _prof = (str(_ex.get("MOMENTUM_STOP_PROFILE", "") or "standard")).strip().lower()
+    if _prof not in ("narrow", "standard", "wide", "flat"):
+        _prof = "standard"
+    try:
+        _raw = str(_ex.get("STOCK_HIGHVOL_LOSS_MULT", "") or "").strip()
+        _stock = float(_raw) if _raw else 2.5
+        if not (0 <= _stock <= 5.0):
+            _stock = 2.5
+    except (TypeError, ValueError):
+        _stock = 2.5
+    _ovr = {}
+    for _k, _v in _ex.items():
+        if isinstance(_k, str) and _k.startswith("MOMENTUM_STOP_MULT_"):
+            try:
+                _fv = float(str(_v).strip())
+            except (TypeError, ValueError):
+                continue
+            if 0 < _fv <= 6.0:
+                _ovr[_k[len("MOMENTUM_STOP_MULT_"):].upper()] = _fv
+    _out = {"_profile": _prof, "_overrides": _ovr}
+    _tbl = _MOMENTUM_STOP_MULT_VIEW.get(_prof, {})
+    for _sym in _ETF_TABLE_SYMBOLS:
+        if _sym in _ovr:
+            _out[_sym] = (_ovr[_sym], "override")
+        elif _prof == "flat":
+            _out[_sym] = (1.0, "flat")
+        else:
+            _out[_sym] = (_tbl.get(_sym, 1.0), "table")
+    if _prof == "flat":
+        _out["_stock"] = (1.0, "flat")
+    elif _stock <= 0:
+        _out["_stock"] = (1.0, "zero")
+    else:
+        _out["_stock"] = (_stock, "stock")
+    return _out
+
 
 # ETF の損切り倍率表（Bot の _MOMENTUM_STOP_MULT と同じ値。食い違えば検査で落ちる）。
 # 案内の表示に使うだけで、Bot の動きはこの値ではなく Bot 側の表で決まる。
@@ -1014,48 +1073,59 @@ def step2_risk(existing, budget):
     #   STOCK_HIGHVOL_LOSS_MULT=0 では ETF の倍率は残る。全部止めるのは
     #   MOMENTUM_STOP_PROFILE=flat。倍率表は Bot 側の _MOMENTUM_STOP_MULT と同じ値
     #  （食い違えば検査で落ちる）。
-    try:
-        _stock_mult = float((existing or {}).get("STOCK_HIGHVOL_LOSS_MULT", "") or 2.5)
-    except (TypeError, ValueError):
-        _stock_mult = 2.5
-    _prof = ((existing or {}).get("MOMENTUM_STOP_PROFILE", "") or "standard").strip().lower()
-    if _prof not in ("narrow", "standard", "wide", "flat"):
-        _prof = "standard"
+    _mult_view = _loss_mult_view(existing)
     try:
         _base = float(max_loss)
     except ValueError:
         _base = 0.0
-    _etf_tbl = _MOMENTUM_STOP_MULT_VIEW.get(_prof, {})
-    if _prof == "flat":
-        _etf_line = "  ・ETF        : 倍率なし（MOMENTUM_STOP_PROFILE=flat・入力値そのまま）"
-        _stock_line = "  ・荒い個別株 : 倍率なし（flat は全銘柄を入力値そのままにします）"
+
+    def _fmt(_sym, _m, _src):
+        _tag = "（個別指定）" if _src == "override" else ""
+        return f"{_sym} ×{_m:g}→{_base * _m:.2f}%{_tag}"
+    _etf_items = [_fmt(_k, *_mult_view[_k]) for _k in _ETF_TABLE_SYMBOLS]
+    if _mult_view["_profile"] == "flat" and all(
+            _mult_view[_k][1] != "override" for _k in _ETF_TABLE_SYMBOLS):
+        _etf_lines = ["  ・倍率表の ETF（SMH / QQQ / SPY / DRAM / IWM）: 倍率なし（一律・入力値そのまま）"]
     else:
-        _etf_line = "  ・ETF（" + _prof + "）: " + " ／ ".join(
-            f"{_k} ×{_v:g}→{_base * _v:.2f}%" for _k, _v in _etf_tbl.items())
-        if _stock_mult > 0:
-            _stock_line = (f"  ・荒い個別株（NVDA / TSLA / AMD / MU / AVGO など）:"
-                           f" ×{_stock_mult:g}→{_base * _stock_mult:.2f}%")
-        else:
-            _stock_line = "  ・荒い個別株 : 倍率なし（STOCK_HIGHVOL_LOSS_MULT=0）"
+        # 80桁の端末で折り返さないよう2行に分ける（配布前レビュー）
+        _etf_lines = [f"  ・倍率表の ETF（{_mult_view['_profile']}）:",
+                      "      " + " ／ ".join(_etf_items[:3]),
+                      "      " + " ／ ".join(_etf_items[3:])]
+    _sm, _ssrc = _mult_view["_stock"]
+    # ★ SOXX は ETF だが倍率表には無く、こちら（荒い銘柄リスト）の倍率で動く（配布前レビュー）
+    if _sm == 1.0:
+        _why = ("一律" if _ssrc == "flat" else "STOCK_HIGHVOL_LOSS_MULT=0")
+        _stock_line = "  ・荒い銘柄リスト（NVDA / TSLA / AMD / MU / AVGO / SOXX など）: 倍率なし（" + _why + "）"
+    else:
+        _stock_line = ("  ・荒い銘柄リスト（NVDA / TSLA / AMD / MU / AVGO / SOXX など）:"
+                       f" ×{_sm:g}→{_base * _sm:.2f}%")
+    _ovr_stock = [_fmt(_k, _m, "override") for _k, _m in _mult_view["_overrides"].items()
+                  if _k not in _ETF_TABLE_SYMBOLS]
+    _ovr_line = ("  ・個別指定（最優先）: " + " ／ ".join(_ovr_stock)) if _ovr_stock else ""
     print()
-    box("⚙ 自動調整: 値動きの大きい銘柄は損切り幅と利確トレール幅を広げます", [
+    box("⚙ 自動調整: 銘柄ごとの倍率で損切り幅と利確トレール幅を合わせます", [
         f"  ・通常の銘柄 : 損切り {max_loss}%（入力値そのまま）",
-        _etf_line,
+    ] + _etf_lines + [
         _stock_line,
+    ] + ([_ovr_line] if _ovr_line else []) + [
         "",
         "理由: 値動きの大きい銘柄は、狭い損切りだと普通のノイズで",
         "      誤って損切りされてしまうため。",
         "",
         "利確トレールの幅も同じ倍率で広げます（大きな動きを取り切るため）。",
+        "倍率が 1 未満の銘柄は損切りだけ狭くなり、利確トレールは狭めません。",
+        "モメンタムの建玉は専用の損切り幅を使うので、この倍率は掛かりません。",
         "発注額は縮めないので、1 トレードあたりの想定最大損失額も",
         "倍率ぶん大きくなります。大きく狙う代わりに大きな損失も",
         "受け入れる、という考え方です（v3.9.209 で変更）。",
         "",
         "※ この調整はプログラムが自動で行います。設定不要です。",
-        "※ 止めたいとき（.env）:",
-        "    個別株だけ止める        → STOCK_HIGHVOL_LOSS_MULT=0",
-        "    ETF も含めて全部止める  → MOMENTUM_STOP_PROFILE=flat",
-        "  （STOCK_HIGHVOL_LOSS_MULT=0 だけでは ETF の倍率は残ります）",
+        "※ 止めたいとき:",
+        "    荒い銘柄リストだけ止める → .env に STOCK_HIGHVOL_LOSS_MULT=0",
+        "    ETF も含めて全部止める   → STEP 14 [5b] で「4 一律」",
+        "                               （.env では MOMENTUM_STOP_PROFILE=flat）",
+        "  （STOCK_HIGHVOL_LOSS_MULT=0 だけでは倍率表の ETF の倍率は残ります）",
+        "  （MOMENTUM_STOP_MULT_<銘柄> を書いた銘柄は、その値が最優先で一律でも残ります）",
     ])
 
     print()

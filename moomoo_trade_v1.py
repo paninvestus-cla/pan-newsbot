@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.213"
+BOT_VERSION = "v3.9.214"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -4833,7 +4833,10 @@ except ValueError:
 #     NVDA : 損切り 1.25% / サイズ 100% → 最大損失 = サイズ × 1.25%（2.5 倍）
 # 旧版（v3.9.208 まで）はサイズを 1/N に縮めて損失額を ETF と同水準に保っていた
 # （リスクパリティ設計）。狙いの大きさまで一緒に縮むため v3.9.209 で廃止。
-# STOCK_HIGHVOL_LOSS_MULT=0 で機能無効化 (全銘柄一律 MAX_LOSS_PCT)。
+# STOCK_HIGHVOL_LOSS_MULT=0 で止まるのは、この荒い銘柄リストの倍率だけ（v3.9.213 で訂正）。
+# 倍率表の ETF（SMH / QQQ / SPY / DRAM / IWM）は _MOMENTUM_STOP_MULT が先に効くので残る。
+# 全部止めるのは MOMENTUM_STOP_PROFILE=flat。MOMENTUM_STOP_MULT_<銘柄> の個別指定は flat より優先。
+# 優先順位の実体は _symbol_loss_mult を参照。
 _HIGHVOL_SYMBOLS: set = {
     "NVDA", "TSLA", "AMD", "MU", "AVGO", "SMH", "MRVL", "ARM",
     "SMCI", "COIN", "MSTR", "PLTR", "SOXX",
@@ -14071,8 +14074,24 @@ async def _check_order_filled(
                             ts_upd.avg_cost     = filled_price
                             ts_upd.avg_cost_confirmed = True   # v3.9.101: 実約定単価で確定
                             ts_upd.entry_pending_fill = False  # v3.9.17: 約定確認 → リスク監視解放
-                            _tracked_position_cost[symbol] = filled_qty * filled_price
-                            _tracked_qty[symbol]           = int(filled_qty)
+                            # ★ v3.9.213（配布前レビュー）: 部分約定のとき約定分だけで上書きすると、
+                            #   まだ生きている残りの注文ぶんが予算から外れる（確保は発注時に解放
+                            #   済み）。その間に別銘柄の発注が通り、残りが約定すると上限を超える。
+                            #   残りが生きている間は「残り株数 × 指値」を発注済みとして数え、
+                            #   取消できた時点で外す（watchdog 側）。
+                            _rem_cost = 0.0
+                            if _is_partial_fill and filled_qty < float(qty):
+                                _rem_cost = max(0.0, float(qty) - float(filled_qty)) * float(price)
+                                if order_id in _pending_orders:
+                                    _pending_orders[order_id]["reserved_cost"] = _rem_cost
+                            with _budget_reserve_lock:
+                                _tracked_position_cost[symbol] = filled_qty * filled_price + _rem_cost
+                                _tracked_qty[symbol]           = int(filled_qty)
+                            if _rem_cost > 0:
+                                log.info(
+                                    f"{tag} [予算] 部分約定の残り ${_rem_cost:,.0f} は注文が生きている間"
+                                    f"だけ発注済みとして数えます（取消で外します）"
+                                )
                             log.info(
                                 f"{tag} [約定反映] qty={int(filled_qty)}株"
                                 f"  avg_cost=${filled_price:.2f}"
@@ -16525,7 +16544,14 @@ async def pending_order_watchdog() -> None:
             # v3.9.212: 決済注文の取消は優先枠（この取消が通らないと再決済に進めない）
             ok = _cancel_order(order_id, sym, trd_env, reason, urgent=is_close)
             if ok:
-                _pending_orders.pop(order_id, None)
+                _popped = _pending_orders.pop(order_id, None) or {}
+                # v3.9.213: 部分約定の残りを発注済みとして数えていた分を、取消できたので外す
+                _rc = float(_popped.get("reserved_cost") or 0.0) if not is_close else 0.0
+                if _rc > 0:
+                    with _budget_reserve_lock:
+                        _tracked_position_cost[sym] = max(
+                            0.0, _tracked_position_cost.get(sym, 0.0) - _rc)
+                    log.info(f"【{sym}】 [予算] 部分約定の残りを取消 → 発注済みから ${_rc:,.0f} を外しました")
             else:
                 # キャンセルAPIが失敗した場合でも FAILED ステータスの注文は除去する
                 # （FAILEDはすでに無効なので残しても意味がない）
