@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.212"
+BOT_VERSION = "v3.9.213"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -16274,39 +16274,65 @@ _budget_reserve_seq = 0
 BUDGET_RESERVE_TTL_SEC = 300.0
 
 
+def _budget_reserved_total_locked(now: float) -> tuple:
+    """_budget_reserve_lock を持った状態で呼ぶ。失効した確保を捨て、(合計, 捨てた行) を返す。
+
+    ★ v3.9.213（利用者2名が別々に再現）: v3.9.210 の budget_reserve は、確保済みの
+      合計をロックの外で読んでから、ロックを取り直して判定・登録していた。この隙間に
+      2本入ると、両方が古い合計で判定して通る（予算1万ドルに対し1万9,900ドルを送信）。
+      失効・合計・判定・登録は、必ず1回のロックの中で行う。そのためロックを取らない
+      内部関数に分けた（_budget_reserve_lock は再入できない）。
+      ログはロックの外で出す（警告のハンドラは同期で走り、ロックを長く握らせるため）。
+    """
+    _stale = [t for t, (_a, _at, _s) in _budget_reserved.items()
+              if now - _at > BUDGET_RESERVE_TTL_SEC]
+    _dropped = [_budget_reserved.pop(t) for t in _stale]
+    return sum(_a for _a, _at, _s in _budget_reserved.values()), _dropped
+
+
+def _log_dropped_reservations(dropped: list) -> None:
+    for _amt, _at, _sym in dropped:
+        log.warning(
+            f"[予算確保] {_sym} の確保 ${_amt:,.0f} が "
+            f"{BUDGET_RESERVE_TTL_SEC:.0f}秒 解放されなかったため失効させました"
+        )
+
+
 def get_budget_reserved_total() -> float:
     """発注中で確保済みの金額。TTL を超えた確保は解放漏れとみなして捨てる。"""
-    _now = time.time()
     with _budget_reserve_lock:
-        _stale = [t for t, (_a, _at, _s) in _budget_reserved.items()
-                  if _now - _at > BUDGET_RESERVE_TTL_SEC]
-        for t in _stale:
-            _amt, _at, _sym = _budget_reserved.pop(t)
-            log.warning(
-                f"[予算確保] {_sym} の確保 ${_amt:,.0f} が "
-                f"{BUDGET_RESERVE_TTL_SEC:.0f}秒 解放されなかったため失効させました"
-            )
-        return sum(_a for _a, _at, _s in _budget_reserved.values())
+        _total, _dropped = _budget_reserved_total_locked(time.time())
+    _log_dropped_reservations(_dropped)
+    return _total
 
 
 def budget_reserve(symbol: str, amount: float) -> Optional[int]:
-    """余力の範囲なら amount を確保してトークンを返す。足りなければ None。"""
+    """余力の範囲なら amount を確保してトークンを返す。足りなければ None。
+
+    判定と登録は1回のロックの中で行う（v3.9.213・上の説明を参照）。
+    """
     global _budget_reserve_seq
     if amount <= 0:
         return None
-    _reserved = get_budget_reserved_total()   # 先に失効処理を通す
+    _token = None
+    _refused = None
     with _budget_reserve_lock:
-        _used = sum(_tracked_position_cost.values()) + _reserved
-        if _used + amount > _BUDGET_USD + 1e-6:
-            log.info(
-                f"[予算確保] {symbol} ${amount:,.0f} を確保できません"
-                f"（確定=${sum(_tracked_position_cost.values()):,.0f}"
-                f" + 発注中=${_reserved:,.0f} / 上限=${_BUDGET_USD:,.0f}）"
-            )
-            return None
-        _budget_reserve_seq += 1
-        _token = _budget_reserve_seq
-        _budget_reserved[_token] = (float(amount), time.time(), symbol)
+        _reserved, _dropped = _budget_reserved_total_locked(time.time())
+        _held = sum(list(_tracked_position_cost.values()))
+        if _held + _reserved + amount > _BUDGET_USD + 1e-6:
+            _refused = (_held, _reserved)
+        else:
+            _budget_reserve_seq += 1
+            _token = _budget_reserve_seq
+            _budget_reserved[_token] = (float(amount), time.time(), symbol)
+    _log_dropped_reservations(_dropped)
+    if _refused is not None:
+        log.info(
+            f"[予算確保] {symbol} ${amount:,.0f} を確保できません"
+            f"（確定=${_refused[0]:,.0f} + 発注中=${_refused[1]:,.0f}"
+            f" / 上限=${_BUDGET_USD:,.0f}）"
+        )
+        return None
     return _token
 
 
@@ -16319,8 +16345,16 @@ def budget_release(token: Optional[int]) -> None:
 
 
 def get_tracked_portfolio_total() -> float:
-    """自前管理のポジションコスト合計を返す（発注中の確保ぶんを含む）"""
-    return sum(_tracked_position_cost.values()) + get_budget_reserved_total()
+    """自前管理のポジションコスト合計を返す（発注中の確保ぶんを含む）
+
+    v3.9.213: 確定ぶんと確保ぶんを同じロックの中で読む（別々に読むと、計上と解放の
+    切り替えの前後を混ぜて読み、表示と早期の上限チェックが一瞬だけ二重に数える）。
+    """
+    with _budget_reserve_lock:
+        _reserved, _dropped = _budget_reserved_total_locked(time.time())
+        _held = sum(list(_tracked_position_cost.values()))
+    _log_dropped_reservations(_dropped)
+    return _held + _reserved
 
 def track_position_add(symbol: str, order_cost: float, qty: int = 0,
                        reserve_token: Optional[int] = None) -> None:
@@ -16331,10 +16365,15 @@ def track_position_add(symbol: str, order_cost: float, qty: int = 0,
     """
     _ledger_mark(symbol, None, getattr(state.get(symbol), "entry_time", None),
                  category=getattr(state.get(symbol), "entry_ai_category", None))
-    _tracked_position_cost[symbol] = _tracked_position_cost.get(symbol, 0.0) + order_cost
-    if qty > 0:
-        _tracked_qty[symbol] = _tracked_qty.get(symbol, 0) + qty
-    budget_release(reserve_token)
+    # v3.9.213: 計上と確保の解放を同じロックの中で行う。別々だと、その間に走った
+    # budget_reserve が「計上前・解放後」を読む余地はないが、読み手ごとに見える合計が
+    # 揺れる。判定側（budget_reserve）と同じロックで一度に切り替える。
+    with _budget_reserve_lock:
+        _tracked_position_cost[symbol] = _tracked_position_cost.get(symbol, 0.0) + order_cost
+        if qty > 0:
+            _tracked_qty[symbol] = _tracked_qty.get(symbol, 0) + qty
+        if reserve_token is not None:
+            _budget_reserved.pop(reserve_token, None)
     log.info(
         f"[ポジション管理] {symbol} +${order_cost:,.0f}"
         f"  追跡株数={_tracked_qty.get(symbol, 0)}株"
