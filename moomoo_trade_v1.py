@@ -180,7 +180,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.214"
+BOT_VERSION = "v3.9.217"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -454,11 +454,16 @@ _GAS_RETRY_MAX_ATTEMPTS = 48
 _GAS_RETRY_MAX_BY_KIND = {
     "trade":           480,   # 重要・少数。実質破棄しない（翌日以降も粘る）
     "summary":         240,
+    # v3.9.217: 決済を確認できないまま送る日次集計。扱いは summary と同じにする
+    #（再送の粘り・破棄の優先度・クールダウンの免除）。違うのは、再送が成功した
+    #  ときに「送信済み」ではなく「暫定」の印を付ける点だけ。
+    "summary_provisional": 240,
     "observation":     48,    # シャドー（中）
     "observation_pnl": 24,    # +60分更新（最低優先・最初に諦める）
 }
 # 退避超過時に「先に捨てる」優先度（数字が大きいほど先に破棄）。
-_GAS_DROP_PRIORITY = {"trade": 0, "summary": 1, "observation": 2, "observation_pnl": 3}
+_GAS_DROP_PRIORITY = {"trade": 0, "summary": 1, "summary_provisional": 1,
+                      "observation": 2, "observation_pnl": 3}
 _GAS_RETRY_BACKOFF = [5, 15]      # インライン再送の待機（秒）
 
 # ① 送信ジッター: 各送信前に小ランダム遅延を入れ、市場イベントで全受講生が同時刻に
@@ -471,7 +476,7 @@ _BULK_CLOSE_REASON_HINTS = ("デモ日次決済", "週末前強制決済", "移�
 _GAS_FAIL_COOLDOWN_THRESHOLD = 5      # 連続失敗この回数でクールダウン突入
 _GAS_FAIL_COOLDOWN_SEC = 180          # 初回クールダウン秒（以後・過負荷継続で指数的に延長）
 _GAS_FAIL_COOLDOWN_MAX_SEC = 1800
-_GAS_COOLDOWN_EXEMPT_KINDS = {"trade", "summary"}
+_GAS_COOLDOWN_EXEMPT_KINDS = {"trade", "summary", "summary_provisional"}
 _gas_send_health = {"consecutive_fail": 0, "cooldown_until": 0.0, "last_cd_log": 0.0}
 
 
@@ -802,12 +807,18 @@ def _gas_queue_drain_once() -> None:
             if len(sent_labels) < _GAS_LABEL_MAX:
                 sent_labels.append(_label(rec))
             _gas_mark_success()
-            if _kind == "summary":
+            if _kind in ("summary", "summary_provisional"):
                 try:
                     _k = str(rec.get("key", ""))
                     _d = _k.rsplit("|", 1)[-1] if "|" in _k else ""
                     if _re_date_key.fullmatch(_d):
-                        _mark_date_sent(_d)
+                        # ★ v3.9.217（配布前レビュー・高）: 暫定として送った集計が
+                        #   キュー経由で再送されると、無条件に送信済みにされていた。
+                        #   区分を kind に残し、暫定は暫定のまま印を付ける。
+                        if _kind == "summary_provisional":
+                            _mark_date_provisional(_d)
+                        else:
+                            _mark_date_sent(_d)
                 except Exception as _e:
                     log.debug(f"[GAS再送] 送信済み日付の記録に失敗(黙殺): {_mask_secrets(_e)}")
             continue
@@ -8998,10 +9009,23 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
             if not _wk_ok:
                 # 決済しきれないまま週末停止に入ると建玉が無監視で残る。
                 # 監視は止めず、通常運転のまま次のループへ（損切り・時間切れは動き続ける）。
+                # ★ v3.9.217（配布前レビュー・中）: 「止めずに続行します」は無条件ではない。
+                #   _weekend_halt は成功時にだけ立つので、この回は監視が続く。ただし
+                #   20:00 ET に OVERNIGHT へ入ると停止の条件に当たり、翌プリマーケットまで
+                #   待機する。時限を書く（この枝はデモでも日次決済を通らないので、
+                #   デモの但し書きは付けない）。
                 log.error(
-                    "[週末決済] 🔴 再試行しても決済しきれません → ニュース・監視は止めずに続行します。"
+                    "[週末決済] 🔴 再試行しても決済しきれません → 監視は 20:00 ET まで続けます"
+                    "（そのあとは翌プリマーケットまで待機します）。"
                     "moomoo アプリで建玉をご確認ください"
                 )
+                # ★ v3.9.215（PAN 指示）: デモ日次決済と同じく、決済の裏取りと日次集計を分ける。
+                log.info(
+                    "[週末決済] 決済は未確認のままですが、日次集計は暫定として送ります"
+                    "（記録を落とさないため・建玉の有無は moomoo アプリでご確認ください）"
+                )
+                _threadsafe_future(asyncio.to_thread(
+                    run_daily_data_collect, _LOG_PATH, None, True))   # 暫定（確定扱いにしない）
                 await asyncio.sleep(60)
                 continue
             # EOD後データ収集（DATA_COLLECT=trueの場合のみ送信）
@@ -9052,9 +9076,31 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
                 if _dd_ok:
                     _dd_ok = await asyncio.to_thread(_sweep_close_verified, trd_env, "デモ日次決済")
             if not _dd_ok:
+                # ★ v3.9.216（配布前レビュー Codex・高）: 「監視は止めずに続行します」は
+                #   デモでは事実と違った。_demo_daily_close_done は決済を試みる前に立つので、
+                #   決済できなくても次の巡回で市場フラグが下ろされ、リスク監視は待機に入る
+                #   （v3.9.215 以前からの動き）。建玉が残った回に何が起きるかを正しく書く。
                 log.error(
-                    "[デモ日次決済] 🔴 再試行しても決済しきれません → 監視は止めずに続行します"
+                    "[デモ日次決済] 🔴 再試行しても決済しきれません。"
+                    "デモは日次決済のあと翌プリマーケットまで監視を止める作りのため、"
+                    "建玉が残っていればそのまま持ち越します。"
+                    "moomoo アプリで建玉をご確認ください"
                 )
+                # ★ v3.9.215（PAN 指示・利用者3名の報告）: 決済の裏取りと日次集計を分ける。
+                #   以前はここで continue していたため、決済を確認できない日はその日の
+                #   集計がシートに届かなかった（ET 9/29・建玉ゼロで実害は無かったが、
+                #   約定があった日に同じことが起きると、その日の記録が残らない）。
+                #   集計は記録であって売買には触れないので、確認できない日も送る。
+                # v3.9.217: デモはこのあと監視が止まるので、残りをこの日のうちに
+                #   決済して損益が積み上がることは無い。それでも暫定で送るのは、
+                #   出してある注文が引けぎわに後から約定して、この日の記録に載る
+                #   ことがあるため（確定は次回起動時の追いかけで送り直す）。
+                log.info(
+                    "[デモ日次決済] 決済は未確認のままですが、日次集計は暫定として送ります"
+                    "（記録を落とさないため・建玉の有無は moomoo アプリでご確認ください）"
+                )
+                _threadsafe_future(asyncio.to_thread(
+                    run_daily_data_collect, _LOG_PATH, None, True))   # 暫定（確定扱いにしない）
                 await asyncio.sleep(60)
                 continue
             _threadsafe_future(asyncio.to_thread(run_daily_data_collect))
@@ -20270,6 +20316,10 @@ _OVN_POSITION_SCOPED_KEYS = (
     "position_ids",
     "sell_fail_count",     # 前の失敗が残り、新しい建玉の1回目で手動決済を促す
     "zero_unfilled_count",
+    # v3.9.215: 売りの出どころ（予約 / その日に発注）と発注時刻。残すと次の建玉の
+    #   約定表示に前サイクルの言い回しと時刻が出る。
+    "sell_kind",
+    "sell_placed_et",
 )
 
 
@@ -20821,16 +20871,19 @@ async def ovn_overnight_loop(trd_env) -> None:
                 if sell_orders:
                     st.update(phase="RESERVED", sell_oids=[o["order_id"] for o in sell_orders],
                               sell_oids_cycle=st.get("entry_date", ""),
-                              qty=pos, position_ids=ids)
+                              qty=pos, position_ids=ids,
+                              sell_kind="unknown")
                     _ovn_say("証券会社側に既存の売り注文を確認したため、その注文を監視します。", "warning")
                     _ovn_save(st)
                     continue
                 oids, msg = await asyncio.to_thread(
                     _ovn_sell_position, trd_env, pos, ids, reserve=True)
                 if oids:
+                    # v3.9.215: どちらの経路で出した売りかを残す（約定時の表示に使う）。
+                    #   reserved = 前日の引け後に予約して寄り付きで約定するもの。
                     st.update(phase="RESERVED", sell_oids=oids,
                               sell_oids_cycle=st.get("entry_date", ""),
-                              qty=pos, position_ids=ids)
+                              qty=pos, position_ids=ids, sell_kind="reserved")
                     _ovn_say("翌営業日の寄り付きで売る注文を出しました（このあとBotを止めても売れます）。"
                              + ("" if msg == "OK" else f" 一部発注のみ: {msg[:120]}"),
                              "info" if msg == "OK" else "error")
@@ -20941,17 +20994,23 @@ async def ovn_overnight_loop(trd_env) -> None:
                     if sell_orders:
                         st.update(phase="RESERVED", sell_oids=[o["order_id"] for o in sell_orders],
                                   sell_oids_cycle=st.get("entry_date", ""),
-                                  qty=pos, position_ids=ids)
+                                  qty=pos, position_ids=ids,
+                                  sell_kind="unknown")
                         _ovn_say("証券会社側に既存の売り注文を確認したため、その注文を監視します。", "warning")
                         _ovn_save(st)
                         continue
                     oids, msg = await asyncio.to_thread(
                         _ovn_sell_position, trd_env, pos, ids, reserve=False)
                     if oids:
+                        # v3.9.215（利用者2名の指摘）: この経路は「いま出す」売り。
+                        #   起動が寄り付きより後になった日もここを通るので、
+                        #   出した時刻をそのまま書く（「寄り付き」と言い切らない）。
+                        _sell_et = now.strftime("%H:%M")
                         st.update(phase="RESERVED", sell_oids=oids,
                                   sell_oids_cycle=st.get("entry_date", ""),
-                                  qty=pos, position_ids=ids, sell_fail_count=0)
-                        _ovn_say("寄り付きの売り注文を出しました。約定確認まで保護を継続します。"
+                                  qty=pos, position_ids=ids, sell_fail_count=0,
+                                  sell_kind="session", sell_placed_et=_sell_et)
+                        _ovn_say(f"売り注文を出しました（{_sell_et} ET）。約定確認まで保護を継続します。"
                                  + ("" if msg == "OK" else f" 一部発注のみ: {msg[:120]}"),
                                  "info" if msg == "OK" else "error")
                     else:
@@ -21053,7 +21112,7 @@ async def ovn_overnight_loop(trd_env) -> None:
                             st["qty"] = _dealt_total  # 損益記録は実約定数で送る
                             _exit_px = await _ovn_exit_price(trd_env, st)
                             _ovn_say(
-                                f"予約注文は一部のみ約定（{_dealt_total}/{_target_qty}株）で終端となり、"
+                                f"売り注文は一部のみ約定（{_dealt_total}/{_target_qty}株）で終端となり、"
                                 "残りの建玉も確認できません。moomoo アプリの履歴をご確認ください。",
                                 "warning")
                             _ovn_report_trade(
@@ -21061,7 +21120,7 @@ async def ovn_overnight_loop(trd_env) -> None:
                                 f"夜間持ち越し: 一部約定 {_dealt_total}/{_target_qty}株（残りは手動決済の可能性）")
                         else:
                             _ovn_say(
-                                "予約注文は約定せずに終端（取消・拒否・失効のいずれか）となり、"
+                                "売り注文は約定せずに終端（取消・拒否・失効のいずれか）となり、"
                                 "建玉も確認できません。手動決済された可能性があります。"
                                 "損益記録は送信しません。moomoo アプリの履歴をご確認ください。",
                                 "warning")
@@ -21072,9 +21131,37 @@ async def ovn_overnight_loop(trd_env) -> None:
                     _ovn_clear_ambiguous(st)
                     _ovn_save(st)
                     state.get(OVN_SYMBOL).ovn_held = False
-                    _ovn_say("予約していた注文が寄り付きで約定しました。")
+                    # v3.9.215: 予約（前日の引け後）と、その日に出した売りを書き分ける。
+                    #   起動が寄り付きより後になった日も「寄り付きで約定」と出ていた
+                    #   （損益は正しいが、実際の発注・約定は寄り付きより後・利用者2名の指摘）。
+                    # ★ v3.9.216（配布前レビュー Codex・中）: 印は建玉のサイクルと
+                    #   揃っているときだけ信じる。版を戻して再更新した場合や、
+                    #   受付後・保存前に止まって既存注文を拾い直した場合は印が無い
+                    #   （または前の建玉のもの）。その回を「予約」と断定すると、
+                    #   直したはずの誤表示がそのまま残る。分からない回は中立に書く。
+                    # v3.9.217（配布前レビュー Gemini・中）: どちらも空だと "" == "" で
+                    #   一致してしまい、前の建玉の印を信じることになる。日付が入って
+                    #   いるときだけ照合する。
+                    #   日付として妥当なときだけ照合する（_ovn_backfill_cycle_stamp と
+                    #   同じ基準。空文字どうしの一致を許すと前の建玉の印を信じる）。
+                    _cyc = str(st.get("entry_date") or "")
+                    _kind_ok = (bool(_re_date_key.fullmatch(_cyc))
+                                and str(st.get("sell_oids_cycle") or "") == _cyc)
+                    _kind = st.get("sell_kind") if _kind_ok else None
+                    if _kind == "reserved":
+                        _ovn_say("予約していた注文が寄り付きで約定しました。")
+                        _ovn_reason = "夜間持ち越し: 予約が寄り付きで約定"
+                    elif _kind == "session":
+                        _placed = st.get("sell_placed_et") or ""
+                        _ovn_say("持ち越し分の売り注文が約定しました"
+                                 + (f"（{_placed} ET に発注）。" if _placed else "。"))
+                        _ovn_reason = "夜間持ち越し: 寄り付き後に売却"
+                    else:
+                        _ovn_say("持ち越し分の売り注文が約定しました"
+                                 "（出した経路は記録に残っていません）。")
+                        _ovn_reason = "夜間持ち越し: 売却"
                     _exit_px = await _ovn_exit_price(trd_env, st)
-                    _ovn_report_trade(st, _exit_px, "夜間持ち越し: 予約が寄り付きで約定")
+                    _ovn_report_trade(st, _exit_px, _ovn_reason)
                     _ovn_save(st)
                 elif pos > 0:
                     statuses = []
@@ -21118,7 +21205,7 @@ async def ovn_overnight_loop(trd_env) -> None:
                                 st.update(phase="HELD_NO_RESERVE", qty=pos, position_ids=ids)
                                 _ovn_save(st)
                 else:
-                    _ovn_say(f"予約注文の約定確認に失敗しました: {pmsg[:120]}", "error")
+                    _ovn_say(f"売り注文の約定確認に失敗しました: {pmsg[:120]}", "error")
 
             # ── ⑤ 日付が変わったら次の日に備える ──────────────────────────
             elif phase == "DONE" and hm >= (10, 30):
@@ -23978,6 +24065,13 @@ def _validate_sent_history(_text: str) -> None:
     _parsed = json.loads(_text)
     if not isinstance(_parsed, dict) or "sent_dates" not in _parsed:
         raise ValueError("送信履歴の形式が違います（sent_dates が無い）")
+    # v3.9.217（配布前レビュー・中）: 新しい鍵は「無い」なら旧形式として通すが、
+    #   在るなら日付文字列の配列であること。null や文字列だと読み戻しで壊れる。
+    for _k in ("sent_dates", "provisional_dates"):
+        _v = _parsed.get(_k)
+        if _k in _parsed and not (isinstance(_v, list)
+                                  and all(isinstance(_d, str) for _d in _v)):
+            raise ValueError(f"送信履歴の形式が違います（{_k} が日付の配列ではない）")
 
 
 def _sent_history_ready() -> bool:
@@ -24010,9 +24104,53 @@ def _load_sent_dates() -> set:
 _SENT_HISTORY_LOCK = threading.RLock()
 
 
+def _load_provisional_dates() -> set:
+    """暫定として送った日付。確定値で送り直すまで残す（v3.9.216）。"""
+    with _SENT_HISTORY_LOCK:
+        _sent_history_ready()
+        try:
+            with open(_sent_history_path(), "r", encoding="utf-8") as f:
+                _v = json.load(f).get("provisional_dates", [])
+            # 壊れた形（null・文字列など）は空として扱う（v3.9.217）
+            if not isinstance(_v, list):
+                return set()
+            return {_d for _d in _v if isinstance(_d, str)}
+        except (OSError, ValueError, TypeError):
+            return set()
+
+
+def _write_sent_history(sent: set, provisional: set) -> None:
+    """送信済みと暫定を1つのファイルに書く（ロック内で呼ぶ）。90日より古い分は捨てる。"""
+    from datetime import timedelta as _td
+    cutoff = (datetime.datetime.now(ZoneInfo("America/New_York")).date()
+              - _td(days=90)).strftime("%Y-%m-%d")
+    _atomic_write_text(
+        _sent_history_path(),
+        json.dumps({"sent_dates": sorted(d for d in sent if d >= cutoff),
+                    "provisional_dates": sorted(d for d in provisional if d >= cutoff)},
+                   ensure_ascii=False))
+
+
+def _mark_date_provisional(date_str: str) -> None:
+    """暫定として送った印を付ける（送信済みにはしない）。
+
+    ★ v3.9.216（配布前レビュー・高）: 決済を確認できないまま送った回を送信済みに
+      すると、そのあと監視が残りを決済しても、その損益と件数が二度と送られない。
+      印を別に持ち、次回起動時の追いかけが確定値を送り直す（GAS は同じ生徒名・
+      日付の行を上書きする）。
+    """
+    try:
+        with _SENT_HISTORY_LOCK:
+            if not _sent_history_ready():
+                return
+            _write_sent_history(_load_sent_dates(),
+                                _load_provisional_dates() | {date_str})
+    except Exception as e:
+        log.warning(f"[データ収集] 暫定の記録エラー: {e}")
+
+
 def _mark_date_sent(date_str: str) -> None:
     """指定日付を送信済みとして記録。90日以上古いエントリは自動削除。"""
-    _dst = _sent_history_path()
     try:
         with _SENT_HISTORY_LOCK:
             _ok = _sent_history_ready()
@@ -24023,13 +24161,8 @@ def _mark_date_sent(date_str: str) -> None:
                     f"見送ります（旧い履歴を失わないため・次回もう一度引き継ぎます）")
                 return
             sent.add(date_str)
-            # 90日以上古い履歴は削除（ファイル肥大化防止）
-            from datetime import timedelta as _td
-            cutoff = (datetime.datetime.now(ZoneInfo("America/New_York")).date()
-                      - _td(days=90)).strftime("%Y-%m-%d")
-            sent = {d for d in sent if d >= cutoff}
-            _atomic_write_text(
-                _dst, json.dumps({"sent_dates": sorted(sent)}, ensure_ascii=False))
+            # 確定値を送れたので、暫定の印は外す（v3.9.216）
+            _write_sent_history(sent, _load_provisional_dates() - {date_str})
     except Exception as e:
         log.warning(f"[データ収集] 送信履歴保存エラー: {e}")
 
@@ -24118,11 +24251,24 @@ def find_unsent_trading_dates(log_path: str = _LOG_PATH,
     if not os.environ.get("STUDENT_NAME", "").strip():
         return []
 
-    sent = _load_sent_dates()
+    # v3.9.216: 暫定として送った日は、まだ確定していないので送り直す対象にする。
+    _prov = _load_provisional_dates()
+    sent = _load_sent_dates() - _prov
     _ET_TZ   = ZoneInfo("America/New_York")
     _JST_TZ  = ZoneInfo("Asia/Tokyo")
     today_et = datetime.datetime.now(_ET_TZ).date()
     cutoff   = today_et - _td(days=lookback_days)
+    # ★ v3.9.217（配布前レビュー・中）: 暫定の日が窓より古いときは、窓のほうを
+    #   その日まで広げる。判定だけ広げても _iter_log_lines が古いアーカイブを
+    #   読み飛ばすので、その日の行がそもそも出てこなかった（8日以上動かし続けると
+    #   暫定値のまま残る）。
+    for _pd in _prov:
+        try:
+            _pdate = datetime.date.fromisoformat(_pd)
+        except (TypeError, ValueError):
+            continue
+        if _pdate < cutoff:
+            cutoff = _pdate
 
     found = set()
     ts_pat = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
@@ -24141,6 +24287,7 @@ def find_unsent_trading_dates(log_path: str = _LOG_PATH,
                 d_et = dt_jst.astimezone(_ET_TZ).date()
             except (ValueError, TypeError):
                 continue
+            # 暫定の日は上で cutoff を広げてあるので、この判定だけで拾える。
             if cutoff <= d_et < today_et:
                 found.add(d_et)
     except Exception as e:
@@ -24561,7 +24708,7 @@ _ENV_IN_LINE = re.compile(r"\senv=(REAL|DEMO)(?![A-Za-z0-9_])")
 
 
 def run_daily_data_collect(log_path: str = _LOG_PATH,
-                           target_date=None) -> None:
+                           target_date=None, provisional: bool = False) -> None:
     """
     .env の DATA_COLLECT=true の場合のみ集計してGASに送信する。
     センシティブな情報（APIキー・口座番号）は一切送信しない。
@@ -24569,6 +24716,12 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
     target_date (Optional[datetime.date]):
       - None: 呼び出し時点のET日付を対象（定時送信・15:45 ET）
       - 日付指定: その日を対象（起動時キャッチアップ）
+
+    provisional (bool):
+      ★ v3.9.216（配布前レビュー Codex・中）: 決済を確認できないまま送る回。
+      送信済みの印を付けない。印を付けると、そのあと監視が残りを決済しても、
+      その損益と件数が翌日の追いかけでも送られず、暫定値のまま残る
+      （GAS は同じ生徒名・日付を上書きするので、後から送れば最終値で置き換わる）。
     """
     import re, json as _json, random as _random, time as _time
     from collections import defaultdict
@@ -24615,7 +24768,10 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
         return
 
     # 重複送信防止：既に送信済みならスキップ
-    if date_str in _load_sent_dates():
+    # v3.9.217（配布前レビュー・高）: 暫定の印が付いた日は「まだ確定していない」。
+    #   送信済みと暫定の両方に入っている状態（キュー再送と暫定送信が前後した回）で、
+    #   追いかけが選んだのにここで戻ってしまい、暫定の印も永久に外れなかった。
+    if date_str in (_load_sent_dates() - _load_provisional_dates()):
         log.info(f"[データ収集] {date_str} は送信済みのためスキップ")
         return
 
@@ -24838,11 +24994,22 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
         # timeout は 30秒: 分散遅延の上限180秒 ＋ 再送3回×30秒 ＋ 待機20秒 ＝ 290秒
         #   で、asyncio が executor スレッドの終了を待つ 300秒の予算内に収まる
         #   （60秒だと 385秒になり予算超過＝Ctrl+C 時に退避前へ打ち切られうる）。
-        _sent_ok = _gas_send_with_retry(cfg_url, payload, kind="summary",
-                                        key=f"{cfg_name}|{date_str}", timeout=30,
-                                        jitter_max=0)
+        # v3.9.217: 暫定はキューにも区分を残す（再送で確定扱いにしないため）
+        _sent_ok = _gas_send_with_retry(
+            cfg_url, payload,
+            kind=("summary_provisional" if provisional else "summary"),
+            key=f"{cfg_name}|{date_str}", timeout=30, jitter_max=0)
         if _sent_ok:
-            _mark_date_sent(date_str)
+            if provisional:
+                # 暫定送信。送信済みにはせず、暫定の印を残す。次回起動時の
+                # 追いかけが確定値を送り直し、GAS が同じ行を上書きする。
+                _mark_date_provisional(date_str)
+                log.info(
+                    f"[データ収集] 暫定として送りました  名前:{cfg_name}  日付:{date_str}"
+                    f"（決済を確認できていないため、次回起動時の追いかけで送り直します）"
+                )
+            else:
+                _mark_date_sent(date_str)
             # 同じ鍵の古い退避が残っていれば掃除（後から届いて新しい行を
             #   上書きするのを防ぐ。詳細は _gas_queue_purge_key の docstring）。
             _gas_queue_purge_key(f"{cfg_name}|{date_str}")
