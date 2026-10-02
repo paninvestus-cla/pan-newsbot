@@ -80,9 +80,36 @@ from types import SimpleNamespace
 from typing import Optional, Union, List, Dict, Tuple, Any
 from zoneinfo import ZoneInfo
 
-import requests
-import anthropic
-from dotenv import load_dotenv
+# v3.9.218: 未導入のときに案内なしの Traceback で終わっていた（認定サポーターの指摘）。
+#   pip の対象を「いま起動している Python」に固定した案内を出す（別の Python に
+#   入れてしまうと、入れたのに直らない、になる）。
+#   配布前レビュー: 依存先の読み込み失敗（DLL など）まで「未導入」と言い切ると、
+#   pip が already satisfied で終わって詰む。元の例外を必ず添える。版の固定は
+#   requirements.txt にあるので、そちらを先に案内する（場所はこのファイルの隣）。
+def _missing_package_exit(pkg: str, mod: str, err: Optional[BaseException] = None) -> None:
+    _req = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
+    print(
+        f"[ERROR] {mod} を読み込めませんでした（{pkg}）。\n"
+        + (f"  原因: {type(err).__name__}: {err}\n" if err is not None else "")
+        + f"  未導入なら、次のどちらかを実行してから、もう一度起動してください:\n"
+        f'  "{sys.executable}" -m pip install -r "{_req}"\n'
+        f'  "{sys.executable}" -m pip install {pkg}\n'
+        f"  入っているのに出る場合は、上の「原因」を添えてご相談ください。"
+    )
+    sys.exit(1)
+
+try:
+    import requests
+except ImportError as _e_imp:
+    _missing_package_exit("requests", "requests", _e_imp)
+try:
+    import anthropic
+except ImportError as _e_imp:
+    _missing_package_exit("anthropic", "anthropic", _e_imp)
+try:
+    from dotenv import load_dotenv
+except ImportError as _e_imp:
+    _missing_package_exit("python-dotenv", "dotenv", _e_imp)
 
 # ── moomoo API ───────────────────────────────────────────────────────────────
 # moomoo-api 10.x: OpenUSTradeContext は OpenSecTradeContext に統合 (旧 9.x 互換のため任意import)。
@@ -157,13 +184,8 @@ except ImportError:
             from futu import Session  # type: ignore
         except ImportError:
             Session = None  # type: ignore
-    except ImportError:
-        print(
-            "[ERROR] moomoo-api がインストールされていません。\n"
-            "  pip install moomoo-api\n"
-            "を実行してください。"
-        )
-        sys.exit(1)
+    except ImportError as _e_imp:
+        _missing_package_exit("moomoo-api", "moomoo", _e_imp)
 
 # OpenD が応答しなくなると、SDK のコールバック待ちスレッド（期限の無い queue.get で待つ非 daemon スレッド）が
 # プロセスの終了を止め、Ctrl+C で終われずタスクの強制終了が要った（利用者の報告・2晩連続）。
@@ -180,7 +202,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.217"
+BOT_VERSION = "v3.9.218"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -5358,6 +5380,14 @@ def _sigint_handler(sig, frame):
     raise KeyboardInterrupt
 
 signal.signal(signal.SIGINT, _sigint_handler)
+# v3.9.218: 停止（SIGTERM・launchd やタスクの停止）も Ctrl+C と同じ終了処理に流す
+#   （認定サポーターの指摘）。これまでは集計・通知の後始末を通らずに落ちていた。
+#   Windows の強制終了（TerminateProcess）はハンドラを呼ばないので、そちらは
+#   起動時の照会（_mark_live_orders_at_startup の呼び出し元）で受け止める。
+try:
+    signal.signal(signal.SIGTERM, _sigint_handler)
+except (AttributeError, ValueError, OSError):
+    pass
 
 _ET           = ZoneInfo("America/New_York")
 # 未定義だったため、Ank 環境の RSS 高速ニュースループ等で NameError を発生
@@ -7653,8 +7683,8 @@ _SWEEP_VERIFY_RETRY_SEC: int = 20
 #   asyncio.to_thread のワーカースレッドで眠り、main() を抜けたあと
 #   asyncio.run() がそのワーカーの終了を待つ（Python 3.9 の
 #   shutdown_default_executor には期限が無い）ため、眠り終わるまで消えない。
-#   停止の合図は Ctrl+C（SIGINT）のみ。タスクスケジューラや launchd からの
-#   停止（SIGTERM）では立たないので、そちらの終了は従来どおり。
+#   停止の合図は Ctrl+C（SIGINT）と、v3.9.218 から SIGTERM（launchd などの停止）。
+#   Windows の強制終了ではハンドラが呼ばれないので立たない。
 
 
 def _sleep_unless_stopping(sec: float) -> bool:
@@ -8887,7 +8917,8 @@ async def market_schedule_loop(trd_env: TrdEnv) -> None:
         価格が見えている RTH 内（15:45 ET）で毎日全決済する
       - 翌日のプリマーケット開始（04:00 ET）に自動再開
       - 実口座（REAL）では本ロジックは発火しない
-        → 実口座は夜間取引セッションも株価取得・発注が可能
+        （v3.9.218 で訂正: 夜間 20:00〜04:00 ET は実口座も下の停止判定で止まる。
+          新規発注も通常の損切り・トレール・時間切れの監視も動かない）
 
 
     """
@@ -13681,6 +13712,10 @@ def sync_positions(trd_env: TrdEnv) -> None:
                             f"[ポジション同期] 【{_sym_h}】 生きている注文があるため"
                             f"時計の復元を見送ります（決済の処理待ちの可能性）"
                         )
+                        # v3.9.218（配布前レビュー・中）: 起動時の同期で建玉が見えず、
+                        #   後からここで拾った銘柄にも同じ印を付ける（起動時だけだと漏れる）。
+                        _note_restart_close_orders(_sym_h, trd_env, _ts_h.position_qty,
+                                                   "ポジション同期")
                         continue
                     _ts_h.entry_time = (_ledger_entry_time(_sym_h, trd_env)
                                         or datetime.datetime.now())
@@ -16974,11 +17009,322 @@ def _mark_sent_unknown(symbol: str) -> None:
     _close_sent_unknown[symbol] = datetime.datetime.now()
 
 
+# v3.9.218: 前回のプロセスが出した決済注文が、約定しないまま証券会社に残っている銘柄
+#   （再起動・停止のあと）。追跡表 _pending_orders はプロセスの中にしかないので、
+#   再起動後はその注文に気づかないまま2本目の決済を出せた（認定サポーターの指摘）。
+#   配布前レビュー（3者共通・高）: 「残っている間は出さない」だけだと、刺さらない古い
+#   指値が当日の失効まで損切りを止める。決済が要る時に、その注文を取り消して確かめて
+#   から出し直す（決済は常に1本、の考え方を再起動のあとにも当てる）。
+_restart_close_marks: dict = {}     # symbol -> {"at": datetime, "note_at": datetime|None}
+_RESTART_CLOSE_RENOTE_MIN: int = 10
+# 配布前レビュー2周目（Claude 別人格・高）: 照会の結果から「このプロセスが出した注文」を
+#   除かないと、自分の決済を「前回の起動の注文」と取り違えて取り消す（追跡表から外した
+#   直後の同期で印が付く）。前回のプロセスの注文は、起動した時点ですでに生きていた注文
+#   だけなので、起動時にその注文IDを控え、そこに無い注文は数えない。
+_startup_live_order_ids: Optional[set] = None   # None = 起動時に控えられなかった
+_own_cancelled_close_oids: set = set()          # このプロセスが取消を受け付けさせた決済
+
+
+def _snapshot_startup_live_orders(trd_env) -> None:
+    """起動した時点で生きている注文の ID を控える（前回のプロセスの注文の候補）。
+
+    3周目のレビュー（Claude 別人格・低）: 黙って None のままだと、後で自分の注文を
+    「前回の起動の注文」と取り違えうる。発注を始める前なので、少し待って取り直す。
+    """
+    global _startup_live_order_ids
+    for _try in range(3):
+        try:
+            with _trade_ctx() as _ctx_ss:
+                _r_ss, _df_ss = _ctx_ss.order_list_query(
+                    trd_env=trd_env,
+                    acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0))
+            if _r_ss == RET_OK:
+                _ids = set()
+                if _df_ss is not None and not _df_ss.empty:
+                    for _, _row in _df_ss.iterrows():
+                        if not _is_terminal_order_status(_row.get("order_status", "")):
+                            _ids.add(str(_row.get("order_id", "")))
+                _startup_live_order_ids = _ids
+                return
+        except Exception as _e_ss:
+            log.debug(f"[起動時復元] 生きている注文の控えに失敗: {_mask_secrets(_e_ss)}")
+        time.sleep(2)
+    log.warning(
+        "[起動時復元] 起動した時点の注文を控えられませんでした。前回の起動の決済が残って"
+        "いないかは、追跡表と取消の記録だけで見分けます（二重決済の防止）"
+    )
+
+
+def _live_close_orders(symbol: str, trd_env, pos_qty) -> tuple:
+    """前回のプロセスが出したとみられる、この建玉を閉じる向きの未約定注文の注文ID一覧。
+
+    戻り値 (照会できたか, [注文ID])。照会に失敗したら (False, [])。
+    数えないもの: 新規（建て増し）の向きの注文、夜間持ち越しが自分の売りとして控えて
+    いる注文、このプロセスが出した注文（追跡表にある・取消を受け付けさせた・起動時の
+    控えに無い）。
+    """
+    try:
+        _q = float(pos_qty or 0)
+    except (TypeError, ValueError):
+        return False, []
+    if _q > 0:
+        _close_sides = {"SELL"}
+    elif _q < 0:
+        _close_sides = {"BUY", "BUY_BACK"}
+    else:
+        return False, []          # 向きが分からない＝確かめられない（安全側）
+    _skip = set(list(_pending_orders.keys())) | set(list(_own_cancelled_close_oids))
+    if symbol == OVN_SYMBOL:
+        try:
+            _st = _ovn_load()
+            _skip |= {str(x) for x in (_st.get("sell_oids") or [_st.get("sell_oid")]) if x}
+        except Exception:
+            return False, []
+    _only = _startup_live_order_ids
+    try:
+        with _trade_ctx(urgent=True) as _ctx_lc:
+            _r_lc, _df_lc = _ctx_lc.order_list_query(
+                trd_env=trd_env,
+                acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0))
+        if _r_lc != RET_OK:
+            return False, []
+        _out = []
+        if _df_lc is not None and not _df_lc.empty:
+            for _, _row in _df_lc.iterrows():
+                # 銘柄は「市場.銘柄」の後ろ側で完全一致（"B" が "BRK.B" に当たらない）
+                if str(_row.get("code", "")).split(".", 1)[-1] != symbol:
+                    continue
+                if _is_terminal_order_status(_row.get("order_status", "")):
+                    continue
+                _side = str(_row.get("trd_side", "")).upper().split(".")[-1]
+                if _side not in _close_sides:
+                    continue
+                _oid = str(_row.get("order_id", ""))
+                if not _oid or _oid in _skip:
+                    continue
+                if _only is not None and _oid not in _only:
+                    continue      # 起動後に出た注文＝このプロセスの注文
+                _out.append(_oid)
+        return True, _out
+    except Exception:
+        return False, []
+
+
+def _mark_restart_close(symbol: str) -> None:
+    _restart_close_marks.setdefault(
+        symbol, {"at": datetime.datetime.now(), "note_at": datetime.datetime.now()})
+
+
+def _restart_close_notice(symbol: str, text: str) -> None:
+    """止めている間の知らせ（間引いて繰り返す。1回きりだと気づけない）。"""
+    _info = _restart_close_marks.get(symbol)
+    if _info is None:
+        return
+    _now = datetime.datetime.now()
+    _last = _info.get("note_at")
+    if _last is not None and (_now - _last).total_seconds() < _RESTART_CLOSE_RENOTE_MIN * 60:
+        return
+    _info["note_at"] = _now
+    try:
+        threading.Thread(target=send_discord_message, args=(f"⚠️ 【{symbol}】 {text}",),
+                         daemon=True, name="restart-close-note").start()
+    except Exception:
+        pass
+
+
+def _cancel_restart_leftovers(symbol: str, trd_env, oids) -> int:
+    """前回の起動の決済注文を急ぎの枠で取り消す。受け付けられた件数を返す。"""
+    _done = 0
+    for _oid in oids:
+        try:
+            if _cancel_order(_oid, symbol, trd_env,
+                             reason="前回の起動で出した決済の取消（二重決済防止）",
+                             urgent=True):
+                _done += 1
+                # 3周目（Claude 別人格・中）: 受け付けた取消を覚えないと、直後の同期が
+                #   まだ終わっていない同じ注文を拾って、もう一度取り消す。
+                _own_cancelled_close_oids.add(str(_oid))
+        except Exception as _e_rc:
+            log.debug(f"【{symbol}】[二重決済防止] 取消の例外 orderId={_oid}: {_mask_secrets(_e_rc)}")
+    return _done
+
+
+def _restart_close_direction_qty(symbol: str):
+    _ts = state.get(symbol)
+    _q = getattr(_ts, "position_qty", 0) or 0
+    if _q == 0:
+        _tq = abs(_tracked_qty.get(symbol, 0) or 0)
+        _q = -_tq if getattr(_ts, "is_short", False) else _tq
+    return _q
+
+
+_RESTART_CANCEL_CONFIRM_SEC: float = 6.0
+_RESTART_SETTLE_SCANS: int = 3
+
+
+def _restart_close_settle(symbol: str, trd_env, oids) -> tuple:
+    """取り消した注文が終わったかを照会で確かめる。戻り値 (全部終わった, どれかが約定していた)。
+
+    3周目のレビュー（Codex・高／Claude 別人格・中）: 取消の「受付」は終わりではない。
+    受付のあとに約定することがあり、その間に新しい決済を出すと2本並ぶ。
+    close_order_chaser と同じく、終端（約定・取消）になったのを確かめてから進む。
+    """
+    _deadline = time.monotonic() + _RESTART_CANCEL_CONFIRM_SEC
+    _left = {str(x) for x in oids}
+    _filled = False
+    while True:
+        for _oid in list(_left):
+            _st, _dealt, _ = _order_status_snapshot(_oid, symbol, trd_env)
+            if _dealt > 0:
+                _filled = True
+            if _is_terminal_order_status(_st):
+                _left.discard(_oid)
+        if not _left:
+            return True, _filled
+        if time.monotonic() >= _deadline:
+            return False, _filled
+        time.sleep(1.5)
+
+
+def _restart_close_gate(symbol: str, trd_env) -> bool:
+    """前回の起動の決済注文が残っている銘柄の、決済前の関門。True = 今回は出さない。
+
+    同じ呼び出しの中で「取り消す → 終わったのを照会で確かめる → 同期して建玉を
+    取り直す → そのまま出す」（1回しか呼ばれない経路も決済しきれるように・2周目）。
+    見送るのは次のときだけ:
+      ・照会できない／取消が受け付けられない／取消が終わったのを確かめられない
+      ・残っていた決済が約定していた（建玉の写しは不在を数回続けて確かめるまで
+        消えないので、反映されるまで数回の同期を待つ・3周目 Claude 別人格・中）
+      ・同期が成功しなかった（sync_positions は失敗を中で握りつぶすので、
+        _account_scan_seq が進んだかで見分ける・3周目 Codex・高）
+    """
+    _info = _restart_close_marks.get(symbol)
+    if _info is None:
+        return False
+    _at = _info.get("at") or datetime.datetime.now()
+    _mins = (datetime.datetime.now() - _at).total_seconds() / 60
+    _settle = _info.get("settle_seq")
+    if _settle is not None and _account_scan_seq < _settle:
+        log.info(f"【{symbol}】[二重決済防止] 前回の起動の決済が約定していたため、"
+                 f"建玉の反映を待っています（同期 {_account_scan_seq}/{_settle}）")
+        return True
+    _q = _restart_close_direction_qty(symbol)
+    if _q == 0:
+        _restart_close_marks.pop(symbol, None)     # 閉じる建玉が無い＝関門の役目は終わり
+        return False
+    # 起動時・同期で取り消した注文が終わったかを先に確かめる
+    _prev = list(_info.get("cancelled_oids") or [])
+    _ok, _oids = _live_close_orders(symbol, trd_env, _q)
+    if not _ok:
+        _msg = (f"[二重決済防止] 注文を照会できません（再起動から {_mins:.0f}分）。前回の起動で"
+                f"出した決済が残っていないか確かめられないため、今回は決済を見送ります")
+        log.warning(f"【{symbol}】{_msg}")
+        _restart_close_notice(symbol, _msg + "。照会できるまで決済が止まります。moomoo アプリで注文と建玉を確認してください。")
+        return True
+    if _oids:
+        _done = _cancel_restart_leftovers(symbol, trd_env, _oids)
+        if _done < len(_oids):
+            _msg = (f"[二重決済防止] 前回の起動で出したとみられる決済注文 {len(_oids)}件のうち"
+                    f" {len(_oids) - _done}件の取消が受け付けられません（約定の途中の可能性）"
+                    f" → 今回は決済を見送ります")
+            log.warning(f"【{symbol}】{_msg}")
+            _restart_close_notice(symbol, _msg + "。moomoo アプリで注文と建玉を確認してください。")
+            return True
+    _check = list(dict.fromkeys(_prev + list(_oids)))
+    if _check:
+        _settled, _filled = _restart_close_settle(symbol, trd_env, _check)
+        if not _settled:
+            _msg = (f"[二重決済防止] 前回の起動の決済注文の取消は受け付けられましたが、"
+                    f"終わったのを確かめられません → 今回は決済を見送ります")
+            log.warning(f"【{symbol}】{_msg}")
+            _info["cancelled_oids"] = _check
+            _restart_close_notice(symbol, _msg + "。")
+            return True
+        _info["cancelled_oids"] = []
+        if _filled:
+            _info["settle_seq"] = _account_scan_seq + _RESTART_SETTLE_SCANS
+            log.warning(f"【{symbol}】[二重決済防止] 前回の起動の決済注文が約定していました"
+                        f" → 建玉の反映を待ってから決済します")
+            return True
+        log.warning(f"【{symbol}】[二重決済防止] 前回の起動の決済注文 {len(_check)}件が"
+                    f"取り消されたのを確かめました → 建玉を取り直して決済します")
+    else:
+        log.info(f"【{symbol}】[二重決済防止] 前回の起動の決済注文は残っていません"
+                 f" → 建玉を取り直して決済します")
+    _seq0 = _account_scan_seq
+    try:
+        sync_positions(trd_env)
+    except Exception as _e_rs:
+        log.debug(f"【{symbol}】[二重決済防止] 再同期例外: {_mask_secrets(_e_rs)}")
+    if _account_scan_seq <= _seq0:
+        log.warning(f"【{symbol}】[二重決済防止] 建玉を取り直せませんでした → 今回は決済を見送ります")
+        return True
+    _restart_close_marks.pop(symbol, None)
+    return False
+
+
+_RESTART_RETRY_SEC: float = 60.0
+
+
+def _note_restart_close_orders(symbol: str, trd_env, pos_qty, where: str) -> None:
+    """生きている注文がある Bot の銘柄で、前回の起動の決済注文が残っていれば取り消し、
+    印を付ける（印のある銘柄は、決済前の関門で取消が終わったのを確かめてから出す）。
+
+    2周目（Codex・中）: 残ったままだと時間切れの時計が戻らず、時間切れ決済が関門に
+    届かない。見つけた時点で取り消すと、次の同期で時計が戻る。
+    3周目（Codex・中／Claude 別人格・中）: 印が付いた後も取消をやり直す（間引いて）。
+    初回だけ失敗した銘柄で、時間切れが失効まで届かなかった。
+    """
+    _info = _restart_close_marks.get(symbol)
+    _now = datetime.datetime.now()
+    if _info is not None:
+        _last = _info.get("retry_at")
+        if _last is not None and (_now - _last).total_seconds() < _RESTART_RETRY_SEC:
+            return
+    _ok, _oids = _live_close_orders(symbol, trd_env, pos_qty)
+    if _info is not None:
+        _info["retry_at"] = _now
+    if _ok and not _oids:
+        return            # 残っているのは新規の向き・このプロセスの注文だけ
+    _first = _info is None
+    _mark_restart_close(symbol)
+    _info = _restart_close_marks[symbol]
+    _info["retry_at"] = _now
+    if _ok:
+        _done = _cancel_restart_leftovers(symbol, trd_env, _oids)
+        _info["cancelled_oids"] = list(dict.fromkeys(
+            list(_info.get("cancelled_oids") or []) + [str(x) for x in _oids]))
+        if _done == len(_oids):
+            _what = (f"起動前から残っていた決済注文 {len(_oids)}件を取り消しました"
+                     f"（二重決済の防止）。決済が要れば、取消が終わったのを確かめてから"
+                     f" Bot が出し直します")
+        else:
+            _what = (f"前回の起動で出したとみられる決済注文 {len(_oids)}件のうち"
+                     f" {len(_oids) - _done}件を取り消せませんでした。次に決済するときに"
+                     f"取り消してから出し直します（取り消せない間は決済を見送ります）")
+    else:
+        _what = ("注文を照会できませんでした（前回の起動の決済が残っていないか確かめられません）。"
+                 "照会できるまで決済を見送ります")
+    log.warning(f"[{where}] 【{symbol}】 {_what}")
+    if _first:
+        try:
+            threading.Thread(
+                target=send_discord_message,
+                args=(f"⚠️ 【{symbol}】 {_what}\nmoomoo アプリで注文と建玉を確認してください。",),
+                daemon=True, name="restart-close-mark").start()
+        except Exception:
+            pass
+
+
 def _sent_unknown_blocks_close(symbol: str, trd_env) -> bool:
     """結果不明の決済が残っている間は、照会で裏を取れるまで新しい決済を出さない。
 
     戻り値 True = 今回は出さない。照会できなかったときも True（安全側）。
     """
+    # 3周目（Claude 別人格・高）: 再起動の関門が通しても、結果不明の決済の確認は
+    #   飛ばさない（両方の印が同時に付くのは、どちらも OpenD が不安定なとき）。
+    if symbol in _restart_close_marks and _restart_close_gate(symbol, trd_env):
+        return True
     if symbol not in _close_sent_unknown:
         return False
     _at = _close_sent_unknown.get(symbol)
@@ -16990,10 +17336,23 @@ def _sent_unknown_blocks_close(symbol: str, trd_env) -> bool:
         )
         return True
     _close_sent_unknown.pop(symbol, None)
+    # v3.9.218（配布前レビュー）: 消えた理由が「約定した」だと、手元の株数と
+    #   position_id は古い。同じ呼び出しの中で同期して取り直してから出す
+    #   （回をまたいで見送ると、1回しか呼ばれない経路が決済しきれない・2周目の指摘）。
     log.info(
         f"【{symbol}】[二重決済防止] 結果の分からない決済（{_ago:.1f}分前）は"
-        f"証券会社側に残っていないことを確認 → 決済を続けます"
+        f"証券会社側に残っていないことを確認 → 建玉を取り直して決済します"
     )
+    _seq0 = _account_scan_seq
+    try:
+        sync_positions(trd_env)
+    except Exception as _e_su:
+        log.debug(f"【{symbol}】[二重決済防止] 再同期例外: {_mask_secrets(_e_su)}")
+    if _account_scan_seq <= _seq0:
+        # 3周目（Codex・高）: sync_positions は失敗を中で握りつぶす。進んだかで見分ける。
+        log.warning(f"【{symbol}】[二重決済防止] 建玉を取り直せませんでした → 今回は決済を見送ります")
+        _mark_sent_unknown(symbol)
+        return True
     return False
 
 
@@ -17369,6 +17728,7 @@ def _cancel_pending_closes_for_symbol(symbol: str, trd_env: TrdEnv, reason: str 
             _ok = False
         if _ok:
             _pending_orders.pop(oid, None)
+            _own_cancelled_close_oids.add(str(oid))   # v3.9.218: 前回の起動の注文と取り違えない
             _confirmed += 1
         else:
             log.warning(
@@ -23324,13 +23684,18 @@ async def main(live: bool) -> None:
 
     log.info(f"  トリガー銘柄: {', '.join(TRIGGER_TICKERS)}")
     log.info(f"  発注銘柄:     {', '.join(exec_syms)}")
-    log.info(f"  セッション制御: 月〜金 04:00〜翌04:00  週末のみ停止")
+    # v3.9.218: 実際の動きに合わせた（停止判定は実口座も夜間 20:00〜04:00 ET を止める）。
+    log.info(f"  セッション制御: 月〜金 04:00〜20:00 ET に稼働（20:00〜翌04:00 ET の夜間と週末は停止）")
     log.info(f"  週末決済: 金曜 {_FRIDAY_CLOSE_TIME.strftime('%H:%M')} ET に全ポジション強制決済・ニュース停止")
     if trd_env == TrdEnv.SIMULATE:
         log.info(f"  🟡 デモ日次決済: 平日毎日 {_FRIDAY_CLOSE_TIME.strftime('%H:%M')} ET に全決済・翌プリマーケットまで停止（デモ：株価更新なし）")
     else:
-        log.info(f"  🔴 実口座: 夜間セッションも取引継続（週末のみ {_FRIDAY_CLOSE_TIME.strftime('%H:%M')} ET に全決済）")
-        log.info(f"  　　→ moomoo確認済: オーバーナイトも株価取得・発注・ポジション照会すべて対応")
+        # v3.9.218: 「夜間も取引継続」と出していたが、実際は夜間（20:00〜04:00 ET）は
+        #   新規発注も通常の損切り・トレール・時間切れの監視も止まる（認定サポーターの指摘）。
+        log.info(f"  🔴 実口座: 夜間（20:00〜翌04:00 ET）は新規発注と、損切り・トレール・時間切れの監視を止めます"
+                 f"（夜間持ち越しの機能は別枠で動きます）")
+        log.info(f"  　　→ 夜間に建玉を残さないには CLOSE_BEFORE_INACTIVE=true（移行の数分前に決済）"
+                 f"・週末は金曜 {_FRIDAY_CLOSE_TIME.strftime('%H:%M')} ET に全決済")
     log.info(f"  戦略: SPY/QQQ ロング（現物買い）/ ショート（空売り）")
     if NEWS_PROFILE_SELECT:
         log.warning(
@@ -23749,6 +24114,9 @@ async def main(live: bool) -> None:
         _restore_etf | set(STOCK_TICKERS) | _restore_earn | _momentum_live_symbols()
     )
     restored = []
+    # v3.9.218: 起動した時点で生きている注文を控える（前回のプロセスの決済と、
+    #   このプロセスが後で出す決済を見分けるため）。発注はまだ1本も出していない。
+    _snapshot_startup_live_orders(trd_env)
     for sym in exec_syms_list:
         ts = state.get(sym)
         # 旧コード `> 0` ではショート持越し時に _tracked_position_cost が空のまま
@@ -23811,7 +24179,18 @@ async def main(live: bool) -> None:
                 # （従来は再起動のたびに現在時刻へリセットされ、時間切れの
                 #   時計が巻き戻っていた）。
                 _ext_set_held(sym, False)
-                if ts.entry_time is None and _has_live_broker_order(sym, trd_env):
+                # v3.9.218: 前回のプロセスが出した決済注文が、約定しないまま証券会社に
+                #   残っていることがある（Ctrl+C 以外で止まった・再起動した）。決済注文の
+                #   追跡表（_pending_orders）はプロセスの中にしかないので、再起動後は空で、
+                #   残った注文に気づかないまま2本目の決済を出せた（建玉が反対向きに
+                #   ひっくり返る。5/27 の +8 → -8 と同じ形・認定サポーターの指摘）。
+                #   この建玉を閉じる向きの注文が残っている（または照会できない）銘柄に
+                #   印を付ける。印のある銘柄は、決済が要る時にその注文を取り消して、
+                #   消えたのを確かめてから出し直す（_restart_close_gate）。
+                _live_at_start = _has_live_broker_order(sym, trd_env)
+                if _live_at_start:
+                    _note_restart_close_orders(sym, trd_env, ts.position_qty, "起動時復元")
+                if ts.entry_time is None and _live_at_start:
                     log.info(
                         f"[起動時復元] {sym} に生きている注文があるため、時間切れの"
                         f"時計はまだ戻しません（注文が片付き次第、同期が自動で戻します）"
@@ -24797,8 +25176,8 @@ def run_daily_data_collect(log_path: str = _LOG_PATH,
         # ★ 2026-09-18（利用者のレビュー）: 待ちをゼロにすると、複数の環境へ
         #   同時に Ctrl+C を送ったとき全部が同時に送る。
         #   終了の速さはほぼ保ったまま、短い散らしだけ残す。
-        #   （2026-09-19: この印が立つのは Ctrl+C だけ。SIGTERM や強制終了では
-        #     立たないので対象外。タスクスケジューラが CTRL_C_EVENT を送る構成なら届く。）
+        #   （2026-09-19: この印が立つのは Ctrl+C と、v3.9.218 から SIGTERM。
+        #     強制終了では立たないので対象外。タスクスケジューラが CTRL_C_EVENT を送る構成なら届く。）
         _short = _random.uniform(0, 3)
         log.info(f"[データ収集] 停止中のため分散待ちを切り上げます（{_short:.1f}秒だけ散らして送信）")
         _time.sleep(_short)
