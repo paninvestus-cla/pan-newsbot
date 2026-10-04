@@ -202,7 +202,7 @@ load_dotenv()
 #  ボットバージョン  ★ 現在の版はここ ★
 #  変更履歴はすべて CHANGELOG.md に記載（本体には履歴を残さない）。
 # ══════════════════════════════════════════════════════════════════════════════
-BOT_VERSION = "v3.9.218"
+BOT_VERSION = "v3.9.219"
 
 _RUN_TRADE_ENV: str = "DEMO"
 
@@ -17100,7 +17100,11 @@ def _live_close_orders(symbol: str, trd_env, pos_qty) -> tuple:
                 if _side not in _close_sides:
                     continue
                 _oid = str(_row.get("order_id", ""))
-                if not _oid or _oid in _skip:
+                if not _oid:
+                    continue
+                # v3.9.219 6周目（Codex・中）: 取消を受け付けて「消えた」とみなした注文が、生きて一覧に戻ったら
+                #   数える（覚えを捨てて、終わったかを確かめ直す）。自分の取消の除外のせいで見えなかった。
+                if _oid in _skip and not (_oid in _own_cancelled_close_oids and _oid in _restart_settled_oids):
                     continue
                 if _only is not None and _oid not in _only:
                     continue      # 起動後に出た注文＝このプロセスの注文
@@ -17160,6 +17164,84 @@ def _restart_close_direction_qty(symbol: str):
 
 _RESTART_CANCEL_CONFIRM_SEC: float = 6.0
 _RESTART_SETTLE_SCANS: int = 3
+# v3.9.219（配布前レビュー2周目・Codex・高／Claude 別人格）: 控え（cancelled_oids）の読み書きを順番に行う。
+#   関門（イベントループ）と同期の中の _note_restart_close_orders（別スレッド）が、読んでから書き戻すため、
+#   錠が無いと、そのあいだに足された控えを消して、その注文を確かめずに通しうる。
+_restart_close_lock = threading.RLock()   # 4周目: 同期の側が錠の中で印を取り直してから控えに足すので、入れ子で取れる種類
+# 4周目（Codex・高）: 同期の中の _note_restart_close_orders が照会・取消している間は、関門を通さない（銘柄 → 処理中の数）
+_restart_note_busy: dict = {}
+# 4周目（Codex・中／Gemini・高）: 終わったと分かった注文（注文ID → 約定していたか）。もう問い合わせない
+_restart_settled_oids: dict = {}
+# 注文ID → 最後にサーバーへ問い合わせ直した時刻。同じ注文は30秒あけ、古い順に回す（枠を同じ注文が使い切らない）
+_restart_last_asked: dict = {}
+# 5周目（Codex・中）: 問い合わせ直しが進まない注文（失敗・サーバーではまだ生きている）は、間隔を倍々に広げる（上限2分）。
+#   枠は口座で共通なので、別の銘柄の進まない注文が枠を使い続けて、消えた注文の確かめが回ってこないのを防ぐ。
+_restart_ask_spacing: dict = {}   # 注文ID → 次の問い合わせまでの秒数
+_RESTART_ASK_SPACING_MAX: float = 120.0   # 6周目（Claude 別人格・低）: 消えた注文の確かめを遅らせすぎない
+# 一覧に無い注文を「もう生きていない」とみなすのは、キャッシュを使わずにサーバーへ問い合わせ直しても無く、
+# それが関門の別々の回で続けてこの回数そろったときだけ（1回の空応答を信じない）。
+_RESTART_GONE_CONFIRMS: int = 3   # 5周目（Claude 別人格・低）: 偽の空応答が続いても決めにくいように3回
+_RESTART_GONE_SPACING_SEC: float = 30.0   # 2回の確認は30秒以上あける（同時に入った関門で潰れない・頻度制限の窓を越える）
+_restart_gone_seen: dict = {}             # 注文ID → (サーバーで一覧に無かった回数, 最後に数えた時刻)
+_restart_refresh_warned: dict = {}        # 注文ID → 問い合わせ直しの失敗を最後に警告した時刻
+# 問い合わせ直し（refresh_cache=True）は、同じ口座で30秒に10回までの上限がある（公式仕様）。
+# 30秒に8回までに間引く。間引いた回は数えも数え直しもしない（次の回に回す）。
+_RESTART_REFRESH_WINDOW_SEC: float = 30.0
+_RESTART_REFRESH_MAX: int = 8
+_restart_refresh_times: list = []
+
+
+def _restart_refresh_allowed() -> bool:
+    _now = time.monotonic()
+    with _restart_close_lock:
+        _restart_refresh_times[:] = [t for t in _restart_refresh_times if _now - t < _RESTART_REFRESH_WINDOW_SEC]
+        if len(_restart_refresh_times) >= _RESTART_REFRESH_MAX:
+            return False
+        _restart_refresh_times.append(_now)
+        return True
+
+
+def _restart_forget_settled(oids) -> None:
+    """5周目（Claude 別人格・低）: 照会で生きて見えた注文は、「終わった」「消えた」の覚えを捨てる
+    （空応答が続いて消えたとみなした注文が一覧に戻ったとき、確かめずに「終わった」で通していた）。"""
+    with _restart_close_lock:
+        for _x in oids or []:
+            _restart_settled_oids.pop(str(_x), None)
+            _restart_gone_seen.pop(str(_x), None)
+
+
+def _restart_oids_add(info: dict, oids) -> None:
+    with _restart_close_lock:
+        info["cancelled_oids"] = list(dict.fromkeys(
+            list(info.get("cancelled_oids") or []) + [str(x) for x in oids]))
+
+
+def _restart_oids_remove(info: dict, oids) -> None:
+    _s = {str(x) for x in oids}
+    with _restart_close_lock:
+        info["cancelled_oids"] = [x for x in (info.get("cancelled_oids") or []) if x not in _s]
+
+
+def _order_on_server(order_id: str, symbol: str, trd_env) -> tuple:
+    """キャッシュを使わずにサーバーへ問い合わせ直す。戻り値 (結果, 状態, 約定数)。
+    結果は "row"（行が返った）・"absent"（照会は成功・一覧に無い）・"error"（照会の失敗）。
+
+    moomoo の注文照会は、まだ終わっていない注文を日付によらず返す（公式仕様）。サーバーに問い合わせ直しても
+    無ければ、その注文はもう生きていない。手元のキャッシュの空応答だけでは決めない（配布前レビュー2周目・Codex・高）。
+    """
+    try:
+        with _trade_ctx() as ctx:
+            ret, df = ctx.order_list_query(
+                trd_env=trd_env, order_id=str(order_id),
+                acc_id=(REAL_ACC_ID if trd_env == TrdEnv.REAL else 0), refresh_cache=True)
+        if ret != RET_OK:
+            return "error", str(df)[:120], 0
+        if df is None or bool(getattr(df, "empty", False)):
+            return "absent", "", 0
+        row = df.iloc[0]
+        return "row", str(row.get("order_status", "")).upper(), int(float(row.get("dealt_qty", 0) or 0))
+    except Exception as _e_ab:
+        return "error", f"{type(_e_ab).__name__}: {_mask_secrets(_e_ab)}"[:120], 0
 
 
 def _restart_close_settle(symbol: str, trd_env, oids) -> tuple:
@@ -17172,13 +17254,68 @@ def _restart_close_settle(symbol: str, trd_env, oids) -> tuple:
     _deadline = time.monotonic() + _RESTART_CANCEL_CONFIRM_SEC
     _left = {str(x) for x in oids}
     _filled = False
+    _asked = set()
+    for _oid in list(_left):
+        if _oid in _restart_settled_oids:          # もう終わったと分かっている注文
+            _left.discard(_oid)
+            _filled = _filled or bool(_restart_settled_oids[_oid])
     while True:
-        for _oid in list(_left):
-            _st, _dealt, _ = _order_status_snapshot(_oid, symbol, trd_env)
+        for _oid in sorted(_left, key=lambda o: _restart_last_asked.get(o, 0.0)):
+            _st, _dealt, _det = _order_status_snapshot(_oid, symbol, trd_env)
             if _dealt > 0:
                 _filled = True
             if _is_terminal_order_status(_st):
                 _left.discard(_oid)
+                _restart_gone_seen.pop(_oid, None)
+                _restart_settled_oids[_oid] = _dealt > 0
+            elif _st == "UNKNOWN" and _det == "NOT_FOUND":
+                # v3.9.219（配布前レビュー・Claude 別人格・高）: 照会は成功したが一覧に無い（失効して日付が変わった等）。
+                #   以前はここで「不明」のまま見送りが続き、損切りも時間切れ決済も再起動まで出なかった。
+                #   2周目（Codex・高／Claude 別人格・中）: 手元のキャッシュの空応答を1回見ただけでは信じない。
+                #   キャッシュを使わずにサーバーへ問い合わせ直しても無く、それが関門の別々の回で続いたときだけ、
+                #   もう生きていないとみなす。約定したかは分からないので「約定していた」側に倒し、建玉の反映を
+                #   待ってから進む（関門の settle_seq）。
+                if (_oid not in _asked
+                        and time.monotonic() - _restart_last_asked.get(_oid, -1e9)
+                            >= _restart_ask_spacing.get(_oid, _RESTART_GONE_SPACING_SEC)
+                        and _restart_refresh_allowed()):
+                    _asked.add(_oid)
+                    _restart_last_asked[_oid] = time.monotonic()
+                    _kind, _st2, _dealt2 = _order_on_server(_oid, symbol, trd_env)
+                    if _kind == "row":
+                        # 3周目（Claude 別人格・低）: サーバーが返した状態をそのまま使う
+                        if _dealt2 > 0:
+                            _filled = True
+                        _restart_gone_seen.pop(_oid, None)
+                        if _is_terminal_order_status(_st2):
+                            _left.discard(_oid)
+                            _restart_settled_oids[_oid] = _dealt2 > 0
+                            continue
+                        _restart_ask_spacing[_oid] = min(
+                            _restart_ask_spacing.get(_oid, _RESTART_GONE_SPACING_SEC) * 2, _RESTART_ASK_SPACING_MAX)
+                    elif _kind == "absent":
+                        _restart_ask_spacing.pop(_oid, None)
+                        _now_g = time.monotonic()
+                        with _restart_close_lock:        # 4周目（Claude 別人格・低）: 読みから書きまでを一度に
+                            _cnt, _t = _restart_gone_seen.get(_oid, (0, None))
+                            if _t is None or _now_g - _t >= _RESTART_GONE_SPACING_SEC:
+                                _restart_gone_seen[_oid] = (_cnt + 1, _now_g)
+                    else:
+                        # 3周目（Claude 別人格・中）: 失敗は数え直さず、黙らずに知らせる（10分おき）
+                        _restart_ask_spacing[_oid] = min(
+                            _restart_ask_spacing.get(_oid, _RESTART_GONE_SPACING_SEC) * 2, _RESTART_ASK_SPACING_MAX)
+                        _now_w = time.monotonic()
+                        if _now_w - _restart_refresh_warned.get(_oid, -1e9) >= 600:
+                            _restart_refresh_warned[_oid] = _now_w
+                            log.warning(f"【{symbol}】[二重決済防止] 前回の決済注文 orderId={_oid} が手元の照会に無く、"
+                                        f"サーバーへの問い合わせ直しにも失敗しました（{_st2}）→ 確かめられるまで決済を見送ります")
+                if _restart_gone_seen.get(_oid, (0, None))[0] >= _RESTART_GONE_CONFIRMS:
+                    _left.discard(_oid)
+                    _restart_gone_seen.pop(_oid, None)
+                    _restart_settled_oids[_oid] = True
+                    _filled = True
+            else:
+                _restart_gone_seen.pop(_oid, None)      # 一覧に出た → 数え直し
         if not _left:
             return True, _filled
         if time.monotonic() >= _deadline:
@@ -17198,9 +17335,16 @@ def _restart_close_gate(symbol: str, trd_env) -> bool:
       ・同期が成功しなかった（sync_positions は失敗を中で握りつぶすので、
         _account_scan_seq が進んだかで見分ける・3周目 Codex・高）
     """
-    _info = _restart_close_marks.get(symbol)
+    # 5周目（Codex・高）: 同期の側が初めて照会している途中は、まだ印が無い。照会が終わるまで見送る。
+    #   6周目（Codex・高）: 印と「処理中」は同じ錠の中で一度に読む（別々に読むと、その間に同期の側が
+    #   印を付けて処理中を外したとき、「印なし・処理中なし」と読んで通していた）。
+    with _restart_close_lock:
+        _info = _restart_close_marks.get(symbol)
+        _busy = _restart_note_busy.get(symbol, 0) > 0
     if _info is None:
-        return False
+        if _busy:
+            log.info(f"【{symbol}】[二重決済防止] 前回の起動の決済注文を照会している途中です → 終わってから決済します")
+        return _busy
     _at = _info.get("at") or datetime.datetime.now()
     _mins = (datetime.datetime.now() - _at).total_seconds() / 60
     _settle = _info.get("settle_seq")
@@ -17210,11 +17354,21 @@ def _restart_close_gate(symbol: str, trd_env) -> bool:
         return True
     _q = _restart_close_direction_qty(symbol)
     if _q == 0:
-        _restart_close_marks.pop(symbol, None)     # 閉じる建玉が無い＝関門の役目は終わり
+        with _restart_close_lock:
+            if _restart_note_busy.get(symbol, 0) > 0:
+                return True                        # 同期の側が照会・取消の途中（4周目）
+            for _oid in (_info.get("cancelled_oids") or []):
+                _restart_gone_seen.pop(str(_oid), None)
+                _restart_settled_oids.pop(str(_oid), None)
+                _restart_last_asked.pop(str(_oid), None)
+                _restart_ask_spacing.pop(str(_oid), None)
+            if _restart_close_marks.get(symbol) is _info:
+                _restart_close_marks.pop(symbol, None)     # 閉じる建玉が無い＝関門の役目は終わり
         return False
     # 起動時・同期で取り消した注文が終わったかを先に確かめる
     _prev = list(_info.get("cancelled_oids") or [])
     _ok, _oids = _live_close_orders(symbol, trd_env, _q)
+    _restart_forget_settled(_oids if _ok else [])
     if not _ok:
         _msg = (f"[二重決済防止] 注文を照会できません（再起動から {_mins:.0f}分）。前回の起動で"
                 f"出した決済が残っていないか確かめられないため、今回は決済を見送ります")
@@ -17224,23 +17378,32 @@ def _restart_close_gate(symbol: str, trd_env) -> bool:
     if _oids:
         _done = _cancel_restart_leftovers(symbol, trd_env, _oids)
         if _done < len(_oids):
+            # v3.9.219（認定サポーターの指摘）: 見送る前に、見つけた注文をすべて控えに残す。
+            #   受け付けられた取消は「自分で取り消した注文」として次の照会から外れるので、控えに
+            #   残さないと、次の回は残りの注文だけを確かめて、取消の途中の注文を見ずに通していた
+            #   （2本以上残り、一部の取消だけ失敗したとき）。受付の成否で分けずに全部を残す
+            #   （終わったかは次の回にまとめて確かめる。待つ側に倒れるだけで、通す側には倒れない）。
+            _restart_oids_add(_info, _prev + [str(x) for x in _oids])
             _msg = (f"[二重決済防止] 前回の起動で出したとみられる決済注文 {len(_oids)}件のうち"
                     f" {len(_oids) - _done}件の取消が受け付けられません（約定の途中の可能性）"
                     f" → 今回は決済を見送ります")
             log.warning(f"【{symbol}】{_msg}")
             _restart_close_notice(symbol, _msg + "。moomoo アプリで注文と建玉を確認してください。")
             return True
-    _check = list(dict.fromkeys(_prev + list(_oids)))
+    _check = list(dict.fromkeys(_prev + [str(x) for x in _oids]))
     if _check:
+        # v3.9.219（配布前レビュー）: 確かめる前に控えに残す（確かめる途中で例外が出ても控えが残る・Gemini）。
+        #   書くときは今の控えと合わせる（別スレッドの同期が足した控えを上書きで消さない・Claude 別人格）。
+        _restart_oids_add(_info, _check)
         _settled, _filled = _restart_close_settle(symbol, trd_env, _check)
         if not _settled:
             _msg = (f"[二重決済防止] 前回の起動の決済注文の取消は受け付けられましたが、"
                     f"終わったのを確かめられません → 今回は決済を見送ります")
             log.warning(f"【{symbol}】{_msg}")
-            _info["cancelled_oids"] = _check
-            _restart_close_notice(symbol, _msg + "。")
+            _restart_close_notice(symbol, _msg + "。続く場合は moomoo アプリでその銘柄の注文と建玉を確かめ、残っている決済注文があれば取り消してください。注文が見当たらないのに続く場合は、Bot を再起動してください。")
             return True
-        _info["cancelled_oids"] = []
+        # 確かめた注文だけを控えから外す（確かめている間に足された控えは残す）
+        _restart_oids_remove(_info, _check)
         if _filled:
             _info["settle_seq"] = _account_scan_seq + _RESTART_SETTLE_SCANS
             log.warning(f"【{symbol}】[二重決済防止] 前回の起動の決済注文が約定していました"
@@ -17259,7 +17422,21 @@ def _restart_close_gate(symbol: str, trd_env) -> bool:
     if _account_scan_seq <= _seq0:
         log.warning(f"【{symbol}】[二重決済防止] 建玉を取り直せませんでした → 今回は決済を見送ります")
         return True
-    _restart_close_marks.pop(symbol, None)
+    # v3.9.219（配布前レビュー・Codex・高）: いまの同期の中で、遅れて見えた前回の決済注文が取り消されて
+    #   控えに足されていたら、それが終わったのを確かめるまで通さない（印ごと外すと確かめずに通っていた）。
+    #   3周目（Codex・高）: 確かめてから印を外すまでの間に同期が控えを足すと、確かめずに通していた。
+    #   確かめと印の外しを、控えの書き込みと同じ錠の中で一度に行う。
+    with _restart_close_lock:
+        # 4周目（Claude 別人格・低）: 印が作り直されていたら（別の印）、外さずに見送る
+        _cur = _restart_close_marks.get(symbol)
+        _hold = ((_cur is not None and (_cur is not _info or bool(_cur.get("cancelled_oids"))))
+                 or _restart_note_busy.get(symbol, 0) > 0)
+        if not _hold:
+            _restart_close_marks.pop(symbol, None)
+    if _hold:
+        log.warning(f"【{symbol}】[二重決済防止] 建玉を取り直す途中で前回の決済注文が見つかったか、照会の途中です"
+                    f" → 終わったのを確かめてから決済します")
+        return True
     return False
 
 
@@ -17281,19 +17458,37 @@ def _note_restart_close_orders(symbol: str, trd_env, pos_qty, where: str) -> Non
         _last = _info.get("retry_at")
         if _last is not None and (_now - _last).total_seconds() < _RESTART_RETRY_SEC:
             return
+    # 4周目（Codex・高）: 照会・取消のあいだは「処理中」を立て、関門を通さない。控えへの登録は、取り消す前に、
+    #   錠の中で印を取り直してから行う（関門が印を外した後に、外れた印へ書き込まない）。
+    with _restart_close_lock:
+        _restart_note_busy[symbol] = _restart_note_busy.get(symbol, 0) + 1
+    try:
+        _note_restart_close_orders_body(symbol, trd_env, pos_qty, where, _info, _now)
+    finally:
+        with _restart_close_lock:
+            _n = _restart_note_busy.get(symbol, 1) - 1
+            if _n <= 0:
+                _restart_note_busy.pop(symbol, None)
+            else:
+                _restart_note_busy[symbol] = _n
+
+
+def _note_restart_close_orders_body(symbol: str, trd_env, pos_qty, where: str, _info, _now) -> None:
     _ok, _oids = _live_close_orders(symbol, trd_env, pos_qty)
+    _restart_forget_settled(_oids if _ok else [])
     if _info is not None:
         _info["retry_at"] = _now
     if _ok and not _oids:
         return            # 残っているのは新規の向き・このプロセスの注文だけ
-    _first = _info is None
-    _mark_restart_close(symbol)
-    _info = _restart_close_marks[symbol]
-    _info["retry_at"] = _now
+    with _restart_close_lock:
+        _first = _restart_close_marks.get(symbol) is None
+        _mark_restart_close(symbol)
+        _info = _restart_close_marks[symbol]
+        _info["retry_at"] = _now
+        if _ok:
+            _restart_oids_add(_info, _oids)        # 取り消す前に控えに足す
     if _ok:
         _done = _cancel_restart_leftovers(symbol, trd_env, _oids)
-        _info["cancelled_oids"] = list(dict.fromkeys(
-            list(_info.get("cancelled_oids") or []) + [str(x) for x in _oids]))
         if _done == len(_oids):
             _what = (f"起動前から残っていた決済注文 {len(_oids)}件を取り消しました"
                      f"（二重決済の防止）。決済が要れば、取消が終わったのを確かめてから"
@@ -17323,7 +17518,8 @@ def _sent_unknown_blocks_close(symbol: str, trd_env) -> bool:
     """
     # 3周目（Claude 別人格・高）: 再起動の関門が通しても、結果不明の決済の確認は
     #   飛ばさない（両方の印が同時に付くのは、どちらも OpenD が不安定なとき）。
-    if symbol in _restart_close_marks and _restart_close_gate(symbol, trd_env):
+    # 6周目（Codex・高）: 入口では印も処理中も見ずに関門を呼ぶ（判定は関門が錠の中で一度に行う）
+    if _restart_close_gate(symbol, trd_env):
         return True
     if symbol not in _close_sent_unknown:
         return False
@@ -20632,6 +20828,10 @@ def _order_status_snapshot(order_id: str, symbol: str, trd_env) -> tuple[str, in
             row = df.iloc[0]
             return (str(row.get("order_status", "")).upper(),
                     int(float(row.get("dealt_qty", 0) or 0)), "OK")
+        if ret == RET_OK:
+            # v3.9.219: 照会は成功したが一覧に無い（当日の注文一覧から外れた前日以前の注文など）。
+            #   照会の失敗と分ける（3つ目の値は、ほかの呼び出し元ではログに出すだけ）。
+            return "UNKNOWN", 0, "NOT_FOUND"
         return "UNKNOWN", 0, str(df)
     except Exception as e:
         return "UNKNOWN", 0, f"{type(e).__name__}: {_mask_secrets(e)}"
